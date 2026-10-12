@@ -303,7 +303,10 @@ textarea { resize: vertical; }
   font: 700 9px/1 "Cascadia Mono", Consolas, monospace;
 }
 .account-settings-card, .browser-settings-card, .proxy-settings-card { grid-column: span 4; }
-.routing-settings-card, .normalization-settings-card { grid-column: 1 / -1; }
+.routing-settings-card, .normalization-settings-card,
+.result-transfer-settings-card, .result-storage-settings-card { grid-column: 1 / -1; }
+.settings-card-note { color: var(--muted); font-size: 10px; line-height: 1.5; }
+.storage-secret-state { display: block; margin-top: 4px; color: var(--mint); font-size: 10px; }
 .settings-form-grid { gap: 7px; padding-top: 7px; }
 .settings-form-grid > .wide { grid-column: 1 / -1; }
 .browser-settings-card .check { grid-column: auto; }

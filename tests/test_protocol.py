@@ -11,7 +11,7 @@ import requests
 from app.catalog import normalize_request
 from app.client import build_submit_body
 from app.upload import _request
-from app.result_transfer import ResultTransferError, _upload_headers
+from app.result_transfer import ResultTransferError, _upload_headers, _config
 from app.service import Service
 from app.store import Store
 
@@ -78,6 +78,28 @@ class ProtocolTests(unittest.TestCase):
                                    "X-Amz-Meta-Upload-Id": "du_123"})
         with self.assertRaisesRegex(ResultTransferError, "value is invalid"):
             _upload_headers({"Content-Type": [None]})
+
+    def test_s3_settings_are_editable_without_exposing_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = Service(Store(str(Path(directory) / "settings.db")))
+            public = service.update_settings({
+                "enable_sd_2_5_480p_x": True,
+                "result_s3_center_api_base": "https://s3-api.example.com",
+                "result_s3_center_token": "secret-token",
+                "result_s3_bucket": "assets",
+                "result_s3_key_prefix": "aicontent/ai-sdijm",
+            })
+            self.assertEqual(public["result_s3_center_token"], "")
+            self.assertTrue(public["result_s3_center_token_configured"])
+            self.assertEqual(_config(service.settings()),
+                             ("https://s3-api.example.com", "secret-token", "assets", "aicontent/ai-sdijm"))
+            service.update_settings({"result_s3_center_token": ""})
+            self.assertEqual(service.settings()["result_s3_center_token"], "secret-token")
+            with self.assertRaisesRegex(ValueError, "prefix is invalid"):
+                service.update_settings({"result_s3_key_prefix": "../invalid"})
+            service.stop()
+            del service
+            gc.collect()
 
     def test_upload_retries_proxy_read_timeout(self):
         class ProxySession:

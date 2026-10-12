@@ -17,7 +17,7 @@ from .catalog import normalize_request
 from .client import DreaminaClient, DreaminaError
 from .errors import public_error
 from .media import MediaError
-from .result_transfer import ResultTransferError, transfer, presign, expires_soon
+from .result_transfer import ResultTransferError, transfer, presign, expires_soon, _config
 from .upload import UploadError
 from .store import Store
 
@@ -37,6 +37,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "excess_media_policy": "reject",
     "prompt_media_reference_cleanup_enabled": True,
     "enable_sd_2_5_480p_x": False,
+    "result_s3_backend": "s3_center_direct",
+    "result_s3_center_api_base": os.getenv("IJM_S3_CENTER_API_BASE", ""),
+    "result_s3_center_token": os.getenv("IJM_S3_CENTER_TOKEN", ""),
+    "result_s3_bucket": os.getenv("IJM_S3_CENTER_BUCKET", "assets"),
+    "result_s3_key_prefix": os.getenv("IJM_S3_CENTER_KEY_PREFIX", "aicontent/ai-sdijm"),
 }
 
 
@@ -54,14 +59,28 @@ class Service:
     def settings(self) -> dict[str, Any]:
         return {**DEFAULT_SETTINGS, **self.store.get_settings()}
 
+    def public_settings(self) -> dict[str, Any]:
+        values = self.settings()
+        values["result_s3_center_token_configured"] = bool(values.get("result_s3_center_token"))
+        values["result_s3_center_token"] = ""
+        return values
+
     def update_settings(self, values: dict[str, Any]) -> dict[str, Any]:
         allowed = set(DEFAULT_SETTINGS)
         filtered = {key: value for key, value in values.items() if key in allowed}
+        if "result_s3_center_token" in filtered and not str(filtered["result_s3_center_token"] or "").strip():
+            filtered.pop("result_s3_center_token")
         for key in ("task_workers", "task_queue_capacity", "poll_interval_seconds", "task_timeout_seconds"):
             if key in filtered and not 1 <= int(filtered[key]) <= (3600 if key != "task_queue_capacity" else 10000):
                 raise ValueError(f"invalid {key}")
+        candidate = {**self.settings(), **filtered}
+        if candidate["enable_sd_2_5_480p_x"]:
+            try:
+                _config(candidate)
+            except ResultTransferError as exc:
+                raise ValueError(str(exc)) from exc
         self.store.update_settings(filtered)
-        return self.settings()
+        return self.public_settings()
 
     def start(self) -> None:
         self._started = True
@@ -308,7 +327,7 @@ class Service:
                                                      "upstream_result_urls": result_urls})
                     try:
                         signed_url, transfer_metadata = transfer(
-                            result_urls[0], str(client.account["proxy_url"]), task_id)
+                            result_urls[0], str(client.account["proxy_url"]), task_id, self.settings())
                         result_urls = [signed_url]
                     except ResultTransferError as exc:
                         self._fail(task_id, "RESULT_TRANSFER_FAILED", str(exc))
@@ -365,7 +384,8 @@ class Service:
                 and task["result_urls"] and expires_soon(task.get("result_transfer") or {})):
             metadata = task["result_transfer"]
             try:
-                url, refreshed = presign(metadata["bucket"], metadata["key"], metadata["size_bytes"])
+                url, refreshed = presign(metadata["bucket"], metadata["key"], metadata["size_bytes"],
+                                         self.settings())
                 task = self.store.update_task(task["id"], {"result_urls": [url],
                     "result_transfer": {**metadata, **refreshed}})
             except (ResultTransferError, KeyError):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -23,16 +24,24 @@ MAX_RESULT_BYTES = 512 * 1024 * 1024
 MAX_SINGLE_UPLOAD_BYTES = 256 * 1024 * 1024
 
 
-def _config() -> tuple[str, str, str]:
-    base = os.getenv("IJM_S3_CENTER_API_BASE", "").strip().rstrip("/")
-    token = os.getenv("IJM_S3_CENTER_TOKEN", "").strip()
-    bucket = os.getenv("IJM_S3_CENTER_BUCKET", "").strip()
+def _config(storage: dict | None = None) -> tuple[str, str, str, str]:
+    storage = storage or {}
+    if str(storage.get("result_s3_backend") or "s3_center_direct") != "s3_center_direct":
+        raise ResultTransferError("sd-2-5-480p-x requires s3-center direct storage")
+    base = str(storage.get("result_s3_center_api_base") or os.getenv("IJM_S3_CENTER_API_BASE", "")).strip().rstrip("/")
+    token = str(storage.get("result_s3_center_token") or os.getenv("IJM_S3_CENTER_TOKEN", "")).strip()
+    bucket = str(storage.get("result_s3_bucket") or os.getenv("IJM_S3_CENTER_BUCKET", "assets")).strip()
+    prefix = str(storage.get("result_s3_key_prefix") or os.getenv("IJM_S3_CENTER_KEY_PREFIX", "aicontent/ai-sdijm")).strip("/")
     parsed = urlsplit(base)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ResultTransferError("s3-center API base is not configured")
     if not token or not bucket:
         raise ResultTransferError("s3-center token or bucket is not configured")
-    return base, token, bucket
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9/_-]{0,99}", prefix) or "//" in prefix or any(
+        part in {".", ".."} for part in prefix.split("/")
+    ):
+        raise ResultTransferError("s3-center object key prefix is invalid")
+    return base, token, bucket, prefix
 
 
 def _json_response(response: requests.Response, label: str) -> dict:
@@ -143,8 +152,9 @@ def _upload_headers(value: object) -> dict[str, str]:
     return headers
 
 
-def presign(bucket: str, key: str, expected_size: int | None = None) -> tuple[str, dict]:
-    base, token, configured_bucket = _config()
+def presign(bucket: str, key: str, expected_size: int | None = None,
+            storage: dict | None = None) -> tuple[str, dict]:
+    base, token, configured_bucket, _ = _config(storage)
     if bucket != configured_bucket:
         raise ResultTransferError("s3-center bucket mismatch")
     with requests.Session() as http:
@@ -170,9 +180,10 @@ def expires_soon(metadata: dict) -> bool:
         return True
 
 
-def transfer(url: str, proxy_url: str, task_id: str) -> tuple[str, dict]:
-    base, token, bucket = _config()
-    key = f"ijm2api/{task_id}/480p.mp4"
+def transfer(url: str, proxy_url: str, task_id: str,
+             storage: dict | None = None) -> tuple[str, dict]:
+    base, token, bucket, prefix = _config(storage)
+    key = f"{prefix}/{task_id}/480p.mp4"
     with tempfile.TemporaryDirectory(prefix="ijm-result-") as directory:
         source, target = Path(directory) / "source.mp4", Path(directory) / "480p.mp4"
         _download(url, proxy_url, source)
@@ -180,11 +191,12 @@ def transfer(url: str, proxy_url: str, task_id: str) -> tuple[str, dict]:
         size = target.stat().st_size
         if size > MAX_SINGLE_UPLOAD_BYTES:
             raise ResultTransferError("480p result exceeds s3-center single-upload limit")
+        idempotency_key = f"ijm2api:{task_id}:{hashlib.sha256(f'{bucket}/{key}'.encode()).hexdigest()[:24]}"
         with requests.Session() as http:
             http.trust_env = False
             created = _post(http, f"{base}/v1/uploads", token,
                             {"bucket": bucket, "key": key, "size": size, "content_type": "video/mp4"},
-                            "s3-center create", {"Idempotency-Key": f"ijm2api:{task_id}:480p"})
+                            "s3-center create", {"Idempotency-Key": idempotency_key})
             upload_id = str(created.get("id") or "")
             upload = created.get("upload") or {}
             if (not re.fullmatch(r"du_[a-f0-9]{32}", upload_id)
@@ -213,7 +225,7 @@ def transfer(url: str, proxy_url: str, task_id: str) -> tuple[str, dict]:
                     or committed.get("logical_key") != f"{bucket}/{key}"
                     or int(committed.get("declared_bytes") or -1) != size):
                 raise ResultTransferError("s3-center committed object does not match upload")
-        signed_url, metadata = presign(bucket, key, size)
+        signed_url, metadata = presign(bucket, key, size, storage)
         metadata["upstream_url"] = url
         metadata["upload_id"] = upload_id
         return signed_url, metadata

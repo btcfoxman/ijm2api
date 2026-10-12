@@ -50,9 +50,14 @@ Model aliases: `sd-2-0`, `sd-2-0-1080p`, `sd-2-0-4k`,
 default to 720p. Seedance 2.0 accepts up to 9 images, 3 audio clips and
 3 videos; Seedance 2.5 accepts up to 30, 10 and 10 respectively.
 
-`sd-2-5-480p-x` is an opt-in result-processing model. Enable it in the
-management console and configure `IJM_S3_CENTER_API_BASE`,
-`IJM_S3_CENTER_TOKEN`, and `IJM_S3_CENTER_BUCKET` in the server `.env`.
+`sd-2-5-480p-x` is an opt-in result-processing model. Enable it and configure
+the **S3 result storage** fields in the management console. The container
+environment variables `IJM_S3_CENTER_API_BASE`, `IJM_S3_CENTER_TOKEN`,
+`IJM_S3_CENTER_BUCKET`, and `IJM_S3_CENTER_KEY_PREFIX` provide initial values.
+The default bucket is `assets` and the object prefix is `aicontent/ai-sdijm`;
+the API base and token can match Lingya2API's s3-center direct settings.
+The console never returns the stored Bearer token; leave the password field
+empty to retain it.
 IJM2API submits Seedance 2.5 at 720p using 720p credits, downloads the
 finished video through the selected account's proxy, converts its shorter
 side to 480 pixels while preserving aspect ratio and audio, uploads the new

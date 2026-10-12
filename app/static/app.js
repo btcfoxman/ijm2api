@@ -124,14 +124,52 @@ $("#refreshButton").addEventListener("click", refresh); $("#accountsRefresh").ad
 $("#addAccountButton").addEventListener("click", () => { $("#accountForm").reset(); $("#accountForm").elements.namedItem("max_concurrency").value = 1; $("#accountDialog").showModal(); });
 $("#batchButton").addEventListener("click", () => { $("#batchResult").hidden = true; $("#batchResult").textContent = ""; $("#batchDialog").showModal(); });
 $("#newTaskButton").addEventListener("click", () => { renderModels(); validateJson(); $("#taskDialog").showModal(); }); $("#requestJson").addEventListener("input", validateJson);
-$("#settingsButton").addEventListener("click", () => { const form = $("#settingsForm"); Object.entries(state.settings).forEach(([key, value]) => { const input = form.elements.namedItem(key); if (!input) return; if (input.type === "checkbox") input.checked = Boolean(value); else input.value = value ?? ""; }); $("#settingsDialog").showModal(); });
+$("#settingsButton").addEventListener("click", () => {
+  const form = $("#settingsForm");
+  Object.entries(state.settings).forEach(([key, value]) => {
+    const input = form.elements.namedItem(key);
+    if (!input || key === "result_s3_center_token") return;
+    if (input.type === "checkbox") input.checked = Boolean(value);
+    else input.value = value ?? "";
+  });
+  form.elements.namedItem("result_s3_center_token").value = "";
+  $("#s3TokenHint").textContent = state.settings.result_s3_center_token_configured
+    ? "已配置；留空保留当前密钥" : "尚未配置";
+  $("#settingsDialog").showModal();
+});
 $("#integrationDocsButton").addEventListener("click", async () => { try { $("#integrationDocsContent").textContent = await apiText("/api/integration-docs"); $("#integrationDocsDialog").showModal(); } catch (error) { toast(error.message, true); } });
 $("#copyIntegrationDocs").addEventListener("click", async () => { await navigator.clipboard.writeText($("#integrationDocsContent").textContent); toast("Markdown 已复制"); });
 $("#costReferenceButton").addEventListener("click", async () => { $("#costReferenceDialog").showModal(); state.costReferences = await api("/api/model-costs?limit=500"); renderCosts(); }); $("#costReferenceRefresh").addEventListener("click", async () => { state.costReferences = await api("/api/model-costs?limit=500"); renderCosts(); });
 $("#accountForm").addEventListener("submit", async (event) => { event.preventDefault(); const data = Object.fromEntries(new FormData(event.currentTarget)); try { data.max_concurrency = Number(data.max_concurrency || 1); data.cdp_port = Number(data.cdp_port || 0); await api("/api/accounts", { method: "POST", body: JSON.stringify(data) }); event.currentTarget.reset(); $("#accountDialog").close(); toast("Account saved. Open web login next."); await refresh(); } catch (error) { toast(error.message, true); } });
 $("#batchForm").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; const panel = $("#batchResult"); try { const result = await api("/api/accounts/batch-import", { method: "POST", body: JSON.stringify({ text: form.elements.namedItem("text").value }) }); const errorText = (result.errors || []).join("\n"); panel.hidden = false; panel.classList.toggle("error", Boolean(errorText)); panel.textContent = `Input ${result.input_count} / Saved ${result.count}${errorText ? `\n${errorText}` : ""}`; await refresh(); if (!errorText) setTimeout(() => $("#batchDialog").close(), 700); } catch (error) { panel.hidden = false; panel.classList.add("error"); panel.textContent = error.message; toast(error.message, true); } });
 $("#profileResetForm").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; try { await api(`/api/accounts/${form.account_id.value}/profile/reset`, { method: "POST", body: JSON.stringify({ proxy_url: form.proxy_url.value || null, start_login: form.start_login.checked }) }); $("#profileResetDialog").close(); toast("Profile 已重置"); await refresh(); } catch (error) { toast(error.message, true); } });
-$("#settingsForm").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; const field = (name) => form.elements.namedItem(name); const payload = { task_workers: Number(field("task_workers").value), task_queue_capacity: Number(field("task_queue_capacity").value), poll_interval_seconds: Number(field("poll_interval_seconds").value), task_timeout_seconds: Number(field("task_timeout_seconds").value), daily_checkin_enabled: field("daily_checkin_enabled").checked, low_balance_disable_threshold: Number(field("low_balance_disable_threshold").value), chrome_executable: field("chrome_executable").value, chrome_user_data_root: field("chrome_user_data_root").value, allow_video_reference_inputs: field("allow_video_reference_inputs").checked, prompt_media_reference_cleanup_enabled: field("prompt_media_reference_cleanup_enabled").checked, enable_sd_2_5_480p_x: field("enable_sd_2_5_480p_x").checked }; try { state.settings = await api("/api/settings", { method: "PATCH", body: JSON.stringify(payload) }); $("#settingsDialog").close(); toast("Settings saved"); await refresh(); } catch (error) { toast(error.message, true); } });
+$("#settingsForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const field = (name) => form.elements.namedItem(name);
+  const payload = {
+    task_workers: Number(field("task_workers").value),
+    task_queue_capacity: Number(field("task_queue_capacity").value),
+    poll_interval_seconds: Number(field("poll_interval_seconds").value),
+    task_timeout_seconds: Number(field("task_timeout_seconds").value),
+    daily_checkin_enabled: field("daily_checkin_enabled").checked,
+    low_balance_disable_threshold: Number(field("low_balance_disable_threshold").value),
+    chrome_executable: field("chrome_executable").value,
+    chrome_user_data_root: field("chrome_user_data_root").value,
+    allow_video_reference_inputs: field("allow_video_reference_inputs").checked,
+    prompt_media_reference_cleanup_enabled: field("prompt_media_reference_cleanup_enabled").checked,
+    enable_sd_2_5_480p_x: field("enable_sd_2_5_480p_x").checked,
+    result_s3_center_api_base: field("result_s3_center_api_base").value.trim(),
+    result_s3_bucket: field("result_s3_bucket").value.trim(),
+    result_s3_key_prefix: field("result_s3_key_prefix").value.trim(),
+  };
+  const token = field("result_s3_center_token").value.trim();
+  if (token) payload.result_s3_center_token = token;
+  try {
+    state.settings = await api("/api/settings", { method: "PATCH", body: JSON.stringify(payload) });
+    $("#settingsDialog").close(); toast("Settings saved"); await refresh();
+  } catch (error) { toast(error.message, true); }
+});
 $("#taskForm").addEventListener("submit", async (event) => { event.preventDefault(); if (!validateJson()) return; try { const task = await api("/api/tasks", { method: "POST", body: $("#requestJson").value }); $("#taskDialog").close(); toast(`任务已创建：${task.id}`); await refresh(); } catch (error) { toast(error.message, true); } });
 $("#clearTasks").addEventListener("click", async () => { try { const result = await api("/api/tasks", { method: "DELETE" }); toast(`已清理 ${result.deleted} 个任务`); await refresh(); } catch (error) { toast(error.message, true); } });
 

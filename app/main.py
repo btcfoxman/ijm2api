@@ -139,7 +139,7 @@ def home(ijm_admin: str | None = Cookie(default=None),
 
 @app.get("/api/settings", dependencies=[Depends(admin_auth)])
 def settings() -> dict[str, Any]:
-    return service.settings()
+    return service.public_settings()
 
 
 @app.patch("/api/settings", dependencies=[Depends(admin_auth)])
