@@ -69,12 +69,27 @@ def _sign(method: str, url: str, *, access_key: str, secret_key: str,
 def _request(session: requests.Session, method: str, url: str,
              *, headers: dict[str, str] | None = None, data: bytes | None = None,
              timeout: int = 90) -> dict[str, Any]:
-    try:
-        response = session.request(method, url, headers=headers, data=data, timeout=timeout)
-        response.raise_for_status()
-        result = response.json()
-    except (requests.RequestException, ValueError) as exc:
-        raise UploadError(f"Dreamina upload transport failed: {type(exc).__name__}") from exc
+    for attempt in range(4):
+        try:
+            response = session.request(method, url, headers=headers, data=data,
+                                       timeout=(15, min(timeout, 60)))
+            response.raise_for_status()
+            result = response.json()
+            break
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            if attempt == 3:
+                raise UploadError(
+                    f"Dreamina upload transport failed after 4 proxy attempts: {type(exc).__name__}"
+                ) from exc
+            time.sleep(min(2 ** attempt, 4))
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status >= 500 and attempt < 3:
+                time.sleep(min(2 ** attempt, 4))
+                continue
+            raise UploadError(f"Dreamina upload HTTP {status}") from exc
+        except ValueError as exc:
+            raise UploadError("Dreamina upload returned invalid JSON") from exc
     if not isinstance(result, dict):
         raise UploadError("Dreamina upload returned an invalid response")
     error = (result.get("ResponseMetadata") or {}).get("Error")

@@ -277,9 +277,12 @@ class DreaminaClient:
         task = record.get("task") or {}
         status = int(task.get("status") or record.get("status") or 0)
         urls = extract_result_urls(record)
-        error_code = str(record.get("fail_code") or task.get("resp_ret") or "")
+        response_return = task.get("resp_ret") or {}
+        if isinstance(response_return, dict):
+            response_return = response_return.get("ret")
+        error_code = str(record.get("fail_code") or response_return or "")
         error = str(record.get("fail_starling_message") or
-                    record.get("fail_starling_key") or "")
+                    record.get("fail_msg") or record.get("fail_starling_key") or "")
         if urls:
             state = "succeeded"
         elif status in {40, 60, 70, 80, 90} or error_code not in {"", "0"}:

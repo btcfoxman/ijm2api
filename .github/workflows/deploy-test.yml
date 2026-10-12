@@ -161,13 +161,41 @@ jobs:
           origin_cert="${HOME}/.cloudflared/cert.pem"
           test -f "$origin_cert"
           cloudflared --origincert "$origin_cert" tunnel route dns "$tunnel_id" "$IJM2API_HOSTNAME" || true
-          main_pid="$(systemctl show -p MainPID --value cloudflared)"
-          test "$main_pid" -gt 1
-          docker run --rm --pid=host python:3.12-slim sh -c 'kill -TERM "$1"' sh "$main_pid"
-          for attempt in $(seq 1 20); do
-            if systemctl is-active --quiet cloudflared; then break; fi
-            sleep 2
-          done
+          # The host's cloudflared service is root-owned. Run a small
+          # account-owned connector for this route so the runner can deploy it.
+          umask 077
+          mkdir -p "$DEPLOY_PATH/.cloudflared" "$HOME/.config/systemd/user"
+          credentials="$DEPLOY_PATH/.cloudflared/credentials.json"
+          docker run --rm -v "$config_dir:/cf:ro" python:3.12-slim \
+            cat "/cf/${tunnel_id}.json" > "$credentials"
+          route_config="$DEPLOY_PATH/.cloudflared/config.yml"
+          cat > "$route_config" <<EOF
+          tunnel: $tunnel_id
+          credentials-file: $credentials
+          ingress:
+            - hostname: $IJM2API_HOSTNAME
+              service: $IJM2API_ORIGIN
+            - service: http_status:404
+          EOF
+          cloudflared tunnel --config "$route_config" ingress validate
+          cat > "$HOME/.config/systemd/user/ijm2api-cloudflared.service" <<EOF
+          [Unit]
+          Description=IJM2API Cloudflare Tunnel connector
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/cloudflared --config $route_config tunnel run
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=default.target
+          EOF
+          systemctl --user daemon-reload
+          systemctl --user enable ijm2api-cloudflared.service
+          systemctl --user restart ijm2api-cloudflared.service
+          systemctl --user is-active --quiet ijm2api-cloudflared.service
       - name: Verify public endpoint
         shell: bash
         run: |

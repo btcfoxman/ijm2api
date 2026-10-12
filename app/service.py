@@ -275,6 +275,7 @@ class Service:
 
     def _poll(self, task_id: str, client: DreaminaClient, deadline: float) -> None:
         errors = 0
+        missing_failure_detail = 0
         while time.monotonic() < deadline and not self._stop.is_set():
             task = self.store.task(task_id)
             if not task or task["status"] in TERMINAL:
@@ -313,6 +314,12 @@ class Service:
                     "completed_at": finished_at})
                 return
             if state["status"] == "failed":
+                # History may first report a terminal status and only add the
+                # localized failure reason a few seconds later.
+                if not state["error"] and missing_failure_detail < 3:
+                    missing_failure_detail += 1
+                    time.sleep(2)
+                    continue
                 reason = state["error"] or "Dreamina video generation failed"
                 upstream_code = state.get("error_code") or ""
                 if upstream_code in {"12009", "12011"}:
