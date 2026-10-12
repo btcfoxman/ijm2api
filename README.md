@@ -49,6 +49,18 @@ Model aliases: `sd-2-0`, `sd-2-0-1080p`, `sd-2-0-4k`,
 `sd-2-5-1080p`, and `sd-2-5-480p-preview`. Unsuffixed aliases
 default to 720p. Seedance 2.0 accepts up to 9 images, 3 audio clips and
 3 videos; Seedance 2.5 accepts up to 30, 10 and 10 respectively.
+
+`sd-2-5-480p-x` is an opt-in result-processing model. Enable it in the
+management console and configure `IJM_S3_CENTER_API_BASE`,
+`IJM_S3_CENTER_TOKEN`, and `IJM_S3_CENTER_BUCKET` in the server `.env`.
+IJM2API submits Seedance 2.5 at 720p using 720p credits, downloads the
+finished video through the selected account's proxy, converts its shorter
+side to 480 pixels while preserving aspect ratio and audio, uploads the new
+MP4 to s3-center, and returns the presigned temporary URL. Querying the
+IJM2API task again refreshes that URL when it is close to expiry. If transfer
+fails, the task reports `RESULT_TRANSFER_FAILED` and keeps the upstream URL
+in its private task record for diagnosis; it never returns the 720p source
+as a 480p result.
 References such as `视频1`, `video2`, `v3`, `视4`, `图片1`,
 `图1`, `img2`, `Image3`, `Audio1` and `音频2` become Dreamina
 `meta_list` media references by one-based index.

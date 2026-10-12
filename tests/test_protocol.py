@@ -1,5 +1,9 @@
 import json
+import gc
+import tempfile
+import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import requests
@@ -7,6 +11,9 @@ import requests
 from app.catalog import normalize_request
 from app.client import build_submit_body
 from app.upload import _request
+from app.result_transfer import ResultTransferError
+from app.service import Service
+from app.store import Store
 
 
 class ProtocolTests(unittest.TestCase):
@@ -52,6 +59,18 @@ class ProtocolTests(unittest.TestCase):
             normalize_request({"model": "sd-2-5-480p", "prompt": "A blue sky",
                                "resolution": "720p"})
 
+    def test_480p_x_generates_upstream_at_720p(self):
+        normalized = normalize_request({"model": "sd-2-5-480p-x", "prompt": "A blue sky",
+                                        "duration": 4, "resolution": "480p"})
+        submitted, _ = build_submit_body(normalized, {"images": [], "videos": [], "audios": []})
+        draft = json.loads(submitted["draft_content"])
+        item = draft["component_list"][0]["abilities"]["gen_video"]["text_to_video_params"]["video_gen_inputs"][0]
+        scene = json.loads(json.loads(submitted["metrics_extra"])["sceneOptions"])[0]
+        self.assertEqual(item["resolution"], "720p")
+        self.assertEqual(scene["resolution"], "720p")
+        self.assertEqual(submitted["extend"]["m_video_commerce_info"]["benefit_type"],
+                         "seedance_25_720p_output")
+
     def test_upload_retries_proxy_read_timeout(self):
         class ProxySession:
             def __init__(self):
@@ -74,6 +93,28 @@ class ProtocolTests(unittest.TestCase):
             result = _request(session, "GET", "https://example.com/upload")
         self.assertEqual(session.calls, 2)
         self.assertTrue(result["Result"]["ok"])
+
+    def test_480p_x_never_returns_upstream_720p_on_transfer_failure(self):
+        class Client:
+            account = {"proxy_url": "socks5://proxy.test:20002"}
+
+            def poll(self, *_):
+                return {"status": "succeeded", "result_urls": ["https://upstream.test/720p.mp4"]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(str(Path(directory) / "test.db"))
+            service = Service(store)
+            request = {"model": "sd-2-5-480p-x", "prompt": "A blue sky", "duration": 4}
+            task = store.create_task("ijm_test", request, normalize_request(request))
+            store.update_task(task["id"], {"status": "running", "account_id": 1})
+            with patch("app.service.transfer", side_effect=ResultTransferError("upload failed")):
+                service._poll(task["id"], Client(), time.monotonic() + 10)
+            failed = store.task(task["id"])
+            self.assertEqual(failed["error_code"], "RESULT_TRANSFER_FAILED")
+            self.assertEqual(failed["upstream_result_urls"], ["https://upstream.test/720p.mp4"])
+            self.assertEqual(service.public_task(failed)["data"], [])
+            service.stop()
+            gc.collect()
 
 
 if __name__ == "__main__":

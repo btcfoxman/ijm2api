@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .catalog import MODELS
+
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -45,6 +47,8 @@ class Store:
                     request_json TEXT NOT NULL,
                     normalized_json TEXT NOT NULL,
                     result_json TEXT NOT NULL DEFAULT '[]',
+                    upstream_result_json TEXT NOT NULL DEFAULT '[]',
+                    result_transfer_json TEXT NOT NULL DEFAULT '{}',
                     media_inputs_json TEXT NOT NULL DEFAULT '[]',
                     thread_id TEXT NOT NULL DEFAULT '',
                     run_id TEXT NOT NULL DEFAULT '',
@@ -70,6 +74,11 @@ class Store:
                 );
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """)
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
+            for name, default in (("upstream_result_json", "[]"),
+                                  ("result_transfer_json", "{}")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE tasks ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'")
         try:
             self.path.chmod(0o600)
         except OSError:
@@ -98,6 +107,8 @@ class Store:
         value["request"] = json.loads(value.pop("request_json"))
         value["normalized"] = json.loads(value.pop("normalized_json"))
         value["result_urls"] = json.loads(value.pop("result_json"))
+        value["upstream_result_urls"] = json.loads(value.pop("upstream_result_json"))
+        value["result_transfer"] = json.loads(value.pop("result_transfer_json"))
         value["media_inputs"] = json.loads(value.pop("media_inputs_json"))
         value["prompt"] = value["request"].get("prompt", "")
         value["channel"] = "ijmapi"
@@ -105,7 +116,8 @@ class Store:
         value["caller_request"] = value["request"]
         value["upstream_request"] = {"model": value["normalized"]["upstream_model"],
             "duration_sec": value["normalized"]["duration"],
-            "resolution": value["normalized"]["resolution"],
+            "resolution": MODELS[value["model"]].generation_resolution,
+            "output_resolution": value["normalized"]["resolution"],
             "ratio": value["normalized"]["aspect_ratio"],
             "media_counts": {key: len(value["normalized"][key])
                              for key in ("images", "videos", "audios")}}
@@ -227,6 +239,10 @@ class Store:
             "balance_before", "balance_after", "completed_at"}}
         if "result_urls" in values:
             data["result_json"] = _json(values["result_urls"])
+        if "upstream_result_urls" in values:
+            data["upstream_result_json"] = _json(values["upstream_result_urls"])
+        if "result_transfer" in values:
+            data["result_transfer_json"] = _json(values["result_transfer"])
         data["updated_at"] = time.time()
         with self._lock, self._connect() as db:
             db.execute("UPDATE tasks SET " + ",".join(f"{key}=?" for key in data) + " WHERE id=?",

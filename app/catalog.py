@@ -17,6 +17,10 @@ class ModelSpec:
     draft_version: str = "3.3.9"
 
     @property
+    def generation_resolution(self) -> str:
+        return "720p" if self.id == "sd-2-5-480p-x" else self.resolution
+
+    @property
     def limits(self) -> dict[str, int]:
         return {"images": 30, "audios": 10, "videos": 10} if self.family == "2.5" else {
             "images": 9, "audios": 3, "videos": 3}
@@ -39,6 +43,7 @@ MODELS = {item.id: item for item in (
     _model("sd-2-0-mini", "dreamina_seedance_40_mini", "720p", "2.0", "seedance_20_mini_720p_output", "3.0.5"),
     _model("sd-2-5", "dreamina_seedance_45_pro", "720p", "2.5", "seedance_25_720p_output"),
     _model("sd-2-5-480p", "dreamina_seedance_45_pro", "480p", "2.5", "seedance_25_480p_output"),
+    _model("sd-2-5-480p-x", "dreamina_seedance_45_pro", "480p", "2.5", "seedance_25_720p_output"),
     _model("sd-2-5-1080p", "dreamina_seedance_45_pro", "1080p", "2.5", "seedance_25_1080p_output"),
     _model("sd-2-5-480p-preview", "dreamina_seedance_45_pro_draft", "480p", "2.5",
            "seedance_25_draft_480p_output", "3.3.28"),

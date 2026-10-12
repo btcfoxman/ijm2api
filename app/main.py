@@ -336,12 +336,13 @@ def browser_close(account_id: int) -> dict[str, Any]:
 
 @app.get("/api/models", dependencies=[Depends(admin_auth)])
 def admin_models() -> list[dict[str, Any]]:
-    return public_models()
+    return [model for model in public_models() if model["id"] != "sd-2-5-480p-x" or
+            service.settings()["enable_sd_2_5_480p_x"]]
 
 
 @app.get("/v1/models", dependencies=[Depends(api_auth)])
 def models() -> dict[str, Any]:
-    return {"object": "list", "data": public_models()}
+    return {"object": "list", "data": admin_models()}
 
 
 @app.get("/api/model-costs", dependencies=[Depends(admin_auth)])
@@ -378,7 +379,7 @@ def clear_tasks() -> dict[str, Any]:
 
 @app.get("/api/integration-docs", dependencies=[Depends(admin_auth)])
 def integration_docs() -> PlainTextResponse:
-    models = ", ".join(item["id"] for item in public_models())
+    models = ", ".join(item["id"] for item in admin_models())
     return PlainTextResponse(f"IJM2API / IJMAPI\n\nPOST /v1/videos\nGET /v1/videos/{{task_id}}\n"
                              f"GET /v1/models\n\nBearer: IJM_API_KEY\n\nModels: {models}\n"
                              "Request fields: model, prompt, duration, aspect_ratio, "
@@ -422,7 +423,7 @@ def get_video_content(task_id: str) -> RedirectResponse:
     task = _task(task_id)
     if task["status"] != "succeeded" or not task["result_urls"]:
         raise HTTPException(status_code=409, detail="video is not ready")
-    return RedirectResponse(task["result_urls"][0], status_code=307)
+    return RedirectResponse(service.public_task(task)["data"][0]["url"], status_code=307)
 
 
 @app.post("/api/v3/contents/generations/tasks", dependencies=[Depends(api_auth)])

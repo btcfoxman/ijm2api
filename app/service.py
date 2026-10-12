@@ -17,6 +17,7 @@ from .catalog import normalize_request
 from .client import DreaminaClient, DreaminaError
 from .errors import public_error
 from .media import MediaError
+from .result_transfer import ResultTransferError, transfer, presign, expires_soon
 from .upload import UploadError
 from .store import Store
 
@@ -35,6 +36,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "allow_video_reference_inputs": True,
     "excess_media_policy": "reject",
     "prompt_media_reference_cleanup_enabled": True,
+    "enable_sd_2_5_480p_x": False,
 }
 
 
@@ -120,6 +122,8 @@ class Service:
     def create(self, request: dict[str, Any]) -> dict[str, Any]:
         normalized = normalize_request(request)
         settings = self.settings()
+        if normalized["model"] == "sd-2-5-480p-x" and not settings["enable_sd_2_5_480p_x"]:
+            raise ValueError("sd-2-5-480p-x is disabled in service settings")
         if not bool(settings["allow_video_reference_inputs"]) and normalized["videos"]:
             raise ValueError("video reference inputs are disabled by service settings")
         if self.store.active_count() >= int(settings["task_workers"]) + int(settings["task_queue_capacity"]):
@@ -127,9 +131,9 @@ class Service:
         task_id = "ijm_" + uuid.uuid4().hex[:16]
         task = self.store.create_task(task_id, request, normalized)
         estimates = [item for item in self.store.model_costs() if
-                     item["model"] == normalized["model"] and
+                     item["model"] == ("sd-2-5" if normalized["model"] == "sd-2-5-480p-x" else normalized["model"]) and
                      item["duration"] == normalized["duration"] and
-                     item["resolution"] == normalized["resolution"] and
+                     item["resolution"] == ("720p" if normalized["model"] == "sd-2-5-480p-x" else normalized["resolution"]) and
                      item["image_count"] == len(normalized["images"]) and
                      item["video_count"] == len(normalized["videos"]) and
                      item["audio_count"] == len(normalized["audios"])]
@@ -297,6 +301,18 @@ class Service:
                         continue
                     self._fail(task_id, "RESULT_MISSING", "Dreamina completed without a video URL")
                     return
+                result_urls = state["result_urls"]
+                transfer_metadata = {}
+                if task["model"] == "sd-2-5-480p-x":
+                    self.store.update_task(task_id, {"status": "running", "progress": 90,
+                                                     "upstream_result_urls": result_urls})
+                    try:
+                        signed_url, transfer_metadata = transfer(
+                            result_urls[0], str(client.account["proxy_url"]), task_id)
+                        result_urls = [signed_url]
+                    except ResultTransferError as exc:
+                        self._fail(task_id, "RESULT_TRANSFER_FAILED", str(exc))
+                        return
                 after = None
                 try:
                     after = client.account_state()["available_balance"]
@@ -308,7 +324,8 @@ class Service:
                 isolated = not self.store.has_account_overlap(
                     int(task["account_id"]), task_id, task["created_at"], finished_at)
                 self.store.update_task(task_id, {"status": "succeeded", "progress": 100,
-                    "result_urls": state["result_urls"], "balance_after": after,
+                    "result_urls": result_urls, "result_transfer": transfer_metadata,
+                    "balance_after": after,
                     "actual_cost": max(0, float(before) - float(after))
                         if isolated and before is not None and after is not None else None,
                     "completed_at": finished_at})
@@ -343,8 +360,18 @@ class Service:
         self.store.update_task(task_id, {"status": "failed", "progress": 100,
             "error_code": code, "error_message": message[:600], "completed_at": time.time()})
 
-    @staticmethod
-    def public_task(task: dict[str, Any]) -> dict[str, Any]:
+    def public_task(self, task: dict[str, Any]) -> dict[str, Any]:
+        if (task["status"] == "succeeded" and task["model"] == "sd-2-5-480p-x"
+                and task["result_urls"] and expires_soon(task.get("result_transfer") or {})):
+            metadata = task["result_transfer"]
+            try:
+                url, refreshed = presign(metadata["bucket"], metadata["key"], metadata["size_bytes"])
+                task = self.store.update_task(task["id"], {"result_urls": [url],
+                    "result_transfer": {**metadata, **refreshed}})
+            except (ResultTransferError, KeyError):
+                # Keep the last successful URL; a temporary presign outage
+                # must not silently replace it with the 720p upstream result.
+                pass
         result = {"id": task["id"], "object": "video", "created_at": task["created_at"],
                   "status": task["status"], "model": task["model"], "progress": task["progress"],
                   "data": [{"url": url} for url in task["result_urls"]],

@@ -101,7 +101,7 @@ def build_submit_body(normalized: dict[str, Any],
     video_seconds = sum(float(item.get("duration") or 0) for item in assets["videos"])
     scene = {
         "type": "video", "scene": "BasicVideoGenerateButton",
-        "resolution": spec.resolution, "modelReqKey": spec.upstream_model,
+        "resolution": spec.generation_resolution, "modelReqKey": spec.upstream_model,
         "videoDuration": duration, "batchNumber": 1,
         "inputVideoDuration": round(video_seconds, 3),
         "chargeInputVideoDuration": True, "isLongVideo": duration > 15,
@@ -109,7 +109,7 @@ def build_submit_body(normalized: dict[str, Any],
         "useSeedanceFast5sFreeTrial": False,
         "reportParams": {
             "enterSource": "generate", "vipSource": "generate",
-            "extraVipFunctionKey": f"{spec.upstream_model}-{spec.resolution}",
+            "extraVipFunctionKey": f"{spec.upstream_model}-{spec.generation_resolution}",
             "useVipFunctionDetailsReporterHoc": True,
             "cashierBusinessExtra": {}},
         "materialTypes": [1 if item["material_type"] == "image"
@@ -130,7 +130,7 @@ def build_submit_body(normalized: dict[str, Any],
         "type": "", "id": _uuid(), "min_version": spec.draft_version,
         "prompt": "" if materials else normalized["prompt"],
         "video_mode": 2, "fps": 24,
-        "duration_ms": duration * 1000, "resolution": spec.resolution,
+        "duration_ms": duration * 1000, "resolution": spec.generation_resolution,
         "idip_meta_list": [],
     }
     if spec.upstream_model.endswith("_draft"):
