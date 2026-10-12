@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>IJM2API Console</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20261011-1">
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
+  <script src="/static/app.js?v=20261011-1" defer></script>
+  <script src="/static/browser-assist.js?v=20261011-1" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="mast">
+      <div class="brand">
+        <span class="brand-mark">IJM</span>
+        <div><p>DREAMINA VIDEO PROTOCOL GATEWAY</p><h1>IJM2API Console</h1></div>
+      </div>
+      <nav class="mast-actions" aria-label="主要操作">
+        <button class="button primary" id="newTaskButton" type="button"><i data-lucide="sparkles"></i><span>测试调用</span></button>
+        <button class="button" id="addAccountButton" type="button"><i data-lucide="user-plus"></i><span>账号</span></button>
+        <button class="button" id="batchButton" type="button"><i data-lucide="users"></i><span>批量导入</span></button>
+        <button class="icon-button" id="settingsButton" type="button" title="运行设置"><i data-lucide="settings"></i></button>
+        <button class="icon-button" id="integrationDocsButton" type="button" title="接入文档"><i data-lucide="notebook-tabs"></i></button>
+        <button class="button" id="costReferenceButton" type="button"><i data-lucide="coins"></i><span>消耗参考</span></button>
+        <a class="icon-button" href="/docs" target="_blank" title="API 文档"><i data-lucide="book-open"></i></a>
+        <button class="icon-button" id="refreshButton" type="button" title="刷新"><i data-lucide="refresh-cw"></i></button>
+        <form method="post" action="/logout"><button class="icon-button" type="submit" title="退出"><i data-lucide="log-out"></i></button></form>
+      </nav>
+    </header>
+
+    <section class="metrics" aria-label="运行概览">
+      <div><span>可用账号</span><strong id="metricAccounts">0 / 0</strong></div>
+      <div><span>剩余额度</span><strong id="metricBalance">0</strong></div>
+      <div><span>运行任务</span><strong id="metricRunning">0</strong></div>
+      <div><span>已完成</span><strong id="metricComplete">0</strong></div>
+      <div class="model-metric"><span>已接入模型</span><strong id="metricModels">0</strong></div>
+      <p id="refreshStatus">等待刷新</p>
+    </section>
+
+    <section class="workspace-section">
+      <div class="section-head">
+        <div class="title-row"><h2>账号池</h2><div class="segmented" id="accountTabs">
+          <button class="active" type="button" data-filter="enabled">启用 <b id="enabledCount">0</b></button>
+          <button type="button" data-filter="disabled">禁用 <b id="disabledCount">0</b></button>
+        </div></div>
+        <button class="icon-button" id="accountsRefresh" type="button" title="刷新账号"><i data-lucide="refresh-cw"></i></button>
+      </div>
+      <div class="table-wrap">
+        <table><thead><tr><th>账号</th><th>状态</th><th>余额 / 套餐</th><th>并发</th><th>使用</th><th>代理</th><th>CDP</th><th>最近检测</th><th class="actions-col">操作</th></tr></thead><tbody id="accountsBody"></tbody></table>
+        <div class="empty" id="accountsEmpty"><i data-lucide="users"></i><span>暂无账号</span></div>
+      </div>
+    </section>
+
+    <section class="workspace-section">
+      <div class="section-head">
+        <div class="title-row"><h2>最近任务</h2><span class="caption" id="taskCount">0 个任务</span></div>
+        <div class="section-actions"><button class="icon-button" id="tasksRefresh" type="button" title="刷新任务"><i data-lucide="refresh-cw"></i></button><button class="icon-button danger" id="clearTasks" type="button" title="清理已结束任务"><i data-lucide="trash-2"></i></button></div>
+      </div>
+      <div class="table-wrap tasks-wrap">
+        <table><thead><tr><th>任务 / 账号</th><th>模型参数 / 提示词 / 素材</th><th>状态</th><th>进度 / 耗时</th><th>创建 / 更新时间</th><th class="result-col">结果</th></tr></thead><tbody id="tasksBody"></tbody></table>
+        <div class="empty" id="tasksEmpty"><i data-lucide="layers"></i><span>暂无任务</span></div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="accountDialog"><form class="dialog-form" id="accountForm">
+    <header><div><p class="eyebrow">ACCOUNT</p><h2>添加或更新账号</h2></div><button class="icon-button close" type="button"><i data-lucide="x"></i></button></header>
+    <div class="form-grid">
+      <label>名称<input name="name" required maxlength="120"></label><label>账号并发<input name="max_concurrency" type="number" min="1" max="50" value="1"></label>
+      <label class="wide">代理地址<input name="proxy_url" class="mono" placeholder="socks5://xray:20002"></label>
+      <label>CDP 端口（留空自动分配）<input name="cdp_port" type="number" min="1024" max="65535"></label>
+      <label>视频项目 ID（可在登录后自动读取）<input name="project_id" class="mono"></label>
+    </div>
+    <footer><button class="button close" type="button">取消</button><button class="button primary" type="submit"><i data-lucide="save"></i><span>保存</span></button></footer>
+  </form></dialog>
+
+  <dialog id="profileResetDialog"><form class="dialog-form" id="profileResetForm">
+    <header><div><p class="eyebrow">BROWSER PROFILE</p><h2>重置浏览器环境</h2></div><button class="icon-button close" type="button"><i data-lucide="x"></i></button></header>
+    <input name="account_id" type="hidden"><div class="reset-account-line"><strong id="profileResetAccount">-</strong><span id="profileResetStatus">-</span></div>
+    <div class="form-grid profile-reset-grid"><label class="wide">新代理地址<input name="proxy_url" class="mono" placeholder="socks5://xray:20002"></label><label class="check"><input name="start_login" type="checkbox" checked>重置后立即打开浏览器</label></div>
+    <div class="reset-warning"><i data-lucide="triangle-alert"></i><span>将关闭该账号的 Chrome 并清除托管 Profile、Cookie 与旧指纹数据。运行中的任务不能重置。</span></div>
+    <footer><button class="button close" type="button">取消</button><button class="button primary" type="submit"><i data-lucide="fingerprint"></i><span>重置并登录</span></button></footer>
+  </form></dialog>
+
+  <dialog id="batchDialog"><form class="dialog-form" id="batchForm">
+    <header><div><p class="eyebrow">BATCH IMPORT</p><h2>批量导入账号</h2></div><button class="icon-button close" type="button"><i data-lucide="x"></i></button></header>
+    <label class="editor-label">每行一个账号：名称 | 代理<textarea name="text" class="mono json-editor" rows="15" required placeholder="ijm-01|socks5://xray:20002"></textarea></label>
+    <p>导入后请逐个打开“网页登录”完成浏览器会话验证。</p>
+    <div class="batch-result" id="batchResult" hidden></div>
+    <footer><button class="button close" type="button">取消</button><button class="button primary" type="submit"><i data-lucide="upload"></i><span>导入</span></button></footer>
+  </form></dialog>
+
+  <dialog id="taskDialog" class="wide-dialog"><form class="dialog-form" id="taskForm">
+    <header><div><p class="eyebrow">GENERATION TEST</p><h2>Dreamina 视频测试调用</h2></div><button class="icon-button close" type="button"><i data-lucide="x"></i></button></header>
+    <div class="model-tabs" id="modelTabs"></div><div class="sample-media-hint active" id="sampleMediaHint"><i data-lucide="info"></i><span>模型素材与参数能力随所选模型更新；超限行为由运行设置控制。</span></div>
+    <label class="editor-label">调用者请求 JSON<textarea id="requestJson" class="mono json-editor" rows="19" spellcheck="false"></textarea></label><div class="validation" id="jsonValidation"></div>
+    <footer><button class="button close" type="button">取消</button><button class="button primary" type="submit"><i data-lucide="play"></i><span>提交任务</span></button></footer>
+  </form></dialog>
+
+  <dialog id="detailDialog" class="detail-dialog"><div class="dialog-form">
+    <header><div><p class="eyebrow" id="detailId">TASK</p><h2 id="detailTitle">任务详情</h2></div><button class="icon-button close" type="button"><i data-lucide="x"></i></button></header>
+    <div class="facts" id="detailFacts"></div><section class="prompt-panel"><div><span>提示词</span><b id="detailMeta"></b></div><p id="detailPrompt">-</p><div class="media-list" id="detailMedia"></div></section>
+    <div class="audit-tabs segmented" id="auditTabs"><button class="active" type="button" data-key="caller_request">调用者请求</button><button type="button" data-key="upstream_request">Dreamina 请求摘要</button><button type="button" data-key="upstream_response">Dreamina 响应摘要</button><button type="button" data-key="caller_response">调用者响应</button></div><pre class="audit-code" id="auditCode"></pre>
+  </div></dialog>
+
+  <dialog id="settingsDialog" class="settings-dialog"><form class="dialog-form" id="settingsForm">
+    <header class="settings-dialog-header"><div><p class="eyebrow">RUNTIME CONTROL PLANE</p><h2>运行设置</h2><p class="settings-subtitle">任务执行、会话恢复、代理分配与请求归一化实时配置</p></div><button class="icon-button close" type="button"><i data-lucide="x"></i></button></header>
+    <div class="settings-sections">
+      <fieldset class="settings-card account-settings-card"><legend>任务与账号维护</legend><div class="form-grid settings-form-grid"><label>任务并发数<input name="task_workers" type="number" min="1" max="50" required></label><label>排队容量<input name="task_queue_capacity" type="number" min="0" max="10000" required></label><label>轮询间隔（秒）<input name="poll_interval_seconds" type="number" min="2" max="120" required></label><label>任务超时（秒）<input name="task_timeout_seconds" type="number" min="60" max="7200" required></label><label>低余额自动禁用<input name="low_balance_disable_threshold" type="number" min="0" step="0.01" required></label><label class="check"><input name="daily_checkin_enabled" type="checkbox">启用每日签到</label></div></fieldset>
+      <fieldset class="settings-card browser-settings-card"><legend>浏览器与 CDP</legend><div class="form-grid settings-form-grid"><label class="wide">Chrome 可执行文件<input name="chrome_executable" class="mono"></label><label class="wide">Chrome Profile 根目录<input name="chrome_user_data_root" class="mono"></label></div></fieldset>
+      <fieldset class="settings-card normalization-settings-card"><legend>参考素材</legend><div class="form-grid settings-form-grid"><label class="check"><input name="allow_video_reference_inputs" type="checkbox">允许输入视频参考素材</label><label class="check"><input name="prompt_media_reference_cleanup_enabled" type="checkbox">转换提示词中的素材编号为 Dreamina 引用</label></div></fieldset>
+    </div>
+    <footer class="settings-dialog-footer"><span>保存后立即作用于新任务</span><div><button class="button close" type="button">取消</button><button class="button primary" type="submit"><i data-lucide="save"></i><span>保存运行设置</span></button></div></footer>
+  </form></dialog>
+
+  <dialog id="integrationDocsDialog" class="docs-dialog"><div class="dialog-form"><header><div><p class="eyebrow">MARKDOWN</p><h2>模型能力与外部调用</h2></div><div class="section-actions"><button class="icon-button" id="copyIntegrationDocs" type="button" title="复制 Markdown"><i data-lucide="copy"></i></button><button class="icon-button close" type="button"><i data-lucide="x"></i></button></div></header><pre class="docs-code" id="integrationDocsContent">加载中...</pre></div></dialog>
+  <dialog id="costReferenceDialog" class="cost-dialog"><div class="dialog-form"><header><div><p class="eyebrow">CREDITS</p><h2>模型消耗参考</h2></div><div class="section-actions"><span class="caption" id="costReferenceStatus">上游询价与真实样本</span><button class="icon-button" id="costReferenceRefresh" type="button"><i data-lucide="refresh-cw"></i></button><button class="icon-button close" type="button"><i data-lucide="x"></i></button></div></header><div class="table-wrap cost-reference-wrap"><table class="cost-reference-table"><thead><tr><th>模型</th><th>时长</th><th>分辨率</th><th>参考消耗</th><th>最近消耗</th><th>样本</th><th>更新时间</th><th>最近任务</th></tr></thead><tbody id="costReferenceBody"></tbody></table><div class="empty" id="costReferenceEmpty"><i data-lucide="coins"></i><span>暂无记录</span></div></div></div></dialog>
+  <dialog id="browserAssistDialog" class="browser-assist-dialog" aria-labelledby="browserAssistTitle">
+    <header class="browser-assist-header"><div><p class="eyebrow">账号登录</p><h2 id="browserAssistTitle">人工验证 <span id="browserAssistAccount" class="mono"></span></h2></div><button class="icon-button close" type="button" aria-label="关闭人工验证"><i data-lucide="x"></i></button></header>
+    <div class="browser-assist-guide"><span class="browser-live-dot"></span><p id="browserAssistStatus" role="status" aria-live="polite">正在连接账号浏览器…</p><span class="caption">画面每 2 秒更新</span></div>
+    <div class="browser-assist-toolbar"><p>点击画面后输入文本或按键，登录并打开一个视频项目，然后保存会话。</p><div class="section-actions"><input id="browserAssistText" type="text" placeholder="向当前焦点输入文本" autocomplete="off"><button class="button" id="browserAssistLogin" type="button">输入</button><button class="icon-button" id="browserAssistEnter" type="button">Enter</button><button class="icon-button" id="browserAssistTab" type="button">Tab</button><button class="icon-button" id="browserAssistUp" type="button" title="页面向上滚动"><i data-lucide="arrow-up"></i></button><button class="icon-button" id="browserAssistDown" type="button" title="页面向下滚动"><i data-lucide="arrow-down"></i></button><button class="icon-button" id="browserAssistRefresh" type="button" title="刷新画面"><i data-lucide="refresh-cw"></i></button></div></div>
+    <div class="browser-assist-viewport" id="browserAssistViewport"><p id="browserAssistPlaceholder">加载实时画面…</p><img id="browserAssistImage" alt="账号浏览器实时画面，点击画面可操作验证框" draggable="false" hidden></div>
+    <footer class="browser-assist-footer"><span>关闭窗口后保留浏览器和登录进度</span><div class="section-actions"><button class="button close" type="button">稍后继续</button><button class="button primary" id="browserAssistComplete" type="button"><i data-lucide="shield-check"></i><span>保存登录会话</span></button></div></footer>
+  </dialog>
+  <div class="media-popover" id="mediaPopover" hidden></div><div class="toast" id="toast"></div>
+</body>
+</html>

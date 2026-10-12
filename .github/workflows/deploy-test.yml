@@ -1,0 +1,179 @@
+name: Pre-production Docker
+
+on:
+  push:
+    branches: [pre]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ijm2api-pre-production
+  cancel-in-progress: false
+
+env:
+  IMAGE_REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: btcfoxman
+  IMAGE_NAME: ijm2api
+  DEPLOY_PATH: /home/btcfoxman/docker/ijm2api
+  DEPLOY_SERVICE: ijm2api
+  IJM2API_HOSTNAME: ijm2api.aiid.edu.kg
+  IJM2API_ORIGIN: http://127.0.0.1:8808
+  CLOUDFLARED_CONFIG: /etc/cloudflared/config.yml
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, x64, ijm2api-pre]
+    outputs:
+      image_tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ghcr.io/btcfoxman/ijm2api:${{ github.sha }}
+            ghcr.io/btcfoxman/ijm2api:latest
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+  deploy:
+    needs: build
+    runs-on: [self-hosted, linux, x64, ijm2api-pre]
+    env:
+      IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prepare compose project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$DEPLOY_PATH"
+          test -f "$DEPLOY_PATH/.env"
+          cp docker-compose.yml "$DEPLOY_PATH/docker-compose.yml"
+          docker network inspect my-shared-net >/dev/null 2>&1 || docker network create my-shared-net
+      - name: Wait for in-flight video tasks
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$(docker inspect -f '{{.State.Running}}' "$DEPLOY_SERVICE" 2>/dev/null || true)" != true ]; then
+            exit 0
+          fi
+          active_tasks() {
+            docker exec -i "$DEPLOY_SERVICE" python - <<'PY'
+          import sqlite3
+          db = sqlite3.connect('file:/app/data/ijm2api.db?mode=ro', uri=True, timeout=10)
+          print(db.execute("SELECT COUNT(*) FROM tasks WHERE status IN ('queued','preparing','submitted','running')").fetchone()[0])
+          PY
+          }
+          deadline=$((SECONDS + 1200))
+          while true; do
+            active="$(active_tasks)"
+            echo "IJM2API active tasks: $active"
+            if [ "$active" -eq 0 ]; then
+              sleep 20
+              if [ "$(active_tasks)" -eq 0 ]; then
+                break
+              fi
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Refusing to restart IJM2API while tasks are active"
+              exit 1
+            fi
+            sleep 15
+          done
+      - name: Pull and start
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$DEPLOY_PATH"
+          IMAGE_REGISTRY="$IMAGE_REGISTRY" IMAGE_NAMESPACE="$IMAGE_NAMESPACE" IMAGE_NAME="$IMAGE_NAME" IMAGE_TAG="$IMAGE_TAG" docker compose pull "$DEPLOY_SERVICE"
+          IMAGE_REGISTRY="$IMAGE_REGISTRY" IMAGE_NAMESPACE="$IMAGE_NAMESPACE" IMAGE_NAME="$IMAGE_NAME" IMAGE_TAG="$IMAGE_TAG" docker compose up -d "$DEPLOY_SERVICE"
+      - name: Verify service
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if curl -fsS --max-time 5 "$IJM2API_ORIGIN/health" >/dev/null; then exit 0; fi
+            sleep 5
+          done
+          docker logs --tail 120 ijm2api
+          exit 1
+      - name: Configure cloudflared ingress
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo test -f "$CLOUDFLARED_CONFIG"
+          tmp="$(mktemp)"
+          trap 'rm -f "$tmp"' EXIT
+          sudo cat "$CLOUDFLARED_CONFIG" > "$tmp"
+          CLOUDFLARED_TMP="$tmp" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          path = Path(os.environ['CLOUDFLARED_TMP'])
+          lines = path.read_text(encoding='utf-8').splitlines()
+          hostname = os.environ['IJM2API_HOSTNAME']
+          service = os.environ['IJM2API_ORIGIN']
+          if not any(line.strip() == 'ingress:' for line in lines):
+              raise SystemExit('cloudflared ingress section is missing')
+          route = f'- hostname: {hostname}'
+          fallback = next((line for line in lines if line.strip() == '- service: http_status:404'), None)
+          if fallback is None:
+              raise SystemExit('cloudflared fallback ingress is missing')
+          item_indent = fallback[:len(fallback) - len(fallback.lstrip())]
+          service_indent = item_indent + '  '
+          index = next((i for i, line in enumerate(lines) if line.strip() == route), None)
+          if index is None:
+              index = next(i for i, line in enumerate(lines) if line.strip() == '- service: http_status:404')
+              lines[index:index] = [f'{item_indent}{route}', f'{service_indent}service: {service}']
+          else:
+              next_route = next((i for i in range(index + 1, len(lines)) if lines[i].strip().startswith('- ')), len(lines))
+              found = next((i for i in range(index + 1, next_route) if lines[i].strip().startswith('service:')), None)
+              lines[index] = f'{item_indent}{route}'
+              if found is None:
+                  lines.insert(index + 1, f'{service_indent}service: {service}')
+              else:
+                  lines[found] = f'{service_indent}service: {service}'
+          path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          PY
+          if ! cmp -s "$tmp" <(sudo cat "$CLOUDFLARED_CONFIG"); then
+            sudo cp "$CLOUDFLARED_CONFIG" "${CLOUDFLARED_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+            sudo install -m 600 -o root -g root "$tmp" "$CLOUDFLARED_CONFIG"
+          fi
+          sudo cloudflared tunnel --config "$CLOUDFLARED_CONFIG" ingress validate
+          tunnel_id="$(sudo awk '/^tunnel:/ {print $2; exit}' "$CLOUDFLARED_CONFIG")"
+          test -n "$tunnel_id"
+          origin_cert="${HOME}/.cloudflared/cert.pem"
+          if [ -f "$origin_cert" ]; then
+            cloudflared --origincert "$origin_cert" tunnel route dns "$tunnel_id" "$IJM2API_HOSTNAME" || true
+          else
+            sudo cloudflared tunnel route dns "$tunnel_id" "$IJM2API_HOSTNAME" || true
+          fi
+          sudo systemctl restart cloudflared
+      - name: Verify public endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if curl -fsS --max-time 10 "https://${IJM2API_HOSTNAME}/health" >/dev/null; then exit 0; fi
+            sleep 5
+          done
+          exit 1
