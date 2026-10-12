@@ -122,6 +122,27 @@ def _transcode(source: Path, target: Path) -> None:
         raise ResultTransferError("480p transcode validation failed")
 
 
+def _upload_headers(value: object) -> dict[str, str]:
+    """Normalize s3-center presigned headers (its values can be string lists)."""
+    if not isinstance(value, dict):
+        raise ResultTransferError("s3-center upload headers are invalid")
+    headers: dict[str, str] = {}
+    for raw_name, raw_value in value.items():
+        name = str(raw_name or "").strip()
+        if not name or any(character in name for character in "\r\n:"):
+            raise ResultTransferError("s3-center upload header name is invalid")
+        if isinstance(raw_value, str):
+            header_value = raw_value
+        elif isinstance(raw_value, (list, tuple)) and all(isinstance(item, str) for item in raw_value):
+            header_value = ",".join(raw_value)
+        else:
+            raise ResultTransferError("s3-center upload header value is invalid")
+        if not header_value or header_value[:1].isspace() or any(character in header_value for character in "\r\n"):
+            raise ResultTransferError("s3-center upload header value is invalid")
+        headers[name] = header_value
+    return headers
+
+
 def presign(bucket: str, key: str, expected_size: int | None = None) -> tuple[str, dict]:
     base, token, configured_bucket = _config()
     if bucket != configured_bucket:
@@ -172,9 +193,7 @@ def transfer(url: str, proxy_url: str, task_id: str) -> tuple[str, dict]:
                     or upload.get("method") != "PUT"
                     or not str(upload.get("url") or "").startswith("https://")):
                 raise ResultTransferError("s3-center create response is invalid")
-            headers = upload.get("headers") or {}
-            if not isinstance(headers, dict):
-                raise ResultTransferError("s3-center upload headers are invalid")
+            headers = _upload_headers(upload.get("headers"))
             for attempt in range(3):
                 try:
                     with target.open("rb") as contents:

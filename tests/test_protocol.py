@@ -11,7 +11,7 @@ import requests
 from app.catalog import normalize_request
 from app.client import build_submit_body
 from app.upload import _request
-from app.result_transfer import ResultTransferError
+from app.result_transfer import ResultTransferError, _upload_headers
 from app.service import Service
 from app.store import Store
 
@@ -70,6 +70,14 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(scene["resolution"], "720p")
         self.assertEqual(submitted["extend"]["m_video_commerce_info"]["benefit_type"],
                          "seedance_25_720p_output")
+
+    def test_s3_center_presigned_header_lists_are_accepted(self):
+        headers = _upload_headers({"Content-Type": ["video/mp4"],
+                                   "X-Amz-Meta-Upload-Id": ["du_123"]})
+        self.assertEqual(headers, {"Content-Type": "video/mp4",
+                                   "X-Amz-Meta-Upload-Id": "du_123"})
+        with self.assertRaisesRegex(ResultTransferError, "value is invalid"):
+            _upload_headers({"Content-Type": [None]})
 
     def test_upload_retries_proxy_read_timeout(self):
         class ProxySession:
