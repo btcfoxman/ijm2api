@@ -1,8 +1,12 @@
 import json
 import unittest
+from unittest.mock import patch
+
+import requests
 
 from app.catalog import normalize_request
 from app.client import build_submit_body
+from app.upload import _request
 
 
 class ProtocolTests(unittest.TestCase):
@@ -47,6 +51,29 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "uses 480p"):
             normalize_request({"model": "sd-2-5-480p", "prompt": "A blue sky",
                                "resolution": "720p"})
+
+    def test_upload_retries_proxy_read_timeout(self):
+        class ProxySession:
+            def __init__(self):
+                self.calls = 0
+
+            def request(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise requests.ReadTimeout("transient proxy timeout")
+                return self
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"Result": {"ok": True}}
+
+        session = ProxySession()
+        with patch("app.upload.time.sleep"):
+            result = _request(session, "GET", "https://example.com/upload")
+        self.assertEqual(session.calls, 2)
+        self.assertTrue(result["Result"]["ok"])
 
 
 if __name__ == "__main__":
