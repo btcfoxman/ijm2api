@@ -30,25 +30,22 @@ jobs:
       image_tag: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          tags: |
-            ghcr.io/btcfoxman/ijm2api:${{ github.sha }}
-            ghcr.io/btcfoxman/ijm2api:latest
-          platforms: linux/amd64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: false
-          sbom: false
+      - name: Build and push image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/btcfoxman/ijm2api"
+          docker build --network=host \
+            --build-arg HTTP_PROXY=http://127.0.0.1:10809 \
+            --build-arg HTTPS_PROXY=http://127.0.0.1:10809 \
+            -t "$image:${{ github.sha }}" -t "$image:latest" .
+          docker push "$image:${{ github.sha }}"
+          docker push "$image:latest"
 
   deploy:
     needs: build
@@ -121,10 +118,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo test -f "$CLOUDFLARED_CONFIG"
+          config_dir="$(dirname "$CLOUDFLARED_CONFIG")"
+          config_name="$(basename "$CLOUDFLARED_CONFIG")"
           tmp="$(mktemp)"
           trap 'rm -f "$tmp"' EXIT
-          sudo cat "$CLOUDFLARED_CONFIG" > "$tmp"
+          docker run --rm -v "$config_dir:/cf:ro" python:3.12-slim cat "/cf/$config_name" > "$tmp"
           CLOUDFLARED_TMP="$tmp" python3 - <<'PY'
           import os
           from pathlib import Path
@@ -154,20 +152,22 @@ jobs:
                   lines[found] = f'{service_indent}service: {service}'
           path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
           PY
-          if ! cmp -s "$tmp" <(sudo cat "$CLOUDFLARED_CONFIG"); then
-            sudo cp "$CLOUDFLARED_CONFIG" "${CLOUDFLARED_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-            sudo install -m 600 -o root -g root "$tmp" "$CLOUDFLARED_CONFIG"
+          cloudflared tunnel --config "$tmp" ingress validate
+          if ! cmp -s "$tmp" <(docker run --rm -v "$config_dir:/cf:ro" python:3.12-slim cat "/cf/$config_name"); then
+            docker run --rm -i -v "$config_dir:/cf" python:3.12-slim sh -c               'cp "/cf/$1" "/cf/$1.bak.$(date +%Y%m%d%H%M%S)" && cat > "/cf/$1" && chmod 600 "/cf/$1"'               sh "$config_name" < "$tmp"
           fi
-          sudo cloudflared tunnel --config "$CLOUDFLARED_CONFIG" ingress validate
-          tunnel_id="$(sudo awk '/^tunnel:/ {print $2; exit}' "$CLOUDFLARED_CONFIG")"
+          tunnel_id="$(awk '/^tunnel:/ {print $2; exit}' "$tmp")"
           test -n "$tunnel_id"
           origin_cert="${HOME}/.cloudflared/cert.pem"
-          if [ -f "$origin_cert" ]; then
-            cloudflared --origincert "$origin_cert" tunnel route dns "$tunnel_id" "$IJM2API_HOSTNAME" || true
-          else
-            sudo cloudflared tunnel route dns "$tunnel_id" "$IJM2API_HOSTNAME" || true
-          fi
-          sudo systemctl restart cloudflared
+          test -f "$origin_cert"
+          cloudflared --origincert "$origin_cert" tunnel route dns "$tunnel_id" "$IJM2API_HOSTNAME" || true
+          main_pid="$(systemctl show -p MainPID --value cloudflared)"
+          test "$main_pid" -gt 1
+          docker run --rm --pid=host python:3.12-slim sh -c 'kill -TERM "$1"' sh "$main_pid"
+          for attempt in $(seq 1 20); do
+            if systemctl is-active --quiet cloudflared; then break; fi
+            sleep 2
+          done
       - name: Verify public endpoint
         shell: bash
         run: |
