@@ -22,6 +22,8 @@ class ResultTransferError(Exception):
 
 MAX_RESULT_BYTES = 512 * 1024 * 1024
 MAX_SINGLE_UPLOAD_BYTES = 256 * 1024 * 1024
+RESULT_DOWNLOAD_ATTEMPTS = 6
+_CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
 
 
 def _config(storage: dict | None = None) -> tuple[str, str, str, str]:
@@ -80,26 +82,71 @@ def _download(url: str, proxy_url: str, target: Path) -> None:
     if not proxy_url:
         raise ResultTransferError("account proxy is required for upstream result download")
     proxy = proxy_url.replace("socks5://", "socks5h://", 1)
-    for attempt in range(3):
+    expected_size: int | None = None
+    validator = ""
+    source_etag = ""
+    source_modified = ""
+    target.unlink(missing_ok=True)
+    for attempt in range(RESULT_DOWNLOAD_ATTEMPTS):
+        offset = target.stat().st_size if target.exists() else 0
+        # Some proxies drop the final HTTP frame after delivering every byte.
+        if expected_size is not None and offset == expected_size and offset > 0:
+            return
+        headers = {"Accept-Encoding": "identity"}
+        if offset:
+            headers["Range"] = f"bytes={offset}-"
+            if validator:
+                headers["If-Range"] = validator
         try:
-            with requests.get(url, proxies={"http": proxy, "https": proxy},
-                              stream=True, timeout=(20, 120)) as response:
-                if response.status_code != 200:
-                    raise ResultTransferError(f"upstream result download HTTP {response.status_code}")
-                size = 0
-                with target.open("wb") as output:
-                    for chunk in response.iter_content(1024 * 1024):
-                        size += len(chunk)
-                        if size > MAX_RESULT_BYTES:
-                            raise ResultTransferError("upstream result exceeds 512 MiB")
-                        output.write(chunk)
-                if not size:
-                    raise ResultTransferError("upstream result is empty")
-                return
+            with requests.Session() as http:
+                http.trust_env = False
+                with http.get(url, proxies={"http": proxy, "https": proxy},
+                              headers=headers, stream=True, timeout=(20, 120)) as response:
+                    if response.status_code in {408, 425, 429, 500, 502, 503, 504}:
+                        raise requests.HTTPError(f"HTTP {response.status_code}")
+                    if response.status_code not in {200, 206}:
+                        raise ResultTransferError(f"upstream result download HTTP {response.status_code}")
+                    if response.status_code == 206:
+                        match = _CONTENT_RANGE.fullmatch(response.headers.get("Content-Range", ""))
+                        if (not offset or not match or int(match.group(1)) != offset
+                                or int(match.group(2)) < offset
+                                or int(match.group(3)) <= int(match.group(2))):
+                            raise ResultTransferError("upstream result resume range is invalid")
+                        total = int(match.group(3))
+                        if expected_size is not None and total != expected_size:
+                            raise ResultTransferError("upstream result changed during download")
+                        expected_size = total
+                    else:
+                        # The server ignored Range (or If-Range detected a new
+                        # object). Start again instead of appending a duplicate.
+                        offset = 0
+                        length = response.headers.get("Content-Length", "")
+                        expected_size = int(length) if length.isdecimal() else None
+                    if expected_size is not None and expected_size > MAX_RESULT_BYTES:
+                        raise ResultTransferError("upstream result exceeds 512 MiB")
+                    etag = response.headers.get("ETag", "")
+                    modified = response.headers.get("Last-Modified", "")
+                    if offset and ((source_etag and etag and etag != source_etag)
+                                   or (source_modified and modified and modified != source_modified)):
+                        raise ResultTransferError("upstream result changed during download")
+                    source_etag, source_modified = etag, modified
+                    validator = etag if etag and not etag.startswith("W/") else modified
+                    size = offset
+                    with target.open("ab" if offset else "wb") as output:
+                        for chunk in response.iter_content(1024 * 1024):
+                            size += len(chunk)
+                            if size > MAX_RESULT_BYTES or (expected_size is not None and size > expected_size):
+                                raise ResultTransferError("upstream result exceeds declared size")
+                            output.write(chunk)
+                    if expected_size is not None and size < expected_size:
+                        raise requests.exceptions.ChunkedEncodingError("upstream result ended before declared size")
+                    if not size:
+                        raise ResultTransferError("upstream result is empty")
+                    return
         except requests.RequestException as exc:
-            if attempt == 2:
+            if attempt == RESULT_DOWNLOAD_ATTEMPTS - 1:
                 raise ResultTransferError(f"upstream result download failed: {type(exc).__name__}") from exc
-            time.sleep(2 ** attempt)
+            time.sleep(min(2 ** attempt, 8))
 
 
 def _probe(path: Path) -> tuple[int, int, float]:
