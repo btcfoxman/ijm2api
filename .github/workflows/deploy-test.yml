@@ -115,9 +115,15 @@ jobs:
           exit 1
       - name: Configure cloudflared ingress
         shell: bash
+        env:
+          HTTP_PROXY: http://127.0.0.1:10809
+          HTTPS_PROXY: http://127.0.0.1:10809
         run: bash scripts/configure_cloudflared.sh
       - name: Verify public endpoint
         shell: bash
+        env:
+          HTTP_PROXY: http://127.0.0.1:10809
+          HTTPS_PROXY: http://127.0.0.1:10809
         run: |
           set -euo pipefail
           for attempt in $(seq 1 30); do

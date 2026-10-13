@@ -31,7 +31,22 @@ ingress:
 EOF
 
 cloudflared tunnel --config "$route_config" ingress validate
-cloudflared tunnel route dns --overwrite-dns "$tunnel_id" "$IJM2API_HOSTNAME"
+if curl -fsS --max-time 10 "https://${IJM2API_HOSTNAME}/health" | grep -q '"service":"ijm2api"'; then
+  echo "IJM2API public route is already healthy"
+else
+  route_ready=false
+  for attempt in 1 2 3; do
+    if cloudflared tunnel route dns --overwrite-dns "$tunnel_id" "$IJM2API_HOSTNAME"; then
+      route_ready=true
+      break
+    fi
+    sleep "$attempt"
+  done
+  if [ "$route_ready" != true ]; then
+    echo "Could not configure IJM2API public DNS route" >&2
+    exit 1
+  fi
+fi
 
 cat > "$HOME/.config/systemd/user/ijm2api-cloudflared.service" <<EOF
 [Unit]
