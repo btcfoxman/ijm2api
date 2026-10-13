@@ -75,6 +75,10 @@ resolution and media count. Account concurrency defaults to 1 and can be
 raised to 50; global worker and queue limits are configurable. A full queue
 returns HTTP 429 before submitting upstream. An interrupted upstream submit
 is marked outcome unknown and is not automatically repeated.
+Credit reads before and after a task are best effort: a failed read does not
+block video submission or hide a completed result. When either read fails,
+that task's actual credit cost is left unknown instead of using a stale cached
+balance to calculate it.
 
 ## Evidence and protocol
 

@@ -45,6 +45,26 @@ class BrowserTransportTests(unittest.TestCase):
             client.account_state()
         self.assertEqual(client.browser.calls, 1)
 
+    def test_task_credit_read_has_short_timeout_and_restores_browser(self):
+        client = DreaminaClient({"id": 1, "cdp_port": 19301,
+                                 "proxy_url": "socks5://proxy.test:20002"})
+
+        class Browser:
+            timeout = 90
+            calls = 0
+
+            def post(self, *_):
+                self.calls += 1
+                self.assert_timeout = self.timeout
+                raise BrowserError("Dreamina browser fetch failed")
+
+        client.browser = Browser()
+        with patch("app.client.time.sleep"), self.assertRaises(BrowserError):
+            client.account_state(max_attempts=2, timeout_seconds=6)
+        self.assertEqual(client.browser.calls, 2)
+        self.assertEqual(client.browser.assert_timeout, 6)
+        self.assertEqual(client.browser.timeout, 90)
+
     def test_fetch_and_non_json_failures_have_safe_diagnostics(self):
         browser = CDPBrowser(19301)
         with patch.object(browser, "evaluate", return_value=json.dumps(

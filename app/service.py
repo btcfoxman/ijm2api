@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -23,6 +24,7 @@ from .store import Store
 
 
 TERMINAL = {"succeeded", "failed", "expired"}
+logger = logging.getLogger(__name__)
 DEFAULT_SETTINGS: dict[str, Any] = {
     "task_workers": 10,
     "task_queue_capacity": 100,
@@ -250,8 +252,17 @@ class Service:
         try:
             self.store.update_task(task_id, {"account_id": account_id, "status": "preparing", "progress": 5})
             client = DreaminaClient(account, store=self.store)
-            before = client.account_state()["available_balance"]
-            self.store.update_account(account_id, {"balance": before, "status": "active"})
+            before = None
+            try:
+                before = client.account_state(max_attempts=2, timeout_seconds=6)["available_balance"]
+            except (BrowserError, KeyError, TypeError, ValueError) as exc:
+                # Credit lookup is only for balance accounting. The generation
+                # endpoint decides whether this account can actually submit.
+                logger.warning("IJM task %s account %s pre-submit credit read failed (%s); "
+                               "continuing with cached balance", task_id, account_id,
+                               type(exc).__name__)
+            if before is not None:
+                self.store.update_account(account_id, {"balance": before, "status": "active"})
             self.store.update_task(task_id, {"balance_before": before, "progress": 12})
             assets = client.upload_inputs(task["normalized"])
             self.store.update_task(task_id, {"progress": 30})
@@ -334,10 +345,12 @@ class Service:
                         return
                 after = None
                 try:
-                    after = client.account_state()["available_balance"]
+                    after = client.account_state(max_attempts=2, timeout_seconds=6)["available_balance"]
+                except (BrowserError, KeyError, TypeError, ValueError) as exc:
+                    logger.warning("IJM task %s post-submit credit read failed (%s); "
+                                   "result remains available", task_id, type(exc).__name__)
+                if after is not None:
                     self.store.update_account(int(task["account_id"]), {"balance": after})
-                except BrowserError:
-                    pass
                 before = task.get("balance_before")
                 finished_at = time.time()
                 isolated = not self.store.has_account_overlap(

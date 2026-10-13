@@ -203,19 +203,27 @@ class DreaminaClient:
         self.store = store
         self.browser = CDPBrowser(int(account["cdp_port"]))
 
-    def account_state(self) -> dict[str, Any]:
+    def account_state(self, *, max_attempts: int = 3,
+                      timeout_seconds: float | None = None) -> dict[str, Any]:
         # A credit read cannot create a video task. Retry only this safe call
         # when a tab navigation or a short proxy interruption breaks fetch.
-        for attempt in range(3):
-            try:
-                data = self.browser.post("/commerce/v1/benefits/user_credit", {})
-                break
-            except BrowserRejected:
-                raise
-            except BrowserError:
-                if attempt == 2:
+        original_timeout = self.browser.timeout if timeout_seconds is not None else None
+        if timeout_seconds is not None:
+            self.browser.timeout = timeout_seconds
+        try:
+            for attempt in range(max_attempts):
+                try:
+                    data = self.browser.post("/commerce/v1/benefits/user_credit", {})
+                    break
+                except BrowserRejected:
                     raise
-                time.sleep(0.5 * (2 ** attempt))
+                except BrowserError:
+                    if attempt == max_attempts - 1:
+                        raise
+                    time.sleep(0.5 * (2 ** attempt))
+        finally:
+            if timeout_seconds is not None:
+                self.browser.timeout = original_timeout
         credit = data.get("credit") or {}
         balance = sum(float(credit.get(key) or 0) for key in
                       ("vip_credit", "gift_credit", "purchase_credit"))
