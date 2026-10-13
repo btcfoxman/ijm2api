@@ -55,6 +55,7 @@ After=network-online.target
 
 [Service]
 Type=simple
+Environment=TUNNEL_TRANSPORT_PROTOCOL=http2
 ExecStart=/usr/local/bin/cloudflared --config $route_config tunnel run
 Restart=always
 RestartSec=5
