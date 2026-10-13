@@ -9,7 +9,7 @@ import time
 import uuid
 from typing import Any
 
-from .browser import CDPBrowser, account_proxy_url
+from .browser import BrowserError, BrowserRejected, CDPBrowser, account_proxy_url
 from .catalog import ALIASES, MODELS, media_alias_kind
 from .media import _download
 from .store import Store
@@ -204,7 +204,18 @@ class DreaminaClient:
         self.browser = CDPBrowser(int(account["cdp_port"]))
 
     def account_state(self) -> dict[str, Any]:
-        data = self.browser.post("/commerce/v1/benefits/user_credit", {})
+        # A credit read cannot create a video task. Retry only this safe call
+        # when a tab navigation or a short proxy interruption breaks fetch.
+        for attempt in range(3):
+            try:
+                data = self.browser.post("/commerce/v1/benefits/user_credit", {})
+                break
+            except BrowserRejected:
+                raise
+            except BrowserError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.5 * (2 ** attempt))
         credit = data.get("credit") or {}
         balance = sum(float(credit.get(key) or 0) for key in
                       ("vip_credit", "gift_credit", "purchase_credit"))

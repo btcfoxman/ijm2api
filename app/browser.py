@@ -203,16 +203,28 @@ class CDPBrowser:
             url += "?" + urllib.parse.urlencode(query)
         payload = json.dumps(body, ensure_ascii=True, separators=(",", ":"))
         expression = (
-            "(async()=>{const r=await fetch(" + json.dumps(url) + ","
+            "(async()=>{let r;try{r=await fetch(" + json.dumps(url) + ","
             "{method:'POST',credentials:'include',headers:{'content-type':'application/json'},"
-            "body:JSON.stringify(" + payload + ")});"
-            "return JSON.stringify({http:r.status,body:await r.json()})})()"
+            "body:JSON.stringify(" + payload + ")})}"
+            "catch(e){return JSON.stringify({transport_error:'fetch'})}"
+            "let body;try{body=await r.json()}"
+            "catch(e){return JSON.stringify({transport_error:'json',http:r.status})}"
+            "return JSON.stringify({http:r.status,body})})()"
         )
         value = self.evaluate(expression, await_promise=True)
         try:
             response = json.loads(value)
         except (TypeError, ValueError) as exc:
             raise BrowserError("Dreamina returned an unreadable JSON response") from exc
+        if not isinstance(response, dict):
+            raise BrowserError("Dreamina returned an invalid response envelope")
+        if response.get("transport_error") == "fetch":
+            raise BrowserError("Dreamina browser fetch failed")
+        if response.get("transport_error") == "json":
+            status = int(response.get("http") or 0)
+            if status >= 400:
+                raise BrowserRejected(f"Dreamina HTTP {status} returned non-JSON")
+            raise BrowserError(f"Dreamina HTTP {status} returned non-JSON")
         if int(response.get("http") or 0) >= 400:
             raise BrowserRejected(f"Dreamina HTTP {response['http']}")
         data = response.get("body")
