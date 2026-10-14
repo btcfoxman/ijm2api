@@ -16,6 +16,8 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Red
 from fastapi.staticfiles import StaticFiles
 
 from .browser import BrowserError, CDPBrowser, browser_alive, clear_managed_profile, start_managed_browser, stop_managed_browser
+from .browser_login import BrowserLoginManager, LoginError
+from .browser_login_api import register_browser_login
 from .catalog import public_models
 from .service import Service
 from .store import Store
@@ -32,16 +34,19 @@ DATA_DIR = Path(os.getenv("IJM_DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 store = Store(str(DATA_DIR / "ijm2api.db"))
 service = Service(store)
+browser_login = BrowserLoginManager(store, service)
 STATIC = Path(__file__).parent / "static"
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     service.start()
+    browser_login.start_maintenance()
     try:
         yield
     finally:
         service.stop()
+        await browser_login.close()
 
 
 app = FastAPI(title="IJM2API", version="0.1.0", lifespan=lifespan)
@@ -72,6 +77,9 @@ def admin_auth(ijm_admin: str | None = Cookie(default=None),
         raise HTTPException(status_code=401, detail="admin login required")
 
 
+register_browser_login(app, browser_login, store, admin_auth, ADMIN_COOKIE)
+
+
 def sync_auth(authorization: str | None = Header(default=None),
               x_api_key: str | None = Header(default=None)) -> None:
     value = _bearer(authorization, x_api_key)
@@ -84,6 +92,13 @@ def _account(account_id: int, *, private: bool = False) -> dict[str, Any]:
     if not value:
         raise HTTPException(status_code=404, detail="account not found")
     return value
+
+
+async def _close_online_account(account_id: int) -> None:
+    try:
+        await browser_login.close_account(account_id)
+    except LoginError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
 
 def _task(task_id: str) -> dict[str, Any]:
@@ -183,13 +198,17 @@ def batch_import(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
 
 @app.patch("/api/accounts/{account_id}", dependencies=[Depends(admin_auth)])
-def patch_account(account_id: int, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+async def patch_account(account_id: int, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     try:
         account = _account(account_id, private=True)
         if "proxy_url" in body and str(body["proxy_url"]).strip() != str(account["proxy_url"]).strip():
+            if browser_login.active and browser_login.active["account_id"] == account_id:
+                raise HTTPException(status_code=409, detail="finish or cancel online login first")
             port = int(account["cdp_port"] or 0)
             if port and port != 19300 + account_id:
-                raise HTTPException(status_code=409, detail="relaunch the external account browser with the new proxy first")
+                if not account.get("managed_profile"):
+                    raise HTTPException(status_code=409, detail="relaunch the external account browser with the new proxy first")
+            await _close_online_account(account_id)
             stop_managed_browser(account_id)
             body = {**body, "cdp_port": 0, "status": "pending", "last_error": ""}
         return store.update_account(account_id, body)
@@ -200,22 +219,28 @@ def patch_account(account_id: int, body: dict[str, Any] = Body(...)) -> dict[str
 
 
 @app.delete("/api/accounts/{account_id}", dependencies=[Depends(admin_auth)])
-def delete_account(account_id: int) -> dict[str, Any]:
+async def delete_account(account_id: int) -> dict[str, Any]:
+    if browser_login.active and browser_login.active["account_id"] == account_id:
+        raise HTTPException(status_code=409, detail="finish or cancel online login first")
     if any(task["account_id"] == account_id and task["status"] not in {"succeeded", "failed", "expired"}
            for task in store.tasks(10000)):
         raise HTTPException(status_code=409, detail="account has active tasks")
     account = _account(account_id, private=True)
+    await _close_online_account(account_id)
     clear_managed_profile(account, Path(str(service.settings()["chrome_user_data_root"])))
     deleted = store.delete_account(account_id)
     return {"deleted": deleted}
 
 
 @app.post("/api/accounts/{account_id}/profile/reset", dependencies=[Depends(admin_auth)])
-def reset_profile(account_id: int, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+async def reset_profile(account_id: int, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    if browser_login.active and browser_login.active["account_id"] == account_id:
+        raise HTTPException(status_code=409, detail="finish or cancel online login first")
     account = _account(account_id, private=True)
     if any(task["account_id"] == account_id and task["status"] not in {"succeeded", "failed", "expired"}
            for task in store.tasks(10000)):
         raise HTTPException(status_code=409, detail="account has active tasks")
+    await _close_online_account(account_id)
     clear_managed_profile(account, Path(str(service.settings()["chrome_user_data_root"])))
     store.clear_media_cache(account_id)
     values: dict[str, Any] = {"cdp_port": 0, "project_id": "", "status": "pending",
@@ -258,15 +283,11 @@ def checkin_account(account_id: int) -> dict[str, Any]:
 
 
 def _browser(account_id: int, *, start: bool = False) -> tuple[dict[str, Any], CDPBrowser]:
-    account = _account(account_id, private=True)
+    try:
+        account = service.open_browser_view(account_id) if start else service.browser_view(account_id)
+    except (BrowserError, KeyError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     port = int(account["cdp_port"] or 0)
-    if start and (not port or (port == 19300 + account_id and not browser_alive(port))):
-        try:
-            port = start_managed_browser(account, chrome=str(service.settings()["chrome_executable"]),
-                                         profiles=Path(str(service.settings()["chrome_user_data_root"])))
-        except BrowserError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        store.update_account(account_id, {"cdp_port": port})
     if not port:
         raise HTTPException(status_code=409, detail="account browser is not configured")
     return account, CDPBrowser(port)
@@ -331,6 +352,7 @@ def browser_complete(account_id: int) -> dict[str, Any]:
 @app.post("/api/accounts/{account_id}/browser/close", dependencies=[Depends(admin_auth)])
 def browser_close(account_id: int) -> dict[str, Any]:
     _account(account_id)
+    service.close_browser_view(account_id)
     return {"ok": True}
 
 

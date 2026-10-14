@@ -5,10 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" href="data:,">
   <title>IJM2API Console</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20261011-1">
+  <link rel="stylesheet" href="/static/styles.css?v=20261014-3">
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
-  <script src="/static/app.js?v=20261011-1" defer></script>
+  <script src="/static/app.js?v=20261014-2" defer></script>
   <script src="/static/browser-assist.js?v=20261011-1" defer></script>
+  <script src="/static/account-login.js?v=20261014-2" defer></script>
 </head>
 <body>
   <main class="shell">
@@ -19,6 +20,7 @@
       </div>
       <nav class="mast-actions" aria-label="主要操作">
         <button class="button primary" id="newTaskButton" type="button"><i data-lucide="sparkles"></i><span>测试调用</span></button>
+        <button class="button" id="onlineAddAccountButton" type="button"><i data-lucide="monitor-up"></i><span>在线添加账号</span></button>
         <button class="button" id="addAccountButton" type="button"><i data-lucide="user-plus"></i><span>账号</span></button>
         <button class="button" id="batchButton" type="button"><i data-lucide="users"></i><span>批量导入</span></button>
         <button class="icon-button" id="settingsButton" type="button" title="运行设置"><i data-lucide="settings"></i></button>
@@ -65,11 +67,27 @@
     </section>
   </main>
 
+  <dialog id="onlineAccountDialog" class="online-account-dialog" aria-labelledby="onlineAccountTitle">
+    <div class="online-account-layout">
+      <header><div><p class="eyebrow">BROWSER ACCOUNT</p><h2 id="onlineAccountTitle">在线账号登录</h2></div><span class="caption">独立 Profile · 登录后保持在线</span></header>
+      <form id="onlineAccountForm" class="online-account-fields">
+        <div id="onlineAccountFields" class="form-grid">
+          <label>账号名称<input name="name" required maxlength="120" placeholder="ijm-new-account"></label>
+          <label>并发上限<input name="max_concurrency" type="number" min="1" max="50" value="1" required></label>
+          <label class="wide">账号代理<input name="proxy_url" class="mono" required placeholder="socks5://host.docker.internal:20002"></label>
+          <button class="button primary" type="submit">创建并打开浏览器</button>
+        </div>
+      </form>
+      <p id="onlineAccountMessage" role="status">登录后进入视频项目，再点击“完成登录并验证”。浏览器会保持在线。</p>
+      <iframe id="onlineAccountFrame" title="账号浏览器" src="about:blank" allow="clipboard-read; clipboard-write"></iframe>
+      <footer><button class="button" id="onlineAccountCancel" type="button">取消</button><button class="button primary" id="onlineAccountFinish" type="button" hidden>完成登录并验证</button></footer>
+    </div>
+  </dialog>
   <dialog id="accountDialog"><form class="dialog-form" id="accountForm">
     <header><div><p class="eyebrow">ACCOUNT</p><h2>添加或更新账号</h2></div><button class="icon-button close" type="button"><i data-lucide="x"></i></button></header>
     <div class="form-grid">
       <label>名称<input name="name" required maxlength="120"></label><label>账号并发<input name="max_concurrency" type="number" min="1" max="50" value="1"></label>
-      <label class="wide">代理地址<input name="proxy_url" class="mono" placeholder="socks5://xray:20002"></label>
+      <label class="wide">代理地址<input name="proxy_url" class="mono" placeholder="socks5://host.docker.internal:20002"></label>
       <label>CDP 端口（留空自动分配）<input name="cdp_port" type="number" min="1024" max="65535"></label>
       <label>视频项目 ID（可在登录后自动读取）<input name="project_id" class="mono"></label>
     </div>
@@ -79,7 +97,7 @@
   <dialog id="profileResetDialog"><form class="dialog-form" id="profileResetForm">
     <header><div><p class="eyebrow">BROWSER PROFILE</p><h2>重置浏览器环境</h2></div><button class="icon-button close" type="button"><i data-lucide="x"></i></button></header>
     <input name="account_id" type="hidden"><div class="reset-account-line"><strong id="profileResetAccount">-</strong><span id="profileResetStatus">-</span></div>
-    <div class="form-grid profile-reset-grid"><label class="wide">新代理地址<input name="proxy_url" class="mono" placeholder="socks5://xray:20002"></label><label class="check"><input name="start_login" type="checkbox" checked>重置后立即打开浏览器</label></div>
+    <div class="form-grid profile-reset-grid"><label class="wide">新代理地址<input name="proxy_url" class="mono" placeholder="socks5://host.docker.internal:20002"></label><label class="check"><input name="start_login" type="checkbox" checked>重置后立即打开浏览器</label></div>
     <div class="reset-warning"><i data-lucide="triangle-alert"></i><span>将关闭该账号的 Chrome 并清除托管 Profile、Cookie 与旧指纹数据。运行中的任务不能重置。</span></div>
     <footer><button class="button close" type="button">取消</button><button class="button primary" type="submit"><i data-lucide="fingerprint"></i><span>重置并登录</span></button></footer>
   </form></dialog>

@@ -37,7 +37,9 @@ class ServiceBalanceTests(unittest.TestCase):
             "status": "succeeded", "result_urls": ["https://example.test/result.mp4"]}
 
     def run_task(self):
-        with patch("app.service.DreaminaClient", return_value=self.client):
+        with patch("app.service.DreaminaClient", return_value=self.client), \
+             patch("app.browser_runtime.start_managed_browser", return_value=19301), \
+             patch("app.browser_runtime.stop_managed_browser"):
             self.service._run(self.task["id"])
         return self.store.task(self.task["id"])
 

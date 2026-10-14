@@ -74,6 +74,8 @@ class Store:
                 );
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """)
+            if "managed_profile" not in {row[1] for row in db.execute("PRAGMA table_info(accounts)")}:
+                db.execute("ALTER TABLE accounts ADD COLUMN managed_profile INTEGER NOT NULL DEFAULT 0")
             columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
             for name, default in (("upstream_result_json", "[]"),
                                   ("result_transfer_json", "{}")):
@@ -95,6 +97,7 @@ class Store:
     def _account(row: sqlite3.Row) -> dict[str, Any]:
         value = dict(row)
         value["enabled"] = bool(value["enabled"])
+        value["managed_profile"] = bool(value["managed_profile"])
         value["balance_details"] = json.loads(value.pop("balance_details_json"))
         value["last_balance"] = value["balance"]
         value["email"] = ""
@@ -147,6 +150,8 @@ class Store:
         with self._lock, self._connect() as db:
             old = db.execute("SELECT * FROM accounts WHERE name=?", (name,)).fetchone()
             if old:
+                if old["managed_profile"] and str(payload.get("proxy_url", old["proxy_url"])) != old["proxy_url"]:
+                    raise ValueError("online account proxy change requires profile reset")
                 values = {"proxy_url": payload.get("proxy_url", old["proxy_url"]),
                           "project_id": str(payload.get("project_id", old["project_id"])),
                           "cdp_port": int(payload.get("cdp_port") or old["cdp_port"]),
@@ -166,8 +171,32 @@ class Store:
                 account_id = int(cursor.lastrowid)
         return self.account(account_id) or {}
 
+    def create_pending_account(self, name: str, proxy_url: str,
+                               max_concurrency: int = 1) -> dict[str, Any]:
+        name = name.strip()
+        if not name:
+            raise ValueError("account name is required")
+        if not proxy_url.strip():
+            raise ValueError("account proxy is required")
+        if not 1 <= max_concurrency <= 50:
+            raise ValueError("max_concurrency must be between 1 and 50")
+        with self._lock, self._connect() as db:
+            try:
+                cursor = db.execute("""INSERT INTO accounts
+                    (name,proxy_url,max_concurrency,managed_profile,enabled,status,updated_at)
+                    VALUES(?,?,?,1,0,'pending',?)""",
+                    (name, proxy_url.strip(), max_concurrency, time.time()))
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("account name already exists") from exc
+        return self.account(int(cursor.lastrowid)) or {}
+
+    def active_account_count(self, account_id: int) -> int:
+        with self._connect() as db:
+            return int(db.execute("""SELECT COUNT(*) FROM tasks WHERE account_id=?
+                AND status IN ('preparing','submitted','running')""", (account_id,)).fetchone()[0])
+
     def update_account(self, account_id: int, values: dict[str, Any]) -> dict[str, Any]:
-        allowed = {"name", "cdp_port", "proxy_url", "project_id", "max_concurrency",
+        allowed = {"name", "cdp_port", "proxy_url", "project_id", "max_concurrency", "managed_profile",
                    "enabled", "status", "balance", "last_error", "last_checkin_date"}
         data = {key: value for key, value in values.items() if key in allowed}
         if "max_concurrency" in data and not 1 <= int(data["max_concurrency"]) <= 50:

@@ -15,10 +15,13 @@ credentials. The `pre` branch runs `.github/workflows/deploy-test.yml` on the
 and installs `ijm2api.aiid.edu.kg` into cloudflared. The public management
 page redirects to `/login`; `/health` is unauthenticated.
 
-Add an account with its proxy in the console, open **Web login**, sign in
-and click **Save login session**. Existing sessions can also be copied into
-the account's managed browser profile by an administrator. API credentials
-and Chrome profiles must stay outside Git.
+Use **在线添加账号** with a name and account proxy, sign in through the embedded
+noVNC browser, then click **完成登录并验证**. The account row's **网页登录**
+action reconnects to that same Chrome. The verified browser stays running;
+video submission, polling, credit checks and daily check-in share its CDP
+session. A service restart restores it from the persisted profile. Existing
+sessions can also be copied into the account's managed profile by an
+administrator. API credentials and Chrome profiles must stay outside Git.
 
 ## API
 

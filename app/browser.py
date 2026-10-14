@@ -125,15 +125,36 @@ def start_managed_browser(account: dict[str, Any], *, chrome: str, profiles: Pat
     raise BrowserError("managed Dreamina Chrome did not start")
 
 
+def close_browser_port(port: int) -> None:
+    """Ask a local CDP browser to exit, including one orphaned by a restart."""
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{port}/json/version", timeout=2) as response:
+            endpoint = json.load(response).get("webSocketDebuggerUrl")
+        if endpoint:
+            ws = websocket.create_connection(endpoint, timeout=2, suppress_origin=True)
+            try:
+                ws.send(json.dumps({"id": 1, "method": "Browser.close"}))
+            finally:
+                ws.close()
+    except (OSError, ValueError, KeyError, websocket.WebSocketException):
+        pass
+
+
 def stop_managed_browser(account_id: int) -> None:
     with _PROCESS_LOCK:
         process = _PROCESSES.pop(account_id, None)
+    close_browser_port(19300 + account_id)
     if process and process.poll() is None:
-        process.terminate()
         try:
-            process.wait(timeout=4)
+            process.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            process.kill()
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
 
 
 def clear_managed_profile(account: dict[str, Any], profiles: Path) -> None:

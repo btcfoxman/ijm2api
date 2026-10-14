@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IJM2API 登录画面</title><style>
+body{display:flex;flex-direction:column;height:100vh;margin:0;background:#101826;color:#e2e8f0;font:13px system-ui}
+#status{padding:8px 12px;min-height:20px}
+#clipboard{display:flex;gap:8px;align-items:center;padding:0 12px 8px;box-sizing:border-box}
+#clipboard-text{min-width:0;flex:1;padding:7px 9px;color:#e2e8f0;background:#1e293b;border:1px solid #475569;border-radius:5px;font:inherit}
+#clipboard button{padding:7px 10px;color:#e2e8f0;background:#334155;border:1px solid #64748b;border-radius:5px;cursor:pointer;font:inherit;white-space:nowrap}
+#clipboard button:disabled{opacity:.5;cursor:not-allowed}
+#screen{flex:1;min-height:0}
+</style></head><body>
+<div id="status" role="status">正在连接服务器浏览器…</div>
+<div id="clipboard">
+  <input id="clipboard-text" type="password" autocomplete="off" spellcheck="false" placeholder="在这里粘贴邮箱或密码，再发送到远端" aria-label="发送到远端的文字">
+  <button id="show-text" type="button" aria-pressed="false">显示</button>
+  <button id="send-text" type="button" disabled>发送到远端剪贴板</button>
+</div>
+<div id="screen"></div>
+<script type="module">
+const status = document.getElementById('status');
+const clipboardText = document.getElementById('clipboard-text');
+const sendText = document.getElementById('send-text');
+const showText = document.getElementById('show-text');
+showText.addEventListener('click', () => {
+  const showing = clipboardText.type === 'password';
+  clipboardText.type = showing ? 'text' : 'password';
+  showText.textContent = showing ? '隐藏' : '显示';
+  showText.setAttribute('aria-pressed', String(showing));
+});
+try {
+  const {default: RFB} = await import('/account-login/novnc/core/rfb.js');
+  const response = await fetch('/account-login/credentials', {credentials:'same-origin', cache:'no-store'});
+  if (!response.ok) throw new Error('登录窗口已结束，请回到账号管理重新打开');
+  const credentials = await response.json();
+  const url = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/account-login/websockify`;
+  const rfb = new RFB(document.getElementById('screen'), url, {credentials});
+  rfb.scaleViewport = true;
+  sendText.addEventListener('click', () => {
+    if (!clipboardText.value) {
+      status.textContent = '请先在上方输入框粘贴文字';
+      return;
+    }
+    rfb.clipboardPasteFrom(clipboardText.value);
+    clipboardText.value = '';
+    clipboardText.type = 'password';
+    showText.textContent = '显示';
+    showText.setAttribute('aria-pressed', 'false');
+    status.textContent = '已发送到远端剪贴板 · 请点击远端输入框，再按 Ctrl+V';
+  });
+  rfb.addEventListener('connect', () => {
+    sendText.disabled = false;
+    status.textContent = '已连接 · 可在上方粘贴文字并发送；登录后请在管理页点击“完成登录并验证”';
+  });
+  rfb.addEventListener('disconnect', () => {
+    sendText.disabled = true;
+    clipboardText.value = '';
+    status.textContent = '画面连接已结束；如果刚才在验证，请查看管理页结果';
+  });
+  rfb.addEventListener('securityfailure', () => { status.textContent = '画面验证失败，请重新打开登录窗口'; });
+  window.addEventListener('pagehide', () => rfb.disconnect(), {once:true});
+} catch (error) { status.textContent = error.message; }
+</script></body></html>

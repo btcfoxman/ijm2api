@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .browser import BrowserError, BrowserRejected, browser_alive, start_managed_browser, stop_managed_browser
+from .browser_runtime import BrowserRuntime
 from .catalog import normalize_request
 from .client import DreaminaClient, DreaminaError
 from .errors import public_error
@@ -57,6 +58,9 @@ class Service:
         self._started = False
         self._stop = threading.Event()
         self._maintenance: threading.Thread | None = None
+        self.browser_runtime = BrowserRuntime(store, self.settings)
+        self._browser_views: dict[int, tuple[dict[str, Any], bool, float]] = {}
+        self._browser_views_lock = threading.RLock()
 
     def settings(self) -> dict[str, Any]:
         return {**DEFAULT_SETTINGS, **self.store.get_settings()}
@@ -102,10 +106,47 @@ class Service:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._maintenance and self._maintenance.is_alive():
+            self._maintenance.join(timeout=5)
         self._pool.shutdown(wait=False, cancel_futures=False)
+        for account_id in list(self._browser_views):
+            self.close_browser_view(account_id)
+        self.browser_runtime.close_all_idle()
+
+    def open_browser_view(self, account_id: int) -> dict[str, Any]:
+        with self._browser_views_lock:
+            if account_id in self._browser_views:
+                account, owned, _ = self._browser_views[account_id]
+                self._browser_views[account_id] = (account, owned, time.monotonic())
+                return account
+            account = self.store.account(account_id, private=True)
+            if not account:
+                raise KeyError(account_id)
+            current, owned = self.browser_runtime.acquire(account)
+            self._browser_views[account_id] = (current, owned, time.monotonic())
+            return current
+
+    def browser_view(self, account_id: int) -> dict[str, Any]:
+        with self._browser_views_lock:
+            if account_id not in self._browser_views:
+                raise BrowserError("account browser view is closed")
+            account, owned, _ = self._browser_views[account_id]
+            self._browser_views[account_id] = (account, owned, time.monotonic())
+            return account
+
+    def close_browser_view(self, account_id: int) -> None:
+        with self._browser_views_lock:
+            entry = self._browser_views.pop(account_id, None)
+        if entry:
+            self.browser_runtime.release(entry[0], entry[1])
 
     def _maintain_accounts(self) -> None:
         while not self._stop.is_set():
+            with self._browser_views_lock:
+                expired = [account_id for account_id, (_, _, touched) in self._browser_views.items()
+                           if time.monotonic() - touched > 20 * 60]
+            for account_id in expired:
+                self.close_browser_view(account_id)
             settings = self.settings()
             needs_rapid_recheck = False
             for account in self.store.accounts(private=True):
@@ -135,7 +176,11 @@ class Service:
         today = datetime.now(ZoneInfo(os.getenv("IJM_TIME_ZONE", "Asia/Taipei"))).date().isoformat()
         if account.get("last_checkin_date") == today:
             return {"already_checked_in": True, "date": today}
-        result = DreaminaClient(account).daily_checkin()
+        account, owned = self.browser_runtime.acquire(account)
+        try:
+            result = DreaminaClient(account).daily_checkin()
+        finally:
+            self.browser_runtime.release(account, owned)
         self.store.update_account(account_id, {"last_checkin_date": today})
         return {"already_checked_in": False, "date": today,
                 "received": result.get("receive_quota", 0)}
@@ -186,13 +231,15 @@ class Service:
         account = self.store.account(account_id, private=True)
         if not account:
             raise KeyError(account_id)
+        account, owned = self.browser_runtime.acquire(account, force_managed=start_browser)
+        try:
+            return self._check_account_live(account)
+        finally:
+            self.browser_runtime.release(account, owned)
+
+    def _check_account_live(self, account: dict[str, Any]) -> dict[str, Any]:
+        account_id = int(account["id"])
         port = int(account["cdp_port"] or 0)
-        managed_port = 19300 + account_id
-        if start_browser or not port or (port == managed_port and not browser_alive(port)):
-            port = start_managed_browser(account, chrome=str(self.settings()["chrome_executable"]),
-                                         profiles=Path(str(self.settings()["chrome_user_data_root"])))
-            self.store.update_account(account_id, {"cdp_port": port})
-            account["cdp_port"] = port
         if not browser_alive(port):
             return self.store.update_account(account_id, {"status": "login_required",
                                                          "last_error": "Dreamina account browser is unavailable"})
@@ -249,8 +296,10 @@ class Service:
             self._worker_slots.release()
             return
         account_id = int(account["id"])
+        owned = False
         try:
             self.store.update_task(task_id, {"account_id": account_id, "status": "preparing", "progress": 5})
+            account, owned = self.browser_runtime.acquire(account)
             client = DreaminaClient(account, store=self.store)
             before = None
             try:
@@ -284,6 +333,7 @@ class Service:
         except Exception as exc:
             self._fail(task_id, "INTERNAL_ERROR", f"{type(exc).__name__}: {exc}")
         finally:
+            self.browser_runtime.release(account, owned)
             self._release_account(account_id)
             self._worker_slots.release()
 
@@ -298,12 +348,15 @@ class Service:
         self._worker_slots.acquire()
         with self._lock:
             self._active[int(task["account_id"])] = self._active.get(int(task["account_id"]), 0) + 1
+        owned = False
         try:
+            account, owned = self.browser_runtime.acquire(account)
             self._poll(task_id, DreaminaClient(account),
                        time.monotonic() + int(self.settings()["task_timeout_seconds"]))
         except Exception as exc:
             self._fail(task_id, type(exc).__name__.upper(), str(exc))
         finally:
+            self.browser_runtime.release(account, owned)
             self._release_account(int(task["account_id"]))
             self._worker_slots.release()
 
