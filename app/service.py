@@ -371,7 +371,11 @@ class Service:
                     continue
                 reason = state["error"] or "Dreamina video generation failed"
                 upstream_code = state.get("error_code") or ""
-                if upstream_code in {"12009", "12011"}:
+                # 2052 was observed with fail_msg=OutputAudioCopyright while
+                # the localized fail_starling_message was only "[none]".
+                if upstream_code in {"12009", "12011", "2052"}:
+                    code = "CONTENT_MODERATION_FAILED"
+                elif "outputaudiocopyright" in reason.lower():
                     code = "CONTENT_MODERATION_FAILED"
                 elif "video editing task" in reason.lower():
                     code = "VIDEO_EDIT_CONSTRAINT"

@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from app.browser import BrowserError, BrowserRejected
 from app.catalog import normalize_request
+from app.errors import public_error
 from app.service import Service
 from app.store import Store
 
@@ -81,6 +82,20 @@ class ServiceBalanceTests(unittest.TestCase):
         self.assertIsNone(task["balance_after"])
         self.assertIsNone(task["actual_cost"])
         self.assertEqual(self.store.account(self.account_id)["balance"], 100)
+
+    def test_output_audio_copyright_is_reported_as_content_moderation(self):
+        self.store.update_task(self.task["id"], {"status": "submitted",
+                                                 "account_id": self.account_id,
+                                                 "run_id": "submit-1", "thread_id": "history-1"})
+        self.client.poll.return_value = {"status": "failed", "error_code": "2052",
+                                         "error": "OutputAudioCopyright"}
+
+        self.service._poll(self.task["id"], self.client, float("inf"))
+
+        task = self.store.task(self.task["id"])
+        self.assertEqual(task["error_code"], "CONTENT_MODERATION_FAILED")
+        self.assertEqual(public_error(task["error_code"], task["error_message"])["message"],
+                         "检测到内容有敏感或违规情况，请修改后重试，积分已返还～")
 
 
 if __name__ == "__main__":

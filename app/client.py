@@ -196,6 +196,18 @@ def extract_result_urls(record: dict[str, Any]) -> list[str]:
     return urls
 
 
+def _history_failure_message(record: dict[str, Any]) -> str:
+    """Ignore empty UI localization placeholders and retain the raw reason."""
+    for key in ("fail_starling_message", "fail_msg", "fail_starling_key"):
+        value = record.get(key)
+        if value is None:
+            continue
+        message = str(value).strip()
+        if message and message.lower() not in {"[none]", "none", "null", "undefined"}:
+            return message
+    return ""
+
+
 class DreaminaClient:
     def __init__(self, account: dict[str, Any], *, store: Store | None = None):
         account_proxy_url(account)
@@ -300,8 +312,7 @@ class DreaminaClient:
         if isinstance(response_return, dict):
             response_return = response_return.get("ret")
         error_code = str(record.get("fail_code") or response_return or "")
-        error = str(record.get("fail_starling_message") or
-                    record.get("fail_msg") or record.get("fail_starling_key") or "")
+        error = _history_failure_message(record)
         if urls:
             state = "succeeded"
         elif status in {40, 60, 70, 80, 90} or error_code not in {"", "0"}:

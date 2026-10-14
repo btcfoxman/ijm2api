@@ -1,6 +1,6 @@
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.browser import BrowserError, BrowserRejected, CDPBrowser
 from app.client import DreaminaClient
@@ -64,6 +64,23 @@ class BrowserTransportTests(unittest.TestCase):
         self.assertEqual(client.browser.calls, 2)
         self.assertEqual(client.browser.assert_timeout, 6)
         self.assertEqual(client.browser.timeout, 90)
+
+    def test_poll_prefers_raw_failure_over_none_localization_placeholder(self):
+        client = DreaminaClient({"id": 1, "cdp_port": 19301,
+                                 "proxy_url": "socks5://proxy.test:20002"})
+        client.browser = Mock()
+        client.browser.post.return_value = {"submit-1": {
+            "status": 30, "task": {"status": 30, "resp_ret": {"ret": "0"}},
+            "fail_code": "2052", "fail_msg": "OutputAudioCopyright",
+            "fail_starling_message": "[none]",
+            "fail_starling_key": "ErrMessage_APP_OutputAudioRisk",
+        }}
+
+        result = client.poll("submit-1", "history-1")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "2052")
+        self.assertEqual(result["error"], "OutputAudioCopyright")
 
     def test_fetch_and_non_json_failures_have_safe_diagnostics(self):
         browser = CDPBrowser(19301)

@@ -8,7 +8,7 @@ def public_error(code: str, message: str) -> dict[str, str]:
     kind = (code or "").upper()
     if kind == "CONTENT_MODERATION_FAILED" or any(token in raw for token in (
         "'code': 12009", "'code': 12011", "content did not meet platform requirements",
-        "output video may contain inappropriate content",
+        "output video may contain inappropriate content", "outputaudiocopyright",
     )):
         return {"code": "CONTENT_MODERATION_FAILED",
                 "message": "检测到内容有敏感或违规情况，请修改后重试，积分已返还～"}
