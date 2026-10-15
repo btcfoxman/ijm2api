@@ -213,7 +213,7 @@ class Service:
             accounts = [item for item in self.store.accounts(private=True)
                         if item["enabled"] and item["status"] == "active" and item["proxy_url"]
                         and (item["balance"] is None or float(item["balance"]) >= estimated_cost)]
-            accounts.sort(key=lambda item: (-(float(item["balance"] or 0)), item["id"]))
+            accounts.sort(key=lambda item: (-int(item["priority"]), -(float(item["balance"] or 0)), item["id"]))
             for account in accounts:
                 account_id = int(account["id"])
                 active = self._active.get(account_id, 0)

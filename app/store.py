@@ -16,6 +16,15 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _priority(value: Any) -> int:
+    if isinstance(value, bool) or not str(value).strip().isdigit():
+        raise ValueError("priority must be a non-negative integer")
+    result = int(value)
+    if result > 2_147_483_647:
+        raise ValueError("priority must not exceed 2147483647")
+    return result
+
+
 class Store:
     def __init__(self, path: str):
         self.path = Path(path)
@@ -30,6 +39,7 @@ class Store:
                     proxy_url TEXT NOT NULL DEFAULT '',
                     project_id TEXT NOT NULL DEFAULT '',
                     max_concurrency INTEGER NOT NULL DEFAULT 1,
+                    priority INTEGER NOT NULL DEFAULT 0,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     status TEXT NOT NULL DEFAULT 'pending',
                     balance REAL,
@@ -76,6 +86,8 @@ class Store:
             """)
             if "managed_profile" not in {row[1] for row in db.execute("PRAGMA table_info(accounts)")}:
                 db.execute("ALTER TABLE accounts ADD COLUMN managed_profile INTEGER NOT NULL DEFAULT 0")
+            if "priority" not in {row[1] for row in db.execute("PRAGMA table_info(accounts)")}:
+                db.execute("ALTER TABLE accounts ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
             columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
             for name, default in (("upstream_result_json", "[]"),
                                   ("result_transfer_json", "{}")):
@@ -146,6 +158,7 @@ class Store:
         max_concurrency = int(payload.get("max_concurrency") or 1)
         if not 1 <= max_concurrency <= 50:
             raise ValueError("max_concurrency must be between 1 and 50")
+        priority = _priority(payload["priority"]) if "priority" in payload else None
         now = time.time()
         with self._lock, self._connect() as db:
             old = db.execute("SELECT * FROM accounts WHERE name=?", (name,)).fetchone()
@@ -156,18 +169,20 @@ class Store:
                           "project_id": str(payload.get("project_id", old["project_id"])),
                           "cdp_port": int(payload.get("cdp_port") or old["cdp_port"]),
                           "max_concurrency": max_concurrency,
+                          "priority": old["priority"] if priority is None else priority,
                           "enabled": int(bool(payload.get("enabled", old["enabled"]))) }
                 db.execute("""UPDATE accounts SET proxy_url=:proxy_url,project_id=:project_id,
-                    cdp_port=:cdp_port,max_concurrency=:max_concurrency,
+                    cdp_port=:cdp_port,max_concurrency=:max_concurrency,priority=:priority,
                     enabled=:enabled,updated_at=:updated_at WHERE id=:id""",
                     {**values, "updated_at": now, "id": old["id"]})
                 account_id = int(old["id"])
             else:
                 cursor = db.execute("""INSERT INTO accounts(name,cdp_port,proxy_url,project_id,
-                    max_concurrency,enabled,updated_at) VALUES(?,?,?,?,?,?,?)""",
+                    max_concurrency,priority,enabled,updated_at) VALUES(?,?,?,?,?,?,?,?)""",
                     (name, int(payload.get("cdp_port") or 0), str(payload.get("proxy_url") or ""),
                      str(payload.get("project_id") or ""),
-                     max_concurrency, int(bool(payload.get("enabled", True))), now))
+                     max_concurrency, priority if priority is not None else 0,
+                     int(bool(payload.get("enabled", True))), now))
                 account_id = int(cursor.lastrowid)
         return self.account(account_id) or {}
 
@@ -196,11 +211,13 @@ class Store:
                 AND status IN ('preparing','submitted','running')""", (account_id,)).fetchone()[0])
 
     def update_account(self, account_id: int, values: dict[str, Any]) -> dict[str, Any]:
-        allowed = {"name", "cdp_port", "proxy_url", "project_id", "max_concurrency", "managed_profile",
+        allowed = {"name", "cdp_port", "proxy_url", "project_id", "max_concurrency", "priority", "managed_profile",
                    "enabled", "status", "balance", "last_error", "last_checkin_date"}
         data = {key: value for key, value in values.items() if key in allowed}
         if "max_concurrency" in data and not 1 <= int(data["max_concurrency"]) <= 50:
             raise ValueError("max_concurrency must be between 1 and 50")
+        if "priority" in data:
+            data["priority"] = _priority(data["priority"])
         if "balance_details" in values:
             data["balance_details_json"] = _json(values["balance_details"])
         data["updated_at"] = time.time()

@@ -48,6 +48,7 @@ function renderAccounts() {
     return `<tr><td><span class="cell-title"><span class="account-id mono">#${account.id}</span>${escapeHtml(account.name)}</span><span class="cell-sub">${escapeHtml(account.email || account.user_id || "")}</span></td>
       <td>${badge(account.enabled ? account.status : ["disabled_low_balance", "suspended"].includes(account.status) ? account.status : "disabled")}<span class="cell-sub" title="${escapeHtml(account.last_error)}">${escapeHtml(account.last_error)}</span></td>
       <td title="${escapeHtml(detail)}"><span class="cell-title mono">${escapeHtml(account.last_balance ?? "-")}</span><span class="cell-sub">${escapeHtml(detail)}</span></td>
+      <td><input class="priority-input mono" data-account-priority="${account.id}" type="number" min="0" max="2147483647" step="1" value="${account.priority ?? 0}" title="优先级越高越先执行；相同优先级按余额和账号编号排序" aria-label="账号 #${account.id} 执行优先级"></td>
       <td><span class="slots ${account.active_tasks ? "busy" : ""}"><i></i><b class="mono">${account.active_tasks || 0} /</b><input class="concurrency-input mono" data-account-concurrency="${account.id}" type="number" min="1" value="${account.max_concurrency}" title="修改账号并发"></span></td><td class="mono">${account.total_uses || 0}</td>
       <td><span class="cell-title mono proxy" title="${escapeHtml(account.proxy_url)}">${escapeHtml(proxyLabel(account.proxy_url))}</span></td><td><span class="cell-title mono">${account.cdp_port || "自动"}</span><span class="cell-sub">${account.project_id || "打开视频项目"}</span></td><td>${fmtTime(account.updated_at)}</td>
       <td><div class="row-actions"><button class="icon-button" data-action="check" data-id="${account.id}" title="检测"><i data-lucide="activity"></i></button><button class="icon-button" data-action="login" data-id="${account.id}" title="CDP 登录"><i data-lucide="monitor-up"></i></button><button class="icon-button" data-action="web-login" data-id="${account.id}" title="网页登录 / 打开账号网页"><i data-lucide="monitor"></i></button><button class="icon-button${account.status === "challenge_required" ? " needs-verification" : ""}" data-action="browser-assist" data-id="${account.id}" title="人工验证"><i data-lucide="mouse-pointer-2"></i></button><button class="icon-button" data-action="reset-profile" data-id="${account.id}" title="重置 Profile"><i data-lucide="fingerprint"></i></button><button class="icon-button" data-action="toggle" data-id="${account.id}" data-enabled="${account.enabled}" title="${account.enabled ? "禁用" : "启用"}"><i data-lucide="${account.enabled ? "pause" : "play"}"></i></button>${account.enabled ? "" : `<button class="icon-button danger" data-action="delete" data-id="${account.id}" title="删除"><i data-lucide="trash-2"></i></button>`}</div></td></tr>`;
@@ -117,6 +118,17 @@ document.addEventListener("click", async (event) => {
   if (!event.target.closest("#mediaPopover,[data-action='media'],[data-detail-media]")) $("#mediaPopover").hidden = true;
 });
 document.addEventListener("change", async (event) => {
+  const priorityInput = event.target.closest("[data-account-priority]");
+  if (priorityInput) {
+    const id = Number(priorityInput.dataset.accountPriority); const value = Number(priorityInput.value);
+    if (!priorityInput.value.trim() || !Number.isInteger(value) || value < 0 || value > 2147483647) {
+      toast("账号优先级必须是 0 到 2147483647 的整数", true); await refresh(); return;
+    }
+    priorityInput.disabled = true;
+    try { await api(`/api/accounts/${id}`, { method: "PATCH", body: JSON.stringify({ priority: value }) }); toast(`账号 #${id} 优先级已调整为 ${value}`); await refresh(); }
+    catch (error) { toast(error.message, true); await refresh(); }
+    return;
+  }
   const input = event.target.closest("[data-account-concurrency]"); if (!input) return;
   const id = Number(input.dataset.accountConcurrency); const value = Number(input.value);
   if (!Number.isInteger(value) || value < 1) { toast("账号并发必须是大于 0 的整数", true); await refresh(); return; }

@@ -129,6 +129,7 @@ tbody tr:hover { background: rgba(85, 215, 173, .035); }
 .slots i { width: 6px; height: 6px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 8px rgba(85,215,173,.5); }
 .slots.busy i { background: var(--yellow); }
 .concurrency-input { width: 52px; height: 23px; padding: 2px 4px; text-align: center; }
+.priority-input { width: 64px; height: 23px; padding: 2px 4px; text-align: center; }
 .proxy { max-width: 180px; }
 .row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 3px; }
 .row-actions .icon-button { width: 25px; min-height: 25px; }
