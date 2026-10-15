@@ -58,7 +58,7 @@
     <section class="workspace-section">
       <div class="section-head">
         <div class="title-row"><h2>最近任务</h2><span class="caption" id="taskCount">0 个任务</span></div>
-        <div class="section-actions"><button class="icon-button" id="tasksRefresh" type="button" title="刷新任务"><i data-lucide="refresh-cw"></i></button><button class="icon-button danger" id="clearTasks" type="button" title="清理已结束任务"><i data-lucide="trash-2"></i></button></div>
+        <div class="section-actions"><label class="task-limit-label" for="taskLimit">显示 <input id="taskLimit" type="number" min="1" max="1000" step="1" value="50" aria-label="最近任务显示条数"> 条</label><button class="icon-button" id="tasksRefresh" type="button" title="刷新任务"><i data-lucide="refresh-cw"></i></button><button class="icon-button danger" id="clearTasks" type="button" title="清理已结束任务"><i data-lucide="trash-2"></i></button></div>
       </div>
       <div class="table-wrap tasks-wrap">
         <table><thead><tr><th>任务 / 账号</th><th>模型参数 / 提示词 / 素材</th><th>状态</th><th>进度 / 耗时</th><th>创建 / 更新时间</th><th class="result-col">结果</th></tr></thead><tbody id="tasksBody"></tbody></table>

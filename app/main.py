@@ -373,7 +373,7 @@ def model_costs() -> list[dict[str, Any]]:
 
 
 @app.get("/api/tasks", dependencies=[Depends(admin_auth)])
-def admin_tasks(limit: int = 100) -> list[dict[str, Any]]:
+def admin_tasks(limit: int = 50) -> list[dict[str, Any]]:
     tasks = store.tasks(max(1, min(limit, 10000)))
     for task in tasks:
         if task["status"] in {"failed", "expired"}:

@@ -98,6 +98,8 @@ svg { width: 14px; height: 14px; stroke-width: 1.8; }
 .section-head { min-height: 36px; display: flex; align-items: center; justify-content: space-between; padding: 3px 7px 3px 10px; border-bottom: 1px solid var(--line); }
 .title-row { gap: 10px; }
 .caption { color: var(--muted); }
+.task-limit-label { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.task-limit-label input { width: 64px; min-height: 30px; padding: 4px 6px; text-align: center; }
 .segmented { display: inline-flex; align-items: stretch; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
 .segmented button {
   min-height: 25px; padding: 0 8px; border: 0; border-right: 1px solid var(--line);

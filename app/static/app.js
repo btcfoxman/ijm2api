@@ -1,4 +1,11 @@
-const state = { accounts: [], tasks: [], models: [], settings: {}, accountFilter: "enabled", selectedModel: "sd-2-0-mini-480p", detail: null, auditKey: "caller_request", costReferences: [] };
+const TASK_LIMIT_STORAGE_KEY = "ijm2api.recentTaskLimit";
+function savedTaskLimit() {
+  try {
+    const value = Number(localStorage.getItem(TASK_LIMIT_STORAGE_KEY));
+    return Number.isInteger(value) && value >= 1 && value <= 1000 ? value : 50;
+  } catch { return 50; }
+}
+const state = { accounts: [], tasks: [], models: [], settings: {}, accountFilter: "enabled", selectedModel: "sd-2-0-mini-480p", detail: null, auditKey: "caller_request", costReferences: [], taskLimit: savedTaskLimit() };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const terminal = new Set(["succeeded", "failed", "expired"]);
@@ -98,7 +105,7 @@ function previewMedia(item, anchor) { if (!item) return; const popover = $("#med
 
 function renderCosts() { const rows = state.costReferences || []; $("#costReferenceBody").innerHTML = rows.map((item) => { const builtin = item.source === "builtin_rate"; return `<tr><td class="mono">${escapeHtml(item.model)}</td><td class="mono">${builtin ? "按整秒" : `${item.duration || 0}S`}</td><td>${escapeHtml(item.resolution || "-")}</td><td><strong class="cost-value mono">${builtin ? `⌊${fmtCost(item.rate_per_second)} × 秒数⌋` : fmtCost(item.cost)}</strong></td><td class="mono">${builtin ? "-" : fmtCost(item.latest_cost)}</td><td>${builtin ? "内置" : item.samples || 0}</td><td>${fmtTime(item.updated_at)}</td><td class="mono">${escapeHtml(String(item.last_task_id || "-").slice(0, 18))}</td></tr>`; }).join(""); $("#costReferenceEmpty").classList.toggle("show", !rows.length); $("#costReferenceStatus").textContent = `${rows.length} 条参考`; }
 
-async function refresh() { $("#refreshStatus").textContent = "刷新中..."; try { const [accounts, tasks, models, settings] = await Promise.all([api("/api/accounts"), api("/api/tasks?limit=20"), api("/api/models"), api("/api/settings")]); Object.assign(state, { accounts, tasks, models, settings }); renderAccounts(); renderTasks(); $("#metricModels").textContent = models.length; $("#refreshStatus").textContent = `更新于 ${new Date().toLocaleTimeString()}`; } catch (error) { toast(error.message, true); $("#refreshStatus").textContent = "刷新失败"; } }
+async function refresh() { $("#refreshStatus").textContent = "刷新中..."; try { const [accounts, tasks, models, settings] = await Promise.all([api("/api/accounts"), api(`/api/tasks?limit=${state.taskLimit}`), api("/api/models"), api("/api/settings")]); Object.assign(state, { accounts, tasks, models, settings }); renderAccounts(); renderTasks(); $("#metricModels").textContent = models.length; $("#refreshStatus").textContent = `更新于 ${new Date().toLocaleTimeString()}`; } catch (error) { toast(error.message, true); $("#refreshStatus").textContent = "刷新失败"; } }
 async function accountAction(button) { const id = Number(button.dataset.id); try { if (button.dataset.action === "delete") { if (!confirm("确认删除该账号及托管 Profile？")) return; await api(`/api/accounts/${id}`, { method: "DELETE" }); } else if (button.dataset.action === "toggle") await api(`/api/accounts/${id}`, { method: "PATCH", body: JSON.stringify({ enabled: button.dataset.enabled !== "true" }) }); else if (button.dataset.action === "login") await api(`/api/accounts/${id}/cdp/reconnect`, { method: "POST" }); else if (button.dataset.action === "check") await api(`/api/accounts/${id}/check`, { method: "POST" }); else if (button.dataset.action === "reset-profile") { const account = state.accounts.find((item) => item.id === id); const form = $("#profileResetForm"); form.account_id.value = id; form.proxy_url.value = account.proxy_url || ""; $("#profileResetAccount").textContent = `#${id} · ${account.name}`; $("#profileResetStatus").textContent = account.status; $("#profileResetDialog").showModal(); return; } toast("操作已提交"); await refresh(); } catch (error) { toast(error.message, true); } }
 
 document.addEventListener("click", async (event) => {
@@ -121,6 +128,18 @@ $("#accountTabs").addEventListener("click", (event) => { const button = event.ta
 $("#auditTabs").addEventListener("click", (event) => { const button = event.target.closest("[data-key]"); if (!button) return; state.auditKey = button.dataset.key; $$("#auditTabs button").forEach((item) => item.classList.toggle("active", item === button)); renderAudit(); });
 $("#modelTabs").addEventListener("click", (event) => { const button = event.target.closest("[data-model]"); if (!button) return; state.selectedModel = button.dataset.model; renderModels(true); validateJson(); });
 $("#refreshButton").addEventListener("click", refresh); $("#accountsRefresh").addEventListener("click", refresh); $("#tasksRefresh").addEventListener("click", refresh);
+$("#taskLimit").value = String(state.taskLimit);
+$("#taskLimit").addEventListener("change", () => {
+  const limit = Number($("#taskLimit").value);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+    $("#taskLimit").value = String(state.taskLimit);
+    toast("最近任务条数须为 1–1000 的整数", true);
+    return;
+  }
+  state.taskLimit = limit;
+  try { localStorage.setItem(TASK_LIMIT_STORAGE_KEY, String(limit)); } catch {}
+  refresh();
+});
 $("#addAccountButton").addEventListener("click", () => { $("#accountForm").reset(); $("#accountForm").elements.namedItem("max_concurrency").value = 1; $("#accountDialog").showModal(); });
 $("#batchButton").addEventListener("click", () => { $("#batchResult").hidden = true; $("#batchResult").textContent = ""; $("#batchDialog").showModal(); });
 $("#newTaskButton").addEventListener("click", () => { renderModels(); validateJson(); $("#taskDialog").showModal(); }); $("#requestJson").addEventListener("input", validateJson);
