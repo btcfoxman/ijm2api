@@ -83,7 +83,8 @@ def _media_list(body: dict[str, Any], singular: str, plural: str) -> list[str]:
     return urls
 
 
-def prompt_references(prompt: str, media: dict[str, list[str]]) -> list[tuple[str, int]]:
+def prompt_references(prompt: str, media: dict[str, list[str]], *,
+                      strict: bool = False) -> list[tuple[str, int]]:
     refs = []
     for match in ALIASES.finditer(prompt):
         kind = media_alias_kind(match.group("kind"))
@@ -91,13 +92,16 @@ def prompt_references(prompt: str, media: dict[str, list[str]]) -> list[tuple[st
         if not media[kind] and not match.group("explicit"):
             continue
         if not 1 <= index <= len(media[kind]):
-            raise ValueError(
-                f"prompt references {match.group(0)} but only {len(media[kind])} {kind} were provided")
+            if strict:
+                raise ValueError(
+                    f"prompt references {match.group(0)} but only {len(media[kind])} {kind} were provided")
+            continue
         refs.append((kind, index))
     return refs
 
 
-def normalize_request(body: dict[str, Any]) -> dict[str, Any]:
+def normalize_request(body: dict[str, Any], *,
+                      strict_media_references: bool = False) -> dict[str, Any]:
     name = str(body.get("model") or "sd-2-0-mini").strip()
     spec = MODELS.get(name)
     if spec is None:
@@ -125,7 +129,7 @@ def normalize_request(body: dict[str, Any]) -> dict[str, Any]:
     for kind, limit in spec.limits.items():
         if len(media[kind]) > limit:
             raise ValueError(f"{name} supports at most {limit} {kind}")
-    prompt_references(prompt, media)
+    prompt_references(prompt, media, strict=strict_media_references)
     return {
         "model": name, "upstream_model": spec.upstream_model,
         "duration": duration, "resolution": resolution, "aspect_ratio": ratio,

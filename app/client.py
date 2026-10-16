@@ -75,10 +75,10 @@ def build_meta_list(prompt: str, index_map: dict[str, list[int]]) -> list[dict[s
     for match in ALIASES.finditer(prompt):
         kind = media_alias_kind(match.group("kind"))
         position = int(match.group("index")) - 1
-        if not index_map[kind] and not match.group("explicit"):
-            continue
         if not 0 <= position < len(index_map[kind]):
-            raise ValueError(f"unbound media reference: {match.group(0)}")
+            # Keep an unmatched label in the surrounding text. A caller may
+            # mention images from an earlier scene without uploading them here.
+            continue
         if match.start() > cursor:
             result.append({"type": "", "id": _uuid(), "meta_type": "text",
                            "text": prompt[cursor:match.start()]})

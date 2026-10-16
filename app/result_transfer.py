@@ -24,6 +24,15 @@ MAX_RESULT_BYTES = 512 * 1024 * 1024
 MAX_SINGLE_UPLOAD_BYTES = 256 * 1024 * 1024
 RESULT_DOWNLOAD_ATTEMPTS = 6
 _CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
+SD_2_5_480P_X_DIMENSIONS = {
+    "16:9": (864, 496),
+    "4:3": (752, 560),
+    "1:1": (640, 640),
+    "3:4": (560, 752),
+    "9:16": (496, 864),
+    "21:9": (992, 432),
+    "9:21": (432, 992),
+}
 
 
 def _config(storage: dict | None = None) -> tuple[str, str, str, str]:
@@ -160,22 +169,33 @@ def _probe(path: Path) -> tuple[int, int, float]:
     return int(stream.get("width") or 0), int(stream.get("height") or 0), float((value.get("format") or {}).get("duration") or 0)
 
 
-def _transcode(source: Path, target: Path) -> None:
+def _transcode(source: Path, target: Path, aspect_ratio: str) -> tuple[int, int]:
+    dimensions = SD_2_5_480P_X_DIMENSIONS.get(aspect_ratio)
+    if dimensions is None:
+        raise ResultTransferError(f"unsupported 480p result aspect ratio: {aspect_ratio}")
+    target_width, target_height = dimensions
     width, height, duration = _probe(source)
-    if min(width, height) < 720 or duration <= 0:
+    if width < target_width or height < target_height or duration <= 0:
         raise ResultTransferError("upstream result is not a valid 720p video")
-    # Keep the shorter side at 480 px and preserve the source aspect ratio.
-    scale = "scale=480:-2" if width <= height else "scale=-2:480"
+    # Cover the requested output frame and crop from its center. The 480p
+    # product tier has aspect-specific pixel dimensions, including 640x640.
+    scale = f"max({target_width}/(iw*sar),{target_height}/ih)"
+    video_filter = (
+        f"scale=w='ceil(iw*sar*{scale}/2)*2':"
+        f"h='ceil(ih*{scale}/2)*2':flags=lanczos,"
+        f"crop={target_width}:{target_height}:(iw-ow)/2:(ih-oh)/2,setsar=1"
+    )
     result = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
-                             "-map", "0:v:0", "-map", "0:a?", "-vf", scale,
+                             "-map", "0:v:0", "-map", "0:a?", "-vf", video_filter,
                              "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
                              "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(target)],
                             capture_output=True, text=True, timeout=900)
     if result.returncode:
         raise ResultTransferError(f"480p transcode failed: {result.stderr[-300:]}")
     out_width, out_height, out_duration = _probe(target)
-    if min(out_width, out_height) != 480 or abs(out_duration - duration) > 0.5:
+    if (out_width, out_height) != dimensions or abs(out_duration - duration) > 0.5:
         raise ResultTransferError("480p transcode validation failed")
+    return dimensions
 
 
 def _upload_headers(value: object) -> dict[str, str]:
@@ -228,13 +248,13 @@ def expires_soon(metadata: dict) -> bool:
 
 
 def transfer(url: str, proxy_url: str, task_id: str,
-             storage: dict | None = None) -> tuple[str, dict]:
+             storage: dict | None = None, *, aspect_ratio: str = "16:9") -> tuple[str, dict]:
     base, token, bucket, prefix = _config(storage)
     key = f"{prefix}/{task_id}/480p.mp4"
     with tempfile.TemporaryDirectory(prefix="ijm-result-") as directory:
         source, target = Path(directory) / "source.mp4", Path(directory) / "480p.mp4"
         _download(url, proxy_url, source)
-        _transcode(source, target)
+        width, height = _transcode(source, target, aspect_ratio)
         size = target.stat().st_size
         if size > MAX_SINGLE_UPLOAD_BYTES:
             raise ResultTransferError("480p result exceeds s3-center single-upload limit")
@@ -275,4 +295,8 @@ def transfer(url: str, proxy_url: str, task_id: str,
         signed_url, metadata = presign(bucket, key, size, storage)
         metadata["upstream_url"] = url
         metadata["upload_id"] = upload_id
+        metadata["width"] = width
+        metadata["height"] = height
+        metadata["aspect_ratio"] = aspect_ratio
+        metadata["fit"] = "center_crop"
         return signed_url, metadata

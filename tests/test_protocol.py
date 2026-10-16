@@ -1,5 +1,7 @@
 import json
 import gc
+import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -11,7 +13,10 @@ import requests
 from app.catalog import normalize_request
 from app.client import build_submit_body
 from app.upload import _request
-from app.result_transfer import ResultTransferError, _upload_headers, _config
+from app.result_transfer import (
+    ResultTransferError, SD_2_5_480P_X_DIMENSIONS, _config, _probe,
+    _transcode, _upload_headers,
+)
 from app.service import Service
 from app.store import Store
 
@@ -51,8 +56,42 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at most 9"):
             normalize_request(payload)
         payload["image_urls"] = ["https://example.com/a.png"]
+        self.assertEqual(normalize_request(payload)["prompt"], payload["prompt"])
         with self.assertRaisesRegex(ValueError, "only 1 images"):
-            normalize_request(payload)
+            normalize_request(payload, strict_media_references=True)
+
+    def test_unmatched_image_labels_remain_text_and_valid_labels_bind(self):
+        payload = {"model": "sd-2-5-480p", "duration": 4,
+                   "prompt": "参考 @图片5、@图片2，再生成一段视频",
+                   "image_urls": [f"https://example.com/{index}.png" for index in range(1, 5)]}
+        normalized = normalize_request(payload)
+        assets = {"images": [{"image_uri": f"image-{index}", "width": 512, "height": 512}
+                             for index in range(1, 5)], "videos": [], "audios": []}
+        submitted, _ = build_submit_body(normalized, assets)
+        draft = json.loads(submitted["draft_content"])
+        nodes = draft["component_list"][0]["abilities"]["gen_video"]["text_to_video_params"][
+            "video_gen_inputs"][0]["unified_edit_input"]["meta_list"]
+        self.assertIn("@图片5", "".join(node.get("text", "") for node in nodes))
+        self.assertEqual([(node["meta_type"], node["material_ref"]["material_idx"])
+                          for node in nodes if "material_ref" in node], [("image", 1)])
+        with self.assertRaisesRegex(ValueError, "only 4 images"):
+            normalize_request(payload, strict_media_references=True)
+
+    def test_strict_reference_setting_controls_task_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = Service(Store(str(Path(directory) / "settings.db")))
+            request = {"model": "sd-2-5-480p", "duration": 4,
+                       "prompt": "参考 @图片5",
+                       "image_urls": [f"https://example.com/{index}.png" for index in range(4)]}
+            self.assertFalse(service.settings()["strict_prompt_media_references"])
+            with patch.object(service._pool, "submit"):
+                self.assertEqual(service.create(request)["status"], "queued")
+            service.update_settings({"strict_prompt_media_references": True})
+            with self.assertRaisesRegex(ValueError, "only 4 images"):
+                service.create(request)
+            service.stop()
+            del service
+            gc.collect()
 
     def test_inferred_resolution_alias_is_fixed(self):
         with self.assertRaisesRegex(ValueError, "uses 480p"):
@@ -70,6 +109,36 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(scene["resolution"], "720p")
         self.assertEqual(submitted["extend"]["m_video_commerce_info"]["benefit_type"],
                          "seedance_25_720p_output")
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg is required")
+    def test_480p_x_transcodes_to_aspect_specific_dimensions(self):
+        self.assertEqual(SD_2_5_480P_X_DIMENSIONS["1:1"], (640, 640))
+        self.assertEqual(SD_2_5_480P_X_DIMENSIONS["9:21"], (432, 992))
+        with tempfile.TemporaryDirectory() as directory:
+            for ratio, source_size, expected in (
+                ("1:1", "720x720", (640, 640)),
+                ("21:9", "1344x576", (992, 432)),
+            ):
+                with self.subTest(ratio=ratio):
+                    source = Path(directory) / f"source-{ratio.replace(':', '-')}.mp4"
+                    target = Path(directory) / f"target-{ratio.replace(':', '-')}.mp4"
+                    subprocess.run([
+                        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "lavfi", "-i", f"color=c=blue:s={source_size}:r=12:d=0.5",
+                        "-f", "lavfi", "-i", "sine=frequency=440:duration=0.5",
+                        "-shortest", "-c:v", "libx264", "-preset", "ultrafast",
+                        "-pix_fmt", "yuv420p", "-c:a", "aac", str(source),
+                    ], check=True, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(_transcode(source, target, ratio), expected)
+                    self.assertEqual(_probe(target)[:2], expected)
+                    streams = subprocess.run([
+                        "ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+                        "-of", "json", str(target),
+                    ], check=True, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(
+                        {stream["codec_type"] for stream in json.loads(streams.stdout)["streams"]},
+                        {"video", "audio"},
+                    )
 
     def test_s3_center_presigned_header_lists_are_accepted(self):
         headers = _upload_headers({"Content-Type": ["video/mp4"],
@@ -134,11 +203,13 @@ class ProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = Store(str(Path(directory) / "test.db"))
             service = Service(store)
-            request = {"model": "sd-2-5-480p-x", "prompt": "A blue sky", "duration": 4}
+            request = {"model": "sd-2-5-480p-x", "prompt": "A blue sky", "duration": 4,
+                       "aspect_ratio": "1:1"}
             task = store.create_task("ijm_test", request, normalize_request(request))
             store.update_task(task["id"], {"status": "running", "account_id": 1})
-            with patch("app.service.transfer", side_effect=ResultTransferError("upload failed")):
+            with patch("app.service.transfer", side_effect=ResultTransferError("upload failed")) as transfer_mock:
                 service._poll(task["id"], Client(), time.monotonic() + 10)
+            self.assertEqual(transfer_mock.call_args.kwargs["aspect_ratio"], "1:1")
             failed = store.task(task["id"])
             self.assertEqual(failed["error_code"], "RESULT_TRANSFER_FAILED")
             self.assertEqual(failed["upstream_result_urls"], ["https://upstream.test/720p.mp4"])

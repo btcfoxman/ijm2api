@@ -62,16 +62,33 @@ the API base and token can match Lingya2API's s3-center direct settings.
 The console never returns the stored Bearer token; leave the password field
 empty to retain it.
 IJM2API submits Seedance 2.5 at 720p using 720p credits, downloads the
-finished video through the selected account's proxy, converts its shorter
-side to 480 pixels while preserving aspect ratio and audio, uploads the new
-MP4 to s3-center, and returns the presigned temporary URL. Querying the
+finished video through the selected account's proxy, then crops and scales it
+to the requested 480p aspect specification (for example, 1:1 is 640×640).
+It preserves audio, uploads the new MP4 to s3-center, and returns the
+presigned temporary URL. Querying the
 IJM2API task again refreshes that URL when it is close to expiry. If transfer
 fails, the task reports `RESULT_TRANSFER_FAILED` and keeps the upstream URL
 in its private task record for diagnosis; it never returns the 720p source
 as a 480p result.
+
+The processed output dimensions follow the requested aspect ratio:
+
+| Aspect ratio | Output pixels |
+| --- | --- |
+| 16:9 | 864×496 |
+| 4:3 | 752×560 |
+| 1:1 | 640×640 |
+| 3:4 | 560×752 |
+| 9:16 | 496×864 |
+| 21:9 | 992×432 |
+| 9:21 | 432×992 |
+
 References such as `视频1`, `video2`, `v3`, `视4`, `图片1`,
 `图1`, `img2`, `Image3`, `Audio1` and `音频2` become Dreamina
 `meta_list` media references by one-based index.
+If a prompt names a reference beyond the supplied media count, IJM2API
+keeps that label as ordinary prompt text by default. Enable **Strict prompt
+media references** in runtime settings to reject such requests before upload.
 
 The console tracks exact observed credit deltas by model, duration,
 resolution and media count. Account concurrency defaults to 1 and can be

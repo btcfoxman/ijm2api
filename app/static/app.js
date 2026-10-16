@@ -189,6 +189,7 @@ $("#settingsForm").addEventListener("submit", async (event) => {
     chrome_user_data_root: field("chrome_user_data_root").value,
     allow_video_reference_inputs: field("allow_video_reference_inputs").checked,
     prompt_media_reference_cleanup_enabled: field("prompt_media_reference_cleanup_enabled").checked,
+    strict_prompt_media_references: field("strict_prompt_media_references").checked,
     enable_sd_2_5_480p_x: field("enable_sd_2_5_480p_x").checked,
     result_s3_center_api_base: field("result_s3_center_api_base").value.trim(),
     result_s3_bucket: field("result_s3_bucket").value.trim(),

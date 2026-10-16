@@ -39,6 +39,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "allow_video_reference_inputs": True,
     "excess_media_policy": "reject",
     "prompt_media_reference_cleanup_enabled": True,
+    "strict_prompt_media_references": False,
     "enable_sd_2_5_480p_x": False,
     "result_s3_backend": "s3_center_direct",
     "result_s3_center_api_base": os.getenv("IJM_S3_CENTER_API_BASE", ""),
@@ -186,8 +187,9 @@ class Service:
                 "received": result.get("receive_quota", 0)}
 
     def create(self, request: dict[str, Any]) -> dict[str, Any]:
-        normalized = normalize_request(request)
         settings = self.settings()
+        normalized = normalize_request(request, strict_media_references=bool(
+            settings["strict_prompt_media_references"]))
         if normalized["model"] == "sd-2-5-480p-x" and not settings["enable_sd_2_5_480p_x"]:
             raise ValueError("sd-2-5-480p-x is disabled in service settings")
         if not bool(settings["allow_video_reference_inputs"]) and normalized["videos"]:
@@ -391,7 +393,8 @@ class Service:
                                                      "upstream_result_urls": result_urls})
                     try:
                         signed_url, transfer_metadata = transfer(
-                            result_urls[0], str(client.account["proxy_url"]), task_id, self.settings())
+                            result_urls[0], str(client.account["proxy_url"]), task_id,
+                            self.settings(), aspect_ratio=task["normalized"]["aspect_ratio"])
                         result_urls = [signed_url]
                     except ResultTransferError as exc:
                         self._fail(task_id, "RESULT_TRANSFER_FAILED", str(exc))
