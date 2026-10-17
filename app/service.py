@@ -25,7 +25,16 @@ from .store import Store
 
 
 TERMINAL = {"succeeded", "failed", "expired"}
+MAX_CREDIT_ACCOUNT_ATTEMPTS = 2
 logger = logging.getLogger(__name__)
+
+
+def _credit_rejected(message: str) -> bool:
+    value = message.lower()
+    return ("ret=1006" in value or "not enough credits left" in value
+            or "no relevant benefits" in value)
+
+
 DEFAULT_SETTINGS: dict[str, Any] = {
     "task_workers": 10,
     "task_queue_capacity": 100,
@@ -210,10 +219,15 @@ class Service:
         self._pool.submit(self._run, task_id)
         return self.public_task(task)
 
-    def _reserve_account(self, estimated_cost: float = 0) -> dict[str, Any] | None:
+    def _reserve_account(self, estimated_cost: float = 0, *,
+                         exclude_ids: set[int] | None = None) -> dict[str, Any] | None:
+        excluded = exclude_ids or set()
         with self._lock:
+            if sum(self._active.values()) >= int(self.settings()["task_workers"]):
+                return None
             accounts = [item for item in self.store.accounts(private=True)
-                        if item["enabled"] and item["status"] == "active" and item["proxy_url"]
+                        if int(item["id"]) not in excluded and item["enabled"]
+                        and item["status"] == "active" and item["proxy_url"]
                         and (item["balance"] is None or float(item["balance"]) >= estimated_cost)]
             accounts.sort(key=lambda item: (-int(item["priority"]), -(float(item["balance"] or 0)), item["id"]))
             for account in accounts:
@@ -224,6 +238,12 @@ class Service:
                 self._active[account_id] = active + 1
                 return account
         return None
+
+    def _has_eligible_account(self, estimated_cost: float, excluded: set[int]) -> bool:
+        return any(int(item["id"]) not in excluded and item["enabled"]
+                   and item["status"] == "active" and item["proxy_url"]
+                   and (item["balance"] is None or float(item["balance"]) >= estimated_cost)
+                   for item in self.store.accounts(private=True))
 
     def _release_account(self, account_id: int) -> None:
         with self._lock:
@@ -287,56 +307,89 @@ class Service:
             time.sleep(1)
         else:
             return
-        account = None
         deadline = time.monotonic() + int(self.settings()["task_timeout_seconds"])
-        while not account and time.monotonic() < deadline and not self._stop.is_set():
-            account = self._reserve_account(float(task.get("estimated_cost") or 0))
-            if not account:
-                time.sleep(1)
-        if not account:
-            self._fail(task_id, "ACCOUNT_POOL_UNAVAILABLE", "no available Dreamina account before timeout")
-            self._worker_slots.release()
-            return
-        account_id = int(account["id"])
-        owned = False
+        estimated_cost = float(task.get("estimated_cost") or 0)
+        attempted = list(task["attempted_account_ids"])
+        credit_reason = task.get("error_message") or "Dreamina account has insufficient credits"
         try:
-            self.store.update_task(task_id, {"account_id": account_id, "status": "preparing", "progress": 5})
-            account, owned = self.browser_runtime.acquire(account)
-            client = DreaminaClient(account, store=self.store)
-            before = None
-            try:
-                before = client.account_state(max_attempts=2, timeout_seconds=6)["available_balance"]
-            except (BrowserError, KeyError, TypeError, ValueError) as exc:
-                # Credit lookup is only for balance accounting. The generation
-                # endpoint decides whether this account can actually submit.
-                logger.warning("IJM task %s account %s pre-submit credit read failed (%s); "
-                               "continuing with cached balance", task_id, account_id,
-                               type(exc).__name__)
-            if before is not None:
-                self.store.update_account(account_id, {"balance": before, "status": "active"})
-            self.store.update_task(task_id, {"balance_before": before, "progress": 12})
-            assets = client.upload_inputs(task["normalized"])
-            self.store.update_task(task_id, {"progress": 30})
-            try:
-                submitted = client.submit(task["normalized"], assets)
-            except BrowserRejected as exc:
-                self._fail(task_id, "UPSTREAM_REJECTED", str(exc))
-                return
-            except BrowserError as exc:
-                self._fail(task_id, "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
-                           str(exc) + "; automatic resubmission is disabled")
-                return
-            self.store.update_task(task_id, {"status": "submitted", "progress": 40,
-                                              "run_id": submitted["run_id"],
-                                              "thread_id": submitted["thread_id"]})
-            self._poll(task_id, client, deadline)
-        except (BrowserError, DreaminaError, MediaError, UploadError, ValueError) as exc:
-            self._fail(task_id, type(exc).__name__.upper(), str(exc))
-        except Exception as exc:
-            self._fail(task_id, "INTERNAL_ERROR", f"{type(exc).__name__}: {exc}")
+            while not self._stop.is_set() and time.monotonic() < deadline:
+                if len(attempted) >= MAX_CREDIT_ACCOUNT_ATTEMPTS:
+                    self._fail(task_id, "INSUFFICIENT_CREDITS", credit_reason)
+                    return
+                account = None
+                while not self._stop.is_set() and time.monotonic() < deadline:
+                    account = self._reserve_account(estimated_cost, exclude_ids=set(attempted))
+                    if account or (attempted and not self._has_eligible_account(
+                            estimated_cost, set(attempted))):
+                        break
+                    self._stop.wait(1)
+                if not account:
+                    code = "INSUFFICIENT_CREDITS" if attempted else "ACCOUNT_POOL_UNAVAILABLE"
+                    message = credit_reason if attempted else "no available Dreamina account before timeout"
+                    self._fail(task_id, code, message)
+                    return
+                account_id = int(account["id"])
+                owned = False
+                try:
+                    self.store.update_task(task_id, {"account_id": account_id,
+                        "status": "preparing", "progress": 5, "balance_before": None,
+                        "error_code": "", "error_message": ""})
+                    account, owned = self.browser_runtime.acquire(account)
+                    client = DreaminaClient(account, store=self.store)
+                    before = None
+                    try:
+                        before = client.account_state(max_attempts=2, timeout_seconds=6)["available_balance"]
+                    except (BrowserError, KeyError, TypeError, ValueError) as exc:
+                        logger.warning("IJM task %s account %s pre-submit credit read failed (%s); "
+                                       "continuing with cached balance", task_id, account_id,
+                                       type(exc).__name__)
+                    if before is not None:
+                        self.store.update_account(account_id, {"balance": before, "status": "active"})
+                    self.store.update_task(task_id, {"balance_before": before, "progress": 12})
+                    assets = client.upload_inputs(task["normalized"])
+                    self.store.update_task(task_id, {"progress": 30})
+                    attempted.append(account_id)
+                    self.store.update_task(task_id, {"attempted_account_ids": attempted})
+                    try:
+                        submitted = client.submit(task["normalized"], assets)
+                    except BrowserRejected as exc:
+                        if not _credit_rejected(str(exc)):
+                            self._fail(task_id, "UPSTREAM_REJECTED", str(exc))
+                            return
+                        credit_reason = str(exc)
+                        self.store.update_account(account_id, {"last_error": credit_reason[:300]})
+                        logger.warning("IJM task %s credit rejection on account %s (attempt %s/%s)",
+                                       task_id, account_id, len(attempted), MAX_CREDIT_ACCOUNT_ATTEMPTS)
+                        if len(attempted) >= MAX_CREDIT_ACCOUNT_ATTEMPTS:
+                            self._fail(task_id, "INSUFFICIENT_CREDITS", credit_reason)
+                            return
+                        self.store.update_task(task_id, {"status": "queued", "progress": 0,
+                            "account_id": None, "balance_before": None,
+                            "error_code": "INSUFFICIENT_CREDITS", "error_message": credit_reason})
+                        deadline = time.monotonic() + int(self.settings()["task_timeout_seconds"])
+                        continue
+                    except BrowserError as exc:
+                        self._fail(task_id, "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
+                                   str(exc) + "; automatic resubmission is disabled")
+                        return
+                    self.store.update_task(task_id, {"status": "submitted", "progress": 40,
+                                                      "run_id": submitted["run_id"],
+                                                      "thread_id": submitted["thread_id"]})
+                    self._poll(task_id, client, deadline)
+                    return
+                except (BrowserError, DreaminaError, MediaError, UploadError, ValueError) as exc:
+                    self._fail(task_id, type(exc).__name__.upper(), str(exc))
+                    return
+                except Exception as exc:
+                    self._fail(task_id, "INTERNAL_ERROR", f"{type(exc).__name__}: {exc}")
+                    return
+                finally:
+                    self.browser_runtime.release(account, owned)
+                    self._release_account(account_id)
+            if not self._stop.is_set():
+                self._fail(task_id, "INSUFFICIENT_CREDITS" if attempted else "ACCOUNT_POOL_UNAVAILABLE",
+                           credit_reason if attempted else "no available Dreamina account before timeout")
         finally:
-            self.browser_runtime.release(account, owned)
-            self._release_account(account_id)
             self._worker_slots.release()
 
     def _resume_poll(self, task_id: str) -> None:

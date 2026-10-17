@@ -62,6 +62,7 @@ class Store:
                     media_inputs_json TEXT NOT NULL DEFAULT '[]',
                     thread_id TEXT NOT NULL DEFAULT '',
                     run_id TEXT NOT NULL DEFAULT '',
+                    attempted_account_ids_json TEXT NOT NULL DEFAULT '[]',
                     error_code TEXT NOT NULL DEFAULT '',
                     error_message TEXT NOT NULL DEFAULT '',
                     estimated_cost REAL NOT NULL DEFAULT 0,
@@ -90,7 +91,8 @@ class Store:
                 db.execute("ALTER TABLE accounts ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
             columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
             for name, default in (("upstream_result_json", "[]"),
-                                  ("result_transfer_json", "{}")):
+                                  ("result_transfer_json", "{}"),
+                                  ("attempted_account_ids_json", "[]")):
                 if name not in columns:
                     db.execute(f"ALTER TABLE tasks ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'")
         try:
@@ -119,6 +121,7 @@ class Store:
     @staticmethod
     def _task(row: sqlite3.Row) -> dict[str, Any]:
         value = dict(row)
+        value["attempted_account_ids"] = json.loads(value.pop("attempted_account_ids_json"))
         value["request"] = json.loads(value.pop("request_json"))
         value["normalized"] = json.loads(value.pop("normalized_json"))
         value["result_urls"] = json.loads(value.pop("result_json"))
@@ -289,6 +292,8 @@ class Store:
             data["upstream_result_json"] = _json(values["upstream_result_urls"])
         if "result_transfer" in values:
             data["result_transfer_json"] = _json(values["result_transfer"])
+        if "attempted_account_ids" in values:
+            data["attempted_account_ids_json"] = _json(values["attempted_account_ids"])
         data["updated_at"] = time.time()
         with self._lock, self._connect() as db:
             db.execute("UPDATE tasks SET " + ",".join(f"{key}=?" for key in data) + " WHERE id=?",
