@@ -147,8 +147,10 @@ class DreaminaImageClient:
                 "material_list": [{"uri": uri, "material_type": 1} for uri in uris],
             }, query={"aid": "513695", "device_platform": "web", "region": "SG",
                       "da_version": IMAGE_VERSION})
-        workspace_id = self.create_workspace()
-        body, submit_id = build_image_submit_body(normalized, assets, workspace_id)
+        # The image workbench submits to its default workspace (0). A newly
+        # created workspace is not opened by this browser page and causes
+        # Dreamina to reject history creation with ret=3016.
+        body, submit_id = build_image_submit_body(normalized, assets)
         data = self.browser.post("/mweb/v1/aigc_draft/generate", body,
                                  query={"aid": "513695", "device_platform": "web",
                                         "region": "SG", "os": "windows",
