@@ -26,6 +26,7 @@ IMAGE_RATIOS = {
     "21:9": (8, 1195, 512),
 }
 IMAGE_VERSION = "3.0.2"
+IMAGE_DRAFT_VERSION = "3.3.30"
 
 
 def resolve_image_model(model: str) -> str:
@@ -100,7 +101,7 @@ def build_image_submit_body(normalized: dict[str, Any], assets: list[dict[str, A
                                      "generate_all": False}},
     }
     draft = {"type": "draft", "id": _uuid(), "min_version": IMAGE_VERSION,
-             "min_features": [], "is_from_tsn": True, "version": IMAGE_VERSION,
+             "min_features": [], "is_from_tsn": True, "version": IMAGE_DRAFT_VERSION,
              "main_component_id": component_id, "component_list": [component]}
     metrics = {"promptSource": "manual", "generateCount": normalized["count"],
                "enterFrom": "click", "position": "page_bottom_box",

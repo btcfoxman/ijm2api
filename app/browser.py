@@ -229,11 +229,11 @@ class CDPBrowser:
             # current device/signature headers. Plain fetch is rejected even
             # from the same authenticated Chrome profile.
             expression = (
-                "(async()=>{let req;try{"
+                "(async()=>{let req=self.__ijm_api_require;try{"
                 "const chunks=self.__LOADABLE_LOADED_CHUNKS__;"
                 "if(!chunks)return JSON.stringify({transport_error:'native-client-unavailable'});"
-                "chunks.push([[900000000+Math.floor(Math.random()*90000000)],{},"
-                "function(r){req=r}]);"
+                "if(!req){chunks.push([[900000000+Math.floor(Math.random()*90000000)],{},"
+                "function(r){req=r}]);self.__ijm_api_require=req}"
                 "if(!req||!req(254815)?.LL||!req(561634)?.Qb)"
                 "return JSON.stringify({transport_error:'native-client-unavailable'});"
                 "const client=new (req(254815).LL)().build({"

@@ -41,6 +41,7 @@ class ImageProtocolTests(unittest.TestCase):
         self.assertEqual(normalized["resolution"], "2k")
         body, _ = build_image_submit_body(normalized, [{"image_uri": "uploaded-image"}], 42)
         component = json.loads(body["draft_content"])["component_list"][0]
+        self.assertEqual(json.loads(body["draft_content"])["version"], "3.3.30")
         self.assertEqual(component["generate_type"], "blend")
         self.assertEqual(component["abilities"]["blend"]["core_param"]["large_image_info"]["width"], 2390)
         self.assertEqual(component["abilities"]["blend"]["ability_list"][0]["image_uri_list"], ["uploaded-image"])
