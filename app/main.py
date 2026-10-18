@@ -19,6 +19,7 @@ from .browser import BrowserError, CDPBrowser, browser_alive, clear_managed_prof
 from .browser_login import BrowserLoginManager, LoginError
 from .browser_login_api import register_browser_login
 from .catalog import public_models
+from .image_client import IMAGE_MODELS
 from .service import Service
 from .store import Store
 
@@ -364,7 +365,9 @@ def admin_models() -> list[dict[str, Any]]:
 
 @app.get("/v1/models", dependencies=[Depends(api_auth)])
 def models() -> dict[str, Any]:
-    return {"object": "list", "data": admin_models()}
+    image_models = [{"id": model + suffix, "object": "model", "owned_by": "ijmapi"}
+                    for model in IMAGE_MODELS for suffix in ("", "-2k", "-4k")]
+    return {"object": "list", "data": admin_models() + image_models}
 
 
 @app.get("/api/model-costs", dependencies=[Depends(admin_auth)])
@@ -403,6 +406,7 @@ def clear_tasks() -> dict[str, Any]:
 def integration_docs() -> PlainTextResponse:
     models = ", ".join(item["id"] for item in admin_models())
     return PlainTextResponse(f"IJM2API / IJMAPI\n\nPOST /v1/videos\nGET /v1/videos/{{task_id}}\n"
+                             "POST /v1/responses (image)\nGET /v1/responses/{response_id}\n"
                              f"GET /v1/models\n\nBearer: IJM_API_KEY\n\nModels: {models}\n"
                              "Request fields: model, prompt, duration, aspect_ratio, "
                              "image_urls, video_urls, audio_urls.\n")
@@ -425,6 +429,26 @@ def _create(body: dict[str, Any]) -> dict[str, Any]:
                 return service.public_task(task)
             time.sleep(2)
     return result
+
+
+@app.post("/v1/responses", dependencies=[Depends(api_auth)])
+def create_image_response(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    try:
+        return service.create_image(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc),
+                            headers={"X-IJMAPI-Submit-Outcome": "not-accepted"}) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=429, detail=str(exc),
+                            headers={"X-IJMAPI-Submit-Outcome": "not-accepted"}) from exc
+
+
+@app.get("/v1/responses/{response_id}", dependencies=[Depends(api_auth)])
+def get_image_response(response_id: str) -> dict[str, Any]:
+    task = _task(response_id)
+    if task["normalized"].get("kind") != "image":
+        raise HTTPException(status_code=404, detail="image response not found")
+    return service.image_response(task)
 
 
 @app.post("/v1/videos", dependencies=[Depends(api_auth)])

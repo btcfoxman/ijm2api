@@ -28,6 +28,12 @@ SAFE_VALUES = {
     "credits", "credit", "cost", "quota", "count", "quantity", "width",
     "height", "fps", "watermark", "watermark_switch", "agent_name",
     "mime_type", "media_type", "asset_type", "mode", "is_vip", "is_member",
+    "model_req_key", "modelreqkey", "image_model", "biz_scene", "scene",
+    "benefit_type", "resource_id", "resource_sub_type", "image_number",
+    "image_count", "generate_mode", "aigc_mode", "seed", "action",
+    "model_key", "root_model", "req_key", "image_ratio", "sample_strength",
+    "intelligent_ratio", "min_version", "version", "gen_type", "image_type",
+    "task_scene", "total_image_count", "finished_image_count", "generate_count",
 }
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f-]{24,}$", re.I)
 
@@ -52,7 +58,7 @@ def endpoint(url: str) -> dict[str, object]:
 
 
 def shape(value: object, key: str = "", depth: int = 0) -> object:
-    if depth >= 8:
+    if depth >= 16:
         return "<depth-limit>"
     if isinstance(value, dict):
         return {str(k)[:100]: shape(v, str(k).lower(), depth + 1)

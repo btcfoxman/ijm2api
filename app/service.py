@@ -17,6 +17,8 @@ from .browser import BrowserError, BrowserRejected, browser_alive, start_managed
 from .browser_runtime import BrowserRuntime
 from .catalog import normalize_request
 from .client import DreaminaClient, DreaminaError
+from .image_client import DreaminaImageClient, resolve_image_model
+from .image_request import normalize_image_request
 from .errors import public_error
 from .media import MediaError
 from .result_transfer import ResultTransferError, transfer, presign, expires_soon, _config
@@ -107,6 +109,8 @@ class Service:
             if task["status"] == "queued":
                 self._pool.submit(self._run, task["id"])
             elif task["status"] in {"submitted", "running"} and task["run_id"] and task["thread_id"]:
+                self._pool.submit(self._resume_poll, task["id"])
+            elif task["status"] in {"submitted", "running"} and task["run_id"] and task["normalized"].get("kind") == "image":
                 self._pool.submit(self._resume_poll, task["id"])
             elif task["status"] == "preparing":
                 self.store.update_task(task["id"], {"status": "failed", "progress": 100,
@@ -219,6 +223,17 @@ class Service:
         self._pool.submit(self._run, task_id)
         return self.public_task(task)
 
+    def create_image(self, request: dict[str, Any]) -> dict[str, Any]:
+        model = str(request.get("model") or "").strip()
+        normalized = normalize_image_request(request, resolve_image_model(model))
+        settings = self.settings()
+        if self.store.active_count() >= int(settings["task_workers"]) + int(settings["task_queue_capacity"]):
+            raise RuntimeError("IJMAPI queue is full")
+        task_id = "ijm_img_" + uuid.uuid4().hex[:16]
+        task = self.store.create_task(task_id, request, normalized)
+        self._pool.submit(self._run_image, task_id)
+        return self.image_response(task)
+
     def _reserve_account(self, estimated_cost: float = 0, *,
                          exclude_ids: set[int] | None = None) -> dict[str, Any] | None:
         excluded = exclude_ids or set()
@@ -294,6 +309,9 @@ class Service:
     def _run(self, task_id: str) -> None:
         task = self.store.task(task_id)
         if not task or task["status"] != "queued":
+            return
+        if task["normalized"].get("kind") == "image":
+            self._run_image(task_id)
             return
         # The executor is only a waiter/dispatcher.  The configurable limit
         # applies to actual upstream work, not to the number of Python threads.
@@ -392,9 +410,138 @@ class Service:
         finally:
             self._worker_slots.release()
 
+    def _run_image(self, task_id: str) -> None:
+        task = self.store.task(task_id)
+        if not task or task["status"] != "queued":
+            return
+        deadline = time.monotonic() + int(self.settings()["task_timeout_seconds"])
+        while not self._stop.is_set():
+            if not self._worker_slots.acquire(timeout=1):
+                continue
+            with self._lock:
+                if sum(self._active.values()) < int(self.settings()["task_workers"]):
+                    break
+            self._worker_slots.release()
+            time.sleep(1)
+        else:
+            return
+        attempted: list[int] = list(task["attempted_account_ids"])
+        try:
+            while not self._stop.is_set() and time.monotonic() < deadline:
+                account = self._reserve_account(1, exclude_ids=set(attempted))
+                if not account:
+                    if not self._has_eligible_account(1, set(attempted)):
+                        self._fail(task_id, "ACCOUNT_POOL_UNAVAILABLE",
+                                   "no Dreamina image account has available credits")
+                        return
+                    time.sleep(1)
+                    continue
+                account_id = int(account["id"])
+                owned = False
+                try:
+                    self.store.update_task(task_id, {"account_id": account_id,
+                        "status": "preparing", "progress": 5, "error_code": "", "error_message": ""})
+                    account, owned = self.browser_runtime.acquire(account)
+                    video_client = DreaminaClient(account, store=self.store)
+                    assets = video_client.upload_inputs(task["normalized"])["images"]
+                    self.store.update_task(task_id, {"progress": 30})
+                    attempted.append(account_id)
+                    self.store.update_task(task_id, {"attempted_account_ids": attempted})
+                    try:
+                        submitted = DreaminaImageClient(int(account["cdp_port"])).submit(
+                            task["normalized"], assets)
+                    except BrowserRejected as exc:
+                        if _credit_rejected(str(exc)) and len(attempted) < MAX_CREDIT_ACCOUNT_ATTEMPTS:
+                            self.store.update_account(account_id, {"last_error": str(exc)[:300]})
+                            self.store.update_task(task_id, {"status": "queued", "progress": 0,
+                                "account_id": None, "error_code": "INSUFFICIENT_CREDITS",
+                                "error_message": str(exc)})
+                            continue
+                        self._fail(task_id, "INSUFFICIENT_CREDITS" if _credit_rejected(str(exc))
+                                   else "UPSTREAM_REJECTED", str(exc))
+                        return
+                    except BrowserError as exc:
+                        self._fail(task_id, "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
+                                   str(exc) + "; automatic resubmission is disabled")
+                        return
+                    self.store.update_task(task_id, {"status": "submitted", "progress": 40,
+                        "run_id": submitted["run_id"], "thread_id": submitted["thread_id"]})
+                    self._poll_image(task_id, DreaminaImageClient(int(account["cdp_port"])), deadline)
+                    return
+                except (BrowserError, DreaminaError, MediaError, UploadError, ValueError) as exc:
+                    self._fail(task_id, type(exc).__name__.upper(), str(exc))
+                    return
+                except Exception as exc:
+                    self._fail(task_id, "INTERNAL_ERROR", f"{type(exc).__name__}: {exc}")
+                    return
+                finally:
+                    self.browser_runtime.release(account, owned)
+                    self._release_account(account_id)
+            if not self._stop.is_set():
+                self._fail(task_id, "UPSTREAM_TIMEOUT", "Dreamina image task timed out")
+        finally:
+            self._worker_slots.release()
+
+    def _resume_image_poll(self, task_id: str) -> None:
+        task = self.store.task(task_id)
+        if not task or not task["account_id"]:
+            return
+        account = self.store.account(int(task["account_id"]), private=True)
+        if not account:
+            self._fail(task_id, "ACCOUNT_MISSING", "task account was removed")
+            return
+        self._worker_slots.acquire()
+        with self._lock:
+            self._active[int(account["id"])] = self._active.get(int(account["id"]), 0) + 1
+        owned = False
+        try:
+            account, owned = self.browser_runtime.acquire(account)
+            self._poll_image(task_id, DreaminaImageClient(int(account["cdp_port"])),
+                             time.monotonic() + int(self.settings()["task_timeout_seconds"]))
+        except Exception as exc:
+            self._fail(task_id, type(exc).__name__.upper(), str(exc))
+        finally:
+            self.browser_runtime.release(account, owned)
+            self._release_account(int(account["id"]))
+            self._worker_slots.release()
+
+    def _poll_image(self, task_id: str, client: DreaminaImageClient, deadline: float) -> None:
+        errors = 0
+        while time.monotonic() < deadline and not self._stop.is_set():
+            task = self.store.task(task_id)
+            if not task or task["status"] in TERMINAL:
+                return
+            try:
+                state = client.poll(task["run_id"])
+                errors = 0
+            except BrowserError:
+                errors += 1
+                if errors >= 8:
+                    raise
+                time.sleep(min(60, 2 ** errors))
+                continue
+            if state["status"] == "succeeded":
+                self.store.update_task(task_id, {"status": "succeeded", "progress": 100,
+                    "result_urls": state["result_urls"], "completed_at": time.time()})
+                return
+            if state["status"] == "failed":
+                self._fail(task_id, "UPSTREAM_FAILED", state["error"])
+                return
+            self.store.update_task(task_id, {"status": "running",
+                                             "progress": max(45, task["progress"])})
+            time.sleep(max(2, int(self.settings()["poll_interval_seconds"])))
+        if not self._stop.is_set():
+            self.store.update_task(task_id, {"status": "expired", "progress": 100,
+                "error_code": "UPSTREAM_TIMEOUT",
+                "error_message": "Dreamina image task timed out; upstream run may continue",
+                "completed_at": time.time()})
+
     def _resume_poll(self, task_id: str) -> None:
         task = self.store.task(task_id)
         if not task or not task["account_id"]:
+            return
+        if task["normalized"].get("kind") == "image":
+            self._resume_image_poll(task_id)
             return
         account = self.store.account(task["account_id"], private=True)
         if not account:
@@ -505,7 +652,28 @@ class Service:
         self.store.update_task(task_id, {"status": "failed", "progress": 100,
             "error_code": code, "error_message": message[:600], "completed_at": time.time()})
 
+    def image_response(self, task: dict[str, Any]) -> dict[str, Any]:
+        status = {"succeeded": "completed", "failed": "failed",
+                  "expired": "failed"}.get(task["status"], "in_progress")
+        result: dict[str, Any] = {
+            "id": task["id"], "object": "response", "created_at": int(task["created_at"]),
+            "status": status, "model": task["model"],
+            "output": [{"id": f"ig_{task['id']}_{index}",
+                        "type": "image_generation_call", "status": "completed", "url": url}
+                       for index, url in enumerate(task["result_urls"])],
+            "metadata": {"task_id": task["id"], "account_id": task.get("account_id")},
+            "error": None,
+        }
+        if status == "failed":
+            result["error"] = public_error(task["error_code"], task["error_message"])
+        return result
+
     def public_task(self, task: dict[str, Any]) -> dict[str, Any]:
+        if task["normalized"].get("kind") == "image":
+            result = self.image_response(task)
+            result["progress"] = task["progress"]
+            result["data"] = [{"url": url} for url in task["result_urls"]]
+            return result
         if (task["status"] == "succeeded" and task["model"] == "sd-2-5-480p-x"
                 and task["result_urls"] and expires_soon(task.get("result_transfer") or {})):
             metadata = task["result_transfer"]

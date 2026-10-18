@@ -132,13 +132,23 @@ class Store:
         value["channel"] = "ijmapi"
         value["generation_id"] = value["run_id"]
         value["caller_request"] = value["request"]
-        value["upstream_request"] = {"model": value["normalized"]["upstream_model"],
-            "duration_sec": value["normalized"]["duration"],
-            "resolution": MODELS[value["model"]].generation_resolution,
-            "output_resolution": value["normalized"]["resolution"],
-            "ratio": value["normalized"]["aspect_ratio"],
-            "media_counts": {key: len(value["normalized"][key])
-                             for key in ("images", "videos", "audios")}}
+        normalized = value["normalized"]
+        if normalized.get("kind") == "image":
+            value["upstream_request"] = {
+                "model": normalized["upstream_model"],
+                "resolution": normalized["resolution"],
+                "ratio": normalized["aspect_ratio"],
+                "count": normalized["count"],
+                "media_counts": {"images": len(normalized["images"])},
+            }
+        else:
+            value["upstream_request"] = {"model": normalized["upstream_model"],
+                "duration_sec": normalized["duration"],
+                "resolution": MODELS[value["model"]].generation_resolution,
+                "output_resolution": normalized["resolution"],
+                "ratio": normalized["aspect_ratio"],
+                "media_counts": {key: len(normalized[key])
+                                 for key in ("images", "videos", "audios")}}
         value["upstream_response"] = {"run_id": value["run_id"],
             "thread_id": value["thread_id"], "status": value["status"],
             "error_code": value["error_code"], "error_message": value["error_message"]}
@@ -328,6 +338,8 @@ class Store:
         grouped: dict[tuple[str, int, str, int, int, int], dict[str, Any]] = {}
         for row in rows:
             request = json.loads(row["normalized_json"])
+            if request.get("kind") == "image":
+                continue
             key = (row["model"], int(request["duration"]), request["resolution"],
                    len(request["images"]), len(request["videos"]), len(request["audios"]))
             item = grouped.setdefault(key, {"model": key[0], "duration": key[1],

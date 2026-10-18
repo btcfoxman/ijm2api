@@ -32,6 +32,16 @@ All task endpoints require `Authorization: Bearer <IJM_API_KEY>` or
 * `GET /v1/videos/{task_id}`: poll status and retrieve `data[].url`.
 * `GET /v1/videos/{task_id}/content`: redirect to the first result.
 * `GET /v1/models`: list models and media limits.
+* `POST /v1/responses`: submit an asynchronous Flare or Sunburst image task.
+* `GET /v1/responses/{response_id}`: poll its status and image URLs.
+
+Image model names are `gpt-image-2.5-flare` and
+`gpt-image-2.5-sunburst`, optionally suffixed with `-2k` or `-4k`.
+Text-to-image and image edits share the OpenAI Responses input shape:
+`input_text` plus optional `input_image` URLs. The image generation tool's
+`ratio` accepts `1:1`, `16:9`, `9:16`, `4:3`, `3:4`, `3:2`, `2:3`, or `21:9`;
+`resolution` accepts `1k`, `2k`, or `4k`. The service returns an image URL in
+`output[].url` when generation completes.
 
 Example:
 
