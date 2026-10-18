@@ -133,8 +133,17 @@ class DreaminaImageClient:
 
     def create_workspace(self) -> int:
         data = self.browser.post("/mweb/v1/workspace/create", {"name": "Image generation"},
-                                 query={"aid": "513695", "device_platform": "web", "region": "SG"})
-        return int(data.get("workspace_id") or 0)
+                                 query={"aid": "513695", "da_version": "3.3.30",
+                                        "web_version": "7.5.0", "aigc_features": "app_lip_sync",
+                                        "os": "windows"})
+        workspace_id = int(data.get("workspace_id") or 0)
+        if not workspace_id:
+            raise RuntimeError("Dreamina image workspace create returned no workspace ID")
+        self.browser.post("/mweb/v1/workspace/update", {"workspace_id": workspace_id},
+                          query={"aid": "513695", "da_version": "3.3.30",
+                                 "web_version": "7.5.0", "aigc_features": "app_lip_sync",
+                                 "os": "windows"})
+        return workspace_id
 
     def submit(self, normalized: dict[str, Any], assets: list[dict[str, Any]]) -> dict[str, str]:
         if assets:
@@ -147,10 +156,10 @@ class DreaminaImageClient:
                 "material_list": [{"uri": uri, "material_type": 1} for uri in uris],
             }, query={"aid": "513695", "device_platform": "web", "region": "SG",
                       "da_version": IMAGE_VERSION})
-        # The image workbench submits to its default workspace (0). A newly
-        # created workspace is not opened by this browser page and causes
-        # Dreamina to reject history creation with ret=3016.
-        body, submit_id = build_image_submit_body(normalized, assets)
+        # The page updates the new workspace before submitting the draft.
+        # Without that step the upstream rejects history creation (ret=3016).
+        workspace_id = self.create_workspace()
+        body, submit_id = build_image_submit_body(normalized, assets, workspace_id)
         data = self.browser.post("/mweb/v1/aigc_draft/generate", body,
                                  query={"aid": "513695", "device_platform": "web",
                                         "region": "SG", "os": "windows",

@@ -64,12 +64,16 @@ class ImageProtocolTests(unittest.TestCase):
         normalized = normalize_image_request(source, resolve_image_model(source["model"]))
         client = DreaminaImageClient(12345)
         with patch.object(client.browser, "post", side_effect=[
+                {"workspace_id": 42},
+                {},
                 {"aigc_data": {"task": {"submit_id": "upstream-1"}}},
         ]) as post:
             self.assertEqual(client.submit(normalized, [])["run_id"], "upstream-1")
+        self.assertEqual(post.call_args_list[1].args[:2],
+                         ("/mweb/v1/workspace/update", {"workspace_id": 42}))
         generate = post.call_args_list[-1]
         self.assertEqual(generate.args[0], "/mweb/v1/aigc_draft/generate")
-        self.assertEqual(generate.args[1]["extend"]["workspace_id"], 0)
+        self.assertEqual(generate.args[1]["extend"]["workspace_id"], 42)
         self.assertTrue(generate.kwargs["native_client"])
         self.assertEqual(generate.kwargs["query"]["da_version"], "3.1.3")
         self.assertEqual(generate.kwargs["query"]["commerce_with_input_video"], "1")
