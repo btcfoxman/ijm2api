@@ -225,27 +225,40 @@ class CDPBrowser:
             url += "?" + urllib.parse.urlencode(query)
         payload = json.dumps(body, ensure_ascii=True, separators=(",", ":"))
         if native_client:
-            # Image generation uses the site's XHR client, which supplies its
-            # current device/signature headers. Plain fetch is rejected even
-            # from the same authenticated Chrome profile.
+            # Image generation uses the site's complete XHR client. Its
+            # container-backed interceptors attach the current account,
+            # device and signature context before sending the draft.
             expression = (
                 "(async()=>{let req=self.__ijm_api_require;try{"
                 "const chunks=self.__LOADABLE_LOADED_CHUNKS__;"
                 "if(!chunks)return JSON.stringify({transport_error:'native-client-unavailable'});"
                 "if(!req){chunks.push([[900000000+Math.floor(Math.random()*90000000)],{},"
                 "function(r){req=r}]);self.__ijm_api_require=req}"
-                "if(!req||!req(254815)?.LL||!req(561634)?.Qb)"
+                "if(!req||!req(254815)?.LL||!req(545525)?.U)"
                 "return JSON.stringify({transport_error:'native-client-unavailable'});"
+                "let container=self.__ijm_api_container;"
+                "if(!container){const seen=new Set();"
+                "for(const element of document.querySelectorAll('*')){"
+                "const key=Object.keys(element).find(k=>k.startsWith('__reactFiber$'));"
+                "let fiber=key&&element[key];"
+                "while(fiber&&!seen.has(fiber)){seen.add(fiber);"
+                "const value=fiber.memoizedProps?.value;"
+                "if(value&&typeof value.createInstance==='function'&&"
+                "typeof value.invokeFunction==='function'){container=value;break}"
+                "fiber=fiber.return}if(container)break}"
+                "self.__ijm_api_container=container}"
+                "if(!container)return JSON.stringify({transport_error:'native-container-unavailable'});"
                 "const client=new (req(254815).LL)().build({"
                 "headers:{'Content-Type':'application/json'},withCredentials:true});"
-                "client.interceptors.request.use(config=>{req(561634).Qb(config);"
-                "Object.assign(config.headers,{loc:'SG',lan:'en',pf:'7',"
-                "'app-sdk-version':'48.0.0',appid:'513695'});return config});"
+                "req(545525).U(container,client);req(561634).vo(client);"
+                "req(547986).Wh(client);req(670446).P(client);req(431316).m(client);"
                 "const response=await client.post(" + json.dumps(url) + ","
                 + payload + ",{params:" + json.dumps(query or {}, ensure_ascii=True) + "});"
-                "return JSON.stringify({http:response.status,body:response.data})"
+                "return JSON.stringify({http:200,body:response})"
                 "}catch(e){if(e?.response)return JSON.stringify({http:e.response.status,"
-                "body:e.response.data});return JSON.stringify({transport_error:'native-client'})}})()"
+                "body:e.response.data});if(e?.ret!==undefined)"
+                "return JSON.stringify({http:200,body:e});"
+                "return JSON.stringify({transport_error:'native-client'})}})()"
             )
         else:
             expression = (
@@ -268,6 +281,8 @@ class CDPBrowser:
             raise BrowserError("Dreamina browser fetch failed")
         if response.get("transport_error") == "native-client-unavailable":
             raise BrowserError("Dreamina page request client is unavailable")
+        if response.get("transport_error") == "native-container-unavailable":
+            raise BrowserError("Dreamina page service container is unavailable")
         if response.get("transport_error") == "native-client":
             raise BrowserError("Dreamina page request client failed")
         if response.get("transport_error") == "json":

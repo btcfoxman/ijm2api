@@ -105,6 +105,26 @@ class BrowserTransportTests(unittest.TestCase):
                 "/mweb/v1/imagex/submit_audit_job", {"uri_list": ["private"]},
                 allow_empty_ret=True), {})
 
+    def test_image_native_client_uses_page_interceptors_and_decodes_data(self):
+        browser = CDPBrowser(19301)
+        reply = json.dumps({"http": 200, "body": {"ret": "0", "data": {"run_id": "abc"}}})
+        with patch.object(browser, "evaluate", return_value=reply) as evaluate:
+            self.assertEqual(browser.post("/mweb/v1/aigc_draft/generate", {"submit_id": "abc"},
+                                          query={"aid": "513695"}, native_client=True),
+                             {"run_id": "abc"})
+        expression = evaluate.call_args.args[0]
+        for interceptor in ("req(545525).U(container,client)", "req(561634).vo(client)",
+                            "req(547986).Wh(client)", "req(670446).P(client)",
+                            "req(431316).m(client)"):
+            self.assertIn(interceptor, expression)
+        self.assertIn("__reactFiber$", expression)
+        self.assertIn("params:{\"aid\": \"513695\"}", expression)
+
+        with patch.object(browser, "evaluate", return_value=json.dumps(
+                {"transport_error": "native-container-unavailable"})):
+            with self.assertRaisesRegex(BrowserError, "service container is unavailable"):
+                browser.post("/mweb/v1/aigc_draft/generate", {}, native_client=True)
+
 
 if __name__ == "__main__":
     unittest.main()
