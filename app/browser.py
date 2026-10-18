@@ -215,7 +215,8 @@ class CDPBrowser:
             raise BrowserError("Dreamina browser JavaScript request returned an error")
         return value.get("value")
 
-    def post(self, path: str, body: dict[str, Any], *, query: dict[str, str] | None = None) -> dict[str, Any]:
+    def post(self, path: str, body: dict[str, Any], *, query: dict[str, str] | None = None,
+             allow_empty_ret: bool = False) -> dict[str, Any]:
         if not path.startswith("/") or path.startswith("//"):
             raise ValueError("Dreamina API path must be absolute")
         origin = COMMERCE_API if path.startswith("/commerce/") else MWEB_API
@@ -251,7 +252,7 @@ class CDPBrowser:
         data = response.get("body")
         if not isinstance(data, dict):
             raise BrowserError("Dreamina returned an invalid response envelope")
-        if str(data.get("ret")) != "0":
+        if str(data.get("ret")) != "0" and not (allow_empty_ret and data.get("ret") == ""):
             raise BrowserRejected(f"Dreamina ret={data.get('ret')}: {str(data.get('errmsg') or 'upstream error')[:300]}")
         value = data.get("data")
         if value is None and isinstance(data.get("response"), str):

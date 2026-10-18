@@ -139,7 +139,8 @@ class DreaminaImageClient:
         if assets:
             uris = [str(item["image_uri"]) for item in assets]
             self.browser.post("/mweb/v1/imagex/submit_audit_job", {"uri_list": uris},
-                              query={"aid": "513695", "device_platform": "web", "region": "SG"})
+                              query={"aid": "513695", "device_platform": "web", "region": "SG"},
+                              allow_empty_ret=True)
             self.browser.post("/mweb/v1/execute_generate_audit", {
                 "scene": 1, "model_key": normalized["upstream_model"],
                 "material_list": [{"uri": uri, "material_type": 1} for uri in uris],

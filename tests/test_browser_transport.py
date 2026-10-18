@@ -95,6 +95,16 @@ class BrowserTransportTests(unittest.TestCase):
             with self.assertRaisesRegex(BrowserRejected, "HTTP 503 returned non-JSON"):
                 browser.post("/commerce/v1/benefits/user_credit", {})
 
+    def test_image_audit_empty_ret_is_allowed_only_when_requested(self):
+        browser = CDPBrowser(19301)
+        reply = json.dumps({"http": 200, "body": {"ret": "", "errmsg": ""}})
+        with patch.object(browser, "evaluate", return_value=reply):
+            with self.assertRaises(BrowserRejected):
+                browser.post("/mweb/v1/imagex/submit_audit_job", {"uri_list": ["private"]})
+            self.assertEqual(browser.post(
+                "/mweb/v1/imagex/submit_audit_job", {"uri_list": ["private"]},
+                allow_empty_ret=True), {})
+
 
 if __name__ == "__main__":
     unittest.main()
