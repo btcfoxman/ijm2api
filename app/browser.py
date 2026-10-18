@@ -216,23 +216,47 @@ class CDPBrowser:
         return value.get("value")
 
     def post(self, path: str, body: dict[str, Any], *, query: dict[str, str] | None = None,
-             allow_empty_ret: bool = False) -> dict[str, Any]:
+             allow_empty_ret: bool = False, native_client: bool = False) -> dict[str, Any]:
         if not path.startswith("/") or path.startswith("//"):
             raise ValueError("Dreamina API path must be absolute")
         origin = COMMERCE_API if path.startswith("/commerce/") else MWEB_API
         url = origin + path
-        if query:
+        if query and not native_client:
             url += "?" + urllib.parse.urlencode(query)
         payload = json.dumps(body, ensure_ascii=True, separators=(",", ":"))
-        expression = (
-            "(async()=>{let r;try{r=await fetch(" + json.dumps(url) + ","
-            "{method:'POST',credentials:'include',headers:{'content-type':'application/json'},"
-            "body:JSON.stringify(" + payload + ")})}"
-            "catch(e){return JSON.stringify({transport_error:'fetch'})}"
-            "let body;try{body=await r.json()}"
-            "catch(e){return JSON.stringify({transport_error:'json',http:r.status})}"
-            "return JSON.stringify({http:r.status,body})})()"
-        )
+        if native_client:
+            # Image generation uses the site's XHR client, which supplies its
+            # current device/signature headers. Plain fetch is rejected even
+            # from the same authenticated Chrome profile.
+            expression = (
+                "(async()=>{let req;try{"
+                "const chunks=self.__LOADABLE_LOADED_CHUNKS__;"
+                "if(!chunks)return JSON.stringify({transport_error:'native-client-unavailable'});"
+                "chunks.push([[900000000+Math.floor(Math.random()*90000000)],{},"
+                "function(r){req=r}]);"
+                "if(!req||!req(254815)?.LL||!req(561634)?.Qb)"
+                "return JSON.stringify({transport_error:'native-client-unavailable'});"
+                "const client=new (req(254815).LL)().build({"
+                "headers:{'Content-Type':'application/json'},withCredentials:true});"
+                "client.interceptors.request.use(config=>{req(561634).Qb(config);"
+                "Object.assign(config.headers,{loc:'SG',lan:'en',pf:'7',"
+                "'app-sdk-version':'48.0.0',appid:'513695'});return config});"
+                "const response=await client.post(" + json.dumps(url) + ","
+                + payload + ",{params:" + json.dumps(query or {}, ensure_ascii=True) + "});"
+                "return JSON.stringify({http:response.status,body:response.data})"
+                "}catch(e){if(e?.response)return JSON.stringify({http:e.response.status,"
+                "body:e.response.data});return JSON.stringify({transport_error:'native-client'})}})()"
+            )
+        else:
+            expression = (
+                "(async()=>{let r;try{r=await fetch(" + json.dumps(url) + ","
+                "{method:'POST',credentials:'include',headers:{'content-type':'application/json'},"
+                "body:JSON.stringify(" + payload + ")})}"
+                "catch(e){return JSON.stringify({transport_error:'fetch'})}"
+                "let body;try{body=await r.json()}"
+                "catch(e){return JSON.stringify({transport_error:'json',http:r.status})}"
+                "return JSON.stringify({http:r.status,body})})()"
+            )
         value = self.evaluate(expression, await_promise=True)
         try:
             response = json.loads(value)
@@ -242,6 +266,10 @@ class CDPBrowser:
             raise BrowserError("Dreamina returned an invalid response envelope")
         if response.get("transport_error") == "fetch":
             raise BrowserError("Dreamina browser fetch failed")
+        if response.get("transport_error") == "native-client-unavailable":
+            raise BrowserError("Dreamina page request client is unavailable")
+        if response.get("transport_error") == "native-client":
+            raise BrowserError("Dreamina page request client failed")
         if response.get("transport_error") == "json":
             status = int(response.get("http") or 0)
             if status >= 400:

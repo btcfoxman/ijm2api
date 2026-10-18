@@ -6,6 +6,10 @@ from __future__ import annotations
 def public_error(code: str, message: str) -> dict[str, str]:
     raw = (message or "").lower()
     kind = (code or "").upper()
+    if (kind == "INPUT_IMAGE_SIZE_UNSUPPORTED" or
+            "image width or height is too large or too small" in raw):
+        return {"code": "INPUT_IMAGE_SIZE_UNSUPPORTED",
+                "message": "参考图片尺寸不符合模型要求，请调整图片尺寸后重试~"}
     if kind == "CONTENT_MODERATION_FAILED" or any(token in raw for token in (
         "'code': 12009", "'code': 12011", "content did not meet platform requirements",
         "output video may contain inappropriate content", "outputaudiocopyright",

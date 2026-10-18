@@ -152,9 +152,13 @@ class DreaminaImageClient:
                                  query={"aid": "513695", "device_platform": "web",
                                         "region": "SG", "os": "windows",
                                         "web_component_open_flag": "1",
-                                        "da_version": IMAGE_VERSION,
+                                        "da_version": "3.1.3",
+                                        "web_version": "7.5.0",
+                                        "aigc_features": "app_lip_sync",
+                                        "babi_param": "{}",
                                         "generate_id": submit_id,
-                                        "commerce_with_input_video": "0"})
+                                        "commerce_with_input_video": "1"},
+                                 native_client=True)
         record = data.get("aigc_data") or {}
         task = record.get("task") or {}
         if not task.get("submit_id"):

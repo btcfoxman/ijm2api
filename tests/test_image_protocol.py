@@ -7,6 +7,7 @@ from app.image_client import (
     image_result_urls, resolve_image_model,
 )
 from app.image_request import normalize_image_request
+from app.errors import public_error
 
 
 class ImageProtocolTests(unittest.TestCase):
@@ -55,6 +56,29 @@ class ImageProtocolTests(unittest.TestCase):
             self.assertEqual(client.poll("one")["result_urls"], ["https://example.com/result.png"])
             self.assertEqual(client.poll("two")["status"], "failed")
         self.assertEqual(image_result_urls(completed), ["https://example.com/result.png"])
+
+    def test_image_submit_uses_page_request_client_and_upstream_query(self):
+        source = {"model": "gpt-image-2.5-flare", "prompt": "a sphere",
+                  "ratio": "3:2"}
+        normalized = normalize_image_request(source, resolve_image_model(source["model"]))
+        client = DreaminaImageClient(12345)
+        with patch.object(client.browser, "post", side_effect=[
+                {"workspace_id": 42},
+                {"aigc_data": {"task": {"submit_id": "upstream-1"}}},
+        ]) as post:
+            self.assertEqual(client.submit(normalized, [])["run_id"], "upstream-1")
+        generate = post.call_args_list[-1]
+        self.assertEqual(generate.args[0], "/mweb/v1/aigc_draft/generate")
+        self.assertTrue(generate.kwargs["native_client"])
+        self.assertEqual(generate.kwargs["query"]["da_version"], "3.1.3")
+        self.assertEqual(generate.kwargs["query"]["commerce_with_input_video"], "1")
+
+    def test_video_reference_image_size_failure_is_normalized(self):
+        failure = public_error("UPSTREAM_FAILED",
+            "The image width or height is too large or too small for this model. Try a different size.")
+        self.assertEqual(failure["code"], "INPUT_IMAGE_SIZE_UNSUPPORTED")
+        self.assertEqual(failure["message"],
+                         "参考图片尺寸不符合模型要求，请调整图片尺寸后重试~")
 
 
 if __name__ == "__main__":
