@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from app.browser import BrowserError, BrowserRejected
 from app.catalog import normalize_request
+from app.client import InputAudioDurationError
 from app.errors import public_error
 from app.service import Service
 from app.store import Store
@@ -98,6 +99,43 @@ class ServiceBalanceTests(unittest.TestCase):
         self.assertEqual(task["error_code"], "CONTENT_MODERATION_FAILED")
         self.assertEqual(public_error(task["error_code"], task["error_message"])["message"],
                          "检测到内容有敏感或违规情况，请修改后重试，积分已返还～")
+
+    def test_short_reference_audio_is_not_submitted(self):
+        self.client.submit.side_effect = InputAudioDurationError(
+            "reference audio 1 is 0.940s; minimum is 2s")
+
+        task = self.run_task()
+
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(task["error_code"], "INPUT_AUDIO_DURATION_UNSUPPORTED")
+        self.assertFalse(task["run_id"])
+        self.assertEqual(self.service.public_task(task)["error"]["message"],
+                         "素材时长不支持，请修改后再试~")
+
+    def test_existing_upstream_failures_have_specific_public_messages(self):
+        cases = (
+            ("The audio clip is too long or too short for this model. Trim it or try a different audio clip.",
+             "INPUT_AUDIO_DURATION_UNSUPPORTED", "素材时长不支持，请修改后再试~"),
+            ("The image you uploaded may contain content that violates our Community Guidelines. Try another image.",
+             "INPUT_IMAGE_CONTENT_VIOLATION", "检测到图片有敏感或违规内容，积分已返还，请重试~"),
+            ("The video may contain third-party content", "OUTPUT_VIDEO_COPYRIGHT",
+             "生成的视频内容违规，请修改描述后重试，积分已返还~"),
+        )
+        for raw, expected_code, expected_message in cases:
+            with self.subTest(raw=raw):
+                result = public_error("UPSTREAM_FAILED", raw)
+                self.assertEqual(result, {"code": expected_code, "message": expected_message})
+
+    def test_upstream_failure_is_classified_for_new_tasks(self):
+        self.store.update_task(self.task["id"], {"status": "submitted",
+            "account_id": self.account_id, "run_id": "submit-1", "thread_id": "history-1"})
+        self.client.poll.return_value = {"status": "failed", "error_code": "",
+            "error": "The video may contain third-party content"}
+
+        self.service._poll(self.task["id"], self.client, float("inf"))
+
+        task = self.store.task(self.task["id"])
+        self.assertEqual(task["error_code"], "OUTPUT_VIDEO_COPYRIGHT")
 
 
 if __name__ == "__main__":

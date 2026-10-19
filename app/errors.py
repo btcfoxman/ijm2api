@@ -6,6 +6,18 @@ from __future__ import annotations
 def public_error(code: str, message: str) -> dict[str, str]:
     raw = (message or "").lower()
     kind = (code or "").upper()
+    if (kind in {"INPUT_AUDIO_DURATION_UNSUPPORTED", "INPUTAUDIODURATIONERROR"} or
+            "audio clip is too long or too short" in raw):
+        return {"code": "INPUT_AUDIO_DURATION_UNSUPPORTED",
+                "message": "素材时长不支持，请修改后再试~"}
+    if (kind == "INPUT_IMAGE_CONTENT_VIOLATION" or
+            ("image you uploaded" in raw and "community guidelines" in raw)):
+        return {"code": "INPUT_IMAGE_CONTENT_VIOLATION",
+                "message": "检测到图片有敏感或违规内容，积分已返还，请重试~"}
+    if (kind == "OUTPUT_VIDEO_COPYRIGHT" or
+            "video may contain third-party content" in raw):
+        return {"code": "OUTPUT_VIDEO_COPYRIGHT",
+                "message": "生成的视频内容违规，请修改描述后重试，积分已返还~"}
     if (kind == "INPUT_IMAGE_SIZE_UNSUPPORTED" or
             "image width or height is too large or too small" in raw):
         return {"code": "INPUT_IMAGE_SIZE_UNSUPPORTED",

@@ -62,6 +62,8 @@ Model aliases: `sd-2-0`, `sd-2-0-1080p`, `sd-2-0-4k`,
 `sd-2-5-1080p`, and `sd-2-5-480p-preview`. Unsuffixed aliases
 default to 720p. Seedance 2.0 accepts up to 9 images, 3 audio clips and
 3 videos; Seedance 2.5 accepts up to 30, 10 and 10 respectively.
+Uploaded reference audio shorter than 2 seconds is rejected before the
+generation request is sent to Dreamina.
 
 `sd-2-5-480p-x` is an opt-in result-processing model. Enable it and configure
 the **S3 result storage** fields in the management console. The container

@@ -20,6 +20,10 @@ class DreaminaError(Exception):
     pass
 
 
+class InputAudioDurationError(DreaminaError):
+    pass
+
+
 _UPLOAD_LOCKS_GUARD = threading.RLock()
 _UPLOAD_LOCKS: dict[int, threading.RLock] = {}
 
@@ -93,6 +97,13 @@ def build_meta_list(prompt: str, index_map: dict[str, list[int]]) -> list[dict[s
 
 def build_submit_body(normalized: dict[str, Any],
                       assets: dict[str, list[dict[str, Any]]]) -> tuple[dict[str, Any], str]:
+    # A sub-two-second reference audio is accepted by VOD upload but the
+    # generation later fails. Reject it before creating a paid upstream task.
+    for index, item in enumerate(assets["audios"], start=1):
+        audio_duration = float(item.get("duration") or 0)
+        if 0 < audio_duration < 2:
+            raise InputAudioDurationError(
+                f"reference audio {index} is {audio_duration:.3f}s; minimum is 2s")
     spec = MODELS[normalized["model"]]
     materials, index_map = build_materials(assets)
     submit_id = _uuid()

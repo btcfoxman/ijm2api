@@ -11,7 +11,7 @@ from unittest.mock import patch
 import requests
 
 from app.catalog import normalize_request
-from app.client import build_submit_body
+from app.client import InputAudioDurationError, build_submit_body
 from app.upload import _request
 from app.result_transfer import (
     ResultTransferError, SD_2_5_480P_X_DIMENSIONS, _config, _probe,
@@ -22,6 +22,17 @@ from app.store import Store
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_short_reference_audio_is_rejected_before_upstream_submit(self):
+        request = normalize_request({"model": "sd-2-0-fast", "prompt": "A blue sky",
+                                     "duration": 8, "audio_urls": ["https://example.com/a.mp3"]})
+        assets = {"images": [], "videos": [],
+                  "audios": [{"vid": "uploaded-audio", "duration": 0.94}]}
+        with self.assertRaisesRegex(InputAudioDurationError, "reference audio 1.*0.940s"):
+            build_submit_body(request, assets)
+        assets["audios"][0]["duration"] = 2.0
+        body, _ = build_submit_body(request, assets)
+        self.assertTrue(body["draft_content"])
+
     def test_25_acceptance_shape_and_reference_order(self):
         body = {
             "model": "sd-2-5", "prompt": "图片10，音频3，视频1。最后只生成一条视频。",

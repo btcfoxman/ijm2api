@@ -16,7 +16,7 @@ from typing import Any
 from .browser import BrowserError, BrowserRejected, browser_alive, start_managed_browser, stop_managed_browser
 from .browser_runtime import BrowserRuntime
 from .catalog import normalize_request
-from .client import DreaminaClient, DreaminaError
+from .client import DreaminaClient, DreaminaError, InputAudioDurationError
 from .image_client import DreaminaImageClient, resolve_image_model
 from .image_request import normalize_image_request
 from .errors import public_error
@@ -370,6 +370,9 @@ class Service:
                     self.store.update_task(task_id, {"attempted_account_ids": attempted})
                     try:
                         submitted = client.submit(task["normalized"], assets)
+                    except InputAudioDurationError as exc:
+                        self._fail(task_id, "INPUT_AUDIO_DURATION_UNSUPPORTED", str(exc))
+                        return
                     except BrowserRejected as exc:
                         if not _credit_rejected(str(exc)):
                             self._fail(task_id, "UPSTREAM_REJECTED", str(exc))
@@ -627,13 +630,20 @@ class Service:
                     continue
                 reason = state["error"] or "Dreamina video generation failed"
                 upstream_code = state.get("error_code") or ""
+                reason_lower = reason.lower()
                 # 2052 was observed with fail_msg=OutputAudioCopyright while
                 # the localized fail_starling_message was only "[none]".
-                if upstream_code in {"12009", "12011", "2052"}:
+                if "audio clip is too long or too short" in reason_lower:
+                    code = "INPUT_AUDIO_DURATION_UNSUPPORTED"
+                elif "image you uploaded" in reason_lower and "community guidelines" in reason_lower:
+                    code = "INPUT_IMAGE_CONTENT_VIOLATION"
+                elif "video may contain third-party content" in reason_lower:
+                    code = "OUTPUT_VIDEO_COPYRIGHT"
+                elif upstream_code in {"12009", "12011", "2052"}:
                     code = "CONTENT_MODERATION_FAILED"
-                elif "outputaudiocopyright" in reason.lower():
+                elif "outputaudiocopyright" in reason_lower:
                     code = "CONTENT_MODERATION_FAILED"
-                elif "video editing task" in reason.lower():
+                elif "video editing task" in reason_lower:
                     code = "VIDEO_EDIT_CONSTRAINT"
                 elif upstream_code == "99999":
                     code = "UPSTREAM_TEMPORARY"
