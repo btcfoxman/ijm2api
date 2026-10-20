@@ -19,9 +19,10 @@ class CreditFailoverTests(unittest.TestCase):
             service = Service(store)
             accounts = []
             clients = {}
-            for index, balance in enumerate((100, 90), 1):
+            for index, (balance, priority) in enumerate(((100, 2), (90, 2), (1000, 1)), 1):
                 account = store.upsert_account({"name": f"account-{index}",
-                    "cdp_port": 19300 + index, "proxy_url": "socks5://proxy.test:20002"})
+                    "cdp_port": 19300 + index, "proxy_url": "socks5://proxy.test:20002",
+                    "priority": priority})
                 store.update_account(account["id"], {"status": "active", "balance": balance})
                 accounts.append(account["id"])
                 client = Mock()
@@ -42,10 +43,11 @@ class CreditFailoverTests(unittest.TestCase):
             task = store.task("ijm_credit_test")
             self.assertEqual(task["status"], "succeeded")
             self.assertEqual(task["id"], "ijm_credit_test")
-            self.assertEqual(task["account_id"], accounts[1])
-            self.assertEqual(task["attempted_account_ids"], accounts)
+            self.assertEqual(task["account_id"], accounts[2])
+            self.assertEqual(task["attempted_account_ids"], [accounts[0], accounts[2]])
             clients[accounts[0]].submit.assert_called_once()
-            clients[accounts[1]].submit.assert_called_once()
+            clients[accounts[1]].submit.assert_not_called()
+            clients[accounts[2]].submit.assert_called_once()
             service.stop()
             del service, store
             gc.collect()

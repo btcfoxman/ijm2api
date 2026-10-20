@@ -235,7 +235,8 @@ class Service:
         return self.image_response(task)
 
     def _reserve_account(self, estimated_cost: float = 0, *,
-                         exclude_ids: set[int] | None = None) -> dict[str, Any] | None:
+                         exclude_ids: set[int] | None = None,
+                         prefer_balance: bool = False) -> dict[str, Any] | None:
         excluded = exclude_ids or set()
         with self._lock:
             if sum(self._active.values()) >= int(self.settings()["task_workers"]):
@@ -244,7 +245,12 @@ class Service:
                         if int(item["id"]) not in excluded and item["enabled"]
                         and item["status"] == "active" and item["proxy_url"]
                         and (item["balance"] is None or float(item["balance"]) >= estimated_cost)]
-            accounts.sort(key=lambda item: (-int(item["priority"]), -(float(item["balance"] or 0)), item["id"]))
+            if prefer_balance:
+                accounts.sort(key=lambda item: (item["balance"] is None,
+                    -(float(item["balance"] or 0)), -int(item["priority"]), item["id"]))
+            else:
+                accounts.sort(key=lambda item: (-int(item["priority"]),
+                    -(float(item["balance"] or 0)), item["id"]))
             for account in accounts:
                 account_id = int(account["id"])
                 active = self._active.get(account_id, 0)
@@ -336,7 +342,8 @@ class Service:
                     return
                 account = None
                 while not self._stop.is_set() and time.monotonic() < deadline:
-                    account = self._reserve_account(estimated_cost, exclude_ids=set(attempted))
+                    account = self._reserve_account(estimated_cost, exclude_ids=set(attempted),
+                                                    prefer_balance=bool(attempted))
                     if account or (attempted and not self._has_eligible_account(
                             estimated_cost, set(attempted))):
                         break
@@ -431,7 +438,8 @@ class Service:
         attempted: list[int] = list(task["attempted_account_ids"])
         try:
             while not self._stop.is_set() and time.monotonic() < deadline:
-                account = self._reserve_account(1, exclude_ids=set(attempted))
+                account = self._reserve_account(1, exclude_ids=set(attempted),
+                                                prefer_balance=bool(attempted))
                 if not account:
                     if not self._has_eligible_account(1, set(attempted)):
                         self._fail(task_id, "ACCOUNT_POOL_UNAVAILABLE",
