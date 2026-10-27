@@ -20,6 +20,7 @@ def test_batch_import_authentication_privacy_and_login_ownership(tmp_path, monke
     assert main.store.accounts() == []
     headers = {'X-Admin-Token': 'synthetic-admin'}
     assert api.post('/api/accounts', headers=headers, json={'name': 'unsafe', 'login_password': 'private'}).status_code == 422
+    assert api.post('/api/accounts', headers=headers, json={'name': 'unsafe', 'login_user_id': 'forged-user'}).status_code == 422
     response = api.post('/api/accounts/batch-import', json=body, headers=headers)
     assert response.status_code == 200
     value = response.json()
@@ -40,6 +41,10 @@ def test_batch_import_authentication_privacy_and_login_ownership(tmp_path, monke
         'name': listed[0]['name'], 'cdp_port': 9999}).status_code == 409
     main.auto_login._pending.clear()
     assert api.patch(f'/api/accounts/{identifier}', headers=headers, json={'watermark_ready': True}).status_code == 422
+    assert api.patch(f'/api/accounts/{identifier}', headers=headers, json={'login_user_id': 'forged-user'}).status_code == 422
+    main.store.update_account(identifier, {'login_user_id': 'synthetic-private-id'})
+    assert 'login_user_id' not in api.get('/api/accounts', headers=headers).text
+    assert 'synthetic-private-id' not in api.get('/api/accounts', headers=headers).text
     main.store.update_account(identifier, {'status': 'setup_required', 'login_stage': 'setup_required', 'login_enable_after': False})
     assert api.patch(f'/api/accounts/{identifier}', headers=headers, json={'enabled': True}).status_code == 200
     assert main.store.account(identifier, private=True)['login_enable_after'] is None
@@ -47,6 +52,13 @@ def test_batch_import_authentication_privacy_and_login_ownership(tmp_path, monke
     assert main.store.account(identifier, private=True)['login_enable_after'] == 0
     assert api.post(f'/api/accounts/{identifier}/auto-login', headers=headers).status_code == 202
     assert main.auto_login._pool.submit.call_args.args[2] is False
+    main.auto_login._pending.clear()
+    main.store.update_account(identifier, {'status': 'disabled', 'enabled': False, 'login_stage': 'ready'})
+    monkeypatch.setattr(main, 'clear_managed_profile', lambda *args: None)
+    response = api.post(f'/api/accounts/{identifier}/profile/reset', headers=headers, json={})
+    assert response.status_code == 200
+    assert main.store.account(identifier, private=True)['login_user_id'] == ''
+    assert 'login_user_id' not in response.json()
     main.auto_login.close()
     main.service.stop()
     gc.collect()

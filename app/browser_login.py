@@ -17,6 +17,7 @@ import requests
 from .browser import BrowserError, BrowserRejected
 from .client import DreaminaClient as UpstreamClient
 from .account_automation import AccountAutomation
+from .auto_login import verified_login_user_id
 
 REQUIRES_PROJECT = False
 
@@ -342,9 +343,13 @@ class BrowserLoginManager:
                 stage = "credit read"
                 state = await asyncio.to_thread(client.account_state)
                 stage = 'generation preferences'
-                ready = await asyncio.to_thread(AccountAutomation(temporary, self.service.settings()).ensure_ready)
+                ready = await asyncio.to_thread(AccountAutomation(temporary, self.service.settings(),
+                    allow_initial_identity=True).ensure_ready)
                 if ready.get('watermark_ready') is not True or ready.get('agreement_ready') is not True:
                     raise LoginError('generation preferences are not confirmed; check watermark and AI agreement settings')
+                login_user_id = verified_login_user_id(ready)
+                if not login_user_id:
+                    raise LoginError('signed-in account identity is not confirmed; complete login before retrying')
                 stage = "page check"
                 project_id = client.browser.project_id()
                 if REQUIRES_PROJECT and not (project_id or account["project_id"]):
@@ -355,7 +360,8 @@ class BrowserLoginManager:
                           "status": "active" if active["enable_after"] else "disabled",
                           "balance": state["available_balance"],
                           "balance_details": state["buckets"], "last_error": "", "login_stage": "ready",
-                          "watermark_ready": True, "agreement_ready": True, "setup_checked_at": time.time()}
+                          "watermark_ready": True, "agreement_ready": True, "setup_checked_at": time.time(),
+                          "login_user_id": login_user_id}
                 if project_id:
                     values["project_id"] = project_id
                 threshold = float(self.service.settings()["low_balance_disable_threshold"] or 0)

@@ -25,7 +25,7 @@ from .auto_login import AutoLoginManager
 from .catalog import public_models
 from .image_client import IMAGE_MODELS
 from .service import Service
-from .store import Store
+from .store import ACCOUNT_SECRET_FIELDS, ACCOUNT_SETUP_FIELDS, Store
 
 
 API_KEY = os.getenv("IJM_API_KEY", "")
@@ -181,7 +181,7 @@ def accounts() -> list[dict[str, Any]]:
 
 @app.post("/api/accounts", dependencies=[Depends(admin_auth)])
 def add_account(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    if {'login_email', 'login_password', 'login_enable_after', 'login_stage', 'watermark_ready', 'agreement_ready', 'setup_checked_at'} & body.keys():
+    if (ACCOUNT_SECRET_FIELDS | ACCOUNT_SETUP_FIELDS) & body.keys():
         raise HTTPException(status_code=422, detail='use batch import for login credentials; setup state is service-managed')
     try:
         with service._lock:
@@ -251,7 +251,7 @@ async def patch_account(account_id: int, body: dict[str, Any] = Body(...)) -> di
     try:
         if auto_login.busy(account_id):
             raise HTTPException(status_code=409, detail='account is in automatic login')
-        if {'login_email', 'login_password', 'login_enable_after', 'login_stage', 'watermark_ready', 'agreement_ready', 'setup_checked_at'} & body.keys():
+        if (ACCOUNT_SECRET_FIELDS | ACCOUNT_SETUP_FIELDS) & body.keys():
             raise HTTPException(status_code=422, detail='use batch import for login credentials; setup state is service-managed')
         if 'enabled' in body:
             body = {**body, 'login_enable_after': False if body['enabled'] is False else None}
@@ -306,7 +306,8 @@ async def reset_profile(account_id: int, body: dict[str, Any] = Body(default={})
     store.clear_media_cache(account_id)
     values: dict[str, Any] = {"cdp_port": 0, "project_id": "", "status": "pending",
                               "last_error": "", "login_stage": "", "watermark_ready": False,
-                              "agreement_ready": False, "setup_checked_at": None, "login_enable_after": None}
+                              "agreement_ready": False, "setup_checked_at": None, "login_enable_after": None,
+                              "login_user_id": ""}
     if body.get("proxy_url") is not None:
         values["proxy_url"] = str(body["proxy_url"])
     result = store.update_account(account_id, values)

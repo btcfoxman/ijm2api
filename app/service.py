@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from .cost_adapter import input_evidence, settle_failed_balance
+from .cost_adapter import input_evidence, number, settle_failed_balance
 
+import json
 import logging
+import math
 import os
 import threading
 import time
@@ -12,12 +14,11 @@ import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from typing import Any
 
-from .browser import BrowserError, BrowserRejected, browser_alive, start_managed_browser, stop_managed_browser
+from .browser import BrowserError, BrowserRejected, browser_alive
 from .browser_runtime import BrowserRuntime
-from .catalog import normalize_request
+from .catalog import MODELS, normalize_request
 from .client import DreaminaClient, DreaminaError, InputAudioDurationError
 from .image_client import DreaminaImageClient, resolve_image_model
 from .image_request import normalize_image_request
@@ -30,6 +31,8 @@ from .store import Store
 
 TERMINAL = {"succeeded", "failed", "expired"}
 MAX_CREDIT_ACCOUNT_ATTEMPTS = 2
+HISTORY_COST_WINDOW_SECONDS = 7 * 24 * 60 * 60
+HISTORY_COST_SAMPLES = 5
 logger = logging.getLogger(__name__)
 
 
@@ -72,6 +75,7 @@ class Service:
         self._pool = ThreadPoolExecutor(max_workers=50, thread_name_prefix="ijm-task")
         self._lock = threading.RLock()
         self._active: dict[int, int] = {}
+        self._credit_reservations: dict[str, tuple[int, float]] = {}
         self._worker_slots = threading.BoundedSemaphore(50)
         self._started = False
         self._stop = threading.Event()
@@ -217,15 +221,20 @@ class Service:
             raise RuntimeError("IJMAPI queue is full")
         task_id = "ijm_" + uuid.uuid4().hex[:16]
         task = self.store.create_task(task_id, request, normalized)
-        estimates = [item for item in self.store.model_costs() if
-                     item["model"] == ("sd-2-5" if normalized["model"] == "sd-2-5-480p-x" else normalized["model"]) and
-                     item["duration"] == normalized["duration"] and
-                     item["resolution"] == ("720p" if normalized["model"] == "sd-2-5-480p-x" else normalized["resolution"]) and
-                     item["image_count"] == len(normalized["images"]) and
-                     item["video_count"] == len(normalized["videos"]) and
-                     item["audio_count"] == len(normalized["audios"])]
+        try:
+            estimates = [item for item in self.store.model_costs() if
+                         item["model"] == ("sd-2-5" if normalized["model"] == "sd-2-5-480p-x" else normalized["model"]) and
+                         item["duration"] == normalized["duration"] and
+                         item["resolution"] == ("720p" if normalized["model"] == "sd-2-5-480p-x" else normalized["resolution"]) and
+                         item["image_count"] == len(normalized["images"]) and
+                         item["video_count"] == len(normalized["videos"]) and
+                         item["audio_count"] == len(normalized["audios"])]
+        except Exception as exc:
+            logger.warning('IJM legacy cost estimate unavailable (%s)', type(exc).__name__)
+            estimates = []
         if estimates:
             task = self.store.update_task(task_id, {"estimated_cost": max(item["cost"] for item in estimates)})
+        task = self._update_cost_estimate(task)
         self._pool.submit(self._run, task_id)
         return self.public_task(task)
 
@@ -240,43 +249,143 @@ class Service:
         self._pool.submit(self._run_image, task_id)
         return self.image_response(task)
 
+    @staticmethod
+    def _cost_dimensions(normalized: dict[str, Any]) -> tuple | None:
+        if normalized.get('kind') == 'image':
+            return None
+        spec = MODELS.get(normalized.get('model'))
+        duration = number(normalized.get('duration'))
+        if not spec or not duration:
+            return None
+        evidence = normalized.get('_cost_evidence')
+        evidence = evidence if isinstance(evidence, dict) else {}
+        reference = number(evidence.get('reference_seconds')) if normalized.get('videos') else 0.0
+        if reference is None or normalized.get('videos') and reference <= 0:
+            return None  # Uploaded metadata must establish reference-video seconds.
+        resolution = spec.generation_resolution if spec.id == 'sd-2-5-480p-x' else normalized.get('resolution')
+        return (spec.upstream_model, duration, resolution, round(reference, 6))
+
+    def _cost_estimate(self, normalized: dict[str, Any], fallback: Any, rows: dict) -> tuple[float, dict]:
+        legacy = number(fallback) or 0.0
+        metadata = {'source': 'legacy_estimate' if legacy else 'unknown', 'sample_count': 0}
+        dimensions = self._cost_dimensions(normalized)
+        if dimensions is None:
+            return legacy, metadata
+        counts = tuple(len(normalized.get(kind) or []) for kind in ('images', 'videos', 'audios'))
+        exact, compatible = [], []
+        now = time.time()
+        for row in rows['history']:
+            cost, before, after = (number(row.get(key)) for key in ('actual_cost', 'balance_before', 'balance_after'))
+            stamp = number(row.get('completed_at')) or number(row.get('updated_at')) or 0
+            if (row.get('status') != 'succeeded' or not cost or before is None or after is None
+                    or after > before or not math.isclose(before - after, cost, abs_tol=1e-6, rel_tol=1e-6)
+                    or not now - HISTORY_COST_WINDOW_SECONDS <= stamp <= now + 60):
+                continue
+            try:
+                request = json.loads(row['normalized_json'])
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(request, dict):
+                continue
+            evidence = request.get('_cost_evidence')
+            if (not isinstance(evidence, dict) or evidence.get('balance_isolated') is not True
+                    or self._cost_dimensions(request) != dimensions):
+                continue
+            if len(compatible) < HISTORY_COST_SAMPLES:
+                compatible.append(cost)
+            if counts == tuple(len(request.get(kind) or []) for kind in ('images', 'videos', 'audios')):
+                if len(exact) < HISTORY_COST_SAMPLES:
+                    exact.append(cost)
+        samples = exact or compatible
+        if samples:
+            return max(samples), {'source': 'recent_actual_exact' if exact else 'recent_actual_dimensions',
+                                  'sample_count': len(samples), 'window_days': 7}
+        return legacy, metadata
+
+    def _update_cost_estimate(self, task: dict) -> dict:
+        with self._lock:
+            try:
+                cost, metadata = self._cost_estimate(task['normalized'], task.get('estimated_cost'), self.store.scheduling_rows())
+            except Exception as exc:
+                logger.warning('IJM recent cost estimate unavailable (%s); keeping prior estimate', type(exc).__name__)
+                return task
+            updated = self.store.update_task(task['id'], {'estimated_cost': cost,
+                'cost_evidence': {'scheduling_estimate': metadata}})
+            if task['id'] in self._credit_reservations:
+                account_id, _ = self._credit_reservations[task['id']]
+                self._credit_reservations[task['id']] = (account_id, cost)
+            return updated
+
+    def _pending_credits(self, rows: dict, exclude_task_id: str | None = None) -> dict[str, tuple[int, float]]:
+        pending = {row['id']: (int(row['account_id']), number(row.get('estimated_cost')) or 0.0)
+                   for row in rows['inflight'] if row['id'] != exclude_task_id}
+        for task_id, (account_id, amount) in self._credit_reservations.items():
+            if task_id != exclude_task_id:
+                pending[task_id] = (account_id, max(amount, pending.get(task_id, (account_id, 0.0))[1]))
+        return pending
+
+    @staticmethod
+    def _available_credits(account: dict, pending: dict) -> tuple[float | None, bool]:
+        amounts = [amount for account_id, amount in pending.values() if account_id == int(account['id'])]
+        balance = number(account.get('balance'))
+        uncertain = any(amount <= 0 for amount in amounts) or balance is None and bool(amounts)
+        return (None if balance is None else balance - sum(amounts), uncertain)
+
+    def _funded_accounts(self, estimated_cost: float, excluded: set[int], pending: dict) -> list[dict]:
+        accounts = []
+        for item in self.store.accounts(private=True):
+            if (int(item['id']) in excluded or not item['enabled'] or item['status'] != 'active'
+                    or not item['proxy_url'] or not _credential_setup_ready(item)):
+                continue
+            available, unknown_hold = self._available_credits(item, pending)
+            if unknown_hold or available is not None and (available < estimated_cost or available <= 0):
+                continue
+            accounts.append({**item, '_available_credits': available})
+        return accounts
+
     def _reserve_account(self, estimated_cost: float = 0, *,
                          exclude_ids: set[int] | None = None,
-                         prefer_balance: bool = False) -> dict[str, Any] | None:
+                         prefer_balance: bool = False, task_id: str | None = None) -> dict[str, Any] | None:
         excluded = exclude_ids or set()
         with self._lock:
             if sum(self._active.values()) >= int(self.settings()["task_workers"]):
                 return None
-            accounts = [item for item in self.store.accounts(private=True)
-                        if int(item["id"]) not in excluded and item["enabled"]
-                        and item["status"] == "active" and item["proxy_url"]
-                        and _credential_setup_ready(item)
-                        and (item["balance"] is None or float(item["balance"]) >= estimated_cost)]
-            if prefer_balance:
-                accounts.sort(key=lambda item: (item["balance"] is None,
-                    -(float(item["balance"] or 0)), -int(item["priority"]), item["id"]))
-            else:
-                accounts.sort(key=lambda item: (-int(item["priority"]),
-                    -(float(item["balance"] or 0)), item["id"]))
+            pending = self._pending_credits(self.store.scheduling_rows(), task_id)
+            accounts = self._funded_accounts(estimated_cost, excluded, pending)
+            # Unknown cost is not a free task: probe a larger balance until a
+            # measured budget exists. Explicit priority always remains first.
+            accounts.sort(key=lambda item: (-int(item['priority']), item['_available_credits'] is None,
+                (item['_available_credits'] or 0) * (1 if estimated_cost > 0 else -1), item['id']))
             for account in accounts:
                 account_id = int(account["id"])
                 active = self._active.get(account_id, 0)
-                if active >= int(account["max_concurrency"]):
+                held = sum(owner == account_id for owner, _ in pending.values())
+                if max(active, held) >= int(account["max_concurrency"]):
                     continue
                 self._active[account_id] = active + 1
+                self._credit_reservations[task_id or 'slot-' + uuid.uuid4().hex] = (account_id, estimated_cost)
                 return account
         return None
 
-    def _has_eligible_account(self, estimated_cost: float, excluded: set[int]) -> bool:
-        return any(int(item["id"]) not in excluded and item["enabled"]
-                   and item["status"] == "active" and item["proxy_url"]
-                   and _credential_setup_ready(item)
-                   and (item["balance"] is None or float(item["balance"]) >= estimated_cost)
-                   for item in self.store.accounts(private=True))
+    def _has_eligible_account(self, estimated_cost: float, excluded: set[int], task_id: str | None = None) -> bool:
+        with self._lock:
+            pending = self._pending_credits(self.store.scheduling_rows(), task_id)
+            return bool(self._funded_accounts(estimated_cost, excluded, pending))
 
-    def _release_account(self, account_id: int) -> None:
+    def _release_account(self, account_id: int, task_id: str | None = None) -> None:
         with self._lock:
             self._active[account_id] = max(self._active.get(account_id, 1) - 1, 0)
+            key = task_id or next((key for key, (owner, _) in self._credit_reservations.items() if owner == account_id), None)
+            if key:
+                self._credit_reservations.pop(key, None)
+
+    def _submission_funded(self, account: dict, task_id: str, estimated_cost: float, balance: Any) -> bool:
+        with self._lock:
+            pending = self._pending_credits(self.store.scheduling_rows(), task_id)
+            current = self.store.account(int(account['id']), private=True) or {}
+            snapshots = [value for raw in (balance, current.get('balance')) if (value := number(raw)) is not None]
+            available, unknown_hold = self._available_credits({**account, 'balance': min(snapshots) if snapshots else None}, pending)
+            return not unknown_hold and available is not None and available > 0 and available >= estimated_cost
 
     def check_account(self, account_id: int, *, start_browser: bool = False) -> dict[str, Any]:
         account = self.store.account(account_id, private=True)
@@ -345,18 +454,22 @@ class Service:
         deadline = time.monotonic() + int(self.settings()["task_timeout_seconds"])
         estimated_cost = float(task.get("estimated_cost") or 0)
         attempted = list(task["attempted_account_ids"])
+        funding_excluded: set[int] = set()
         credit_reason = task.get("error_message") or "Dreamina account has insufficient credits"
         try:
+            task = self._update_cost_estimate(self.store.task(task_id) or task)
+            estimated_cost = float(task.get('estimated_cost') or 0)
             while not self._stop.is_set() and time.monotonic() < deadline:
                 if len(attempted) >= MAX_CREDIT_ACCOUNT_ATTEMPTS:
                     self._fail(task_id, "INSUFFICIENT_CREDITS", credit_reason)
                     return
                 account = None
                 while not self._stop.is_set() and time.monotonic() < deadline:
-                    account = self._reserve_account(estimated_cost, exclude_ids=set(attempted),
-                                                    prefer_balance=bool(attempted))
-                    if account or (attempted and not self._has_eligible_account(
-                            estimated_cost, set(attempted))):
+                    excluded = set(attempted) | funding_excluded
+                    account = self._reserve_account(estimated_cost, exclude_ids=excluded,
+                                                    prefer_balance=bool(attempted), task_id=task_id)
+                    if account or ((attempted or funding_excluded) and not self._has_eligible_account(
+                            estimated_cost, excluded, task_id)):
                         break
                     self._stop.wait(1)
                 if not account:
@@ -374,16 +487,29 @@ class Service:
                     client = DreaminaClient(account, store=self.store)
                     before = None
                     try:
-                        before = client.account_state(max_attempts=2, timeout_seconds=6)["available_balance"]
+                        before = number(client.account_state(max_attempts=2, timeout_seconds=6)["available_balance"])
                     except (BrowserError, KeyError, TypeError, ValueError) as exc:
                         logger.warning("IJM task %s account %s pre-submit credit read failed (%s); "
                                        "continuing with cached balance", task_id, account_id,
                                        type(exc).__name__)
                     if before is not None:
                         self.store.update_account(account_id, {"balance": before, "status": "active"})
+                    if not self._submission_funded(account, task_id, estimated_cost,
+                                                   before if before is not None else account.get('balance')):
+                        funding_excluded.add(account_id)
+                        self.store.update_task(task_id, {'status': 'queued', 'account_id': None, 'progress': 0})
+                        continue
                     self.store.update_task(task_id, {"balance_before": before, "progress": 12})
                     assets = client.upload_inputs(task["normalized"])
-                    self.store.update_task(task_id, {"cost_evidence": input_evidence(assets)})
+                    task = self.store.update_task(task_id, {"cost_evidence": input_evidence(assets)})
+                    task = self._update_cost_estimate(task)
+                    estimated_cost = float(task.get('estimated_cost') or 0)
+                    if not self._submission_funded(account, task_id, estimated_cost,
+                                                   before if before is not None else account.get('balance')):
+                        funding_excluded.add(account_id)
+                        self.store.update_task(task_id, {'status': 'queued', 'account_id': None,
+                                                       'progress': 0, 'balance_before': None})
+                        continue
                     self.store.update_task(task_id, {"progress": 30})
                     attempted.append(account_id)
                     self.store.update_task(task_id, {"attempted_account_ids": attempted})
@@ -425,10 +551,12 @@ class Service:
                     return
                 finally:
                     self.browser_runtime.release(account, owned)
-                    self._release_account(account_id)
+                    self._release_account(account_id, task_id)
             if not self._stop.is_set():
                 self._fail(task_id, "INSUFFICIENT_CREDITS" if attempted else "ACCOUNT_POOL_UNAVAILABLE",
                            credit_reason if attempted else "no available Dreamina account before timeout")
+        except Exception as exc:
+            self._fail(task_id, 'INTERNAL_ERROR', f'{type(exc).__name__}: task scheduling could not complete')
         finally:
             self._worker_slots.release()
 
@@ -448,12 +576,14 @@ class Service:
         else:
             return
         attempted: list[int] = list(task["attempted_account_ids"])
+        funding_excluded: set[int] = set()
         try:
             while not self._stop.is_set() and time.monotonic() < deadline:
-                account = self._reserve_account(1, exclude_ids=set(attempted),
-                                                prefer_balance=bool(attempted))
+                excluded = set(attempted) | funding_excluded
+                account = self._reserve_account(0, exclude_ids=excluded,
+                                                prefer_balance=bool(attempted), task_id=task_id)
                 if not account:
-                    if not self._has_eligible_account(1, set(attempted)):
+                    if not self._has_eligible_account(0, excluded, task_id):
                         self._fail(task_id, "ACCOUNT_POOL_UNAVAILABLE",
                                    "no Dreamina image account has available credits")
                         return
@@ -466,6 +596,17 @@ class Service:
                         "status": "preparing", "progress": 5, "error_code": "", "error_message": ""})
                     account, owned = self.browser_runtime.acquire(account)
                     video_client = DreaminaClient(account, store=self.store)
+                    balance = None
+                    try:
+                        balance = number(video_client.account_state(max_attempts=2, timeout_seconds=6)['available_balance'])
+                    except (BrowserError, KeyError, TypeError, ValueError):
+                        pass
+                    if balance is not None:
+                        self.store.update_account(account_id, {'balance': balance})
+                    if not self._submission_funded(account, task_id, 0, balance if balance is not None else account.get('balance')):
+                        funding_excluded.add(account_id)
+                        self.store.update_task(task_id, {'status': 'queued', 'account_id': None, 'progress': 0})
+                        continue
                     assets = video_client.upload_inputs(task["normalized"])["images"]
                     self.store.update_task(task_id, {"progress": 30})
                     attempted.append(account_id)
@@ -499,7 +640,7 @@ class Service:
                     return
                 finally:
                     self.browser_runtime.release(account, owned)
-                    self._release_account(account_id)
+                    self._release_account(account_id, task_id)
             if not self._stop.is_set():
                 self._fail(task_id, "UPSTREAM_TIMEOUT", "Dreamina image task timed out")
         finally:
@@ -525,7 +666,7 @@ class Service:
             self._fail(task_id, type(exc).__name__.upper(), str(exc))
         finally:
             self.browser_runtime.release(account, owned)
-            self._release_account(int(account["id"]))
+            self._release_account(int(account["id"]), task_id)
             self._worker_slots.release()
 
     def _poll_image(self, task_id: str, client: DreaminaImageClient, deadline: float) -> None:
@@ -582,7 +723,7 @@ class Service:
             self._fail(task_id, type(exc).__name__.upper(), str(exc))
         finally:
             self.browser_runtime.release(account, owned)
-            self._release_account(int(task["account_id"]))
+            self._release_account(int(task["account_id"]), task_id)
             self._worker_slots.release()
 
     def _poll(self, task_id: str, client: DreaminaClient, deadline: float) -> None:

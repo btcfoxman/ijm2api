@@ -79,7 +79,8 @@ def test_success_requires_identity_preferences_and_credit_read(context):
     pool = queued(manager)
     manager.start(item['id'])
     fn, identifier, enable = pool.submit.call_args.args
-    ready = {'identity_verified': True, 'watermark_ready': True, 'agreement_ready': True}
+    ready = {'identity_verified': True, 'watermark_ready': True, 'agreement_ready': True,
+             'identity': {'user_id': 'synthetic-user-1'}}
     client = Mock()
     client.account_state.return_value = {'available_balance': 20, 'buckets': {'gift_credit': 20}}
     with patch('app.auto_login.start_managed_browser', return_value=19301), \
@@ -90,8 +91,30 @@ def test_success_requires_identity_preferences_and_credit_read(context):
     saved = store.account(item['id'])
     assert saved['enabled'] and saved['status'] == 'active' and saved['login_stage'] == 'ready'
     assert saved['watermark_ready'] and saved['agreement_ready'] and saved['balance'] == 20
+    assert store.account(item['id'], private=True)['login_user_id'] == 'synthetic-user-1'
+    assert 'login_user_id' not in saved and 'synthetic-user-1' not in json.dumps(saved)
     assert not manager.busy(item['id'])
     assert client.submit.call_count == 0
+
+
+@pytest.mark.parametrize('identity', [None, {}, {'user_id': ''}, {'user_id': '0'}, {'user_id': True},
+                                     {'user_id': 123}, {'user_id': ' user-1'}, {'user_id': 'user\n1'},
+                                     {'user_id': 'x' * 257}])
+def test_missing_or_invalid_sdk_identity_never_enables_the_login(context, identity):
+    store, service, manager = context
+    item = account(store)
+    pool = queued(manager)
+    manager.start(item['id'])
+    ready = {'identity_verified': True, 'watermark_ready': True, 'agreement_ready': True, 'identity': identity}
+    with patch('app.auto_login.start_managed_browser', return_value=19301), \
+         patch('app.auto_login.AccountAutomation') as automation, patch('app.auto_login.DreaminaClient') as client:
+        automation.return_value.run.return_value = ready
+        fn, identifier, enable = pool.submit.call_args.args
+        fn(identifier, enable)
+    saved = store.account(item['id'])
+    assert saved['status'] == 'login_required' and not saved['enabled']
+    assert store.account(item['id'], private=True)['login_user_id'] == ''
+    client.assert_not_called()
 
 
 @pytest.mark.parametrize('missing', ['identity_verified', 'watermark_ready', 'agreement_ready'])

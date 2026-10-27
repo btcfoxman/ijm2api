@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.account_import import AUTO_PROXY_PORTS, AccountImporter, parse_import_lines, validate_proxy
 from app.store import Store
@@ -210,6 +211,50 @@ class AccountImportTests(unittest.TestCase):
         self.store.upsert_account({"name": saved["name"], "login_password": "fourth password"})
         self.assertIsNone(self.store.account(saved["id"], private=True)["login_enable_after"])
 
+    def test_private_user_binding_persists_without_public_projection(self):
+        saved = self.saved()
+        self.assertEqual(saved["login_user_id"], "")
+        public = self.store.update_account(saved["id"], {"login_user_id": "synthetic-user-12345"})
+        self.assertNotIn("login_user_id", public)
+        reopened = Store(str(self.store.path))
+        self.assertEqual(reopened.account(saved["id"], private=True)["login_user_id"], "synthetic-user-12345")
+        self.assertNotIn("synthetic-user-12345", json.dumps(reopened.accounts()))
+        self.assertNotIn("login_user_id", json.dumps(reopened.accounts()))
+        for invalid in (None, 12345, False, [], {}, "bad\x00id", "bad\nid", "x" * 257):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.store.update_account(saved["id"], {"login_user_id": invalid})
+        self.assertEqual(self.store.account(saved["id"], private=True)["login_user_id"], "synthetic-user-12345")
+        self.store.update_account(saved["id"], {"login_user_id": ""})
+        self.assertEqual(self.store.account(saved["id"], private=True)["login_user_id"], "")
+
+    def test_real_credential_changes_clear_user_binding_but_duplicates_keep_it(self):
+        saved = self.saved()
+        self.store.update_account(saved["id"], {"login_user_id": "synthetic-user-12345"})
+        self.store.update_account(saved["id"], {"login_password": "", "login_email": "PERSON@example.test"})
+        report = self.importer.import_text("person@example.test| secret ")
+        self.assertEqual(report["duplicate_count"], 1)
+        self.assertEqual(self.store.account(saved["id"], private=True)["login_user_id"], "synthetic-user-12345")
+        for method, password in (("update", "second password"), ("import", "third password"), ("upsert", "fourth password")):
+            with self.subTest(method=method):
+                self.store.update_account(saved["id"], {"login_user_id": "synthetic-user-12345"})
+                if method == "update":
+                    self.store.update_account(saved["id"], {"login_password": password})
+                elif method == "import":
+                    self.assertEqual(self.importer.import_text("person@example.test|" + password)["count"], 1)
+                else:
+                    self.store.upsert_account({"name": saved["name"], "login_password": password})
+                self.assertEqual(self.store.account(saved["id"], private=True)["login_user_id"], "")
+        self.store.update_account(saved["id"], {"login_user_id": "synthetic-user-12345"})
+        with self.assertRaises(ValueError):
+            self.store.update_account(saved["id"], {"login_email": "different@example.test"})
+        self.assertEqual(self.store.account(saved["id"], private=True)["login_user_id"], "synthetic-user-12345")
+
+    def test_attaching_email_to_idle_legacy_account_clears_user_binding(self):
+        saved = self.store.upsert_account({"name": "manual", "proxy_url": "socks5://proxy.test:20004"})
+        self.store.update_account(saved["id"], {"login_user_id": "synthetic-user-12345"})
+        self.store.update_account(saved["id"], {"login_email": "person@example.test", "login_password": "synthetic password"})
+        self.assertEqual(self.store.account(saved["id"], private=True)["login_user_id"], "")
+
     def test_unconfigured_proxy_pool_fails_without_direct_account(self):
         report = AccountImporter(self.store, proxy_urls=()).import_text("person@example.test|secret")
         self.assertEqual(report["count"], 0)
@@ -219,7 +264,7 @@ class AccountImportTests(unittest.TestCase):
         saved = self.store.upsert_account({"name": "legacy", "proxy_url": "socks5://proxy.test:20001"})
         with sqlite3.connect(self.store.path) as db:
             db.execute("DROP INDEX accounts_login_email")
-            for column in ("login_email", "login_password", "login_stage", "watermark_ready", "agreement_ready", "setup_checked_at", "login_enable_after"):
+            for column in ("login_email", "login_password", "login_stage", "watermark_ready", "agreement_ready", "setup_checked_at", "login_enable_after", "login_user_id"):
                 db.execute(f"ALTER TABLE accounts DROP COLUMN {column}")
         reopened = Store(str(self.store.path))
         public = reopened.account(saved["id"])
@@ -229,6 +274,47 @@ class AccountImportTests(unittest.TestCase):
         self.assertFalse(public["agreement_ready"])
         self.assertFalse(public["watermark_ready"])
         self.assertIsNone(reopened.account(saved["id"], private=True)["login_enable_after"])
+        self.assertEqual(reopened.account(saved["id"], private=True)["login_user_id"], "")
+
+    def test_scheduling_rows_are_raw_readonly_and_inflight_is_unbounded(self):
+        normalized = '{"reference_video_seconds":4}'
+        request = '{"duration":4}'
+        rows = [(f"success-{index}", 1, "succeeded", normalized, request, 3, 2, index + 1, index + 1, "")
+                for index in range(1001)]
+        rows.extend((f"inflight-{index}", 1, ("preparing", "submitting", "submitted", "running")[index % 4],
+                     normalized, request, 3, None, -10, None, "") for index in range(1002))
+        rows.extend([
+            ("queued-bound", 1, "queued", normalized, request, 3, None, 0, None, ""),
+            ("unknown-failed", 1, "failed", normalized, request, 3, None, 0, 1, "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN"),
+            ("unbound", None, "preparing", normalized, request, 3, None, 0, None, ""),
+            ("success-without-actual", 1, "succeeded", normalized, request, 3, None, 9999, 9999, ""),
+            ("failed-actual", 1, "failed", normalized, request, 3, 2, 9999, 9999, ""),
+            ("expired", 1, "expired", normalized, request, 3, None, 0, 1, ""),
+            ("cancelled", 1, "cancelled", normalized, request, 3, None, 0, 1, ""),
+            ("success-stale-unknown", 1, "succeeded", normalized, request, 3, None, 0, 1, "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN"),
+            ("cancelled-stale-unknown", 1, "cancelled", normalized, request, 3, None, 0, 1, "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN"),
+        ])
+        with sqlite3.connect(self.store.path) as db:
+            db.executemany("INSERT INTO tasks(id,account_id,model,status,normalized_json,request_json,estimated_cost,"
+                           "actual_cost,created_at,updated_at,completed_at,error_code) VALUES(?,?,'synthetic-model',?,?,?,?,?,?,1,?,?)", rows)
+        connection = self.store._connect()
+        queries = []
+        connection.set_trace_callback(queries.append)
+        try:
+            with patch.object(self.store, "_connect", return_value=connection), patch.object(
+                    self.store, "_task", side_effect=AssertionError("scheduler must avoid public task projection")):
+                value = self.store.scheduling_rows()
+            self.assertEqual(connection.total_changes, 0)
+        finally:
+            connection.close()
+        self.assertTrue(all(query.lstrip().upper().startswith("SELECT ") for query in queries))
+        self.assertEqual(len(value["history"]), 1000)
+        self.assertEqual(value["history"][0]["id"], "success-1000")
+        self.assertEqual(value["history"][-1]["id"], "success-1")
+        self.assertEqual(len(value["inflight"]), 1004)
+        self.assertIn("unknown-failed", {row["id"] for row in value["inflight"]})
+        self.assertTrue(all(row["normalized_json"] == normalized and row["request_json"] == request
+                            for row in value["history"] + value["inflight"]))
 
     @unittest.skipUnless(shutil.which("node"), "Node is required for the UI helper contract")
     def test_ui_progress_retry_and_safe_results(self):

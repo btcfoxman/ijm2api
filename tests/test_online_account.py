@@ -57,7 +57,8 @@ class OnlineLoginTests(unittest.IsolatedAsyncioTestCase):
         self.manager = BrowserLoginManager(self.store, self.service)
         self.setup_check = patch('app.browser_login.AccountAutomation')
         self.setup = self.setup_check.start()
-        self.setup.return_value.ensure_ready.return_value = {'watermark_ready': True, 'agreement_ready': True}
+        self.setup.return_value.ensure_ready.return_value = {'identity_verified': True,
+            'watermark_ready': True, 'agreement_ready': True, 'identity': {'user_id': 'synthetic-manual-user'}}
         self.addCleanup(self.setup_check.stop)
 
     async def asyncTearDown(self):
@@ -116,6 +117,20 @@ class OnlineLoginTests(unittest.IsolatedAsyncioTestCase):
                 await self.manager.finish(active['id'])
         self.assertFalse(self.store.account(self.account['id'])['enabled'])
         self.assertIs(self.manager.viewer(active['ticket']), active)
+
+    async def test_manual_finish_requires_a_verified_sdk_id_and_retains_the_viewer(self):
+        active = self.active_login()
+        self.setup.return_value.ensure_ready.return_value = {'identity_verified': True,
+            'watermark_ready': True, 'agreement_ready': True, 'identity': {}}
+        client = Mock()
+        client.account_state.return_value = {'available_balance': 123, 'buckets': {}}
+        with patch('app.browser_login.UpstreamClient', return_value=client):
+            with self.assertRaisesRegex(LoginError, 'identity is not confirmed'):
+                await self.manager.finish(active['id'])
+        self.assertFalse(self.store.account(self.account['id'])['enabled'])
+        self.assertEqual(self.store.account(self.account['id'], private=True)['login_user_id'], '')
+        self.assertIs(self.manager.viewer(active['ticket']), active)
+        self.assertIs(self.setup.call_args.kwargs['allow_initial_identity'], True)
 
     async def test_automatic_login_blocks_manual_profile_takeover(self):
         self.service.auto_login_busy = lambda account_id: True
@@ -188,6 +203,10 @@ class OnlineLoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['cdp_port'], 29999)
         self.assertEqual(result['project_id'], '')
         self.assertEqual(result['balance'], 123)
+        self.assertEqual(self.store.account(self.account['id'], private=True)['login_user_id'], 'synthetic-manual-user')
+        self.assertNotIn('login_user_id', result)
+        self.assertNotIn('synthetic-manual-user', str(result))
+        self.assertIs(self.setup.call_args.kwargs['allow_initial_identity'], True)
         self.assertIsNone(self.manager.active)
         with patch('app.browser_runtime.browser_alive', return_value=True), \
              patch('app.browser_runtime.start_managed_browser') as start:

@@ -21,6 +21,17 @@ SAFE_FAILURES = {
 }
 
 
+def verified_login_user_id(ready: dict) -> str:
+    """Return a usable SDK identity only from an explicitly verified result."""
+    identity = ready.get('identity')
+    value = identity.get('user_id') if isinstance(identity, dict) else None
+    if (ready.get('identity_verified') is not True or not isinstance(value, str)
+            or not value or value == '0' or len(value) > 256
+            or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value)):
+        return ''
+    return value
+
+
 class AutoLoginManager:
     def __init__(self, store, service, *, manual_active: Callable[[], dict | None] | None = None):
         self.store, self.service = store, service
@@ -103,6 +114,11 @@ class AutoLoginManager:
                 self.store.update_account(account_id, {'status': 'setup_required', 'login_stage': 'setup_required',
                     'last_error': SAFE_FAILURES['setup_required'], 'enabled': False})
                 return
+            login_user_id = verified_login_user_id(ready)
+            if not login_user_id:
+                self.store.update_account(account_id, {'status': 'login_required', 'login_stage': 'login_required',
+                    'last_error': SAFE_FAILURES['login_required'], 'enabled': False})
+                return
             stage('verifying')
             state = DreaminaClient(account).account_state(max_attempts=2, timeout_seconds=10)
             balance = state['available_balance']
@@ -111,7 +127,8 @@ class AutoLoginManager:
             self.store.update_account(account_id, {'status': 'disabled_low_balance' if low else 'active' if enable_after else 'disabled',
                 'enabled': enable_after and not low, 'login_stage': 'ready', 'watermark_ready': True,
                 'agreement_ready': True, 'setup_checked_at': time.time(), 'balance': balance,
-                'balance_details': state['buckets'], 'last_error': '账号额度低于启用阈值' if low else ''})
+                'balance_details': state['buckets'], 'login_user_id': login_user_id,
+                'last_error': '账号额度低于启用阈值' if low else ''})
         except Exception as error:
             status = getattr(error, 'status', '')
             if status not in SAFE_FAILURES:

@@ -14,7 +14,7 @@ from .catalog import MODELS
 from .account_import import masked_email, normalize_email
 
 
-ACCOUNT_SECRET_FIELDS = {"login_email", "login_password", "login_enable_after", "cookie", "cookies", "user_agent"}
+ACCOUNT_SECRET_FIELDS = {"login_email", "login_password", "login_user_id", "login_enable_after", "cookie", "cookies", "user_agent"}
 ACCOUNT_SETUP_FIELDS = {"login_stage", "watermark_ready", "agreement_ready", "setup_checked_at"}
 
 
@@ -99,7 +99,8 @@ class Store:
             for name, declaration in (("login_email", "TEXT NOT NULL DEFAULT ''"),
                     ("login_password", "TEXT NOT NULL DEFAULT ''"), ("login_stage", "TEXT NOT NULL DEFAULT ''"),
                     ("watermark_ready", "INTEGER NOT NULL DEFAULT 0"), ("agreement_ready", "INTEGER NOT NULL DEFAULT 0"),
-                    ("setup_checked_at", "REAL NOT NULL DEFAULT 0"), ("login_enable_after", "INTEGER DEFAULT NULL")):
+                    ("setup_checked_at", "REAL NOT NULL DEFAULT 0"), ("login_enable_after", "INTEGER DEFAULT NULL"),
+                    ("login_user_id", "TEXT NOT NULL DEFAULT ''")):
                 if name not in account_columns:
                     db.execute(f"ALTER TABLE accounts ADD COLUMN {name} {declaration}")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS accounts_login_email ON accounts(LOWER(login_email)) WHERE login_email<>''")
@@ -230,7 +231,7 @@ class Store:
                 if old and any(old[key] != value for key, value in credentials.items()):
                     status = "disabled" if not old["enabled"] and old["status"] == "disabled" else "pending"
                     db.execute("UPDATE accounts SET enabled=0,status=?,managed_profile=1,login_stage='',"
-                               "watermark_ready=0,agreement_ready=0,setup_checked_at=0,login_enable_after=NULL WHERE id=?", (status, account_id))
+                               "watermark_ready=0,agreement_ready=0,setup_checked_at=0,login_enable_after=NULL,login_user_id='' WHERE id=?", (status, account_id))
         return self.account(account_id) or {}
 
     @staticmethod
@@ -325,9 +326,23 @@ class Store:
             return int(db.execute("""SELECT COUNT(*) FROM tasks WHERE account_id=?
                 AND status IN ('preparing','submitted','running','submission_unknown')""", (account_id,)).fetchone()[0])
 
+    def scheduling_rows(self) -> dict[str, list[dict[str, Any]]]:
+        """Return bounded raw history and every bound unresolved credit hold."""
+        columns = ("id,account_id,model,status,normalized_json,request_json,estimated_cost,actual_cost,"
+                   "balance_before,balance_after,created_at,completed_at,updated_at")
+        with self._connect() as db:
+            history = db.execute(f"""SELECT {columns} FROM tasks
+                WHERE status='succeeded' AND actual_cost IS NOT NULL
+                ORDER BY COALESCE(completed_at,updated_at) DESC,updated_at DESC LIMIT 1000""").fetchall()
+            inflight = db.execute(f"""SELECT {columns} FROM tasks WHERE account_id IS NOT NULL AND
+                (status NOT IN ('succeeded','failed','expired','cancelled')
+                 OR (status IN ('failed','expired') AND error_code='UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'))
+                ORDER BY created_at,id""").fetchall()
+        return {"history": [dict(row) for row in history], "inflight": [dict(row) for row in inflight]}
+
     def update_account(self, account_id: int, values: dict[str, Any]) -> dict[str, Any]:
         allowed = {"name", "cdp_port", "proxy_url", "project_id", "max_concurrency", "priority", "managed_profile",
-                   "enabled", "status", "balance", "last_error", "last_checkin_date", "login_enable_after", *ACCOUNT_SETUP_FIELDS}
+                   "enabled", "status", "balance", "last_error", "last_checkin_date", "login_user_id", "login_enable_after", *ACCOUNT_SETUP_FIELDS}
         data = {key: value for key, value in values.items() if key in allowed}
         if "max_concurrency" in data and not 1 <= int(data["max_concurrency"]) <= 50:
             raise ValueError("max_concurrency must be between 1 and 50")
@@ -345,6 +360,11 @@ class Store:
             if not isinstance(intent, (bool, int)) or intent not in (False, True):
                 raise ValueError("login enable intent must be a boolean or null")
             data["login_enable_after"] = int(intent)
+        if "login_user_id" in data:
+            identity = data["login_user_id"]
+            if (not isinstance(identity, str) or len(identity) > 256
+                    or any(ord(char) < 32 or ord(char) == 127 for char in identity)):
+                raise ValueError("login user ID must be a valid string")
         if "setup_checked_at" in data:
             data["setup_checked_at"] = float(data["setup_checked_at"] or 0)
             if not math.isfinite(data["setup_checked_at"]) or data["setup_checked_at"] < 0:
@@ -360,7 +380,7 @@ class Store:
             if any(old[key] != value for key, value in credentials.items()):
                 status = "disabled" if not old["enabled"] and old["status"] == "disabled" else "pending"
                 data.update(enabled=0, managed_profile=1, status=status, login_stage="",
-                            watermark_ready=0, agreement_ready=0, setup_checked_at=0, login_enable_after=None)
+                            watermark_ready=0, agreement_ready=0, setup_checked_at=0, login_enable_after=None, login_user_id="")
             cursor = db.execute("UPDATE accounts SET " + ",".join(f"{key}=?" for key in data) + " WHERE id=?",
                                 (*data.values(), account_id))
             if not cursor.rowcount:
