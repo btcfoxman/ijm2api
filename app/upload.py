@@ -100,11 +100,12 @@ def _request(session: requests.Session, method: str, url: str,
 
 def _api_call(session: requests.Session, method: str, url: str,
               token: dict[str, str], service: str,
-              payload: dict[str, Any] | None = None) -> dict[str, Any]:
+              payload: dict[str, Any] | None = None, *,
+              signing_region: str = "ap-southeast-1") -> dict[str, Any]:
     body = json.dumps(payload, separators=(",", ":")).encode() if payload is not None else b""
     headers = _sign(method, url, access_key=token["access_key_id"],
                     secret_key=token["secret_access_key"],
-                    session_token=token["session_token"], region="ap-southeast-1",
+                    session_token=token["session_token"], region=signing_region,
                     service=service, payload=body)
     headers.update({"accept": "*/*", "origin": "https://dreamina.capcut.com",
                     "referer": "https://dreamina.capcut.com/ai-tool/generate"})
@@ -163,12 +164,28 @@ def upload_media_bytes(contents: bytes, kind: str, *, browser: CDPBrowser,
             raise UploadError("Dreamina upload token is incomplete")
     if image:
         service_id = str(token["space_name"])
-        url = "https://imagex-normal-sg.capcutapi.com/"
+        region = token.get("region")
+        if region == "us":
+            url = "https://imagex16-normal-us-ttp2.capcutapi.us/"
+            signing_region = "us-east-1"
+        elif region == "useast8":
+            # Verified against the official SDK's region fallback and a successful Apply.
+            if ("upload_domain" in token
+                    and token["upload_domain"] != "imagex16-normal-us-ttp2.capcutapi.us"):
+                raise UploadError("Dreamina image upload domain is unsupported")
+            url = "https://imagex16-normal-us-ttp2.capcutapi.us/"
+            signing_region = "ap-singapore-1"
+        elif region in (None, "", "sg"):
+            url = "https://imagex-normal-sg.capcutapi.com/"
+            signing_region = "ap-southeast-1"
+        else:
+            raise UploadError("Dreamina image upload region is unsupported")
         apply = url + "?" + urllib.parse.urlencode({
             "Action": "ApplyImageUpload", "Version": "2018-08-01",
             "ServiceId": service_id, "FileSize": len(contents),
             "s": secrets.token_hex(6), "device_platform": "web"})
-        result = _api_call(session, "GET", apply, token, "imagex")
+        result = _api_call(session, "GET", apply, token, "imagex",
+                           signing_region=signing_region)
         address = (result.get("Result") or {}).get("UploadAddress") or {}
         store = (address.get("StoreInfos") or [None])[0] or {}
         host = (address.get("UploadHosts") or [None])[0]
@@ -180,7 +197,8 @@ def upload_media_bytes(contents: bytes, kind: str, *, browser: CDPBrowser,
             "Action": "CommitImageUpload", "Version": "2018-08-01",
             "ServiceId": service_id})
         result = _api_call(session, "POST", commit, token, "imagex",
-                           {"SessionKey": address["SessionKey"], "SuccessActionStatus": "200"})
+                           {"SessionKey": address["SessionKey"], "SuccessActionStatus": "200"},
+                           signing_region=signing_region)
         item = ((result.get("Result") or {}).get("Results") or [None])[0] or {}
         plugin = ((result.get("Result") or {}).get("PluginResult") or [None])[0] or {}
         uri = plugin.get("ImageUri") or item.get("Uri")
@@ -195,12 +213,20 @@ def upload_media_bytes(contents: bytes, kind: str, *, browser: CDPBrowser,
                 "filename": filename}
     space = str(token["space_name"])
     origin = "https://vod-normal-sg.capcutapi.com/"
+    api_kwargs: dict[str, str] = {}
+    region = token.get("region")
+    if region in ("useast8", "us"):
+        if ("upload_domain" in token
+                and token["upload_domain"] != "vod16-normal-us-ttp2.capcutapi.us"):
+            raise UploadError("Dreamina VOD upload domain is unsupported")
+        origin = "https://vod16-normal-us-ttp2.capcutapi.us/"
+        api_kwargs["signing_region"] = "ap-singapore-1" if region == "useast8" else "us-east-1"
     apply = origin + "?" + urllib.parse.urlencode({
         "Action": "ApplyUploadInner", "Version": "2020-11-19",
         "SpaceName": space, "FileType": "video", "IsInner": "1",
         "FileSize": len(contents), "s": secrets.token_hex(6),
         "device_platform": "web"})
-    result = _api_call(session, "GET", apply, token, "vod")
+    result = _api_call(session, "GET", apply, token, "vod", **api_kwargs)
     node = (((result.get("Result") or {}).get("InnerUploadAddress") or {})
             .get("UploadNodes") or [None])[0] or {}
     store = (node.get("StoreInfos") or [None])[0] or {}
@@ -211,7 +237,7 @@ def upload_media_bytes(contents: bytes, kind: str, *, browser: CDPBrowser,
     commit = origin + "?" + urllib.parse.urlencode({
         "Action": "CommitUploadInner", "Version": "2020-11-19", "SpaceName": space})
     result = _api_call(session, "POST", commit, token, "vod",
-                       {"SessionKey": node["SessionKey"], "Functions": []})
+                       {"SessionKey": node["SessionKey"], "Functions": []}, **api_kwargs)
     item = ((result.get("Result") or {}).get("Results") or [None])[0] or {}
     vid = item.get("Vid") or node.get("Vid")
     if not vid:

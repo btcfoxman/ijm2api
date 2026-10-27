@@ -1,4 +1,4 @@
-"""Private headed Chromium and short-lived VNC lease for Picsart account login."""
+"""Private headed Chromium and short-lived VNC lease for Dreamina account login."""
 
 from __future__ import annotations
 
@@ -14,7 +14,9 @@ from urllib.parse import urlsplit
 
 import requests
 
+from .browser import BrowserError, BrowserRejected
 from .client import DreaminaClient as UpstreamClient
+from .account_automation import AccountAutomation
 
 REQUIRES_PROJECT = False
 
@@ -23,6 +25,35 @@ class LoginError(Exception):
     def __init__(self, message: str, status: int = 409) -> None:
         super().__init__(message)
         self.status = status
+
+
+def _verification_failure(exc: Exception, stage: str) -> str:
+    """Explain a failed admin check without returning browser or response data."""
+    known_browser_errors = {
+        "account proxy must be a SOCKS5 or HTTP proxy with host and port":
+            "account proxy configuration is invalid",
+        "open and log in to Dreamina in the account browser":
+            "open the Dreamina generation page and finish login",
+        "Dreamina browser fetch failed":
+            "Dreamina credit request failed; check browser region and proxy connectivity",
+        "Dreamina browser JavaScript request failed":
+            "Dreamina page is not ready; wait for the generation page to load",
+        "Dreamina browser JavaScript request returned an error":
+            "Dreamina page is not ready; wait for the generation page to load",
+        "Dreamina returned an unreadable JSON response":
+            "Dreamina credit service returned an unreadable response",
+        "Dreamina returned an invalid response envelope":
+            "Dreamina credit service returned an unreadable response",
+        "Dreamina HTTP 200 returned non-JSON":
+            "Dreamina credit service returned an unreadable response",
+    }
+    if isinstance(exc, BrowserRejected):
+        reason = "Dreamina credit service rejected verification; check the signed-in account"
+    elif isinstance(exc, BrowserError):
+        reason = known_browser_errors.get(str(exc), "browser connection or page request failed")
+    else:
+        reason = "account verification could not complete"
+    return f"browser login verification failed ({stage}): {reason}"
 
 
 def browser_proxy(value: str) -> str:
@@ -244,6 +275,8 @@ class BrowserLoginManager:
             account = self.store.account(account_id, private=True)
             if not account:
                 raise LoginError("account not found", 404)
+            if getattr(self.service, 'auto_login_busy', lambda _: False)(account_id):
+                raise LoginError('account is in automatic login')
             proxy = browser_proxy(str(account["proxy_url"]))
             desktop = self.desktops.get(account_id)
             if desktop and desktop.proxy != proxy:
@@ -253,6 +286,8 @@ class BrowserLoginManager:
                 self.desktops.pop(account_id, None)
                 desktop = None
             with self.service._lock:
+                if getattr(self.service, 'auto_login_busy', lambda _: False)(account_id):
+                    raise LoginError('account is in automatic login')
                 if self.service._active.get(account_id, 0) or self.store.active_account_count(account_id):
                     raise LoginError("account has active tasks")
                 try:
@@ -262,14 +297,18 @@ class BrowserLoginManager:
                         self.service.browser_runtime.close_idle(account_id)
                 except Exception as exc:
                     raise LoginError("account browser is in use") from exc
-                self.store.update_account(account_id, {"enabled": False, "status": "logging_in"})
+                self.store.update_account(account_id, {"enabled": False, "status": "logging_in",
+                    "login_stage": "manual_login", "watermark_ready": False, "agreement_ready": False,
+                    "setup_checked_at": None})
             root = Path(str(self.service.settings()["chrome_user_data_root"]))
             desktop = desktop or LoginDesktop(root / str(account_id), proxy)
             active = {"id": secrets.token_urlsafe(18), "ticket": secrets.token_urlsafe(32),
                       "account_id": account_id, "desktop": desktop,
                       "previous": account, "new_desktop": account_id not in self.desktops,
-                      "enable_after": bool(account["enabled"] or account["status"] in
-                                           {"pending", "login_required", "logging_in"}),
+                      "enable_after": (bool(account['login_enable_after'])
+                                       if account.get('login_enable_after') is not None
+                                       else bool(account["enabled"] or account["status"] in
+                                           {"pending", "login_required", "logging_in"})),
                       "deadline": time.monotonic() + self.LEASE_SECONDS, "phase": "starting"}
             self.active = active
             try:
@@ -292,21 +331,31 @@ class BrowserLoginManager:
             active = self._owned(session_id)
             active["phase"] = "verifying"
             account_id = active["account_id"]
+            stage = "account lookup"
             try:
                 account = self.store.account(account_id, private=True)
                 if not account:
                     raise LoginError("account no longer exists", 404)
                 temporary = {**account, "cdp_port": active["desktop"].cdp_port}
+                stage = "browser setup"
                 client = UpstreamClient(temporary)
+                stage = "credit read"
                 state = await asyncio.to_thread(client.account_state)
+                stage = 'generation preferences'
+                ready = await asyncio.to_thread(AccountAutomation(temporary, self.service.settings()).ensure_ready)
+                if ready.get('watermark_ready') is not True or ready.get('agreement_ready') is not True:
+                    raise LoginError('generation preferences are not confirmed; check watermark and AI agreement settings')
+                stage = "page check"
                 project_id = client.browser.project_id()
                 if REQUIRES_PROJECT and not (project_id or account["project_id"]):
-                    raise LoginError("open a Pippit video project before finishing login")
+                    raise LoginError("open the Dreamina generation page before finishing login")
+                stage = "account update"
                 values = {"cdp_port": active["desktop"].cdp_port,
                           "managed_profile": True, "enabled": active["enable_after"],
                           "status": "active" if active["enable_after"] else "disabled",
                           "balance": state["available_balance"],
-                          "balance_details": state["buckets"], "last_error": ""}
+                          "balance_details": state["buckets"], "last_error": "", "login_stage": "ready",
+                          "watermark_ready": True, "agreement_ready": True, "setup_checked_at": time.time()}
                 if project_id:
                     values["project_id"] = project_id
                 threshold = float(self.service.settings()["low_balance_disable_threshold"] or 0)
@@ -326,7 +375,7 @@ class BrowserLoginManager:
                     active["phase"] = "login"
                 if isinstance(exc, LoginError):
                     raise
-                raise LoginError(f"browser login verification failed: {type(exc).__name__}", 409) from exc
+                raise LoginError(_verification_failure(exc, stage), 409) from exc
 
     async def cancel(self, session_id: str) -> None:
         async with self.lock:
@@ -345,9 +394,13 @@ class BrowserLoginManager:
 
     async def close_account(self, account_id: int) -> None:
         async with self.lock:
+            if getattr(self.service, 'auto_login_busy', lambda _: False)(account_id):
+                raise LoginError('account is in automatic login')
             if self.active and self.active["account_id"] == account_id:
                 raise LoginError("finish or cancel online login first")
             with self.service._lock:
+                if getattr(self.service, 'auto_login_busy', lambda _: False)(account_id):
+                    raise LoginError('account is in automatic login')
                 if self.service._active.get(account_id, 0) or self.store.active_account_count(account_id):
                     raise LoginError("account has active tasks")
                 try:

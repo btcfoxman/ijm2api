@@ -7,7 +7,8 @@
   <title>IJM2API Console</title>
   <link rel="stylesheet" href="/static/styles.css?v=20261014-3">
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
-  <script src="/static/app.js?v=20261014-2" defer></script>
+  <script src="/api/cost-reference/assets/task-cost.js"></script>
+<script src="/static/app.js?v=ijm-batch-login-20261027" defer></script>
   <script src="/static/browser-assist.js?v=20261011-1" defer></script>
   <script src="/static/account-login.js?v=20261014-2" defer></script>
 </head>
@@ -25,6 +26,7 @@
         <button class="button" id="batchButton" type="button"><i data-lucide="users"></i><span>批量导入</span></button>
         <button class="icon-button" id="settingsButton" type="button" title="运行设置"><i data-lucide="settings"></i></button>
         <button class="icon-button" id="integrationDocsButton" type="button" title="接入文档"><i data-lucide="notebook-tabs"></i></button>
+        <a class="button" href="/api/cost-reference/page" target="_blank" rel="noopener"><span>实时消耗表</span></a>
         <button class="button" id="costReferenceButton" type="button"><i data-lucide="coins"></i><span>消耗参考</span></button>
         <a class="icon-button" href="/docs" target="_blank" title="API 文档"><i data-lucide="book-open"></i></a>
         <button class="icon-button" id="refreshButton" type="button" title="刷新"><i data-lucide="refresh-cw"></i></button>
@@ -61,7 +63,7 @@
         <div class="section-actions"><label class="task-limit-label" for="taskLimit">显示 <input id="taskLimit" type="number" min="1" max="1000" step="1" value="50" aria-label="最近任务显示条数"> 条</label><button class="icon-button" id="tasksRefresh" type="button" title="刷新任务"><i data-lucide="refresh-cw"></i></button><button class="icon-button danger" id="clearTasks" type="button" title="清理已结束任务"><i data-lucide="trash-2"></i></button></div>
       </div>
       <div class="table-wrap tasks-wrap">
-        <table><thead><tr><th>任务 / 账号</th><th>模型参数 / 提示词 / 素材</th><th>状态</th><th>进度 / 耗时</th><th>创建 / 更新时间</th><th class="result-col">结果</th></tr></thead><tbody id="tasksBody"></tbody></table>
+        <table><thead><tr><th>任务 / 账号</th><th>模型参数 / 提示词 / 素材</th><th>消耗额</th><th>状态</th><th>进度 / 耗时</th><th>创建 / 更新时间</th><th class="result-col">结果</th></tr></thead><tbody id="tasksBody"></tbody></table>
         <div class="empty" id="tasksEmpty"><i data-lucide="layers"></i><span>暂无任务</span></div>
       </div>
     </section>
@@ -104,9 +106,10 @@
 
   <dialog id="batchDialog"><form class="dialog-form" id="batchForm">
     <header><div><p class="eyebrow">BATCH IMPORT</p><h2>批量导入账号</h2></div><button class="icon-button close" type="button"><i data-lucide="x"></i></button></header>
-    <label class="editor-label">每行一个账号：名称 | 代理<textarea name="text" class="mono json-editor" rows="15" required placeholder="ijm-01|socks5://xray:20002"></textarea></label>
-    <p>导入后请逐个打开“网页登录”完成浏览器会话验证。</p>
-    <div class="batch-result" id="batchResult" hidden></div>
+    <label class="editor-label">每行一个账号：邮箱 | 密码 | 可选代理<textarea name="text" class="mono json-editor" rows="10" required autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="user@example.com|password&#10;second@example.com|password|socks5://host.docker.internal:20002&#10;旧格式：ijm-01|socks5://host.docker.internal:20003"></textarea></label>
+    <p>邮箱账号导入后自动登录，并确认去水印与 AI 生成协议；遇到验证时可打开“网页登录”继续。兼容 Tab、---- 分隔及原名称|代理格式，密码两端空格会保留。</p>
+    <p>不填代理时保留已有代理；新账号按使用量分配 20001–20022、20031–20040 共 32 个代理端口。显式代理保留，已有 Profile 的代理变更须先重置。</p>
+    <div class="batch-result" id="batchResult" role="status" aria-live="polite" hidden></div>
     <footer><button class="button close" type="button">取消</button><button class="button primary" type="submit"><i data-lucide="upload"></i><span>导入</span></button></footer>
   </form></dialog>
 

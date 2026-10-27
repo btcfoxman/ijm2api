@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "source": "用户确认：上游按额度批量采购；同一额度池跨模型、时长和分辨率共用采购单价。",
+  "currency": "CNY",
+  "entries": [
+    {
+      "id": "purchase:sdhapi",
+      "channel": "sdhapi",
+      "provider": "higg2api",
+      "unit": "credits",
+      "purchase_amount": "120",
+      "purchase_units": "1200"
+    },
+    {
+      "id": "purchase:sdmapi",
+      "channel": "sdmapi",
+      "provider": "sdmapi",
+      "unit": "sdmapi:credits",
+      "purchase_amount": "1000",
+      "purchase_units": "1000"
+    },
+    {
+      "id": "purchase:pipapi",
+      "channel": "pipapi",
+      "provider": "pip2api",
+      "unit": "credits",
+      "purchase_amount": "440",
+      "purchase_units": "17600"
+    }
+  ]
+}

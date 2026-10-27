@@ -7,6 +7,7 @@
   const finish = document.getElementById('onlineAccountFinish');
   let sessionId = '';
   let busy = false;
+  let viewerReload = 0;
 
   async function request(path, method = 'GET', body) {
     const response = await fetch(path, {method, credentials:'same-origin',
@@ -21,13 +22,18 @@
     frame.src = 'about:blank';
     if (id) await request(`/api/admin/account-login/${encodeURIComponent(id)}/cancel`, 'POST').catch(() => {});
   }
+  async function reconnectViewer(id) {
+    const ticket = await request(`/api/admin/account-login/${encodeURIComponent(id)}/viewer`, 'POST');
+    if (sessionId !== id) return;
+    const separator = ticket.url.includes('?') ? '&' : '?';
+    frame.src = `${ticket.url}${separator}viewer_reload=${++viewerReload}`;
+  }
   async function show(session) {
     sessionId = session.active.session_id;
     fields.hidden = true;
     finish.hidden = false;
-    message.textContent = '请在远端浏览器完成登录，进入视频项目，再点击“完成登录并验证”。';
-    const ticket = await request(`/api/admin/account-login/${encodeURIComponent(sessionId)}/viewer`, 'POST');
-    frame.src = ticket.url;
+    message.textContent = '请在远端浏览器完成登录并打开 Dreamina 生成页，再点击“完成登录并验证”。';
+    await reconnectViewer(sessionId);
   }
   async function open(accountId) {
     if (busy) return;
@@ -75,7 +81,17 @@
       if (window.refresh) await window.refresh();
       if (window.toast) window.toast(`账号 #${account.id} 已验证，余额 ${account.balance ?? '—'}`);
     } catch (error) {
-      message.textContent = `验证未完成：${error.message}。请检查远端页面后重试。`;
+      const failedSession = sessionId;
+      if (!failedSession) return;
+      let recovered = false;
+      try {
+        await reconnectViewer(failedSession);
+        recovered = true;
+      } catch (_) { /* Keep the original verification error visible. */ }
+      if (sessionId === failedSession) {
+        const nextStep = recovered ? '远端画面已恢复，请检查 Dreamina 生成页后重试。' : '远端画面恢复失败，请重新打开登录窗口。';
+        message.textContent = `验证未完成：${error.message}。${nextStep}`;
+      }
     } finally { finish.disabled = false; busy = false; }
   });
   document.getElementById('onlineAccountCancel').addEventListener('click', async () => {

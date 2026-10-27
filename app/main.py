@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .cost_adapter import build_observations
+
 import os
 import secrets
 import hashlib
@@ -18,6 +20,8 @@ from fastapi.staticfiles import StaticFiles
 from .browser import BrowserError, CDPBrowser, browser_alive, clear_managed_profile, start_managed_browser, stop_managed_browser
 from .browser_login import BrowserLoginManager, LoginError
 from .browser_login_api import register_browser_login
+from .account_import import AccountImporter
+from .auto_login import AutoLoginManager
 from .catalog import public_models
 from .image_client import IMAGE_MODELS
 from .service import Service
@@ -36,16 +40,20 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 store = Store(str(DATA_DIR / "ijm2api.db"))
 service = Service(store)
 browser_login = BrowserLoginManager(store, service)
+auto_login = AutoLoginManager(store, service, manual_active=lambda: browser_login.active)
+service.auto_login_busy = auto_login.busy
 STATIC = Path(__file__).parent / "static"
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    auto_login.recover_interrupted()
     service.start()
     browser_login.start_maintenance()
     try:
         yield
     finally:
+        auto_login.close()
         service.stop()
         await browser_login.close()
 
@@ -173,34 +181,80 @@ def accounts() -> list[dict[str, Any]]:
 
 @app.post("/api/accounts", dependencies=[Depends(admin_auth)])
 def add_account(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    if {'login_email', 'login_password', 'login_enable_after', 'login_stage', 'watermark_ready', 'agreement_ready', 'setup_checked_at'} & body.keys():
+        raise HTTPException(status_code=422, detail='use batch import for login credentials; setup state is service-managed')
     try:
-        return store.upsert_account(body)
+        with service._lock:
+            existing = next((item for item in store.accounts(private=True)
+                if item['name'] == str(body.get('name') or '').strip()), None)
+            if existing:
+                _assert_account_mutable(existing, body)
+            result = store.upsert_account(body)
+            if existing and 'enabled' in body:
+                result = store.update_account(existing['id'], {'login_enable_after': False if body['enabled'] is False else None})
+            return result
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/api/accounts/batch-import", dependencies=[Depends(admin_auth)])
 def batch_import(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    lines = [line.strip() for line in str(body.get("text") or "").splitlines() if line.strip()]
-    results = []
-    errors = []
-    for number, line in enumerate(lines, 1):
-        parts = [part.strip() for part in line.split("|")]
-        if not parts[0]:
-            errors.append(f"line {number}: account name is empty")
-            continue
-        try:
-            results.append(store.upsert_account({"name": parts[0],
-                "proxy_url": parts[1] if len(parts) > 1 else "", "max_concurrency": 1}))
-        except ValueError as exc:
-            errors.append(f"line {number}: {exc}")
-    return {"input_count": len(lines), "count": len(results), "duplicate_count": 0,
-            "login_started_count": 0, "errors": errors}
+    with service._lock:
+        result = AccountImporter(store, login_busy=auto_login.busy).import_text(str(body.get('text') or ''))
+        for row in result['results']:
+            if not row.get('login_needed'):
+                continue
+            try:
+                account = auto_login.start(int(row['account_id']))
+                row.update(status=account['status'], login_stage=account.get('login_stage', ''),
+                           message='已加入自动登录队列')
+                result['login_started_count'] += 1
+            except (ValueError, BrowserError):
+                row['message'] = '账号已保存，自动登录尚未启动，请检查占用状态后重试'
+                result['errors'].append(f"第 {row['line']} 行：账号已保存，自动登录尚未启动")
+        return result
+
+
+@app.post('/api/accounts/{account_id}/auto-login', dependencies=[Depends(admin_auth)], status_code=202)
+def start_auto_login(account_id: int) -> dict[str, Any]:
+    try:
+        return auto_login.start(account_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail='account not found') from exc
+    except (ValueError, BrowserError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get('/api/accounts/login-results', dependencies=[Depends(admin_auth)])
+def account_login_results() -> dict[str, Any]:
+    return {'jobs': [{'account_id': account['id'], 'status': account['status'],
+        'phase': account.get('login_stage', ''), 'message': account.get('last_error', ''),
+        'watermark_ready': account.get('watermark_ready', False),
+        'agreement_ready': account.get('agreement_ready', False)}
+        for account in store.accounts() if account.get('login_stage')]}
+
+
+def _assert_account_mutable(account: dict[str, Any], body: dict[str, Any]) -> None:
+    """Call under service._lock to protect the browser identity during work."""
+    account_id = int(account['id'])
+    if (auto_login.busy(account_id) or account['status'] == 'logging_in'
+            or browser_login.active and browser_login.active['account_id'] == account_id):
+        raise HTTPException(status_code=409, detail='account is in browser login')
+    identity = {'cdp_port', 'proxy_url', 'project_id', 'managed_profile'}
+    if any(key in body and body[key] != account.get(key) for key in identity):
+        if service._active.get(account_id, 0) or store.active_account_count(account_id):
+            raise HTTPException(status_code=409, detail='account has active tasks')
 
 
 @app.patch("/api/accounts/{account_id}", dependencies=[Depends(admin_auth)])
 async def patch_account(account_id: int, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     try:
+        if auto_login.busy(account_id):
+            raise HTTPException(status_code=409, detail='account is in automatic login')
+        if {'login_email', 'login_password', 'login_enable_after', 'login_stage', 'watermark_ready', 'agreement_ready', 'setup_checked_at'} & body.keys():
+            raise HTTPException(status_code=422, detail='use batch import for login credentials; setup state is service-managed')
+        if 'enabled' in body:
+            body = {**body, 'login_enable_after': False if body['enabled'] is False else None}
         account = _account(account_id, private=True)
         if "proxy_url" in body and str(body["proxy_url"]).strip() != str(account["proxy_url"]).strip():
             if browser_login.active and browser_login.active["account_id"] == account_id:
@@ -212,7 +266,9 @@ async def patch_account(account_id: int, body: dict[str, Any] = Body(...)) -> di
             await _close_online_account(account_id)
             stop_managed_browser(account_id)
             body = {**body, "cdp_port": 0, "status": "pending", "last_error": ""}
-        return store.update_account(account_id, body)
+        with service._lock:
+            _assert_account_mutable(_account(account_id, private=True), body)
+            return store.update_account(account_id, body)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="account not found") from exc
     except ValueError as exc:
@@ -221,6 +277,8 @@ async def patch_account(account_id: int, body: dict[str, Any] = Body(...)) -> di
 
 @app.delete("/api/accounts/{account_id}", dependencies=[Depends(admin_auth)])
 async def delete_account(account_id: int) -> dict[str, Any]:
+    if auto_login.busy(account_id):
+        raise HTTPException(status_code=409, detail='account is in automatic login')
     if browser_login.active and browser_login.active["account_id"] == account_id:
         raise HTTPException(status_code=409, detail="finish or cancel online login first")
     if any(task["account_id"] == account_id and task["status"] not in {"succeeded", "failed", "expired"}
@@ -235,6 +293,8 @@ async def delete_account(account_id: int) -> dict[str, Any]:
 
 @app.post("/api/accounts/{account_id}/profile/reset", dependencies=[Depends(admin_auth)])
 async def reset_profile(account_id: int, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    if auto_login.busy(account_id):
+        raise HTTPException(status_code=409, detail='account is in automatic login')
     if browser_login.active and browser_login.active["account_id"] == account_id:
         raise HTTPException(status_code=409, detail="finish or cancel online login first")
     account = _account(account_id, private=True)
@@ -245,7 +305,8 @@ async def reset_profile(account_id: int, body: dict[str, Any] = Body(default={})
     clear_managed_profile(account, Path(str(service.settings()["chrome_user_data_root"])))
     store.clear_media_cache(account_id)
     values: dict[str, Any] = {"cdp_port": 0, "project_id": "", "status": "pending",
-                              "last_error": ""}
+                              "last_error": "", "login_stage": "", "watermark_ready": False,
+                              "agreement_ready": False, "setup_checked_at": None, "login_enable_after": None}
     if body.get("proxy_url") is not None:
         values["proxy_url"] = str(body["proxy_url"])
     result = store.update_account(account_id, values)
@@ -381,7 +442,7 @@ def admin_tasks(limit: int = 50) -> list[dict[str, Any]]:
     for task in tasks:
         if task["status"] in {"failed", "expired"}:
             task["public_error"] = service.public_task(task)["error"]
-    return tasks
+    return [_with_cost_observations(task) for task in tasks]
 
 
 @app.post("/api/tasks", dependencies=[Depends(admin_auth)])
@@ -394,7 +455,7 @@ def admin_task(task_id: str) -> dict[str, Any]:
     task = _task(task_id)
     if task["status"] in {"failed", "expired"}:
         task["public_error"] = service.public_task(task)["error"]
-    return task
+    return _with_cost_observations(task)
 
 
 @app.delete("/api/tasks", dependencies=[Depends(admin_auth)])
@@ -480,3 +541,18 @@ def create_generic(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
 @app.get("/api/v3/contents/generations/tasks/{task_id}", dependencies=[Depends(api_auth)])
 def get_generic(task_id: str) -> dict[str, Any]:
     return service.public_task(_task(task_id))
+
+
+def _with_cost_observations(task: dict[str, Any]) -> dict[str, Any]:
+    full_task = task
+    return {**task, "cost_observations": [{key: value for key, value in row.items() if not key.startswith("_")}
+                                        for row in build_observations(full_task or task)]}
+
+
+from .cost_reference import install_cost_reference
+
+cost_reference = install_cost_reference(
+    app, service_name="ijm2api", database_path=store.path,
+    admin_dependency=admin_auth, adapter=build_observations,
+    token_env="IJM_COST_SYNC_TOKEN",
+)

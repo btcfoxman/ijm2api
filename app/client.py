@@ -295,6 +295,12 @@ class DreaminaClient:
     def submit(self, normalized: dict[str, Any],
                assets: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
         body, submit_id = build_submit_body(normalized, assets)
+        # These ordinary account-setting requests never invoke the Generate UI:
+        # confirming its modal can otherwise resume a paid pending submission.
+        from .account_automation import AccountAutomation
+        ready = AccountAutomation(self.account).ensure_ready()
+        if ready.get('watermark_ready') is not True or ready.get('agreement_ready') is not True:
+            raise BrowserRejected('Dreamina generation preferences require account setup')
         query = {"aid": "513695", "device_platform": "web", "region": "SG",
                  "os": "windows", "web_component_open_flag": "1",
                  "aigc_features": "app_lip_sync",

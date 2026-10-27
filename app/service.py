@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .cost_adapter import input_evidence, settle_failed_balance
+
 import logging
 import os
 import threading
@@ -19,7 +21,7 @@ from .catalog import normalize_request
 from .client import DreaminaClient, DreaminaError, InputAudioDurationError
 from .image_client import DreaminaImageClient, resolve_image_model
 from .image_request import normalize_image_request
-from .errors import public_error
+from .errors import public_error, upstream_review_error
 from .media import MediaError
 from .result_transfer import ResultTransferError, transfer, presign, expires_soon, _config
 from .upload import UploadError
@@ -29,6 +31,10 @@ from .store import Store
 TERMINAL = {"succeeded", "failed", "expired"}
 MAX_CREDIT_ACCOUNT_ATTEMPTS = 2
 logger = logging.getLogger(__name__)
+
+
+def _credential_setup_ready(account: dict[str, Any]) -> bool:
+    return not account.get('login_email') or bool(account.get('watermark_ready') and account.get('agreement_ready'))
 
 
 def _credit_rejected(message: str) -> bool:
@@ -244,6 +250,7 @@ class Service:
             accounts = [item for item in self.store.accounts(private=True)
                         if int(item["id"]) not in excluded and item["enabled"]
                         and item["status"] == "active" and item["proxy_url"]
+                        and _credential_setup_ready(item)
                         and (item["balance"] is None or float(item["balance"]) >= estimated_cost)]
             if prefer_balance:
                 accounts.sort(key=lambda item: (item["balance"] is None,
@@ -263,6 +270,7 @@ class Service:
     def _has_eligible_account(self, estimated_cost: float, excluded: set[int]) -> bool:
         return any(int(item["id"]) not in excluded and item["enabled"]
                    and item["status"] == "active" and item["proxy_url"]
+                   and _credential_setup_ready(item)
                    and (item["balance"] is None or float(item["balance"]) >= estimated_cost)
                    for item in self.store.accounts(private=True))
 
@@ -305,6 +313,9 @@ class Service:
         threshold = float(self.settings()["low_balance_disable_threshold"] or 0)
         values: dict[str, Any] = {"balance": balance, "balance_details": state["buckets"],
                                   "status": "active", "last_error": ""}
+        if not _credential_setup_ready(account):
+            values.update(status='setup_required', enabled=False,
+                          last_error='账号登录及生成设置尚未完成，请使用自动登录或网页登录完成验证')
         if project_id:
             values["project_id"] = project_id
         if threshold > 0 and balance < threshold:
@@ -372,6 +383,7 @@ class Service:
                         self.store.update_account(account_id, {"balance": before, "status": "active"})
                     self.store.update_task(task_id, {"balance_before": before, "progress": 12})
                     assets = client.upload_inputs(task["normalized"])
+                    self.store.update_task(task_id, {"cost_evidence": input_evidence(assets)})
                     self.store.update_task(task_id, {"progress": 30})
                     attempted.append(account_id)
                     self.store.update_task(task_id, {"attempted_account_ids": attempted})
@@ -627,7 +639,8 @@ class Service:
                     "balance_after": after,
                     "actual_cost": max(0, float(before) - float(after))
                         if isolated and before is not None and after is not None else None,
-                    "completed_at": finished_at})
+                    "completed_at": finished_at,
+                    "cost_evidence": {"balance_isolated": isolated and before is not None and after is not None}})
                 return
             if state["status"] == "failed":
                 # History may first report a terminal status and only add the
@@ -655,8 +668,11 @@ class Service:
                     code = "VIDEO_EDIT_CONSTRAINT"
                 elif upstream_code == "99999":
                     code = "UPSTREAM_TEMPORARY"
+                elif review_code := upstream_review_error(upstream_code, reason):
+                    code = review_code
                 else:
                     code = "UPSTREAM_FAILED"
+                settle_failed_balance(self.store, task, client)
                 self._fail(task_id, code, reason)
                 return
             self.store.update_task(task_id, {"status": "running", "progress": max(45, task["progress"])})

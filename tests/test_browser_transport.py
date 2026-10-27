@@ -1,9 +1,174 @@
 import json
+import shutil
+import subprocess
 import unittest
+import urllib.parse
 from unittest.mock import Mock, patch
 
 from app.browser import BrowserError, BrowserRejected, CDPBrowser
 from app.client import DreaminaClient
+
+
+@unittest.skipUnless(shutil.which("node"), "Node.js is required for page-context execution")
+class CreditRegionContextTests(unittest.TestCase):
+    def expression(self, path="/commerce/v1/benefits/user_credit", **kwargs):
+        browser = CDPBrowser(19301)
+        with patch.object(browser, "evaluate", return_value=json.dumps(
+                {"http": 200, "body": {"ret": "0", "data": {}}})) as evaluate:
+            browser.post(path, {}, **kwargs)
+        return evaluate.call_args.args[0]
+
+    def execute_contexts(self, expressions, contexts):
+        script = r"""
+const vm = require('node:vm');
+let input = '';
+process.stdin.on('data', (part) => { input += part; });
+process.stdin.on('end', async () => {
+  const {expressions, contexts} = JSON.parse(input);
+  const calls = [], values = [];
+  const sandbox = {URL, location: {hostname: 'dreamina.capcut.com'}};
+  sandbox.fetch = async (url, options) => {
+    calls.push({url, options});
+    if (sandbox.throwFetch) throw new Error('synthetic network failure');
+    return {status: 200, json: async () => ({ret: '0', data: {credit: {gift_credit: 7}}})};
+  };
+  vm.createContext(sandbox);
+  for (let i = 0; i < contexts.length; i++) {
+    const item = contexts[i];
+    if (item.sdk === undefined) delete sandbox.__locationInfo;
+    else sandbox.__locationInfo = item.sdk;
+    sandbox.location.hostname = item.hostname || 'dreamina.capcut.com';
+    sandbox.throwFetch = !!item.throwFetch;
+    values.push(await vm.runInContext(expressions[i % expressions.length], sandbox));
+  }
+  process.stdout.write(JSON.stringify({calls, values}));
+});
+"""
+        result = subprocess.run([shutil.which("node"), "-e", script],
+                                input=json.dumps({"expressions": expressions, "contexts": contexts}),
+                                text=True, capture_output=True, timeout=10, check=True)
+        return json.loads(result.stdout)
+
+    def test_us_page_sdk_credit_check_uses_verified_origin_and_appid(self):
+        context = {"sdk": {"code": "US", "domain": {
+            "commerce_domain": "https://commerce-us-ttp2.us.capcut.com"}}}
+        client = DreaminaClient({"id": 1, "cdp_port": 19301,
+                                 "proxy_url": "socks5://proxy.test:20002"})
+        observed = []
+
+        def evaluate(expression, **_):
+            result = self.execute_contexts([expression], [context])
+            observed.extend(result["calls"])
+            return result["values"][0]
+
+        with patch.object(client.browser, "evaluate", side_effect=evaluate):
+            self.assertEqual(client.account_state(max_attempts=1)["available_balance"], 7)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0]["url"],
+                         "https://commerce-us-ttp2.us.capcut.com/commerce/v1/benefits/user_credit")
+        self.assertEqual(observed[0]["options"]["headers"],
+                         {"content-type": "application/json", "appid": "513641"})
+        self.assertEqual(observed[0]["options"]["credentials"], "include")
+
+    def test_sg_unknown_and_malicious_contexts_preserve_sg_request(self):
+        bad_domains = ["https://commerce-us-ttp2.us.capcut.com:443",
+                       "https://commerce-us-ttp2.us.capcut.com:8443",
+                       "https://user@commerce-us-ttp2.us.capcut.com",
+                       "https://commerce-us-ttp2.us.capcut.com.attacker.test",
+                       "http://commerce-us-ttp2.us.capcut.com",
+                       "https://commerce-us-ttp2.us.capcut.com/path",
+                       "https://commerce-us-ttp2.us.capcut.com?token=private"]
+        contexts = [{}, {"sdk": {"code": "SG", "domain": {
+            "commerce_domain": "https://commerce-api-sg.capcut.com"}}}]
+        contexts += [{"sdk": {"code": "US", "domain": {"commerce_domain": value}}}
+                     for value in bad_domains]
+        contexts += [{"hostname": "attacker.test", "sdk": {"code": "US", "domain": {
+            "commerce_domain": "https://commerce-us-ttp2.us.capcut.com"}}}]
+        result = self.execute_contexts([self.expression()], contexts)
+        self.assertEqual(len(result["calls"]), len(contexts))
+        for call in result["calls"]:
+            self.assertEqual(call["url"],
+                             "https://commerce-api-sg.capcut.com/commerce/v1/benefits/user_credit")
+            self.assertEqual(call["options"]["headers"], {"content-type": "application/json"})
+
+    def test_context_is_read_again_per_call_without_cross_account_cache(self):
+        us = {"sdk": {"code": "US", "domain": {
+            "commerce_domain": "https://commerce-us-ttp2.us.capcut.com"}}}
+        sg = {"sdk": {"code": "SG", "domain": {
+            "commerce_domain": "https://commerce-api-sg.capcut.com"}}}
+        result = self.execute_contexts([self.expression()], [us, sg, us, {}])
+        self.assertEqual(["appid" in call["options"]["headers"] for call in result["calls"]],
+                         [True, False, True, False])
+
+    def test_failed_us_fetch_is_not_replayed_in_sg(self):
+        result = self.execute_contexts([self.expression()], [{"throwFetch": True, "sdk": {
+            "code": "US", "domain": {"commerce_domain": "https://commerce-us-ttp2.us.capcut.com"}}}])
+        self.assertEqual(len(result["calls"]), 1)
+        self.assertEqual(json.loads(result["values"][0]), {"transport_error": "fetch"})
+
+    def test_us_token_submit_and_poll_share_region_without_altering_body(self):
+        us = {"sdk": {"code": "US", "domain": {
+            "commerce_domain": "https://commerce-us-ttp2.us.capcut.com"}}}
+        paths = ["/mweb/v1/get_upload_token", "/mweb/v1/aigc_draft/generate",
+                 "/mweb/v1/get_history_by_ids"]
+        for path in paths:
+            with self.subTest(path=path):
+                expression = self.expression(path, query={"aid": "513695", "region": "SG",
+                                                         "device_platform": "web", "generate_id": "same-id"})
+                call = self.execute_contexts([expression], [us])["calls"][0]
+                parsed = urllib.parse.urlsplit(call["url"])
+                self.assertEqual(parsed.netloc, "dreamina-api-us-ttp2.us.capcut.com")
+                self.assertEqual(parsed.path, path)
+                self.assertEqual(dict(urllib.parse.parse_qsl(parsed.query)), {
+                    "aid": "513641", "region": "US", "device_platform": "web", "generate_id": "same-id"})
+                self.assertEqual(call["options"]["headers"]["appid"], "513641")
+                self.assertEqual(call["options"]["body"], "{}")
+        call = self.execute_contexts([self.expression(paths[0], query={"aid": "513695"})], [us])["calls"][0]
+        self.assertNotIn("region", dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(call["url"]).query)))
+
+    def test_sg_or_unknown_mweb_context_keeps_original_query_and_headers(self):
+        contexts = [{}, {"sdk": {"code": "SG", "domain": {
+            "commerce_domain": "https://commerce-api-sg.capcut.com"}}},
+            {"sdk": {"code": "US", "domain": {
+                "commerce_domain": "https://commerce-us-ttp2.us.capcut.com:443"}}}]
+        expression = self.expression("/mweb/v1/aigc_draft/generate", query={"aid": "513695", "region": "SG"})
+        calls = self.execute_contexts([expression], contexts)["calls"]
+        for call in calls:
+            self.assertEqual(call["url"],
+                             "https://mweb-api-sg.capcut.com/mweb/v1/aigc_draft/generate?aid=513695&region=SG")
+            self.assertEqual(call["options"]["headers"], {"content-type": "application/json"})
+
+    def test_mweb_context_is_not_cached_or_retried_across_regions(self):
+        us = {"sdk": {"code": "US", "domain": {
+            "commerce_domain": "https://commerce-us-ttp2.us.capcut.com"}}}
+        expression = self.expression("/mweb/v1/aigc_draft/generate")
+        result = self.execute_contexts([expression], [us, {}, {**us, "throwFetch": True}])
+        self.assertEqual(len(result["calls"]), 3)
+        self.assertEqual([urllib.parse.urlsplit(c["url"]).hostname for c in result["calls"]],
+                         ["dreamina-api-us-ttp2.us.capcut.com", "mweb-api-sg.capcut.com",
+                          "dreamina-api-us-ttp2.us.capcut.com"])
+        self.assertEqual(json.loads(result["values"][-1]), {"transport_error": "fetch"})
+
+    def test_commerce_write_and_native_paths_keep_existing_transport(self):
+        us = {"sdk": {"code": "US", "domain": {
+            "commerce_domain": "https://commerce-us-ttp2.us.capcut.com"}}}
+        paths = ["/commerce/v1/benefits/credit_receive"]
+        for path in paths:
+            expression = self.expression(path)
+            self.assertNotIn("__locationInfo", expression)
+            call = self.execute_contexts([expression], [us])["calls"][0]
+            self.assertNotIn("appid", call["options"]["headers"])
+            self.assertEqual(call["url"], ("https://commerce-api-sg.capcut.com" if
+                             path.startswith("/commerce/") else "https://mweb-api-sg.capcut.com") + path)
+        native = self.expression(native_client=True)
+        self.assertNotIn("__locationInfo", native)
+        self.assertIn("req(545525).U(container,client)", native)
+        self.assertIn("https://commerce-api-sg.capcut.com/commerce/v1/benefits/user_credit", native)
+        native_generate = self.expression("/mweb/v1/aigc_draft/generate", native_client=True,
+                                          query={"region": "SG", "aid": "513695"})
+        self.assertNotIn("__locationInfo", native_generate)
+        self.assertIn("https://mweb-api-sg.capcut.com/mweb/v1/aigc_draft/generate", native_generate)
+        self.assertIn('"region": "SG"', native_generate)
 
 
 class BrowserTransportTests(unittest.TestCase):

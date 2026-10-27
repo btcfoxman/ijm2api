@@ -3,6 +3,17 @@
 from __future__ import annotations
 
 
+def upstream_review_error(code: str, message: str) -> str | None:
+    """Classify observed terminal review failures without inferring refunds."""
+    by_code = {"2059": "UPSTREAM_REVIEW_FAILED", "1064": "UPSTREAM_REVIEW_SERVICE_ERROR",
+               "2041": "UPSTREAM_IMAGE_REVIEW_FAILED"}
+    by_name = {"SafeCenterReviewFail": "UPSTREAM_REVIEW_FAILED",
+               "ReviewRpc": "UPSTREAM_REVIEW_SERVICE_ERROR",
+               "OutputImageRisk": "UPSTREAM_IMAGE_REVIEW_FAILED",
+               "This image may contain inappropriate content": "UPSTREAM_IMAGE_REVIEW_FAILED"}
+    return by_code.get(str(code or "").strip()) or by_name.get((message or "").strip())
+
+
 def public_error(code: str, message: str) -> dict[str, str]:
     raw = (message or "").lower()
     kind = (code or "").upper()
@@ -42,4 +53,14 @@ def public_error(code: str, message: str) -> dict[str, str]:
         return {"code": "MEDIA_UPLOAD_FAILED", "message": "上游维护中，请稍后再试~"}
     if kind in {"ACCOUNT_POOL_UNAVAILABLE", "BROWSERERROR", "ACCOUNT_MISSING"}:
         return {"code": kind, "message": "上游维护中，请稍后再试~"}
+    review_kind = kind if kind in {"UPSTREAM_REVIEW_FAILED", "UPSTREAM_REVIEW_SERVICE_ERROR",
+                                  "UPSTREAM_IMAGE_REVIEW_FAILED"} else None
+    if not review_kind and kind in {"UPSTREAM_FAILED", "2059", "1064", "2041", ""}:
+        review_kind = upstream_review_error(code, message)
+    if review_kind == "UPSTREAM_REVIEW_FAILED":
+        return {"code": review_kind, "message": "上游审核未通过，请检查提示词和参考素材后重试~"}
+    if review_kind == "UPSTREAM_REVIEW_SERVICE_ERROR":
+        return {"code": review_kind, "message": "上游审核服务异常，请稍后重试~"}
+    if review_kind == "UPSTREAM_IMAGE_REVIEW_FAILED":
+        return {"code": review_kind, "message": "上游图片内容审核未通过，请调整提示词或参考素材后重试~"}
     return {"code": kind or "UPSTREAM_FAILED", "message": "生成失败，积分已返还，请重试~"}

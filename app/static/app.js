@@ -5,7 +5,7 @@ function savedTaskLimit() {
     return Number.isInteger(value) && value >= 1 && value <= 1000 ? value : 50;
   } catch { return 50; }
 }
-const state = { accounts: [], tasks: [], models: [], settings: {}, accountFilter: "enabled", selectedModel: "sd-2-0-mini-480p", detail: null, auditKey: "caller_request", costReferences: [], taskLimit: savedTaskLimit() };
+const state = { accounts: [], tasks: [], models: [], settings: {}, loginJobs: [], batchReport: null, accountFilter: "enabled", selectedModel: "sd-2-0-mini-480p", detail: null, auditKey: "caller_request", costReferences: [], taskLimit: savedTaskLimit() };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const terminal = new Set(["succeeded", "failed", "expired"]);
@@ -27,7 +27,29 @@ function toast(message, error = false) { const item = $("#toast"); item.textCont
 function fmtTime(value) { return value ? new Date(Number(value) * 1000).toLocaleString() : "-"; }
 function fmtCost(value) { const number = Number(value || 0); return Number.isInteger(number) ? String(number) : number.toFixed(2).replace(/0+$/, "").replace(/\.$/, ""); }
 function elapsed(task) { const end = Number(task.completed_at || Date.now() / 1000); const total = Math.max(Math.floor(end - Number(task.created_at || end)), 0); return total < 60 ? `${total}秒` : `${Math.floor(total / 60)}分${total % 60}秒`; }
-function badge(status) { const labels = { active: "可用", pending: "待检测", login_pending: "待登录", logging_in: "登录中", login_failed: "登录失败", challenge_required: "需验证", profile_resetting: "重置中", queued: "排队", preparing: "准备", submitted: "已提交", running: "生成中", succeeded: "完成", failed: "失败", expired: "超时", login_required: "需登录", network_error: "网络异常", suspended: "上游封禁", disabled: "禁用", disabled_low_balance: "低额度" }; return `<span class="badge ${escapeHtml(status)}">${escapeHtml(labels[status] || status || "未知")}</span>`; }
+function badge(status) { const labels = { active: "可用", pending: "待检测", login_pending: "待登录", logging_in: "登录中", login_failed: "登录失败", challenge_required: "需验证", verification_required: "需安全验证", setup_required: "需设置", agreement_required: "待确认协议", profile_resetting: "重置中", queued: "排队", preparing: "准备", submitted: "已提交", running: "生成中", succeeded: "完成", failed: "失败", expired: "超时", login_required: "需登录", network_error: "网络异常", suspended: "上游封禁", disabled: "禁用", disabled_low_balance: "低额度" }; return `<span class="badge ${escapeHtml(status)}">${escapeHtml(labels[status] || status || "未知")}</span>`; }
+function loginStageLabel(stage) { const labels = { queued: "等待自动登录", opening_browser: "准备浏览器", browser: "准备浏览器", starting: "准备浏览器", login: "模拟登录", email: "输入邮箱", password: "输入密码", settings: "设置去水印和协议", logging_in: "模拟登录", authenticating: "验证登录", watermark: "关闭水印", agreement: "确认 AI 生成协议", verifying: "核验账号设置", ready: "登录及设置完成", interrupted: "已中断，可重试", setup_required: "设置未完成", agreement_required: "协议待确认", challenge_required: "需人工验证", verification_required: "需安全验证", login_required: "需重新登录", login_failed: "登录失败", network_error: "网络异常" }; return labels[stage] || stage || ""; }
+function loginProgress(account) {
+  const stage = loginStageLabel(account.login_stage);
+  if (!stage) return "";
+  return [stage, account.watermark_ready ? "去水印已就绪" : "", account.agreement_ready ? "协议已确认" : ""].filter(Boolean).join(" · ");
+}
+function renderBatchResult() {
+  if (!state.batchReport) return;
+  const report = state.batchReport;
+  const lines = [`共 ${report.input_count || 0} 行 / 保存 ${report.count || 0} / 重复 ${report.duplicate_count || 0} / 已排队 ${report.login_started_count || 0}`];
+  for (const row of report.results || []) {
+    const job = state.loginJobs.find((item) => Number(item.account_id) === Number(row.account_id));
+    const account = state.accounts.find((item) => Number(item.id) === Number(row.account_id));
+    const progress = job ? loginStageLabel(job.phase) : account ? loginStageLabel(account.login_stage) : "";
+    lines.push(`第 ${row.line} 行${row.account_id ? ` · #${row.account_id}` : ""}${row.login_identifier ? ` · ${row.login_identifier}` : ""}：${progress || row.message || "已处理"}${job?.message ? ` · ${job.message}` : ""}`);
+  }
+  lines.push(...(report.errors || []));
+  const panel = $("#batchResult");
+  panel.hidden = false;
+  panel.classList.toggle("error", Boolean(report.errors?.length));
+  panel.textContent = lines.join("\n");
+}
 function proxyLabel(value) { try { const url = new URL(value); return `${url.hostname}:${url.port}`; } catch { return value || "直连"; } }
 function failureMessage(task) {
   if (task.public_error?.message) return task.public_error.message;
@@ -45,13 +67,15 @@ function renderAccounts() {
   $("#accountsBody").innerHTML = items.map((account) => {
     const quota = account.balance_details || {};
     const detail = `VIP ${quota.vip_credit ?? 0} / Gift ${quota.gift_credit ?? 0} / Add-on ${quota.purchase_credit ?? 0}`;
-    return `<tr><td><span class="cell-title"><span class="account-id mono">#${account.id}</span>${escapeHtml(account.name)}</span><span class="cell-sub">${escapeHtml(account.email || account.user_id || "")}</span></td>
-      <td>${badge(account.enabled ? account.status : ["disabled_low_balance", "suspended"].includes(account.status) ? account.status : "disabled")}<span class="cell-sub" title="${escapeHtml(account.last_error)}">${escapeHtml(account.last_error)}</span></td>
+    const progress = loginProgress(account);
+    const visibleStatus = account.enabled || ["disabled_low_balance", "suspended", "logging_in", "login_pending", "login_required", "login_failed", "challenge_required", "verification_required", "setup_required", "agreement_required", "network_error"].includes(account.status) ? account.status : "disabled";
+    return `<tr><td><span class="cell-title"><span class="account-id mono">#${account.id}</span>${escapeHtml(account.name)}</span><span class="cell-sub">${escapeHtml(account.login_identifier || account.email || account.user_id || "")}</span></td>
+      <td>${badge(visibleStatus)}<span class="cell-sub" title="${escapeHtml([progress, account.last_error].filter(Boolean).join(" · "))}">${escapeHtml(account.last_error || progress)}</span></td>
       <td title="${escapeHtml(detail)}"><span class="cell-title mono">${escapeHtml(account.last_balance ?? "-")}</span><span class="cell-sub">${escapeHtml(detail)}</span></td>
       <td><input class="priority-input mono" data-account-priority="${account.id}" type="number" min="0" max="2147483647" step="1" value="${account.priority ?? 0}" title="优先级越高越先执行；相同优先级按余额和账号编号排序" aria-label="账号 #${account.id} 执行优先级"></td>
       <td><span class="slots ${account.active_tasks ? "busy" : ""}"><i></i><b class="mono">${account.active_tasks || 0} /</b><input class="concurrency-input mono" data-account-concurrency="${account.id}" type="number" min="1" value="${account.max_concurrency}" title="修改账号并发"></span></td><td class="mono">${account.total_uses || 0}</td>
       <td><span class="cell-title mono proxy" title="${escapeHtml(account.proxy_url)}">${escapeHtml(proxyLabel(account.proxy_url))}</span></td><td><span class="cell-title mono">${account.cdp_port || "自动"}</span><span class="cell-sub">${account.project_id || "打开视频项目"}</span></td><td>${fmtTime(account.updated_at)}</td>
-      <td><div class="row-actions"><button class="icon-button" data-action="check" data-id="${account.id}" title="检测"><i data-lucide="activity"></i></button><button class="icon-button" data-action="login" data-id="${account.id}" title="CDP 登录"><i data-lucide="monitor-up"></i></button><button class="icon-button" data-action="web-login" data-id="${account.id}" title="网页登录 / 打开账号网页"><i data-lucide="monitor"></i></button><button class="icon-button${account.status === "challenge_required" ? " needs-verification" : ""}" data-action="browser-assist" data-id="${account.id}" title="人工验证"><i data-lucide="mouse-pointer-2"></i></button><button class="icon-button" data-action="reset-profile" data-id="${account.id}" title="重置 Profile"><i data-lucide="fingerprint"></i></button><button class="icon-button" data-action="toggle" data-id="${account.id}" data-enabled="${account.enabled}" title="${account.enabled ? "禁用" : "启用"}"><i data-lucide="${account.enabled ? "pause" : "play"}"></i></button>${account.enabled ? "" : `<button class="icon-button danger" data-action="delete" data-id="${account.id}" title="删除"><i data-lucide="trash-2"></i></button>`}</div></td></tr>`;
+      <td><div class="row-actions">${account.password_configured ? `<button class="icon-button" data-action="auto-login" data-id="${account.id}" title="自动登录并完成去水印 / AI 协议设置"${account.status === "logging_in" ? " disabled" : ""}><i data-lucide="log-in"></i></button>` : ""}<button class="icon-button" data-action="check" data-id="${account.id}" title="检测"><i data-lucide="activity"></i></button><button class="icon-button" data-action="login" data-id="${account.id}" title="CDP 登录"><i data-lucide="monitor-up"></i></button><button class="icon-button" data-action="web-login" data-id="${account.id}" title="网页登录 / 打开账号网页"><i data-lucide="monitor"></i></button><button class="icon-button${account.status === "challenge_required" ? " needs-verification" : ""}" data-action="browser-assist" data-id="${account.id}" title="人工验证"><i data-lucide="mouse-pointer-2"></i></button><button class="icon-button" data-action="reset-profile" data-id="${account.id}" title="重置 Profile"><i data-lucide="fingerprint"></i></button><button class="icon-button" data-action="toggle" data-id="${account.id}" data-enabled="${account.enabled}" title="${account.enabled ? "禁用" : "启用"}"><i data-lucide="${account.enabled ? "pause" : "play"}"></i></button>${account.enabled ? "" : `<button class="icon-button danger" data-action="delete" data-id="${account.id}" title="删除"><i data-lucide="trash-2"></i></button>`}</div></td></tr>`;
   }).join("");
   $("#accountsEmpty").classList.toggle("show", !items.length); $("#metricAccounts").textContent = `${enabled.filter((item) => item.status === "active").length} / ${state.accounts.length}`;
   $("#metricBalance").textContent = state.accounts.reduce((sum, item) => sum + Number(item.last_balance || 0), 0).toLocaleString(); icons();
@@ -62,16 +86,21 @@ function mediaFromTask(task) {
   const results = (task.result_urls || []).map((url, index) => ({ kind: "video", label: `结果${index + 1}`, url, result: true })); return [...inputs, ...results];
 }
 function taskSpec(task) { const request = task.request || {}; return [task.model, request.duration ? `${request.duration}S` : "", request.resolution, request.aspect_ratio].filter(Boolean).join(" · "); }
+function costObservationCell(task) {
+  return globalThis.TaskCost?.cell(task.id, task.task_cost) || '<span class="cell-sub">未知</span>';
+}
+
 function renderTasks() {
   const items = state.tasks.slice(0, 20); $("#tasksBody").innerHTML = items.map((task) => {
     const media = mediaFromTask(task); const inputs = media.filter((item) => !item.result); const results = media.filter((item) => item.result);
     const result = task.status === "failed" || task.status === "expired" ? `<span class="error-stack"><span class="error-public">响应：${escapeHtml(failureMessage(task))}</span><span class="error-upstream" title="${escapeHtml(task.error_message)}">上游：${escapeHtml(task.error_message || "未知错误")}</span></span>` : `<span class="result-links">${results.map((item) => `<a href="${escapeHtml(item.url)}" target="_blank">视${results.length > 1 ? results.indexOf(item) + 1 : ""}</a>`).join("")}</span>`;
     return `<tr><td><button class="cell-title link-button mono" data-action="detail" data-id="${escapeHtml(task.id)}">${escapeHtml(task.id.slice(0, 20))}</button><span class="cell-sub mono">${escapeHtml((task.channel || "待分配").toUpperCase())}${task.account_id ? ` · #${task.account_id} · ${escapeHtml(task.account_name || "")}` : ""}</span></td>
-      <td class="prompt-cell"><span class="cell-title" title="${escapeHtml(task.prompt)}">${escapeHtml(task.prompt || "-")}</span><span class="task-meta-line"><span class="task-spec">${escapeHtml(taskSpec(task))}</span>${inputs.length ? `<span class="media-text">${inputs.map((item, index) => `<button data-action="media" data-id="${escapeHtml(task.id)}" data-media-index="${index}">${{ image: "图", video: "视", audio: "音" }[item.kind]}${item.label}</button>`).join(" ")}</span>` : ""}</span></td>
+      <td class="prompt-cell"><span class="cell-title" title="${escapeHtml(task.prompt)}">${escapeHtml(task.prompt || "-")}</span><span class="task-meta-line"><span class="task-spec">${escapeHtml(taskSpec(task))}</span>${inputs.length ? `<span class="media-text">${inputs.map((item, index) => `<button data-action="media" data-id="${escapeHtml(task.id)}" data-media-index="${index}">${{ image: "图", video: "视", audio: "音" }[item.kind]}${item.label}</button>`).join(" ")}</span>` : ""}</span></td><td class="task-cost-column">${costObservationCell(task)}</td>
       <td>${badge(task.status)}</td><td><div class="progress-stack"><span class="progress-value"><b class="mono">${task.progress || 0}%</b><span class="progress-track"><i style="width:${Math.min(Number(task.progress || 0), 100)}%"></i></span></span><span class="elapsed">${terminal.has(task.status) ? "耗时" : "已用"} ${elapsed(task)}</span></div></td>
       <td><span class="time-stack"><span>创建 ${fmtTime(task.created_at)}</span><span>更新 ${fmtTime(task.updated_at)}</span></span></td><td>${result}</td></tr>`;
   }).join("");
   $("#tasksEmpty").classList.toggle("show", !items.length); $("#taskCount").textContent = `最近 ${items.length} 条`; $("#metricRunning").textContent = items.filter((item) => !terminal.has(item.status)).length; $("#metricComplete").textContent = items.filter((item) => item.status === "succeeded").length; icons();
+  globalThis.TaskCost?.hydrate(document, {});
 }
 
 function defaultPayload() {
@@ -106,12 +135,21 @@ function previewMedia(item, anchor) { if (!item) return; const popover = $("#med
 
 function renderCosts() { const rows = state.costReferences || []; $("#costReferenceBody").innerHTML = rows.map((item) => { const builtin = item.source === "builtin_rate"; return `<tr><td class="mono">${escapeHtml(item.model)}</td><td class="mono">${builtin ? "按整秒" : `${item.duration || 0}S`}</td><td>${escapeHtml(item.resolution || "-")}</td><td><strong class="cost-value mono">${builtin ? `⌊${fmtCost(item.rate_per_second)} × 秒数⌋` : fmtCost(item.cost)}</strong></td><td class="mono">${builtin ? "-" : fmtCost(item.latest_cost)}</td><td>${builtin ? "内置" : item.samples || 0}</td><td>${fmtTime(item.updated_at)}</td><td class="mono">${escapeHtml(String(item.last_task_id || "-").slice(0, 18))}</td></tr>`; }).join(""); $("#costReferenceEmpty").classList.toggle("show", !rows.length); $("#costReferenceStatus").textContent = `${rows.length} 条参考`; }
 
-async function refresh() { $("#refreshStatus").textContent = "刷新中..."; try { const [accounts, tasks, models, settings] = await Promise.all([api("/api/accounts"), api(`/api/tasks?limit=${state.taskLimit}`), api("/api/models"), api("/api/settings")]); Object.assign(state, { accounts, tasks, models, settings }); renderAccounts(); renderTasks(); $("#metricModels").textContent = models.length; $("#refreshStatus").textContent = `更新于 ${new Date().toLocaleTimeString()}`; } catch (error) { toast(error.message, true); $("#refreshStatus").textContent = "刷新失败"; } }
-async function accountAction(button) { const id = Number(button.dataset.id); try { if (button.dataset.action === "delete") { if (!confirm("确认删除该账号及托管 Profile？")) return; await api(`/api/accounts/${id}`, { method: "DELETE" }); } else if (button.dataset.action === "toggle") await api(`/api/accounts/${id}`, { method: "PATCH", body: JSON.stringify({ enabled: button.dataset.enabled !== "true" }) }); else if (button.dataset.action === "login") await api(`/api/accounts/${id}/cdp/reconnect`, { method: "POST" }); else if (button.dataset.action === "check") await api(`/api/accounts/${id}/check`, { method: "POST" }); else if (button.dataset.action === "reset-profile") { const account = state.accounts.find((item) => item.id === id); const form = $("#profileResetForm"); form.account_id.value = id; form.proxy_url.value = account.proxy_url || ""; $("#profileResetAccount").textContent = `#${id} · ${account.name}`; $("#profileResetStatus").textContent = account.status; $("#profileResetDialog").showModal(); return; } toast("操作已提交"); await refresh(); } catch (error) { toast(error.message, true); } }
+async function refresh() {
+  $("#refreshStatus").textContent = "刷新中...";
+  try {
+    const [accounts, tasks, models, settings, loginResults] = await Promise.all([api("/api/accounts"), api(`/api/tasks?limit=${state.taskLimit}`), api("/api/models"), api("/api/settings"), api("/api/accounts/login-results")]);
+    Object.assign(state, { accounts, tasks, models, settings, loginJobs: loginResults.jobs || [] });
+    renderAccounts(); renderTasks(); renderBatchResult();
+    $("#metricModels").textContent = models.length;
+    $("#refreshStatus").textContent = `更新于 ${new Date().toLocaleTimeString()}`;
+  } catch (error) { toast(error.message, true); $("#refreshStatus").textContent = "刷新失败"; }
+}
+async function accountAction(button) { const id = Number(button.dataset.id); try { if (button.dataset.action === "delete") { if (!confirm("确认删除该账号及托管 Profile？")) return; await api(`/api/accounts/${id}`, { method: "DELETE" }); } else if (button.dataset.action === "toggle") await api(`/api/accounts/${id}`, { method: "PATCH", body: JSON.stringify({ enabled: button.dataset.enabled !== "true" }) }); else if (button.dataset.action === "auto-login") await api(`/api/accounts/${id}/auto-login`, { method: "POST" }); else if (button.dataset.action === "login") await api(`/api/accounts/${id}/cdp/reconnect`, { method: "POST" }); else if (button.dataset.action === "check") await api(`/api/accounts/${id}/check`, { method: "POST" }); else if (button.dataset.action === "reset-profile") { const account = state.accounts.find((item) => item.id === id); const form = $("#profileResetForm"); form.account_id.value = id; form.proxy_url.value = account.proxy_url || ""; $("#profileResetAccount").textContent = `#${id} · ${account.name}`; $("#profileResetStatus").textContent = account.status; $("#profileResetDialog").showModal(); return; } toast("操作已提交"); await refresh(); } catch (error) { toast(error.message, true); } }
 
 document.addEventListener("click", async (event) => {
   const close = event.target.closest(".close"); if (close) close.closest("dialog")?.close();
-  const accountButton = event.target.closest("[data-action='check'],[data-action='login'],[data-action='reset-profile'],[data-action='toggle'],[data-action='delete']"); if (accountButton) await accountAction(accountButton);
+  const accountButton = event.target.closest("[data-action='auto-login'],[data-action='check'],[data-action='login'],[data-action='reset-profile'],[data-action='toggle'],[data-action='delete']"); if (accountButton) await accountAction(accountButton);
   const detail = event.target.closest("[data-action='detail']"); if (detail) try { showDetail(await api(`/api/tasks/${detail.dataset.id}`)); } catch (error) { toast(error.message, true); }
   const media = event.target.closest("[data-action='media']"); if (media) { const task = state.tasks.find((item) => item.id === media.dataset.id); previewMedia(mediaFromTask(task).filter((item) => !item.result)[Number(media.dataset.mediaIndex)], media); }
   const detailMedia = event.target.closest("[data-detail-media]"); if (detailMedia) { const request = state.detail.request || {}; const items = [...(request._images || []).map((item) => ({ ...item, kind: "image" })), ...(request._videos || []).map((item) => ({ ...item, kind: "video" })), ...(request._audio || []).map((item) => ({ ...item, kind: "audio" }))]; previewMedia(items[Number(detailMedia.dataset.detailMedia)], detailMedia); }
@@ -153,7 +191,7 @@ $("#taskLimit").addEventListener("change", () => {
   refresh();
 });
 $("#addAccountButton").addEventListener("click", () => { $("#accountForm").reset(); $("#accountForm").elements.namedItem("max_concurrency").value = 1; $("#accountDialog").showModal(); });
-$("#batchButton").addEventListener("click", () => { $("#batchResult").hidden = true; $("#batchResult").textContent = ""; $("#batchDialog").showModal(); });
+$("#batchButton").addEventListener("click", () => { renderBatchResult(); $("#batchDialog").showModal(); });
 $("#newTaskButton").addEventListener("click", () => { renderModels(); validateJson(); $("#taskDialog").showModal(); }); $("#requestJson").addEventListener("input", validateJson);
 $("#settingsButton").addEventListener("click", () => {
   const form = $("#settingsForm");
@@ -172,7 +210,17 @@ $("#integrationDocsButton").addEventListener("click", async () => { try { $("#in
 $("#copyIntegrationDocs").addEventListener("click", async () => { await navigator.clipboard.writeText($("#integrationDocsContent").textContent); toast("Markdown 已复制"); });
 $("#costReferenceButton").addEventListener("click", async () => { $("#costReferenceDialog").showModal(); state.costReferences = await api("/api/model-costs?limit=500"); renderCosts(); }); $("#costReferenceRefresh").addEventListener("click", async () => { state.costReferences = await api("/api/model-costs?limit=500"); renderCosts(); });
 $("#accountForm").addEventListener("submit", async (event) => { event.preventDefault(); const data = Object.fromEntries(new FormData(event.currentTarget)); try { data.max_concurrency = Number(data.max_concurrency || 1); data.cdp_port = Number(data.cdp_port || 0); await api("/api/accounts", { method: "POST", body: JSON.stringify(data) }); event.currentTarget.reset(); $("#accountDialog").close(); toast("Account saved. Open web login next."); await refresh(); } catch (error) { toast(error.message, true); } });
-$("#batchForm").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; const panel = $("#batchResult"); try { const result = await api("/api/accounts/batch-import", { method: "POST", body: JSON.stringify({ text: form.elements.namedItem("text").value }) }); const errorText = (result.errors || []).join("\n"); panel.hidden = false; panel.classList.toggle("error", Boolean(errorText)); panel.textContent = `Input ${result.input_count} / Saved ${result.count}${errorText ? `\n${errorText}` : ""}`; await refresh(); if (!errorText) setTimeout(() => $("#batchDialog").close(), 700); } catch (error) { panel.hidden = false; panel.classList.add("error"); panel.textContent = error.message; toast(error.message, true); } });
+$("#batchForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget; const panel = $("#batchResult"); const submit = form.querySelector("button[type=submit]");
+  submit.disabled = true;
+  try {
+    state.batchReport = await api("/api/accounts/batch-import", { method: "POST", body: JSON.stringify({ text: form.elements.namedItem("text").value }) });
+    form.elements.namedItem("text").value = "";
+    renderBatchResult(); await refresh();
+  } catch (error) { panel.hidden = false; panel.classList.add("error"); panel.textContent = error.message; toast(error.message, true); }
+  finally { submit.disabled = false; }
+});
 $("#profileResetForm").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; try { await api(`/api/accounts/${form.account_id.value}/profile/reset`, { method: "POST", body: JSON.stringify({ proxy_url: form.proxy_url.value || null, start_login: form.start_login.checked }) }); $("#profileResetDialog").close(); toast("Profile 已重置"); await refresh(); } catch (error) { toast(error.message, true); } });
 $("#settingsForm").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -206,3 +254,6 @@ $("#taskForm").addEventListener("submit", async (event) => { event.preventDefaul
 $("#clearTasks").addEventListener("click", async () => { try { const result = await api("/api/tasks", { method: "DELETE" }); toast(`已清理 ${result.deleted} 个任务`); await refresh(); } catch (error) { toast(error.message, true); } });
 
 icons(); refresh(); setInterval(refresh, 8000);
+
+// Shared task cost presentation: advisory only, independent of generation.
+globalThis.TaskCost?.hydrate(document, {});

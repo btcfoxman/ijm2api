@@ -51,7 +51,7 @@ MODELS = {item.id: item for item in (
 
 RATIOS = {"16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "9:21"}
 ALIASES = re.compile(
-    r"(?<![\w<])(?P<explicit>@)?(?P<kind>视频|video|v|视|图片|image|img|图|音频|audio|音)\s*(?P<index>\d+)(?!\w)",
+    r"(?<![A-Za-z0-9_<@])(?P<explicit>@)?(?P<kind>视频|video|v|视|图片|image|img|图|音频|audio|音)\s*(?P<index>\d+)(?![A-Za-z0-9_\d])",
     re.I,
 )
 

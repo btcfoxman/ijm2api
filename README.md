@@ -10,9 +10,12 @@ launcher `ijm.bat` uses port 20002, so the matching server proxy is
 ## Deploy
 
 Create `/home/btcfoxman/docker/ijm2api/.env` from `.env.example` with unique
-credentials. The `pre` branch runs `.github/workflows/deploy-test.yml` on the
-`ijm2api-pre` self-hosted runner, builds the Docker image, starts port 8808,
-and installs `ijm2api.aiid.edu.kg` into cloudflared. The public management
+credentials. The `pre` branch runs `.github/workflows/deploy-test.yml`: a
+GitHub-hosted runner runs the complete checks and builds and publishes the SHA
+image. The `ijm2api-pre` self-hosted runner only pulls that image and restarts
+port 8808 after tasks and logins become idle. Deployment preserves the existing
+Compose layers, `.env`, data, Chrome profiles, and Cloudflared ingress at
+`ijm2api.aiid.edu.kg`, with a database backup and image rollback. The public management
 page redirects to `/login`; `/health` is unauthenticated.
 
 Use **在线添加账号** with a name and account proxy, sign in through the embedded
@@ -22,6 +25,41 @@ video submission, polling, credit checks and daily check-in share its CDP
 session. A service restart restores it from the persisted profile. Existing
 sessions can also be copied into the account's managed profile by an
 administrator. API credentials and Chrome profiles must stay outside Git.
+
+### Batch account login
+
+The account page's **批量导入** accepts one account per line:
+
+```text
+person@example.com|password|socks5://host.docker.internal:20003
+another@example.com|password
+```
+
+The proxy column is optional. Existing accounts retain their assigned proxy;
+new accounts without a proxy use the least-used exit from ports 20001–20022
+and 20031–20040 on `host.docker.internal`. Explicit proxies are retained,
+validated, and never silently exchanged for another exit. The legacy
+`name|proxy` format remains available for manual browser authorization.
+
+Email/password imports queue ordinary browser logins with two concurrent jobs,
+separate account profiles, and the selected proxy. The account remains disabled
+until its login identity, credit read, watermark preference, and AI-content
+agreement state are confirmed. The importer does not take over active video
+tasks, change an existing account's identity, or overwrite another profile.
+Duplicates are reported, and failed jobs can use **自动登录** to retry.
+Passwords are private database fields and are excluded from management APIs,
+batch results, logs, and exports. A successful import clears the form's password
+textarea. Verification challenges and unknown dialogs remain available for
+manual browser completion rather than reporting a false success.
+
+The account preparation uses the observed website settings and verifies the
+saved state. It never presses Generate to elicit the AI agreement dialog:
+confirming that dialog may continue a pending paid generation. Video submission
+also checks the saved preferences before sending its single generation request.
+
+Admin API endpoints are `POST /api/accounts/batch-import` with `{ "text": "..." }`,
+`POST /api/accounts/{id}/auto-login`, and `GET /api/accounts/login-results`.
+Readiness fields are service-managed and cannot be set through account PATCH.
 
 ## API
 
@@ -120,3 +158,13 @@ Only 2.0 Mini, 2.0 Standard, 2.5 Standard and 2.5 Preview were seen in
 this trace. Fast, 1080p and 4K aliases use inferred protocol mappings and
 require their own upstream acceptance checks if Dreamina changes model
 availability.
+
+## 视频消耗观测
+
+任务管理列表新增“消耗额度”，区分账单实耗、可信独占余额差、上游报价、公式与未知值。失败任务的可信扣款也进入观测；只有明确退款凭据才冲减。历史 `actual_cost` 可能保存报价，不能直接视作真实支出。参考视频秒数使用实际上传素材元数据，解析不到时保留未知。
+
+管理台“实时消耗表”打开 `/api/cost-reference/page`；本地 SQLite 观测缓存独立于任务清理保存，默认 30 秒刷新。配置独立的 `IJM_COST_SYNC_TOKEN` 后，聚合端可通过 `GET /internal/cost-observations?cursor=0&limit=500` 携带 `Authorization: Bearer <token>` 增量读取；普通 API 密钥不接受为成本同步密钥。导出只包含计费维度及费用证据，不含账号、提示词或素材 URL。
+
+容器使用现有 Compose 的 `env_file: .env` 读取此密钥；把键加入部署目录 `.env` 后，在更新镜像时重新创建该服务容器。`Dockerfile` 已复制整个 `app`，费用模块及 HTML 随镜像发布，SQLite 缓存保存在挂载的 `./data`。镜像标签由发布命令临时设置 `IMAGE_REGISTRY`、`IMAGE_NAMESPACE`、`IMAGE_NAME`、`IMAGE_TAG`，不写进应用 `.env`。
+
+该功能仅供手动路由调价参考，不提交付费测试任务，也不更改路由、调度或并发。未知额度不按零处理。

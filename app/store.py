@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -10,6 +11,11 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import MODELS
+from .account_import import masked_email, normalize_email
+
+
+ACCOUNT_SECRET_FIELDS = {"login_email", "login_password", "login_enable_after", "cookie", "cookies", "user_agent"}
+ACCOUNT_SETUP_FIELDS = {"login_stage", "watermark_ready", "agreement_ready", "setup_checked_at"}
 
 
 def _json(value: Any) -> str:
@@ -89,6 +95,14 @@ class Store:
                 db.execute("ALTER TABLE accounts ADD COLUMN managed_profile INTEGER NOT NULL DEFAULT 0")
             if "priority" not in {row[1] for row in db.execute("PRAGMA table_info(accounts)")}:
                 db.execute("ALTER TABLE accounts ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+            account_columns = {row[1] for row in db.execute("PRAGMA table_info(accounts)")}
+            for name, declaration in (("login_email", "TEXT NOT NULL DEFAULT ''"),
+                    ("login_password", "TEXT NOT NULL DEFAULT ''"), ("login_stage", "TEXT NOT NULL DEFAULT ''"),
+                    ("watermark_ready", "INTEGER NOT NULL DEFAULT 0"), ("agreement_ready", "INTEGER NOT NULL DEFAULT 0"),
+                    ("setup_checked_at", "REAL NOT NULL DEFAULT 0"), ("login_enable_after", "INTEGER DEFAULT NULL")):
+                if name not in account_columns:
+                    db.execute(f"ALTER TABLE accounts ADD COLUMN {name} {declaration}")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS accounts_login_email ON accounts(LOWER(login_email)) WHERE login_email<>''")
             columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
             for name, default in (("upstream_result_json", "[]"),
                                   ("result_transfer_json", "{}"),
@@ -110,6 +124,14 @@ class Store:
     @staticmethod
     def _account(row: sqlite3.Row) -> dict[str, Any]:
         value = dict(row)
+        email = str(value.get("login_email") or "")
+        value["email_configured"] = bool(email)
+        value["password_configured"] = bool(value.get("login_password"))
+        value["login_identifier"] = masked_email(email)
+        for key in ACCOUNT_SECRET_FIELDS:
+            value.pop(key, None)
+        for key in ("watermark_ready", "agreement_ready"):
+            value[key] = bool(value.get(key))
         value["enabled"] = bool(value["enabled"])
         value["managed_profile"] = bool(value["managed_profile"])
         value["balance_details"] = json.loads(value.pop("balance_details_json"))
@@ -172,10 +194,13 @@ class Store:
         if not 1 <= max_concurrency <= 50:
             raise ValueError("max_concurrency must be between 1 and 50")
         priority = _priority(payload["priority"]) if "priority" in payload else None
+        credentials = self._credential_values(payload)
         now = time.time()
         with self._lock, self._connect() as db:
             old = db.execute("SELECT * FROM accounts WHERE name=?", (name,)).fetchone()
             if old:
+                credentials = self._credential_values(payload, old)
+                self._assert_credentials_idle(db, old, credentials)
                 if old["managed_profile"] and str(payload.get("proxy_url", old["proxy_url"])) != old["proxy_url"]:
                     raise ValueError("online account proxy change requires profile reset")
                 values = {"proxy_url": payload.get("proxy_url", old["proxy_url"]),
@@ -197,7 +222,84 @@ class Store:
                      max_concurrency, priority if priority is not None else 0,
                      int(bool(payload.get("enabled", True))), now))
                 account_id = int(cursor.lastrowid)
+                if credentials:
+                    db.execute("UPDATE accounts SET enabled=0,status='pending',managed_profile=1 WHERE id=?", (account_id,))
+            if credentials:
+                db.execute("UPDATE accounts SET " + ",".join(f"{key}=?" for key in credentials) + " WHERE id=?",
+                           (*credentials.values(), account_id))
+                if old and any(old[key] != value for key, value in credentials.items()):
+                    status = "disabled" if not old["enabled"] and old["status"] == "disabled" else "pending"
+                    db.execute("UPDATE accounts SET enabled=0,status=?,managed_profile=1,login_stage='',"
+                               "watermark_ready=0,agreement_ready=0,setup_checked_at=0,login_enable_after=NULL WHERE id=?", (status, account_id))
         return self.account(account_id) or {}
+
+    @staticmethod
+    def _credential_values(payload: dict[str, Any], old: sqlite3.Row | dict[str, Any] | None = None) -> dict[str, str]:
+        values = {}
+        if payload.get("login_email"):
+            values["login_email"] = normalize_email(payload["login_email"])
+            if old and old["login_email"] and values["login_email"] != old["login_email"]:
+                raise ValueError("login identity change requires a separate account")
+        if payload.get("login_password"):
+            password = str(payload["login_password"])
+            if "\x00" in password:
+                raise ValueError("password contains an invalid character")
+            values["login_password"] = password
+        return values
+
+    @staticmethod
+    def _assert_credentials_idle(db: sqlite3.Connection, old: sqlite3.Row, values: dict[str, Any]) -> None:
+        if not any(old[key] != value for key, value in values.items()):
+            return
+        busy = db.execute("SELECT COUNT(*) FROM tasks WHERE account_id=? AND status IN ('preparing','submitted','running','submission_unknown')",
+                          (old["id"],)).fetchone()[0]
+        if busy or old["status"] in {"active", "login_pending", "logging_in", "profile_resetting"}:
+            raise ValueError("account identity is protected while active or in use")
+        if old["cdp_port"] and not old["managed_profile"]:
+            raise ValueError("external profile requires an explicit profile reset before credential import")
+
+    def find_import_account(self, email: str, name: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            if email:
+                rows = db.execute("SELECT * FROM accounts WHERE LOWER(login_email)=? OR (login_email='' AND LOWER(name)=?)",
+                                  (email.casefold(), email.casefold())).fetchall()
+                if len(rows) > 1:
+                    raise ValueError("multiple existing accounts match the login identity")
+                row = rows[0] if rows else None
+            else:
+                row = db.execute("SELECT * FROM accounts WHERE name=?", (name,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def import_account(self, payload: dict[str, Any], *, busy: bool = False) -> tuple[dict[str, Any], bool]:
+        """Called under the service login lock; retain existing profiles and proxies."""
+        with self._lock:
+            existing = self.find_import_account(payload.get("login_email", ""), payload["name"])
+            if existing:
+                credentials = self._credential_values(payload, existing)
+                changed = any(existing[key] != value for key, value in credentials.items())
+                if existing["proxy_url"] and payload["proxy_url"] != existing["proxy_url"]:
+                    raise ValueError("existing proxy requires an explicit profile reset")
+                proxy_changed = payload["proxy_url"] != existing["proxy_url"]
+                if proxy_changed and (existing["cdp_port"] or existing["managed_profile"]):
+                    raise ValueError("existing profile proxy cannot be replaced")
+                if not changed and not proxy_changed:
+                    return self.account(existing["id"]) or {}, False
+                if busy or self.active_account_count(existing["id"]) or existing["status"] in {
+                        "active", "logging_in", "login_pending", "profile_resetting"}:
+                    raise ValueError("account is active or in use")
+                values = {**credentials, "proxy_url": payload["proxy_url"]}
+                if credentials:
+                    status = "disabled" if not existing["enabled"] and existing["status"] == "disabled" else "pending"
+                    values.update(enabled=False, managed_profile=True, status=status, login_stage="",
+                                  watermark_ready=False, agreement_ready=False, setup_checked_at=0)
+                return self.update_account(existing["id"], values), True
+            with self._connect() as db:
+                collision = db.execute("SELECT id FROM accounts WHERE name=?", (payload["name"],)).fetchone()
+            if collision:
+                raise ValueError("account name belongs to a different login identity")
+            account = self.upsert_account({key: value for key, value in payload.items()
+                if key in {"name", "proxy_url", "login_email", "login_password"}})
+            return account, True
 
     def create_pending_account(self, name: str, proxy_url: str,
                                max_concurrency: int = 1) -> dict[str, Any]:
@@ -221,11 +323,11 @@ class Store:
     def active_account_count(self, account_id: int) -> int:
         with self._connect() as db:
             return int(db.execute("""SELECT COUNT(*) FROM tasks WHERE account_id=?
-                AND status IN ('preparing','submitted','running')""", (account_id,)).fetchone()[0])
+                AND status IN ('preparing','submitted','running','submission_unknown')""", (account_id,)).fetchone()[0])
 
     def update_account(self, account_id: int, values: dict[str, Any]) -> dict[str, Any]:
         allowed = {"name", "cdp_port", "proxy_url", "project_id", "max_concurrency", "priority", "managed_profile",
-                   "enabled", "status", "balance", "last_error", "last_checkin_date"}
+                   "enabled", "status", "balance", "last_error", "last_checkin_date", "login_enable_after", *ACCOUNT_SETUP_FIELDS}
         data = {key: value for key, value in values.items() if key in allowed}
         if "max_concurrency" in data and not 1 <= int(data["max_concurrency"]) <= 50:
             raise ValueError("max_concurrency must be between 1 and 50")
@@ -233,8 +335,32 @@ class Store:
             data["priority"] = _priority(data["priority"])
         if "balance_details" in values:
             data["balance_details_json"] = _json(values["balance_details"])
+        for key in ("watermark_ready", "agreement_ready"):
+            if key in data:
+                if not isinstance(data[key], (bool, int)) or data[key] not in (False, True):
+                    raise ValueError("setup readiness must be a boolean")
+                data[key] = int(data[key])
+        if "login_enable_after" in data and data["login_enable_after"] is not None:
+            intent = data["login_enable_after"]
+            if not isinstance(intent, (bool, int)) or intent not in (False, True):
+                raise ValueError("login enable intent must be a boolean or null")
+            data["login_enable_after"] = int(intent)
+        if "setup_checked_at" in data:
+            data["setup_checked_at"] = float(data["setup_checked_at"] or 0)
+            if not math.isfinite(data["setup_checked_at"]) or data["setup_checked_at"] < 0:
+                raise ValueError("invalid setup check time")
         data["updated_at"] = time.time()
         with self._lock, self._connect() as db:
+            old = db.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+            if old is None:
+                raise KeyError(account_id)
+            credentials = self._credential_values(values, old)
+            self._assert_credentials_idle(db, old, credentials)
+            data.update(credentials)
+            if any(old[key] != value for key, value in credentials.items()):
+                status = "disabled" if not old["enabled"] and old["status"] == "disabled" else "pending"
+                data.update(enabled=0, managed_profile=1, status=status, login_stage="",
+                            watermark_ready=0, agreement_ready=0, setup_checked_at=0, login_enable_after=None)
             cursor = db.execute("UPDATE accounts SET " + ",".join(f"{key}=?" for key in data) + " WHERE id=?",
                                 (*data.values(), account_id))
             if not cursor.rowcount:
@@ -304,6 +430,12 @@ class Store:
             data["result_transfer_json"] = _json(values["result_transfer"])
         if "attempted_account_ids" in values:
             data["attempted_account_ids_json"] = _json(values["attempted_account_ids"])
+        if "cost_evidence" in values:
+            current = self.task(task_id) or {}
+            normalized = dict(current.get("normalized") or {})
+            normalized["_cost_evidence"] = {
+                **normalized.get("_cost_evidence", {}), **values["cost_evidence"]}
+            data["normalized_json"] = _json(normalized)
         data["updated_at"] = time.time()
         with self._lock, self._connect() as db:
             db.execute("UPDATE tasks SET " + ",".join(f"{key}=?" for key in data) + " WHERE id=?",
