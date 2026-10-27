@@ -489,7 +489,7 @@ class AccountAutomation:
             if stage == 'unknown':
                 if unknown_since is None:
                     unknown_since = time.monotonic()
-                if time.monotonic() - unknown_since < 5:
+                if time.monotonic() - unknown_since < 30:
                     # Login and optional-dialog animations can leave an
                     # unrecognized wrapper briefly. Only wait: never click,
                     # fill, or verify identity through an unknown panel.
@@ -524,18 +524,19 @@ class AccountAutomation:
                 if actions & {'email', 'password'}:
                     raise AutomationError('login_failed', 'Dreamina login returned to its start after credentials were submitted')
                 attempt = navigation[stage]
-                if now - attempt['at'] >= 8:
-                    if attempt['count'] >= 3:
-                        raise AutomationError('login_required', 'Dreamina login panel did not open')
+                # A false result only checked readiness; no navigation was
+                # sent. Once three real/uncertain actions are spent, wait
+                # for their delayed result until the overall deadline.
+                if attempt['count'] < 3 and now - attempt['at'] >= 8:
                     callback('login')
-                    attempt['count'] += 1
                     attempt['at'] = now
                     try:
-                        self._action(stage, email, password)
+                        if self._action(stage, email, password):
+                            attempt['count'] += 1
                     except BrowserError:
                         # An uncertain navigation cannot create a video or
                         # send credentials; the next fresh stage decides.
-                        pass
+                        attempt['count'] += 1
             elif stage in {'email', 'password'} and stage not in actions:
                 callback(stage if stage in {'email', 'password'} else 'login')
                 if self._action(stage, email, password):

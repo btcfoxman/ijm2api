@@ -384,7 +384,8 @@ class LoginTests(unittest.TestCase):
             with self.assertRaises(AutomationError) as caught:
                 automation.run(ACCOUNT['login_email'], 'synthetic-password')
         self.assertEqual(caught.exception.status, 'setup_required')
-        self.assertLess(clock[0], 5.5)
+        self.assertGreaterEqual(clock[0], 30)
+        self.assertLess(clock[0], 30.5)
         action.assert_called_once_with('promotion', ACCOUNT['login_email'], 'synthetic-password')
 
     def test_password_exit_unknown_animation_only_waits_then_verifies_identity(self):
@@ -393,7 +394,7 @@ class LoginTests(unittest.TestCase):
         browser.evaluate.side_effect = lambda expression, **_: (IDENTITY.copy() if authenticated[0] else {'authenticated': False}) if expression == _IDENTITY else {'stage': 'waiting'}
         automation = AccountAutomation(ACCOUNT, browser=browser)
         clock, count = [0.0], [0]
-        sequence = ['password', 'unknown', 'unknown', 'waiting']
+        sequence = ['password', *['unknown'] * 10, 'waiting']
 
         def view():
             stage = sequence[min(count[0], len(sequence) - 1)]
@@ -412,6 +413,8 @@ class LoginTests(unittest.TestCase):
             result = automation.run(ACCOUNT['login_email'], 'synthetic-password')
         self.assertIs(result['identity_verified'], True)
         self.assertEqual(result['identity']['user_id'], IDENTITY['user_id'])
+        self.assertGreater(clock[0], 5)
+        self.assertLess(clock[0], 30)
         submit.assert_called_once_with('password', ACCOUNT['login_email'], 'synthetic-password')
         browser.post.assert_called_once_with('/mweb/v1/get_settings', {})
 
@@ -431,7 +434,8 @@ class LoginTests(unittest.TestCase):
             with self.assertRaises(AutomationError) as caught:
                 automation.run(ACCOUNT['login_email'], 'synthetic-password')
         self.assertEqual(caught.exception.status, 'setup_required')
-        self.assertLess(clock[0], 5.5)
+        self.assertGreaterEqual(clock[0], 30)
+        self.assertLess(clock[0], 30.5)
         identity.assert_called_once_with()
         submit.assert_called_once_with('password', ACCOUNT['login_email'], 'synthetic-password')
         automation.browser.post.assert_not_called()
@@ -505,8 +509,52 @@ class LoginTests(unittest.TestCase):
                         automation.run(ACCOUNT['login_email'], 'synthetic-password')
                 self.assertEqual(caught.exception.status, 'login_required')
                 self.assertEqual(action.call_count, 3)
-                self.assertGreaterEqual(clock[0], 24)
-                self.assertLess(clock[0], 30)
+                self.assertGreaterEqual(clock[0], automation.timeout)
+                self.assertLess(clock[0], automation.timeout + 1)
+
+    def test_navigation_not_dispatched_does_not_spend_real_click_budget(self):
+        clock, state = [0.0], {'attempts': 0, 'authenticated': False}
+        automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
+        attempt_times = []
+
+        def action(stage, *_):
+            self.assertEqual(stage, 'signed_out')
+            state['attempts'] += 1
+            attempt_times.append(clock[0])
+            if state['attempts'] < 5:
+                return False
+            state['authenticated'] = True
+            return True
+
+        with patch.object(automation, '_view', side_effect=lambda: {'stage': 'waiting' if state['authenticated'] else 'signed_out'}), \
+             patch.object(automation, '_identity', side_effect=lambda: IDENTITY.copy() if state['authenticated'] else None), \
+             patch.object(automation, '_action', side_effect=action), \
+             patch.object(automation, 'ensure_ready', return_value={'identity_verified': True}), \
+             patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]), \
+             patch('app.account_automation.time.sleep', side_effect=lambda _: clock.__setitem__(0, clock[0] + 1)):
+            result = automation.run(ACCOUNT['login_email'], 'synthetic-password')
+        self.assertIs(result['identity_verified'], True)
+        self.assertEqual(attempt_times, [0, 8, 16, 24, 32])
+
+    def test_spent_navigation_budget_waits_for_late_panel_without_more_navigation(self):
+        clock, count = [0.0], [0]
+        automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
+
+        def action(stage, *_):
+            self.assertEqual(stage, 'signed_out')
+            count[0] += 1
+            return True
+
+        with patch.object(automation, '_view', side_effect=lambda: {'stage': 'waiting' if clock[0] >= 35 else 'signed_out'}), \
+             patch.object(automation, '_identity', side_effect=lambda: IDENTITY.copy() if clock[0] >= 35 else None), \
+             patch.object(automation, '_action', side_effect=action), \
+             patch.object(automation, 'ensure_ready', return_value={'identity_verified': True}), \
+             patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]), \
+             patch('app.account_automation.time.sleep', side_effect=lambda _: clock.__setitem__(0, clock[0] + 1)):
+            result = automation.run(ACCOUNT['login_email'], 'synthetic-password')
+        self.assertIs(result['identity_verified'], True)
+        self.assertEqual(count[0], 3)
+        self.assertGreaterEqual(clock[0], 35)
 
     def test_ignored_first_login_open_recovers_without_replaying_credentials(self):
         clock, state = [0.0], {'stage': 'signed_out', 'opens': 0, 'authenticated': False}
