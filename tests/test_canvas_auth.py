@@ -334,6 +334,7 @@ def test_legacy_profile_is_verified_before_cli_identity_and_preserves_enabled_in
     automation.return_value.ensure_ready.return_value = {'identity_verified': True,
         'watermark_ready': True, 'agreement_ready': True,
         'identity': {'user_id': 'legacy-verified-id'}}
+    automation.return_value.read_ready.return_value = automation.return_value.ensure_ready.return_value
     monkeypatch.setattr('app.canvas_auth.AccountAutomation', automation)
 
     def identity():
@@ -371,7 +372,7 @@ def test_legacy_security_challenge_fails_without_cli_or_paid_submission(context,
     store, service, client, browser, manager, identifier = context
     store.update_account(identifier, {'login_user_id': '', 'watermark_ready': False, 'agreement_ready': False})
     automation = Mock()
-    automation.return_value.ensure_ready.side_effect = AutomationError(stage, 'private-cookie=secret')
+    automation.return_value.read_ready.side_effect = AutomationError(stage, 'private-cookie=secret')
     monkeypatch.setattr('app.canvas_auth.AccountAutomation', automation)
     execute(context)
     saved = store.account(identifier, private=True)
@@ -383,6 +384,7 @@ def test_legacy_security_challenge_fails_without_cli_or_paid_submission(context,
     client.identity.assert_not_called()
     client.auth_start.assert_not_called()
     client.submit.assert_not_called()
+    automation.return_value.ensure_ready.assert_not_called()
 
 
 @pytest.mark.parametrize('user_id', ['0', 0, None, '', True])
@@ -392,6 +394,7 @@ def test_legacy_zero_or_invalid_identity_never_fakes_verified_setup(context, mon
     automation = Mock()
     automation.return_value.ensure_ready.return_value = {'identity_verified': True,
         'watermark_ready': True, 'agreement_ready': True, 'identity': {'user_id': user_id}}
+    automation.return_value.read_ready.return_value = automation.return_value.ensure_ready.return_value
     monkeypatch.setattr('app.canvas_auth.AccountAutomation', automation)
     execute(context)
     saved = store.account(identifier, private=True)
@@ -402,6 +405,7 @@ def test_legacy_zero_or_invalid_identity_never_fakes_verified_setup(context, mon
     client.identity.assert_not_called()
     client.auth_start.assert_not_called()
     client.submit.assert_not_called()
+    automation.return_value.ensure_ready.assert_not_called()
 
 
 @pytest.mark.parametrize('missing', ['identity_verified', 'watermark_ready', 'agreement_ready'])
@@ -412,6 +416,7 @@ def test_legacy_missing_evidence_does_not_publish_ready_flags(context, monkeypat
         'identity': {'user_id': 'legacy-id'}, missing: False}
     automation = Mock()
     automation.return_value.ensure_ready.return_value = evidence
+    automation.return_value.read_ready.return_value = evidence
     monkeypatch.setattr('app.canvas_auth.AccountAutomation', automation)
     execute(context)
     saved = store.account(identifier, private=True)
@@ -432,3 +437,136 @@ def test_legacy_migration_never_borrows_an_account_in_manual_login(context, monk
     automation.assert_not_called()
     client.identity.assert_not_called()
     assert service.browser_runtime.open == service.browser_runtime.closed == 0
+
+
+def test_legacy_cold_sdk_waits_for_real_identity_before_setting_confirmation(context, monkeypatch):
+    from app.account_automation import AutomationError
+    store, service, client, browser, manager, identifier = context
+    store.update_account(identifier, {'login_user_id': '', 'watermark_ready': False, 'agreement_ready': False})
+    clock = [0.0]
+    monkeypatch.setattr('app.canvas_auth.time.monotonic', lambda: clock[0])
+    manager.timeout = 60
+    evidence = {'identity_verified': True, 'watermark_ready': True, 'agreement_ready': True,
+        'identity': {'user_id': 'late-sdk-id'}}
+    automation = Mock()
+
+    def read():
+        assert service.browser_runtime.open == 1
+        assert store.account(identifier, private=True)['login_user_id'] == ''
+        if clock[0] < 18:
+            automation.return_value.ensure_ready.assert_not_called()
+            raise AutomationError('login_required', 'Dreamina identity read could not complete')
+        return evidence
+
+    def ensure():
+        assert clock[0] == 18
+        assert automation.return_value.read_ready.call_count == 19
+        return evidence
+
+    automation.return_value.read_ready.side_effect = read
+    automation.return_value.ensure_ready.side_effect = ensure
+    monkeypatch.setattr('app.canvas_auth.AccountAutomation', automation)
+    client.identity.return_value = {'id': 'late-sdk-id', 'credits': 20}
+    manager.start(identifier)
+    monkeypatch.setattr(manager._jobs[identifier]['cancel'], 'wait',
+        Mock(side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay) or False))
+    manager._run(identifier)
+    assert manager.status(identifier)['state'] == 'ready'
+    automation.return_value.ensure_ready.assert_called_once_with()
+    assert service.browser_runtime.open == 0 and service.browser_runtime.closed == 1
+    assert store.account(identifier, private=True)['login_user_id'] == 'late-sdk-id'
+    client.auth_start.assert_not_called()
+    client.submit.assert_not_called()
+
+
+@pytest.mark.parametrize('status,message', [
+    ('login_required', 'Dreamina login session has not been verified'),
+    ('login_required', 'Dreamina signed-in identity does not match this account'),
+    ('challenge_required', 'Dreamina login requires a human security challenge'),
+    ('verification_required', 'Dreamina login requires email or security verification'),
+    ('setup_required', 'Dreamina identity read could not complete'),
+])
+def test_legacy_definitive_authentication_errors_are_never_retried(context, monkeypatch, status, message):
+    from app.account_automation import AutomationError
+    store, service, client, browser, manager, identifier = context
+    store.update_account(identifier, {'login_user_id': '', 'watermark_ready': False, 'agreement_ready': False})
+    automation = Mock()
+    automation.return_value.read_ready.side_effect = AutomationError(status, message)
+    monkeypatch.setattr('app.canvas_auth.AccountAutomation', automation)
+    manager.start(identifier)
+    pause = Mock(side_effect=AssertionError('definitive rejection was retried'))
+    monkeypatch.setattr(manager._jobs[identifier]['cancel'], 'wait', pause)
+    manager._run(identifier)
+    assert manager.status(identifier)['state'] == 'failed'
+    automation.return_value.read_ready.assert_called_once_with()
+    automation.return_value.ensure_ready.assert_not_called()
+    pause.assert_not_called()
+    client.identity.assert_not_called()
+    assert service.browser_runtime.open == 0 and service.browser_runtime.closed == 1
+
+
+@pytest.mark.parametrize('overall,expected', [(60, 30), (7, 7)])
+def test_legacy_sdk_wait_is_bounded_by_thirty_seconds_and_overall_deadline(context, monkeypatch, overall, expected):
+    from app.account_automation import AutomationError
+    store, service, client, browser, manager, identifier = context
+    store.update_account(identifier, {'login_user_id': '', 'watermark_ready': False, 'agreement_ready': False})
+    clock = [0.0]
+    monkeypatch.setattr('app.canvas_auth.time.monotonic', lambda: clock[0])
+    manager.timeout = overall
+    automation = Mock()
+    automation.return_value.read_ready.side_effect = AutomationError('login_required',
+        'Dreamina identity read could not complete')
+    monkeypatch.setattr('app.canvas_auth.AccountAutomation', automation)
+    manager.start(identifier)
+    monkeypatch.setattr(manager._jobs[identifier]['cancel'], 'wait',
+        Mock(side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay) or False))
+    manager._run(identifier)
+    assert manager.status(identifier)['state'] == 'failed'
+    assert clock[0] == expected
+    automation.return_value.ensure_ready.assert_not_called()
+    client.identity.assert_not_called()
+    assert service.browser_runtime.open == 0 and service.browser_runtime.closed == 1
+
+
+def test_cancelling_legacy_sdk_wait_releases_browser_without_confirming_settings(context, monkeypatch):
+    from app.account_automation import AutomationError
+    store, service, client, browser, manager, identifier = context
+    store.update_account(identifier, {'login_user_id': '', 'watermark_ready': False, 'agreement_ready': False})
+    automation = Mock()
+    automation.return_value.read_ready.side_effect = AutomationError('login_required',
+        'Dreamina identity read could not complete')
+    monkeypatch.setattr('app.canvas_auth.AccountAutomation', automation)
+    manager.start(identifier)
+    monkeypatch.setattr(manager._jobs[identifier]['cancel'], 'wait',
+        Mock(side_effect=lambda delay: manager.cancel(identifier) or True))
+    manager._run(identifier)
+    assert manager.status(identifier)['state'] == 'cancelled'
+    automation.return_value.read_ready.assert_called_once_with()
+    automation.return_value.ensure_ready.assert_not_called()
+    client.identity.assert_not_called()
+    assert service.browser_runtime.open == 0 and service.browser_runtime.closed == 1
+
+
+@pytest.mark.parametrize('interrupt', ['cancel', 'deadline'])
+def test_legacy_identity_response_after_interruption_cannot_confirm_settings(context, monkeypatch, interrupt):
+    store, service, client, browser, manager, identifier = context
+    store.update_account(identifier, {'login_user_id': '', 'watermark_ready': False, 'agreement_ready': False})
+    clock = [0.0]
+    monkeypatch.setattr('app.canvas_auth.time.monotonic', lambda: clock[0])
+    automation = Mock()
+
+    def read():
+        if interrupt == 'cancel':
+            manager.cancel(identifier)
+        else:
+            clock[0] = 31
+        return {'identity_verified': True, 'watermark_ready': True, 'agreement_ready': True,
+            'identity': {'user_id': 'real-but-too-late'}}
+
+    automation.return_value.read_ready.side_effect = read
+    monkeypatch.setattr('app.canvas_auth.AccountAutomation', automation)
+    execute(context)
+    assert manager.status(identifier)['state'] == ('cancelled' if interrupt == 'cancel' else 'failed')
+    automation.return_value.ensure_ready.assert_not_called()
+    client.identity.assert_not_called()
+    assert service.browser_runtime.open == 0 and service.browser_runtime.closed == 1

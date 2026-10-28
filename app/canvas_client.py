@@ -247,7 +247,7 @@ class CanvasClient:
                 return _data(self.runner.run(self.account, args, timeout=timeout))
             except CanvasCLIError as exc:
                 error = exc.details.get("error", {})
-                transient = (exc.code in {"CLI_COMMAND_TIMEOUT", "CLI_INVALID_RESPONSE"}
+                transient = (exc.code in {"CLI_COMMAND_TIMEOUT", "CLI_INVALID_RESPONSE", "cli.invalid_service_response"}
                              or bool(error.get("retryable")) and error.get("reason") in _TRANSIENT)
                 if not read_only or attempt == 2 or not transient:
                     raise
@@ -349,7 +349,7 @@ class CanvasClient:
                     if check.code == "MEDIA_UPLOAD_FAILED":
                         raise check
                 error = exc.details.get("error", {})
-                retryable = (exc.code in {"CLI_COMMAND_TIMEOUT", "CLI_INVALID_RESPONSE", "MEDIA_UPLOAD_PENDING"}
+                retryable = (exc.code in {"CLI_COMMAND_TIMEOUT", "CLI_INVALID_RESPONSE", "MEDIA_UPLOAD_PENDING", "cli.invalid_service_response"}
                              or bool(error.get("retryable")))
                 if attempt == 2 or not retryable:
                     raise
@@ -431,8 +431,19 @@ class CanvasClient:
             raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "An existing Canvas submission must only be queried", outcome_unknown=True)
         if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < int(context["quoted_credits"]):
             raise CanvasCLIError("CLI_CREDIT_CEILING_EXCEEDED", "Canvas quote exceeds the authorized credit ceiling")
-        confirmed = self._call(["node", "confirm", "--project-id", context["project_id"],
-                                "--node-id", context["node_id"], "--credit-ceiling", str(ceiling)])
+        # Official node confirm mints only a spending-ceiling token. It never
+        # launches generation; a lost/invalid confirmation response may be
+        # retried for the same node and ceiling. This exception must not extend
+        # to node run, whose acceptance could have been lost after charging.
+        for attempt in range(3):
+            try:
+                confirmed = self._call(["node", "confirm", "--project-id", context["project_id"],
+                                        "--node-id", context["node_id"], "--credit-ceiling", str(ceiling)])
+                break
+            except CanvasCLIError as exc:
+                if exc.code != "cli.invalid_service_response" or attempt == 2:
+                    raise
+                time.sleep(0.25 * 2 ** attempt)
         token = confirmed.get("creditConfirmationToken")
         if not isinstance(token, str) or not token:
             raise CanvasCLIError("CLI_CONFIRMATION_INVALID", "Canvas did not issue a credit confirmation token")

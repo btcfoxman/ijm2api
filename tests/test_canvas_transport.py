@@ -449,3 +449,82 @@ def test_unsupported_proxy_input_cannot_change_routing_or_drop_auth(tmp_path, ur
     with pytest.raises(CanvasCLIError):
         runner._proxy_config({**ACCOUNT, "proxy_url": url})
     assert not list(runner.account_directory(ACCOUNT).glob("proxy/*.conf"))
+
+
+def test_invalid_service_response_retries_only_read_calls(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.canvas_client.time.sleep", lambda _: None)
+    runner = FakeRunner(tmp_path)
+    original = runner.run
+    failures = 2
+    def interrupted(account, args, timeout=None):
+        nonlocal failures
+        if args[:2] == ["model", "list"] and failures:
+            runner.calls.append(args)
+            failures -= 1
+            raise CanvasCLIError("cli.invalid_service_response", "The service returned an invalid response")
+        return original(account, args, timeout=timeout)
+    runner.run = interrupted
+    assert CanvasClient(runner, ACCOUNT).capabilities()[0]["model"] == "seedance_2.0_mini"
+    assert len(runner.calls) == 3
+    assert all(args[:2] == ["model", "list"] for args in runner.calls)
+
+
+def test_invalid_upload_response_looks_up_then_retries_original_id(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.canvas_client.time.sleep", lambda _: None)
+    runner = FakeRunner(tmp_path)
+    original = runner.run
+    first = True
+    lookup_missing = False
+    def interrupted(account, args, timeout=None):
+        nonlocal first, lookup_missing
+        if args[:2] == ["resource", "upload"] and first:
+            first, lookup_missing = False, True
+            runner.calls.append(args)
+            raise CanvasCLIError("cli.invalid_service_response", "The service returned an invalid response")
+        if args[:2] == ["resource", "get"] and lookup_missing:
+            lookup_missing = False
+            runner.calls.append(args)
+            raise CanvasCLIError("cli.resource_unavailable", "Resource not registered")
+        return original(account, args, timeout=timeout)
+    runner.run = interrupted
+    source = tmp_path / "input.png"
+    source.write_bytes(b"image")
+    context = CanvasClient(runner, ACCOUNT).prepare(request(), "ijm_retry_upload",
+        {"images": [str(source)], "videos": [], "audios": []}, persist=runner.persisted.append)
+    uploads = [(index, args) for index, args in enumerate(runner.calls) if args[:2] == ["resource", "upload"]]
+    assert len(uploads) == 2 and uploads[0][1] == uploads[1][1]
+    resource_id = uploads[0][1][-1]
+    assert runner.calls[uploads[0][0] + 1][2] == resource_id
+    assert context["uploaded_resources"] == [resource_id]
+    assert not any(args[:2] == ["node", "run"] for args in runner.calls)
+
+
+def test_invalid_confirmation_response_retries_tokens_then_runs_once(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.canvas_client.time.sleep", lambda _: None)
+    runner, client, context = prepare(tmp_path)
+    original = runner.run
+    failures = 2
+    def interrupted(account, args, timeout=None):
+        nonlocal failures
+        if args[:2] == ["node", "confirm"] and failures:
+            runner.calls.append(args)
+            failures -= 1
+            raise CanvasCLIError("cli.invalid_service_response", "The service returned an invalid response")
+        return original(account, args, timeout=timeout)
+    runner.run = interrupted
+    accepted = client.submit(context, 20)
+    assert accepted["phase"] == "accepted"
+    confirms = [args for args in runner.calls if args[:2] == ["node", "confirm"]]
+    assert len(confirms) == 3 and confirms[0] == confirms[1] == confirms[2]
+    assert sum(args[:2] == ["node", "run"] for args in runner.calls) == 1
+
+
+def test_invalid_paid_run_response_is_not_replayed(tmp_path):
+    runner, client, context = prepare(tmp_path)
+    runner.run_failure = CanvasCLIError("cli.invalid_service_response", "The service returned an invalid response",
+                                       outcome_unknown=True)
+    with pytest.raises(CanvasCLIError) as found:
+        client.submit(context, 20)
+    assert found.value.outcome_unknown
+    assert sum(args[:2] == ["node", "confirm"] for args in runner.calls) == 1
+    assert sum(args[:2] == ["node", "run"] for args in runner.calls) == 1

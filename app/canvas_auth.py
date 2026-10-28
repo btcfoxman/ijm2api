@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 import websocket
 
 from .browser import BrowserError, _targets
-from .account_automation import AccountAutomation
+from .account_automation import AccountAutomation, AutomationError
 from .auto_login import verified_login_user_id
 
 
@@ -298,8 +298,17 @@ class CanvasAuthManager:
                     'CLI 授权已取消' if cancel.is_set() or self._closed else '账号浏览器暂忙，请稍后重试授权')
                 return None
             with self.service.browser_runtime.lease(account) as browser_account:
-                evidence = AccountAutomation(browser_account, self.service.settings(),
-                    allow_initial_identity=True).ensure_ready()
+                automation = AccountAutomation(browser_account, self.service.settings(),
+                    allow_initial_identity=True)
+                # CDP and even document.readyState=complete can precede the
+                # website's first real Passport SDK request. Wait on a safe
+                # identity read, without guessing an SDK URL or mutating settings.
+                initial = self._wait_browser_identity(automation,
+                    min(deadline, time.monotonic() + 30), cancel)
+                if initial is None or cancel.is_set() or self._closed:
+                    self._publish(account_id, 'cancelled', 'CLI 授权已取消')
+                    return None
+                evidence = automation.ensure_ready()
                 user_id = verified_login_user_id(evidence) if isinstance(evidence, dict) else ''
                 if (not user_id or evidence.get('identity_verified') is not True
                         or evidence.get('watermark_ready') is not True
@@ -330,6 +339,32 @@ class CanvasAuthManager:
         finally:
             if owns_slot:
                 self._browser_slots.release()
+
+    def _wait_browser_identity(self, automation: Any, deadline: float,
+                               cancel: threading.Event) -> dict | None:
+        while not cancel.is_set() and not self._closed:
+            if time.monotonic() >= deadline:
+                raise AutomationError('login_required', 'Dreamina identity read could not complete')
+            try:
+                evidence = automation.read_ready()
+            except AutomationError as exc:
+                if (exc.status != 'login_required'
+                        or str(exc) != 'Dreamina identity read could not complete'):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                cancel.wait(min(1, remaining))
+                continue
+            if (not isinstance(evidence, dict) or evidence.get('identity_verified') is not True
+                    or not verified_login_user_id(evidence)):
+                raise AutomationError('login_required', 'Dreamina login session has not been verified')
+            if cancel.is_set() or self._closed:
+                return None
+            if time.monotonic() >= deadline:
+                raise AutomationError('login_required', 'Dreamina identity read could not complete')
+            return evidence
+        return None
 
     def _await_authorization(self, account_id: int, account: dict, client: Any,
                              device_code: str, deadline: float, browser: Any = None) -> None:
