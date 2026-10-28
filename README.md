@@ -72,6 +72,19 @@ directory and verifies SHA256 using `tools/install_canvas_cli.py`. The running
 service never downloads or upgrades the CLI. Builds and full validation run on
 GitHub Actions; the deployment host only pulls and restarts the built image.
 
+Canvas embeds native ImageX/VOD clients that do not consistently honor HTTP
+proxy environment variables. The image also pins upstream
+[graftcp 0.8.3](https://github.com/hmgle/graftcp/releases/tag/v0.8.3), installed
+by `tools/install_canvas_proxy.py` from its release archive with both archive
+and executable SHA256 verification. Account CLI children use this process-local
+tracer with the selected account proxy; it installs no host-wide proxy or
+network rules. The upstream GPL license and source reference are included at
+`/usr/local/share/doc/graftcp/`. CI verifies tracer startup before building.
+The current 3.5 pre container supports tracing its own child under its existing
+capabilities and default seccomp profile; `SYS_PTRACE`, `SYS_ADMIN` and
+`privileged` are not required or added. A tracing/proxy failure keeps CLI
+submission unavailable instead of silently falling back to a direct connection.
+
 ### Batch account login
 
 The account page's **批量导入** accepts one account per line:
@@ -191,10 +204,13 @@ resolution and media count. Account concurrency defaults to 1 and can be
 raised to 50; global worker and queue limits are configurable. A full queue
 returns HTTP 429 before submitting upstream. An interrupted upstream submit
 is marked outcome unknown and is not automatically repeated.
-Credit reads before and after a task are best effort: a failed read does not
+In explicit browser mode, credit reads before and after a task are best effort: a failed read does not
 block video submission or hide a completed result. When either read fails,
 that task's actual credit cost is left unknown instead of using a stale cached
 balance to calculate it.
+Canvas CLI requires an explicit available balance before paid submission;
+partial account responses receive bounded read retries and remain unknown if
+the upstream omits the credit fields.
 
 ## Evidence and protocol
 

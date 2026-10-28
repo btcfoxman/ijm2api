@@ -121,13 +121,13 @@ def test_isolated_environments_and_invalidation(tmp_path, monkeypatch):
     monkeypatch.setenv("ALL_PROXY", "http://ambient:9999")
     monkeypatch.setenv("NO_PROXY", "*")
     monkeypatch.setenv("OPENAI_API_KEY", "do-not-inherit")
-    runner = CanvasCLI(tmp_path)
+    runner = CanvasCLI(tmp_path, allow_unwrapped_for_tests=True)
     first = runner.environment(ACCOUNT)
     other = runner.environment({**ACCOUNT, "id": 6})
     assert first["HOME"] != other["HOME"]
     assert first["DREAMINA_CANVAS_STATE_DIR"] != other["DREAMINA_CANVAS_STATE_DIR"]
-    assert first["HTTPS_PROXY"] == "socks5h://user:secret@127.0.0.1:20005"
-    assert first["NO_PROXY"] != "*"
+    assert "HTTPS_PROXY" not in first and "HTTP_PROXY" not in first
+    assert "NO_PROXY" not in first and "http_proxy" not in first
     assert "ALL_PROXY" not in first and "OPENAI_API_KEY" not in first
     profile = runner.profile(ACCOUNT)
     (runner.account_directory(ACCOUNT) / "old-business.json").write_text("keep me")
@@ -146,7 +146,7 @@ def patch_process(monkeypatch, program):
 def test_runner_reads_error_json_from_stderr_and_redacts(monkeypatch, tmp_path):
     patch_process(monkeypatch, "import sys,json;sys.stderr.write(json.dumps({'ok':False,'error':{'code':'bad','message':'https://user:pass@example.test/path?token=secret','accessToken':'secret'}}));sys.exit(21)")
     with pytest.raises(CanvasCLIError) as found:
-        CanvasCLI(tmp_path).run(ACCOUNT, ["node", "run"])
+        CanvasCLI(tmp_path, allow_unwrapped_for_tests=True).run(ACCOUNT, ["node", "run"])
     assert found.value.outcome_unknown
     assert "secret" not in str(found.value) and "pass@" not in str(found.value)
     assert found.value.details["error"]["accessToken"] == "[redacted]"
@@ -164,14 +164,14 @@ def test_run_outcome_is_conservative(monkeypatch, tmp_path, error, exit_code, un
     value = json.dumps({"ok": False, "error": error})
     patch_process(monkeypatch, f"import sys;sys.stderr.write({value!r});sys.exit({exit_code})")
     with pytest.raises(CanvasCLIError) as found:
-        CanvasCLI(tmp_path).run(ACCOUNT, ["node", "run"])
+        CanvasCLI(tmp_path, allow_unwrapped_for_tests=True).run(ACCOUNT, ["node", "run"])
     assert found.value.outcome_unknown is unknown
 
 
 def test_runner_output_limit(monkeypatch, tmp_path):
     patch_process(monkeypatch, "import sys;sys.stdout.write('x'*1000000)")
     with pytest.raises(CanvasCLIError) as found:
-        CanvasCLI(tmp_path, max_output_bytes=1024).run(ACCOUNT, ["node", "run"])
+        CanvasCLI(tmp_path, max_output_bytes=1024, allow_unwrapped_for_tests=True).run(ACCOUNT, ["node", "run"])
     assert found.value.code == "CLI_OUTPUT_LIMIT" and found.value.outcome_unknown
 
 
@@ -263,7 +263,7 @@ def test_partial_acceptance_keeps_unknown_even_with_rejection_reason(monkeypatch
                         "partialData": {"items": [{"state": "accepted", "resources": [{"resourceId": "one"}]}]}})
     patch_process(monkeypatch, f"import sys;sys.stderr.write({value!r});sys.exit(2)")
     with pytest.raises(CanvasCLIError) as found:
-        CanvasCLI(tmp_path).run(ACCOUNT, ["node", "run"])
+        CanvasCLI(tmp_path, allow_unwrapped_for_tests=True).run(ACCOUNT, ["node", "run"])
     assert found.value.outcome_unknown
 
 
@@ -290,7 +290,7 @@ def test_failed_diagnostic_does_not_hide_terminal_generation_failure(tmp_path, m
 
 
 def test_runtime_probe_rejects_wrong_distribution(tmp_path, monkeypatch):
-    runner = CanvasCLI(tmp_path)
+    runner = CanvasCLI(tmp_path, allow_unwrapped_for_tests=True)
     monkeypatch.setattr(runner, "run", lambda *a, **k: {"data": {
         "version": "1.2.0", "distribution": "cn", "edition": "public"}})
     with pytest.raises(CanvasCLIError) as found:
@@ -377,3 +377,75 @@ def test_identity_only_uses_consistent_explicit_aggregate_balance(monkeypatch, f
     monkeypatch.setattr("app.canvas_client.time.sleep", lambda _: None)
     identity = CanvasClient(IdentityRunner([{"userId": 42, **fields}]), ACCOUNT).identity()
     assert identity["available_balance"] == expected
+
+
+def test_protected_command_uses_private_account_proxy_config_and_cleans_it(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.canvas_cli.sys.platform", "linux")
+    actual = subprocess.Popen
+    captured = {}
+    def protected_popen(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        config = Path(command[2])
+        captured["config"] = config
+        captured["text"] = config.read_text()
+        if os.name != "nt":
+            assert config.stat().st_mode & 0o777 == 0o600
+            assert config.parent.stat().st_mode & 0o777 == 0o700
+        return actual([sys.executable, "-c", "print('{\"ok\":true,\"data\":{}}')"], **kwargs)
+    monkeypatch.setattr("app.canvas_cli.subprocess.Popen", protected_popen)
+    runner = CanvasCLI(tmp_path, proxy_binary="/pinned/graftcp")
+    runner.run(ACCOUNT, ["auth", "status"])
+    assert captured["command"][:2] == ["/pinned/graftcp", "--config"]
+    assert captured["command"][3:5] == ["--", "dreamina-canvas"]
+    assert "secret" not in " ".join(captured["command"])
+    assert not any("proxy" in key.lower() for key in captured["env"])
+    assert "select_proxy_mode = only_socks5" in captured["text"]
+    assert "socks5 = 127.0.0.1:20005" in captured["text"]
+    assert "socks5_password = secret" in captured["text"]
+    assert "dns_proxy = true" in captured["text"] and "udp_proxy = true" in captured["text"]
+    assert "ignore_local = false" in captured["text"]
+    assert not captured["config"].exists()
+
+
+def test_missing_proxy_wrapper_never_runs_bare_cli(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.canvas_cli.sys.platform", "linux")
+    commands = []
+    def unavailable(command, **kwargs):
+        commands.append(command)
+        raise FileNotFoundError("not installed")
+    monkeypatch.setattr("app.canvas_cli.subprocess.Popen", unavailable)
+    runner = CanvasCLI(tmp_path, proxy_binary="/missing/graftcp")
+    with pytest.raises(CanvasCLIError) as found:
+        runner.run(ACCOUNT, ["auth", "status"])
+    assert found.value.code == "CLI_PROXY_WRAPPER_UNAVAILABLE"
+    assert len(commands) == 1 and commands[0][0] == "/missing/graftcp"
+    assert not list(runner.account_directory(ACCOUNT).glob("proxy/*.conf"))
+
+
+def test_proxy_configs_are_per_account_and_http_has_no_direct_fallback(tmp_path):
+    runner = CanvasCLI(tmp_path)
+    first = runner._proxy_config(ACCOUNT)
+    other = runner._proxy_config({**ACCOUNT, "id": 6, "proxy_url": "http://127.0.0.1:20006"})
+    try:
+        assert first.parent != other.parent
+        assert "only_socks5" in first.read_text() and "only_http_proxy" in other.read_text()
+        assert "http_proxy = 127.0.0.1:20006" in other.read_text()
+        assert "secret" not in other.read_text()
+        assert " = direct" not in other.read_text() and " = auto" not in other.read_text()
+    finally:
+        first.unlink()
+        other.unlink()
+
+
+@pytest.mark.parametrize("url", [
+    "socks5://user:secret%0Aselect_proxy_mode%3Ddirect@127.0.0.1:20005",
+    "socks5://user:%20secret@127.0.0.1:20005",
+    "http://user:secret@127.0.0.1:20005",
+    "https://127.0.0.1:20005",
+])
+def test_unsupported_proxy_input_cannot_change_routing_or_drop_auth(tmp_path, url):
+    runner = CanvasCLI(tmp_path)
+    with pytest.raises(CanvasCLIError):
+        runner._proxy_config({**ACCOUNT, "proxy_url": url})
+    assert not list(runner.account_directory(ACCOUNT).glob("proxy/*.conf"))

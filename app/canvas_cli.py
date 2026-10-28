@@ -13,15 +13,17 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 
 PINNED_VERSION = "1.2.0"
+PINNED_PROXY_VERSION = "0.8.3"
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 _SECRET_KEY = re.compile(r"token|password|secret|authorization|cookie|devicecode|privatekey", re.I)
 _PROFILE = re.compile(r"[A-Za-z0-9_.-]{1,80}\Z")
@@ -116,9 +118,15 @@ def account_proxy(account: dict[str, Any]) -> str:
 
 class CanvasCLI:
     def __init__(self, data_dir: str | Path, binary: str | None = None, *,
-                 timeout: float = 120, max_output_bytes: int = MAX_OUTPUT_BYTES) -> None:
+                 timeout: float = 120, max_output_bytes: int = MAX_OUTPUT_BYTES,
+                 proxy_binary: str | None = None, allow_unwrapped_for_tests: bool = False) -> None:
         self.data_dir = Path(data_dir).resolve()
         self.binary = binary or os.getenv("IJM_CANVAS_CLI_BINARY", "dreamina-canvas")
+        self.proxy_binary = (proxy_binary if proxy_binary is not None
+                             else os.getenv("IJM_CANVAS_PROXY_BINARY", "/usr/local/bin/graftcp"))
+        # This constructor-only seam is for fake subprocess tests on machines
+        # without Linux ptrace. There is no settings/environment/API bypass.
+        self._allow_unwrapped_for_tests = bool(allow_unwrapped_for_tests)
         self.timeout = max(1, float(timeout))
         self.max_output_bytes = max(1024, int(max_output_bytes))
         self._guard = threading.Lock()
@@ -172,7 +180,9 @@ class CanvasCLI:
                 or any(name not in commands or not flags <= commands[name] for name, flags in required.items())):
             raise CanvasCLIError("CLI_RUNTIME_INCOMPATIBLE", "Canvas CLI is missing required command contracts")
         return {"available": True, "version": version["version"], "commit": version.get("commit"),
-                "distribution": version["distribution"], "schema_version": str(schema["schemaVersion"])}
+                "distribution": version["distribution"], "schema_version": str(schema["schemaVersion"]),
+                "proxy_transport": "test_unwrapped" if self._allow_unwrapped_for_tests else "graftcp",
+                "proxy_version": None if self._allow_unwrapped_for_tests else PINNED_PROXY_VERSION}
 
     def profile(self, account: dict[str, Any]) -> str:
         """The epoch also isolates OS keyring entries after an account reset."""
@@ -237,11 +247,43 @@ class CanvasCLI:
                     "DREAMINA_CANVAS_STATE_DIR": str(directory / "business"),
                     "TMPDIR": str(directory / "tmp"), "TMP": str(directory / "tmp"),
                     "TEMP": str(directory / "tmp"), "BROWSER": "false"})
-        proxy = account_proxy(account)
-        env.update({"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy,
-                    "http_proxy": proxy, "https_proxy": proxy,
-                    "NO_PROXY": "localhost,127.0.0.1,::1", "no_proxy": "localhost,127.0.0.1,::1"})
+        account_proxy(account)
+        # graftcp owns every socket (including Go SDK transports with Proxy=nil).
+        # HTTP_PROXY here would send an already proxied CLI connection through
+        # the account proxy a second time. Never inherit ambient proxy options.
+        env["GOMAXPROCS"] = "2"
         return env
+
+    def _proxy_config(self, account: dict[str, Any]) -> Path:
+        parsed = urlsplit(account_proxy(account))
+        host = str(parsed.hostname)
+        endpoint = f"[{host}]:{parsed.port}" if ":" in host else f"{host}:{parsed.port}"
+        lines = ["dns_proxy = true", "dns_server = 1.1.1.1:53", "udp_proxy = true",
+                 "ignore_local = false"]
+        if parsed.scheme in {"socks5", "socks5h"}:
+            user, password = unquote(parsed.username or ""), unquote(parsed.password or "")
+            # v0.8.3's config parser trims field values and has no quoting. A
+            # decoded newline must never become another routing/config option.
+            if any(value != value.strip() or any(c in value for c in "\r\n\x00")
+                   or len(value.encode("utf-8")) > 255 for value in (user, password)):
+                raise CanvasCLIError("CLI_PROXY_CREDENTIAL_UNSUPPORTED", "Account proxy credentials cannot be represented safely by the proxy transport")
+            lines.extend(["select_proxy_mode = only_socks5", f"socks5 = {endpoint}",
+                          f"socks5_username = {user}", f"socks5_password = {password}"])
+        elif parsed.scheme == "http" and parsed.username is None and parsed.password is None:
+            # graftcp 0.8.3 ConfigureHTTPProxy accepts host:port, not an auth URL.
+            # only_http_proxy rejects generic UDP instead of falling back direct.
+            lines.extend(["select_proxy_mode = only_http_proxy", f"http_proxy = {endpoint}"])
+        else:
+            raise CanvasCLIError("CLI_PROXY_TRANSPORT_UNSUPPORTED", "Canvas proxy transport supports SOCKS5 and unauthenticated HTTP; authenticated HTTP or HTTPS requires manual browser mode")
+        directory = self.account_directory(account) / "proxy"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name != "nt":
+            directory.chmod(0o700)
+        path = directory / ("graftcp-" + uuid.uuid4().hex + ".conf")
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write("\n".join(lines) + "\n")
+        return path
 
     def _lock(self, account_id: int) -> threading.RLock:
         with self._guard:
@@ -301,6 +343,12 @@ class CanvasCLI:
         command = [self.binary, "--format", "json", "--non-interactive",
                    "--profile", self.profile(account), *args]
         env = self.environment(account)
+        proxy_config = None
+        if not self._allow_unwrapped_for_tests:
+            if not sys.platform.startswith("linux") or not self.proxy_binary:
+                raise CanvasCLIError("CLI_PROXY_WRAPPER_REQUIRED", "Canvas requires its pinned Linux per-account proxy transport")
+            proxy_config = self._proxy_config(account)
+            command = [self.proxy_binary, "--config", str(proxy_config), "--", *command]
         kwargs: dict[str, Any] = {"env": env, "cwd": str(self.account_directory(account)),
                                   "stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,
                                   "stderr": subprocess.PIPE}
@@ -312,7 +360,10 @@ class CanvasCLI:
         try:
             process = subprocess.Popen(command, **kwargs)
         except OSError as exc:
-            raise CanvasCLIError("CLI_UNAVAILABLE", f"Canvas CLI could not start: {type(exc).__name__}") from None
+            if proxy_config:
+                proxy_config.unlink(missing_ok=True)
+            code = "CLI_PROXY_WRAPPER_UNAVAILABLE" if not self._allow_unwrapped_for_tests else "CLI_UNAVAILABLE"
+            raise CanvasCLIError(code, f"Canvas protected command could not start: {type(exc).__name__}") from None
         with self._guard:
             self._processes[account_id] = process
         buffers = [bytearray(), bytearray()]
@@ -353,6 +404,8 @@ class CanvasCLI:
                     stream.close()
             with self._guard:
                 self._processes.pop(account_id, None)
+            if proxy_config:
+                proxy_config.unlink(missing_ok=True)
         paid_submit = args[:2] == ["node", "run"]
         if overflow.is_set():
             raise CanvasCLIError("CLI_OUTPUT_LIMIT", "Canvas CLI output exceeded its limit",
