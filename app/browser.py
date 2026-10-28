@@ -429,7 +429,7 @@ class CDPBrowser:
                 "return JSON.stringify({http:200,body:e});"
                 "return JSON.stringify({transport_error:'native-client'})}})()"
             )
-        elif path == "/commerce/v1/benefits/user_credit" or path.startswith("/mweb/"):
+        elif path in {"/commerce/v1/benefits/user_credit", "/commerce/v1/benefits/credit_receive"} or path.startswith("/mweb/"):
             # Use the current page's verified regional SDK configuration for
             # credit and MWEB calls. Never cache context across accounts or
             # retry a request in another region. Native SDK calls are separate.

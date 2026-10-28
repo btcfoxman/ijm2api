@@ -333,10 +333,34 @@ process.stdin.on('end', async () => {
                           "dreamina-api-us-ttp2.us.capcut.com"])
         self.assertEqual(json.loads(result["values"][-1]), {"transport_error": "fetch"})
 
-    def test_commerce_write_and_native_paths_keep_existing_transport(self):
+    def test_daily_claim_uses_verified_region_once_without_altering_body(self):
         us = {"sdk": {"code": "US", "domain": {
             "commerce_domain": "https://commerce-us-ttp2.us.capcut.com"}}}
-        paths = ["/commerce/v1/benefits/credit_receive"]
+        jp = {"sdk": {"code": "JP", "domain": {
+            "commerce_domain": "https://commerce-api-sg.capcut.com"}}}
+        client = DreaminaClient({"id": 1, "cdp_port": 19301,
+                                 "proxy_url": "socks5://proxy.test:20002"})
+        with patch.object(client.browser, "evaluate", return_value=json.dumps(
+                {"http": 200, "body": {"ret": "0", "data": {"receive_quota": 5}}})) as evaluate:
+            self.assertEqual(client.daily_checkin(), {"receive_quota": 5})
+        expression = evaluate.call_args.args[0]
+        result = self.execute_contexts([expression], [us, jp, {**us, "throwFetch": True}])
+        self.assertEqual(len(result['calls']), 3)
+        self.assertEqual([call['url'] for call in result['calls']], [
+            "https://commerce-us-ttp2.us.capcut.com/commerce/v1/benefits/credit_receive",
+            "https://commerce-api-sg.capcut.com/commerce/v1/benefits/credit_receive",
+            "https://commerce-us-ttp2.us.capcut.com/commerce/v1/benefits/credit_receive"])
+        for call in result['calls']:
+            self.assertEqual(json.loads(call['options']['body']), {"time_zone": "Asia/Taipei"})
+            self.assertEqual(call['options']['credentials'], 'include')
+        self.assertEqual(result['calls'][0]['options']['headers']['appid'], '513641')
+        self.assertNotIn('appid', result['calls'][1]['options']['headers'])
+        self.assertEqual(json.loads(result['values'][-1]), {'transport_error': 'fetch'})
+
+    def test_unrelated_commerce_write_and_native_paths_keep_existing_transport(self):
+        us = {"sdk": {"code": "US", "domain": {
+            "commerce_domain": "https://commerce-us-ttp2.us.capcut.com"}}}
+        paths = ["/commerce/v1/benefits/team_credit_allocate"]
         for path in paths:
             expression = self.expression(path)
             self.assertNotIn("__locationInfo", expression)

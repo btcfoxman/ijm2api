@@ -11,12 +11,14 @@ import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from .browser import BrowserError, BrowserRejected, browser_alive
+from .browser import BrowserError, BrowserRejected, CDPBrowser, browser_alive
+from .account_automation import AccountAutomation, AutomationError
 from .browser_runtime import BrowserRuntime
 from .canvas_cli import CanvasCLI, CanvasCLIError
 from .canvas_service import CanvasServiceMixin, execution_mode
@@ -37,6 +39,10 @@ MAX_CREDIT_ACCOUNT_ATTEMPTS = 2
 HISTORY_COST_WINDOW_SECONDS = 7 * 24 * 60 * 60
 HISTORY_COST_SAMPLES = 5
 logger = logging.getLogger(__name__)
+
+
+class AccountMaintenanceBusy(BrowserError):
+    """A daily credit claim must wait until all generation accounting is idle."""
 
 
 def _credential_setup_ready(account: dict[str, Any]) -> bool:
@@ -73,6 +79,7 @@ class Service(CanvasServiceMixin):
         self._pool = ThreadPoolExecutor(max_workers=50, thread_name_prefix="ijm-task")
         self._lock = threading.RLock()
         self._active: dict[int, int] = {}
+        self._aux_account_owners: dict[int, object] = {}
         self._credit_reservations: dict[str, tuple[int, float]] = {}
         self._worker_slots = threading.BoundedSemaphore(50)
         self._started = False
@@ -210,6 +217,7 @@ class Service(CanvasServiceMixin):
                 failed, retry_at = self._maintenance_failures.get(account_id, (0, 0))
                 if time.monotonic() < retry_at:
                     continue
+                stage = 'check_account'
                 try:
                     # CLI accounts without credentials wait for authorization;
                     # routine maintenance must not open Chrome for them.
@@ -224,13 +232,23 @@ class Service(CanvasServiceMixin):
                     if checked["status"] == "login_required":
                         needs_rapid_recheck = True
                     if settings["daily_checkin_enabled"] and checked['status'] in {'active', 'cli_auth_required'}:
+                        stage = 'daily_checkin'
                         with self._browser_aux_slots:
                             self.checkin_account(account_id)
                     self._maintenance_failures.pop(account_id, None)
-                except (BrowserError, CanvasCLIError, ValueError, KeyError):
+                except AccountMaintenanceBusy:
+                    # Occupancy is temporary and does not mean the account or
+                    # its proxy failed. Revisit it during the next normal pass.
+                    continue
+                except (BrowserError, CanvasCLIError, ValueError, KeyError) as exc:
                     failed += 1
+                    retry_seconds = min(1800, 60 * 2 ** min(failed - 1, 5))
                     self._maintenance_failures[account_id] = (failed,
-                        time.monotonic() + min(1800, 60 * 2 ** min(failed - 1, 5)))
+                        time.monotonic() + retry_seconds)
+                    logger.warning('IJM account maintenance failed account_id=%s stage=%s error_type=%s',
+                        account_id, stage, type(exc).__name__, extra={
+                        'account_id': account_id, 'stage': stage,
+                        'error_type': type(exc).__name__})
                     continue
             interval = max(30, int(settings["account_maintenance_interval_seconds"]))
             # A restarted Chrome often exposes its tab before the app can make
@@ -245,14 +263,75 @@ class Service(CanvasServiceMixin):
         today = datetime.now(ZoneInfo(os.getenv("IJM_TIME_ZONE", "Asia/Taipei"))).date().isoformat()
         if account.get("last_checkin_date") == today:
             return {"already_checked_in": True, "date": today}
-        account, owned = self.browser_runtime.acquire(account)
-        try:
-            result = DreaminaClient(account).daily_checkin()
-        finally:
-            self.browser_runtime.release(account, owned)
-        self.store.update_account(account_id, {"last_checkin_date": today})
+        with self._exclusive_aux_account(account_id):
+            account = self.store.account(account_id, private=True)
+            if account.get('last_checkin_date') == today:
+                return {"already_checked_in": True, "date": today}
+            account, owned = self.browser_runtime.acquire(account)
+            try:
+                self._wait_checkin_identity(account)
+                result = DreaminaClient(account).daily_checkin()
+            finally:
+                self.browser_runtime.release(account, owned)
+            self.store.update_account(account_id, {"last_checkin_date": today})
         return {"already_checked_in": False, "date": today,
                 "received": result.get("receive_quota", 0)}
+
+    @contextmanager
+    def _exclusive_aux_account(self, account_id: int):
+        account = self.store.account(account_id, private=True)
+        if not account:
+            raise KeyError(account_id)
+        # BrowserRuntime's lock can span Chrome startup and shutdown. Inspect
+        # it before taking the global generation admission lock.
+        if account.get('status') == 'logging_in' or self.browser_runtime.busy(account_id):
+            raise AccountMaintenanceBusy('Account browser is busy; daily check-in is deferred')
+        owner = object()
+        with self._lock:
+            current = self.store.account(account_id, private=True)
+            if not current:
+                raise KeyError(account_id)
+            if (current.get('status') == 'logging_in' or self._active.get(account_id, 0) or self.store.active_account_count(account_id)
+                    or account_id in self._aux_account_owners):
+                raise AccountMaintenanceBusy('Account is busy; daily check-in is deferred until its tasks finish')
+            self._aux_account_owners[account_id] = owner
+        try:
+            yield
+        finally:
+            with self._lock:
+                if self._aux_account_owners.get(account_id) is owner:
+                    self._aux_account_owners.pop(account_id, None)
+
+    def _wait_checkin_identity(self, account: dict[str, Any]) -> None:
+        """Wait only for genuine read-only SDK readiness before one daily claim."""
+        expected = str(account.get('login_user_id') or '')
+        if not expected:
+            raise BrowserError('Dreamina check-in requires a verified signed-in account')
+        deadline = time.monotonic() + 30
+        browser = CDPBrowser(int(account.get('cdp_port') or 0), timeout=10)
+        automation = AccountAutomation(account, self.settings(), browser=browser)
+        while not self._stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BrowserError('Dreamina check-in identity readiness timed out')
+            browser.timeout = min(10, remaining)
+            try:
+                ready = automation.read_ready()
+            except AutomationError as exc:
+                if (exc.status != 'login_required'
+                        or str(exc) != 'Dreamina identity read could not complete'):
+                    raise
+                self._stop.wait(min(.5, max(0, deadline - time.monotonic())))
+                continue
+            if time.monotonic() >= deadline:
+                raise BrowserError('Dreamina check-in identity readiness timed out')
+            if self._stop.is_set():
+                raise BrowserError('Dreamina check-in was cancelled before claiming credits')
+            identity = ready.get('identity') or {}
+            if ready.get('identity_verified') is not True or str(identity.get('user_id') or '') != expected:
+                raise BrowserError('Dreamina check-in identity does not match this account')
+            return
+        raise BrowserError('Dreamina check-in was cancelled before claiming credits')
 
     def create(self, request: dict[str, Any]) -> dict[str, Any]:
         settings = self.settings()
@@ -425,11 +504,13 @@ class Service(CanvasServiceMixin):
         return (None if balance is None else balance - sum(amounts), uncertain)
 
     def _funded_accounts(self, estimated_cost: float, excluded: set[int], pending: dict,
-                         backend: str | None = None) -> list[dict]:
+                         backend: str | None = None, *, include_aux_busy: bool = False) -> list[dict]:
         accounts = []
         for item in self.store.accounts(private=True):
             if (int(item['id']) in excluded or not item['enabled'] or item['status'] != 'active'
                     or not item['proxy_url'] or not _credential_setup_ready(item)):
+                continue
+            if not include_aux_busy and int(item['id']) in self._aux_account_owners:
                 continue
             if execution_mode(item) == 'canvas_cli' and item.get('cli_auth_status') != 'ready':
                 continue
@@ -473,7 +554,7 @@ class Service(CanvasServiceMixin):
         with self._lock:
             pending = self._pending_credits(self.store.scheduling_rows(), task_id)
             backend = (self.store.task(task_id) or {}).get('execution_backend') if task_id else None
-            return bool(self._funded_accounts(estimated_cost, excluded, pending, backend))
+            return bool(self._funded_accounts(estimated_cost, excluded, pending, backend, include_aux_busy=True))
 
     def _release_account(self, account_id: int, task_id: str | None = None) -> None:
         with self._lock:
@@ -532,9 +613,11 @@ class Service(CanvasServiceMixin):
     def _has_waiting_credit_account(self, estimated_cost: float, excluded: set[int], task_id: str) -> bool:
         with self._lock:
             pending = self._pending_credits(self.store.scheduling_rows(), task_id)
-            return any(any(owner == int(account['id']) for owner, _ in pending.values())
+            return any(int(account['id']) in self._aux_account_owners
+                       or any(owner == int(account['id']) for owner, _ in pending.values())
                        for account in self._funded_accounts(estimated_cost, excluded, {},
-                           (self.store.task(task_id) or {}).get('execution_backend') if task_id else None))
+                           (self.store.task(task_id) or {}).get('execution_backend') if task_id else None,
+                           include_aux_busy=True))
 
     def check_account(self, account_id: int, *, start_browser: bool = False) -> dict[str, Any]:
         account = self.store.account(account_id, private=True)
