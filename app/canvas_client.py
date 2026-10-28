@@ -28,6 +28,20 @@ _TRANSIENT = {"network_timeout", "dns_resolution_failed", "network_error",
               "service_unavailable", "rate_limited", "transport_error"}
 
 
+def identity_network_error(exc: CanvasCLIError) -> bool:
+    """Explicit read-only transport errors, excluding auth and business errors."""
+    code = str(exc.code).upper()
+    if exc.outcome_unknown or any(word in code for word in (
+            'AUTH', 'IDENTITY', 'CREDENTIAL', 'MISMATCH', 'EXPIRED', 'UNKNOWN')):
+        return False
+    error = exc.details.get('error') or {}
+    if not isinstance(error, dict) or code.isdigit() or str(error.get('serviceCode') or '').isdigit():
+        return False
+    return code == 'CLI_COMMAND_TIMEOUT' or (error.get('retryable') is True
+        and str(error.get('reason') or '').lower() in {
+            'network_timeout', 'dns_resolution_failed', 'network_error', 'transport_error'})
+
+
 def safe_cli_diagnostic(exc: CanvasCLIError, *, secrets: tuple[str, ...] = ()) -> dict[str, Any]:
     """Keep failure facts without persisting an envelope or its credentials."""
     source = exc.details.get("error", exc.details)
@@ -301,14 +315,28 @@ class CanvasClient:
         raise AssertionError("unreachable")
 
     def identity(self, *, deadline: float | None = None) -> dict[str, Any]:
+        validated = None
         for attempt in range(3):
-            data = self._call(["auth", "account"], timeout=10, read_only=(attempt == 0), deadline=deadline)
+            try:
+                data = self._call(["auth", "account"], timeout=10, read_only=(attempt == 0), deadline=deadline)
+            except CanvasCLIError as exc:
+                if validated is None or not identity_network_error(exc):
+                    raise
+                # Credit fields are optional. A failed follow-up cannot erase
+                # the identity confirmed by this invocation's service reply.
+                self._remaining(deadline)
+                data = validated
+                balance = None
+                break
             user_id = str(data.get("userId") or "")
             if not user_id:
                 raise CanvasCLIError("CLI_IDENTITY_INVALID", "Canvas did not return a service-authenticated user ID")
             expected = str(self.account.get("login_user_id") or "")
             if expected and user_id != expected:
                 raise CanvasCLIError("CLI_ACCOUNT_MISMATCH", "Canvas authorization belongs to another account")
+            if validated is not None and str(validated.get('userId')) != user_id:
+                raise CanvasCLIError("CLI_ACCOUNT_MISMATCH", "Canvas account changed during its credit read")
+            validated = data
             balance = _available_balance(data)
             if balance is not None or attempt == 2:
                 break

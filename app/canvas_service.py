@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from .canvas_cli import CanvasCLIError, sanitize
-from .canvas_client import CanvasClient
+from .canvas_client import CanvasClient, identity_network_error
 from .account_policy import credit_rejected
 from .cost_adapter import input_evidence, number
 from .media import MediaError, _download
@@ -215,15 +215,7 @@ class CanvasServiceMixin:
         context = task.get('upstream_context') or {}
         if any(key not in {'previous_submissions', 'recovery_resolution', 'preflight_failures'} for key in context):
             return False
-        code = str(exc.code).upper()
-        if any(word in code for word in ('AUTH', 'IDENTITY', 'CREDENTIAL', 'MISMATCH', 'EXPIRED', 'UNKNOWN')):
-            return False
-        error = exc.details.get('error') or {}
-        if not isinstance(error, dict) or code.isdigit() or str(error.get('serviceCode') or '').isdigit():
-            return False
-        return code == 'CLI_COMMAND_TIMEOUT' or (error.get('retryable') is True
-            and str(error.get('reason') or '').lower() in {
-                'network_timeout', 'dns_resolution_failed', 'network_error', 'transport_error'})
+        return identity_network_error(exc)
 
     def _execute_canvas(self, task_id: str, account: dict, deadline: float) -> bool | str:
         """Return False only for a verified pre-run funding rejection."""
@@ -271,12 +263,15 @@ class CanvasServiceMixin:
                     "cli_auth_error": "CLI identity does not match the signed-in account", "status": "cli_auth_required"})
                 self._fail_canvas_task(task_id, "ACCOUNT_VERIFICATION_FAILED", "CLI identity does not match the signed-in account")
                 return True
-            before = number(state.get("available_balance"))
-            if before is None:
-                self._fail_canvas_task(task_id, "ACCOUNT_VERIFICATION_FAILED", "CLI did not return an authoritative available balance")
+            fresh_before = number(state.get("available_balance"))
+            budget_balance = fresh_before if fresh_before is not None else number(account.get('balance'))
+            if budget_balance is None:
+                self._fail_canvas_task(task_id, "ACCOUNT_VERIFICATION_FAILED", "CLI account has neither a fresh nor a cached available balance for its budget")
                 return True
-            self.store.update_account(account_id, {"balance": before})
-            self._update_canvas_task(task_id, {"balance_before": before})
+            if fresh_before is not None:
+                self.store.update_account(account_id, {"balance": fresh_before})
+            # Cached credits can admit a quoted task, but cannot prove spend.
+            self._update_canvas_task(task_id, {"balance_before": fresh_before})
             normalized = dict(task["normalized"])
             normalized["_execution_backend"] = "canvas_cli"
             if task['model'] == 'sd-2-5-480p-x':
@@ -302,7 +297,7 @@ class CanvasServiceMixin:
                     "cost_evidence": {"canvas_quote": {"amount": quote, "source": "node.quote"},
                                       "execution_backend": "canvas_cli"}})
                 self._credit_reservations[task_id] = (account_id, quote)
-                funded, _ = self._submission_budget_status(account, task_id, quote, before)
+                funded, _ = self._submission_budget_status(account, task_id, quote, budget_balance)
                 if not funded:
                     self._update_canvas_task(task_id, {"status": "queued", "account_id": None,
                         "progress": 0, "balance_before": None, "upstream_context": {
@@ -313,7 +308,7 @@ class CanvasServiceMixin:
                     return False
                 if not (task['normalized'].get('_cost_evidence') or {}).get('canvas_budget_checked'):
                     pending = self._pending_credits(self.store.scheduling_rows(), task_id)
-                    current_available, _ = self._available_credits({**account, 'balance': before}, pending)
+                    current_available, _ = self._available_credits({**account, 'balance': budget_balance}, pending)
                     candidates = self._funded_accounts(quote, set(task.get('attempted_account_ids') or []), pending, 'canvas_cli')
                     candidates = [a for a in candidates if int(a['id']) != account_id
                         and int(a['priority']) == int(account['priority'])

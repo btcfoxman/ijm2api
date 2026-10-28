@@ -1297,3 +1297,131 @@ def test_queued_identity_retry_without_eligible_accounts_retains_last_error_on_r
     assert result['status'] == 'failed' and result['error_code'] == 'CLI_COMMAND_TIMEOUT'
     assert result['error_message'] == 'prior identity timeout'
     client.assert_not_called()
+
+
+@pytest.mark.parametrize('kind', ['video', 'image'])
+def test_optional_credit_timeout_can_generate_with_cached_budget_without_fabricating_actual_cost(context, kind, monkeypatch):
+    from app.canvas_client import CanvasClient
+    store, service, _ = context
+    account = owner(store, balance=100)
+    identifier = preflight_task(store, service, kind)
+    client = fake_client(store, service, account, kind=kind, quote=100)
+    class IdentityRead:
+        def __init__(self):
+            self.calls = 0
+        def run(self, selected, args, timeout=None, deadline=None):
+            assert selected['id'] == account['id'] and args == ['auth', 'account']
+            self.calls += 1
+            if self.calls == 2:
+                raise CanvasCLIError('CLI_COMMAND_TIMEOUT', 'optional credit refresh timeout')
+            data = {'userId': account['login_user_id'], 'isVip': True, 'vipLevel': 'basic'}
+            if self.calls > 2:
+                data['availableCredits'] = '26'
+            return {'ok': True, 'data': data}
+    runner = IdentityRead()
+    client.identity.side_effect = CanvasClient(runner, account).identity
+    client.poll.return_value['credit_facts'][0]['amount'] = 10
+    original_prepare = client.prepare.side_effect
+    def prepare(*args, **kwargs):
+        assert store.task(identifier)['balance_before'] is None
+        assert store.account(account['id'])['balance'] == 100
+        return original_prepare(*args, **kwargs)
+    client.prepare.side_effect = prepare
+    monkeypatch.setattr('app.canvas_client.time.sleep', lambda _: None)
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._run(identifier)
+    result = store.task(identifier)
+    assert result['status'] == 'succeeded', result['error_message']
+    assert result['balance_before'] is None and result['balance_after'] == 26
+    assert result['actual_cost'] is None and result['estimated_cost'] == 100
+    evidence = result['normalized']['_cost_evidence']
+    assert evidence['canvas_resource_snapshots'][0]['amount'] == 10
+    assert evidence['canvas_resource_snapshots'][0]['source'] == 'precharge'
+    assert evidence['canvas_resource_snapshots'][0]['settled'] is False
+    assert not evidence.get('balance_isolated')
+    assert store.account(account['id'])['balance'] == 26
+    assert not result['upstream_context'].get('preflight_failures')
+    client.submit.assert_called_once()
+    assert client.submit.call_args.args[1] == 100
+    assert runner.calls == 3 and not service._credit_reservations
+
+
+@pytest.mark.parametrize('kind', ['video', 'image'])
+def test_missing_fresh_and_cached_balance_fails_before_preparation(context, kind):
+    store, service, _ = context
+    account = owner(store, balance=None)
+    identifier = preflight_task(store, service, kind)
+    store.update_task(identifier, {'account_id': account['id'], 'status': 'preparing'})
+    client = fake_client(store, service, account, kind=kind)
+    client.identity.side_effect = None
+    client.identity.return_value = {'user_id': account['login_user_id'], 'available_balance': None}
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._execute_canvas(identifier, account, time.monotonic() + 30)
+    result = store.task(identifier)
+    assert result['status'] == 'failed' and result['error_code'] == 'ACCOUNT_VERIFICATION_FAILED'
+    assert result['balance_before'] is None and result['actual_cost'] is None
+    client.prepare.assert_not_called()
+    client.submit.assert_not_called()
+
+
+@pytest.mark.parametrize('kind', ['video', 'image'])
+def test_cached_budget_still_uses_server_quote_and_two_account_credit_rejection_limit(context, kind):
+    store, service, _ = context
+    accounts = [owner(store, f'owner-{i}', balance=100, priority=5-i) for i in range(3)]
+    identifier = preflight_task(store, service, kind)
+    clients = {a['id']: fake_client(store, service, a, kind=kind, quote=10) for a in accounts}
+    for account in accounts:
+        client = clients[account['id']]
+        client.identity.side_effect = None
+        client.identity.return_value = {'user_id': account['login_user_id'], 'available_balance': None}
+        client.submit.side_effect = CanvasCLIError('INSUFFICIENT_CREDITS', 'not enough credits left', outcome_unknown=False)
+    with patch.object(service, 'canvas_client', side_effect=lambda a: clients[a['id']]):
+        service._run(identifier)
+    result = store.task(identifier)
+    assert result['status'] == 'failed' and result['error_code'] == 'INSUFFICIENT_CREDITS'
+    assert result['attempted_account_ids'] == [a['id'] for a in accounts[:2]]
+    assert result['balance_before'] is None and result['actual_cost'] is None
+    assert all(clients[a['id']].submit.call_args.args[1] == 10 for a in accounts[:2])
+    clients[accounts[2]['id']].identity.assert_not_called()
+
+
+@pytest.mark.parametrize('kind', ['video', 'image'])
+def test_cached_balance_limits_budget_and_quote_reselection_without_becoming_fresh(context, kind):
+    store, service, _ = context
+    accounts = [owner(store, 'too-small', balance=5, priority=5),
+                owner(store, 'funded', balance=15, priority=4)]
+    identifier = preflight_task(store, service, kind)
+    clients = {a['id']: fake_client(store, service, a, kind=kind, quote=10) for a in accounts}
+    for account in accounts:
+        clients[account['id']].identity.side_effect = None
+        clients[account['id']].identity.return_value = {'user_id': account['login_user_id'], 'available_balance': None}
+    with patch.object(service, 'canvas_client', side_effect=lambda a: clients[a['id']]):
+        service._run(identifier)
+    result = store.task(identifier)
+    assert result['status'] == 'succeeded' and result['account_id'] == accounts[1]['id']
+    assert result['balance_before'] is None and result['actual_cost'] is None
+    clients[accounts[0]['id']].submit.assert_not_called()
+    clients[accounts[1]['id']].submit.assert_called_once()
+
+
+@pytest.mark.parametrize('kind', ['video', 'image'])
+def test_cached_balance_preserves_same_priority_smallest_funded_quote_reselection(context, kind):
+    store, service, _ = context
+    accounts = [owner(store, 'big', balance=100, priority=5),
+                owner(store, 'fit', balance=20, priority=5),
+                owner(store, 'too-small', balance=5, priority=5),
+                owner(store, 'lower', balance=15, priority=4)]
+    identifier = preflight_task(store, service, kind)
+    clients = {a['id']: fake_client(store, service, a, kind=kind, quote=10) for a in accounts}
+    for account in accounts:
+        clients[account['id']].identity.side_effect = None
+        clients[account['id']].identity.return_value = {'user_id': account['login_user_id'], 'available_balance': None}
+    with patch.object(service, 'canvas_client', side_effect=lambda a: clients[a['id']]):
+        service._run(identifier)
+    result = store.task(identifier)
+    assert result['status'] == 'succeeded' and result['account_id'] == accounts[1]['id']
+    assert result['balance_before'] is None and result['actual_cost'] is None
+    assert result['attempted_account_ids'] == [accounts[1]['id']]
+    assert sum(client.submit.call_count for client in clients.values()) == 1
+    clients[accounts[2]['id']].identity.assert_not_called()
+    clients[accounts[3]['id']].identity.assert_not_called()

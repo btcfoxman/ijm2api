@@ -505,7 +505,10 @@ class IdentityRunner:
     def run(self, account, args, timeout=None, deadline=None):
         self.calls.append(args)
         assert args == ["auth", "account"]
-        return {"ok": True, "data": self.responses[min(len(self.calls) - 1, len(self.responses) - 1)]}
+        response = self.responses[min(len(self.calls) - 1, len(self.responses) - 1)]
+        if isinstance(response, Exception):
+            raise response
+        return {"ok": True, "data": response}
 
 
 def test_real_identity_partial_credits_read_is_retried_without_login(monkeypatch):
@@ -524,6 +527,61 @@ def test_missing_credits_stays_unknown_after_bounded_read_retries(monkeypatch):
     runner = IdentityRunner([{"userId": 42, "isVip": True, "vipLevel": "basic"}])
     assert CanvasClient(runner, ACCOUNT).identity()["available_balance"] is None
     assert len(runner.calls) == 3
+
+
+@pytest.mark.parametrize('error', [
+    CanvasCLIError('CLI_COMMAND_TIMEOUT', 'optional credit timeout'),
+    CanvasCLIError('cli.api_failed', 'optional network failure',
+                   details={'error': {'retryable': True, 'reason': 'network_error'}}),
+])
+def test_optional_credit_network_failure_preserves_identity_verified_in_same_call(monkeypatch, error):
+    monkeypatch.setattr('app.canvas_client.time.sleep', lambda _: None)
+    runner = IdentityRunner([{'userId': 42, 'isVip': True, 'vipLevel': 'basic'}, error])
+    result = CanvasClient(runner, ACCOUNT).identity()
+    assert result['user_id'] == '42' and result['available_balance'] is None
+    assert result['membership'] == {'isVip': True, 'vipLevel': 'basic'}
+    assert result['raw']['userId'] == 42 and len(runner.calls) == 2
+
+
+@pytest.mark.parametrize('response,code', [
+    (CanvasCLIError('CLI_AUTH_EXPIRED', 'expired'), 'CLI_AUTH_EXPIRED'),
+    (CanvasCLIError('cli.service_rejected', 'business failure',
+                   details={'error': {'serviceCode': '20114'}}), 'cli.service_rejected'),
+    ({'userId': 43, 'availableCredits': '100'}, 'CLI_ACCOUNT_MISMATCH'),
+    ({'availableCredits': '100'}, 'CLI_IDENTITY_INVALID'),
+])
+def test_optional_credit_read_never_hides_auth_mismatch_or_business_failure(monkeypatch, response, code):
+    monkeypatch.setattr('app.canvas_client.time.sleep', lambda _: None)
+    runner = IdentityRunner([{'userId': 42}, response])
+    with pytest.raises(CanvasCLIError) as error:
+        CanvasClient(runner, ACCOUNT).identity()
+    assert error.value.code == code and len(runner.calls) == 2
+
+
+def test_prior_identity_call_cannot_cover_a_new_mandatory_identity_failure(monkeypatch):
+    monkeypatch.setattr('app.canvas_client.time.sleep', lambda _: None)
+    runner = IdentityRunner([{'userId': 42, 'availableCredits': '100'}])
+    client = CanvasClient(runner, ACCOUNT)
+    assert client.identity()['user_id'] == '42'
+    runner.responses = [CanvasCLIError('CLI_COMMAND_TIMEOUT', 'fresh identity unavailable')]
+    with pytest.raises(CanvasCLIError) as error:
+        client.identity()
+    assert error.value.code == 'CLI_COMMAND_TIMEOUT'
+
+
+def test_optional_credit_timeout_cannot_return_identity_after_absolute_deadline(monkeypatch):
+    clock = {'now': 0.0}
+    class TimedIdentity(IdentityRunner):
+        def run(self, account, args, timeout=None, deadline=None):
+            if self.calls:
+                clock['now'] = deadline
+            return super().run(account, args, timeout=timeout, deadline=deadline)
+    runner = TimedIdentity([{'userId': 42}, CanvasCLIError('CLI_COMMAND_TIMEOUT', 'optional read timeout')])
+    monkeypatch.setattr('app.canvas_client.time', SimpleNamespace(monotonic=lambda: clock['now'],
+        sleep=lambda delay: clock.update(now=clock['now'] + delay)))
+    with pytest.raises(CanvasCLIError) as error:
+        CanvasClient(runner, ACCOUNT).identity(deadline=5)
+    assert error.value.code == 'CLI_TASK_DEADLINE_EXCEEDED' and clock['now'] == 5
 
 
 @pytest.mark.parametrize("fields,expected", [

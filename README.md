@@ -227,9 +227,16 @@ In explicit browser mode, credit reads before and after a task are best effort: 
 block video submission or hide a completed result. When either read fails,
 that task's actual credit cost is left unknown instead of using a stale cached
 balance to calculate it.
-Canvas CLI requires an explicit available balance before paid submission;
-partial account responses receive bounded read retries and remain unknown if
-the upstream omits the credit fields.
+Canvas CLI requires a service-verified account identity; its credit fields are
+optional in the official contract. Bounded follow-up reads can recover those
+fields, but a network failure in that optional read preserves the identity
+already verified in the same call. Authentication errors and mismatches still
+fail, and no read may extend the task deadline. A cached available balance may
+be used only for the shared admission budget when fresh credits are omitted;
+the complete server quote and confirmation ceiling remain mandatory. Without
+either balance, admission fails safely. Only fresh before/after readings can
+establish actual spend: cached credits and resource precharges never become an
+actual debit, even when a fresh balance is returned after generation.
 
 ## Evidence and protocol
 
