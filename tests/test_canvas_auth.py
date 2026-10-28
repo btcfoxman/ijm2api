@@ -88,14 +88,15 @@ def test_wrong_existing_identity_never_authorizes_account(context):
     client.logout.assert_not_called()
 
 
-def test_normal_device_confirmation_closes_browser_before_wait_and_checks_identity(context):
+def test_normal_device_confirmation_keeps_browser_until_cli_proves_authorized(context):
     store, service, client, browser, manager, identifier = context
     client.identity.side_effect = [RuntimeError('no authorization'), {'id': 'account-123', 'credits': 20}]
     challenge(client)
 
     def wait(code, timeout):
         assert code == 'private-device-code' and timeout == 5
-        assert service.browser_runtime.open == 0
+        assert service.browser_runtime.open == 1
+        assert service.browser_runtime.closed == 0
         return {'status': 'authenticated'}
 
     client.auth_wait.side_effect = wait
@@ -105,6 +106,86 @@ def test_normal_device_confirmation_closes_browser_before_wait_and_checks_identi
     assert 'private-device-code' not in str(manager.status(identifier))
     assert 'private-device-code' not in str(store.account(identifier))
     client.submit.assert_not_called()
+
+
+def test_slow_page_after_twenty_seconds_is_rechecked_and_click_is_not_repeated(context, monkeypatch):
+    store, service, client, browser, manager, identifier = context
+    challenge(client)
+    clock = [0.0]
+    monkeypatch.setattr('app.canvas_auth.time.monotonic', lambda: clock[0])
+    manager.timeout = 60
+    browser.step.side_effect = ['waiting', 'confirmed']
+    client.identity.side_effect = [RuntimeError('not authorized'), {'id': 'account-123', 'credits': 20}]
+    manager.start(identifier)
+    monkeypatch.setattr(manager._jobs[identifier]['cancel'], 'wait', Mock(return_value=False))
+    observations = []
+
+    def wait(code, timeout):
+        observations.append((clock[0], service.browser_runtime.open, service.browser_runtime.closed))
+        assert service.browser_runtime.open == 1 and service.browser_runtime.closed == 0
+        if len(observations) == 1:
+            clock[0] = 25.0  # Initial page content was slower than the old cutoff.
+            return {'status': 'pending'}
+        if len(observations) == 2:
+            clock[0] = 35.0  # Click dispatched, but consent HTTP is still pending.
+            return {'status': 'authorization_pending'}
+        return {'status': 'authenticated'}
+
+    client.auth_wait.side_effect = wait
+    manager._run(identifier)
+    assert manager.status(identifier)['state'] == 'ready'
+    assert browser.step.call_count == 2
+    assert len(observations) == 3
+    assert service.browser_runtime.open == 0 and service.browser_runtime.closed == 1
+
+
+def test_manual_assist_reuses_pending_browser_and_its_existing_auxiliary_slot(context):
+    store, service, client, browser, manager, identifier = context
+    challenge(client)
+    browser.step.return_value = 'manual_required'
+    client.identity.side_effect = [RuntimeError('not authorized'), {'id': 'account-123', 'credits': 20}]
+    service.open_browser_view = Mock(return_value={**store.account(identifier, private=True), 'cdp_port': 19301})
+    service.close_browser_view = Mock()
+    # The other account occupies one slot; this worker occupies the last one.
+    assert manager._browser_slots.acquire(blocking=False)
+
+    def wait(code, timeout):
+        assert service.browser_runtime.open == 1
+        assert manager.status(identifier)['state'] == 'manual_required'
+        assert manager.open_assist(identifier)['state'] == 'manual_required'
+        assert not manager._jobs[identifier]['assist_slot']
+        assert browser.open.call_count == 1  # No reload aborts a pending consent.
+        return {'status': 'authenticated'}
+
+    client.auth_wait.side_effect = wait
+    try:
+        execute(context)
+    finally:
+        manager._browser_slots.release()
+    assert manager.status(identifier)['state'] == 'ready'
+    service.close_browser_view.assert_called_once_with(identifier)
+    assert service.browser_runtime.open == 0 and service.browser_runtime.closed == 1
+
+
+def test_pending_consent_keeps_browser_until_deadline_then_releases_it(context, monkeypatch):
+    store, service, client, browser, manager, identifier = context
+    challenge(client)
+    clock = [0.0]
+    monkeypatch.setattr('app.canvas_auth.time.monotonic', lambda: clock[0])
+    client.identity.side_effect = RuntimeError('not authorized')
+    manager.start(identifier)
+    monkeypatch.setattr(manager._jobs[identifier]['cancel'], 'wait', Mock(return_value=False))
+
+    def wait(code, timeout):
+        assert service.browser_runtime.open == 1 and service.browser_runtime.closed == 0
+        clock[0] += 10
+        return {'status': 'pending'}
+
+    client.auth_wait.side_effect = wait
+    manager._run(identifier)
+    assert manager.status(identifier)['state'] == 'expired'
+    assert service.browser_runtime.open == 0 and service.browser_runtime.closed == 1
+    assert browser.step.call_count == 1
 
 
 def test_captcha_is_not_clicked_and_browser_is_released(context):

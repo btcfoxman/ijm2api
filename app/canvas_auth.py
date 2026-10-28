@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from datetime import datetime, timezone
 import json
 import math
@@ -185,18 +186,41 @@ class CanvasAuthManager:
                     if job.get('assist_slot'):
                         self._browser_slots.release()
                         job['assist_slot'] = False
-            if not self._browser_slots.acquire(blocking=False):
+            shares_worker_browser = bool(job.get('browser_active'))
+            if not shares_worker_browser and not self._browser_slots.acquire(blocking=False):
                 raise ValueError('other account browser operations are busy; retry shortly')
             try:
                 account = self.service.open_browser_view(account_id)
-                self.browser_factory(account).open(str(uri))
+                # Reloading after a dispatched Authorize click can abort the
+                # consent HTTP request. The active worker already opened it.
+                if not shares_worker_browser:
+                    self.browser_factory(account).open(str(uri))
                 job['assist'] = True
-                job['assist_slot'] = True
+                job['assist_slot'] = not shares_worker_browser
             except Exception:
                 self.service.close_browser_view(account_id)
-                self._browser_slots.release()
+                if not shares_worker_browser:
+                    self._browser_slots.release()
                 raise ValueError('Canvas authorization browser could not open; check the account proxy') from None
             return dict(job['public'])
+
+    def _close_assist(self, account_id: int) -> None:
+        with self._guard:
+            job = self._jobs[account_id]
+            if job.get('assist'):
+                try:
+                    self.service.close_browser_view(account_id)
+                except Exception:
+                    pass
+                finally:
+                    job['assist'] = False
+            if job.get('assist_slot'):
+                self._browser_slots.release()
+                job['assist_slot'] = False
+
+    def _browser_inactive(self, account_id: int) -> None:
+        with self._guard:
+            self._jobs[account_id]['browser_active'] = False
 
     @staticmethod
     def _identity_id(identity: Any) -> str:
@@ -306,6 +330,42 @@ class CanvasAuthManager:
             if owns_slot:
                 self._browser_slots.release()
 
+    def _await_authorization(self, account_id: int, account: dict, client: Any,
+                             device_code: str, deadline: float, browser: Any = None) -> None:
+        """A click is only dispatched; CLI completion proves consent was saved."""
+        cancel = self._jobs[account_id]['cancel']
+        clicked = False
+        manual = browser is None
+        while not cancel.is_set() and not self._closed and time.monotonic() < deadline:
+            if browser is not None and not clicked and not manual:
+                try:
+                    state = browser.step()
+                    if state == 'manual_required':
+                        manual = True
+                        self._publish(account_id, 'manual_required', '授权需要人工确认，请打开账号授权画面完成')
+                    elif state == 'confirmed':
+                        clicked = True
+                except Exception:
+                    manual = True
+                    self._publish(account_id, 'manual_required', '自动授权未完成，请打开账号授权画面确认')
+            try:
+                result = client.auth_wait(device_code, timeout=5)
+                if isinstance(result, dict) and str(result.get('status') or result.get('state') or '').lower() in {
+                        'pending', 'authorization_pending', 'waiting', 'timeout'}:
+                    cancel.wait(.5)
+                    continue
+                self._accept_identity(account_id, account, client.identity())
+                return
+            except Exception as exc:
+                code = str(getattr(exc, 'code', '')).upper()
+                if any(part in code for part in ('PENDING', 'TIMEOUT', 'SLOW_DOWN', 'WAITING')):
+                    cancel.wait(1)
+                    continue
+                self._publish(account_id, 'failed', 'CLI 授权验证失败，请重新授权')
+                return
+        self._publish(account_id, 'cancelled' if cancel.is_set() or self._closed else 'expired',
+            'CLI 授权已取消' if cancel.is_set() or self._closed else 'CLI 授权已过期，请重试')
+
     def _run(self, account_id: int) -> None:
         job = self._jobs[account_id]
         cancel = job['cancel']
@@ -352,56 +412,31 @@ class CanvasAuthManager:
                 if self._browser_slots.acquire(timeout=.25):
                     slot = True
                     break
-            if slot:
-                try:
-                    with self.service.browser_runtime.lease(account) as browser_account:
+            with ExitStack() as resources:
+                browser = None
+                if slot:
+                    resources.callback(self._browser_slots.release)
+                    try:
+                        browser_account = resources.enter_context(self.service.browser_runtime.lease(account))
                         browser = self.browser_factory(browser_account)
                         browser.open(str(uri))
-                        browser_deadline = min(deadline, time.monotonic() + 20)
-                        while not cancel.is_set() and not self._closed and time.monotonic() < browser_deadline:
-                            state = browser.step()
-                            if state == 'manual_required':
-                                self._publish(account_id, 'manual_required', '授权需要人工确认，请打开授权链接完成')
-                                break
-                            if state == 'confirmed':
-                                break
-                            cancel.wait(.5)
-                except Exception:
-                    self._publish(account_id, 'manual_required', '自动授权未完成，请打开授权链接确认')
-                finally:
-                    self._browser_slots.release()
-            while not cancel.is_set() and not self._closed and time.monotonic() < deadline:
-                try:
-                    result = client.auth_wait(str(challenge['deviceCode']), timeout=5)
-                    if isinstance(result, dict) and str(result.get('status') or result.get('state') or '').lower() in {
-                            'pending', 'authorization_pending', 'waiting', 'timeout'}:
-                        cancel.wait(.5)
-                        continue
-                    self._accept_identity(account_id, account, client.identity())
-                    return
-                except Exception as exc:
-                    code = str(getattr(exc, 'code', '')).upper()
-                    if any(part in code for part in ('PENDING', 'TIMEOUT', 'SLOW_DOWN', 'WAITING')):
-                        cancel.wait(1)
-                        continue
-                    self._publish(account_id, 'failed', 'CLI 授权验证失败，请重新授权')
-                    return
-            self._publish(account_id, 'cancelled' if cancel.is_set() or self._closed else 'expired',
-                'CLI 授权已取消' if cancel.is_set() or self._closed else 'CLI 授权已过期，请重试')
+                        with self._guard:
+                            job['browser_active'] = True
+                        resources.callback(self._browser_inactive, account_id)
+                        # Close a viewer lease first, the worker browser second,
+                        # and only then release its auxiliary concurrency slot.
+                        resources.callback(self._close_assist, account_id)
+                    except Exception:
+                        browser = None
+                        resources.close()
+                        self._publish(account_id, 'manual_required', '自动授权未完成，请打开账号授权画面确认')
+                self._await_authorization(account_id, account, client,
+                    str(challenge['deviceCode']), deadline, browser=browser)
         except Exception:
             self._publish(account_id, 'failed', 'CLI 授权失败，请检查账号代理后重试')
         finally:
-            with self._guard:
-                if job.get('assist'):
-                    try:
-                        self.service.close_browser_view(account_id)
-                    except Exception:
-                        pass
-                    finally:
-                        job['assist'] = False
-                if job.get('assist_slot'):
-                    self._browser_slots.release()
-                    job['assist_slot'] = False
+            self._close_assist(account_id)
+            self._browser_inactive(account_id)
             job['done'].set()
 
     def recover_interrupted(self) -> None:

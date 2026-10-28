@@ -63,6 +63,30 @@ function failureMessage(task) {
 function executionLabel(backend) { return backend === "canvas_cli" ? "Canvas CLI" : backend === "browser" ? "网页" : "待分配"; }
 function cliAuthLabel(status) { return ({ pending: "待授权", required: "待授权", ready: "已授权", expired: "授权已过期", error: "授权异常", queued: "等待授权", authorizing: "授权中", manual_required: "等待确认授权", failed: "授权失败", cancelled: "已取消授权" })[status] || "待授权"; }
 
+function accountAvailability(account, settings = state.settings) {
+  const cli = account.execution_mode !== "browser";
+  const runtime = settings.canvas_cli_runtime || {};
+  const authorized = account.cli_auth_status === "ready";
+  const gateOpen = settings.canvas_cli_enabled === true;
+  const runtimeAvailable = runtime.available !== false;
+  const enabledAndActive = Boolean(account.enabled) && account.status === "active";
+  let status = account.enabled || account.status === "cli_auth_required" || ["disabled_low_balance", "suspended", "logging_in", "login_pending", "login_required", "login_failed", "challenge_required", "verification_required", "setup_required", "agreement_required", "network_error"].includes(account.status) ? account.status : "disabled";
+  if (cli && enabledAndActive) {
+    status = !authorized ? "cli_auth_required" : !runtimeAvailable ? "cli_runtime_unavailable" : !gateOpen ? "cli_paused" : "active";
+  }
+  const notice = cli && !runtimeAvailable
+    ? `CLI 运行环境不兼容，暂不能接单${runtime.message ? `：${runtime.message}` : ""}`
+    : cli && !authorized ? "请完成 Canvas CLI 授权" : cli && !gateOpen ? "Canvas CLI 接单已关闭" : "";
+  const summary = cli ? [cliAuthLabel(account.cli_auth_status), !gateOpen ? "接单已关闭" : "", !runtimeAvailable ? "CLI 环境不兼容" : ""].filter(Boolean).join(" · ") : "";
+  return { available: enabledAndActive && (!cli || authorized && gateOpen && runtimeAvailable), status, notice, summary };
+}
+
+function accountAvailabilityBadge(value) {
+  if (value.status === "cli_runtime_unavailable") return '<span class="badge network_error">CLI 环境不兼容</span>';
+  if (value.status === "cli_paused") return '<span class="badge disabled">接单已关闭</span>';
+  return badge(value.status);
+}
+
 function renderAccounts() {
   const enabled = state.accounts.filter((item) => item.enabled); const disabled = state.accounts.filter((item) => !item.enabled);
   const items = state.accountFilter === "enabled" ? enabled : disabled;
@@ -73,16 +97,16 @@ function renderAccounts() {
       ? quota.details.map((item) => `${item.available ?? "-"}${item.expiresAt ? ` · 到期 ${item.expiresAt}` : ""}`).join(" / ") || "CLI 积分明细未提供"
       : `VIP ${quota.vip_credit ?? 0} / Gift ${quota.gift_credit ?? 0} / Add-on ${quota.purchase_credit ?? 0}`;
     const progress = loginProgress(account);
-    const visibleStatus = account.enabled || account.status === "cli_auth_required" || ["disabled_low_balance", "suspended", "logging_in", "login_pending", "login_required", "login_failed", "challenge_required", "verification_required", "setup_required", "agreement_required", "network_error"].includes(account.status) ? account.status : "disabled";
+    const availability = accountAvailability(account);
     return `<tr><td><span class="cell-title"><span class="account-id mono">#${account.id}</span>${escapeHtml(account.name)}</span><span class="cell-sub">${escapeHtml(account.login_identifier || account.email || account.user_id || "")}</span></td>
-      <td>${badge(visibleStatus)}<span class="cell-sub" title="${escapeHtml([progress, account.last_error].filter(Boolean).join(" · "))}">${escapeHtml(account.last_error || progress)}</span></td>
+      <td>${accountAvailabilityBadge(availability)}<span class="cell-sub" title="${escapeHtml([availability.notice, progress, account.last_error].filter(Boolean).join(" · "))}">${escapeHtml(availability.notice || account.last_error || progress)}</span></td>
       <td title="${escapeHtml(detail)}"><span class="cell-title mono">${escapeHtml(account.last_balance ?? "-")}</span><span class="cell-sub">${escapeHtml(detail)}</span></td>
       <td><input class="priority-input mono" data-account-priority="${account.id}" type="number" min="0" max="2147483647" step="1" value="${account.priority ?? 0}" title="优先级越高越先执行；相同优先级按余额和账号编号排序" aria-label="账号 #${account.id} 执行优先级"></td>
       <td><span class="slots ${account.active_tasks ? "busy" : ""}"><i></i><b class="mono">${account.active_tasks || 0} /</b><input class="concurrency-input mono" data-account-concurrency="${account.id}" type="number" min="1" value="${account.max_concurrency}" title="修改账号并发"></span></td><td class="mono">${account.total_uses || 0}</td>
-      <td><span class="cell-title mono proxy" title="${escapeHtml(account.proxy_url)}">${escapeHtml(proxyLabel(account.proxy_url))}</span></td><td><div class="execution-controls"><select class="execution-select" data-account-mode="${account.id}" aria-label="账号 #${account.id} 提交模式"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}><option value="canvas_cli"${account.execution_mode !== "browser" ? " selected" : ""}>Canvas CLI</option><option value="browser"${account.execution_mode === "browser" ? " selected" : ""}>网页提交</option></select><button class="link-button" data-action="cli-auth" data-id="${account.id}"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}>CLI 授权</button></div><span class="cell-sub" title="${escapeHtml(account.cli_auth_error || account.cli_user_id || "")}">${escapeHtml(cliAuthLabel(account.cli_auth_status))}${account.execution_mode !== "browser" && !state.settings.canvas_cli_enabled ? " \u00b7 \u63a5\u5355\u5df2\u5173\u95ed" : ""}${account.execution_mode === "browser" ? ` · CDP ${account.cdp_port || "按需启动"}` : ""}</span></td><td>${fmtTime(account.updated_at)}</td>
+      <td><span class="cell-title mono proxy" title="${escapeHtml(account.proxy_url)}">${escapeHtml(proxyLabel(account.proxy_url))}</span></td><td><div class="execution-controls"><select class="execution-select" data-account-mode="${account.id}" aria-label="账号 #${account.id} 提交模式"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}><option value="canvas_cli"${account.execution_mode !== "browser" ? " selected" : ""}>Canvas CLI</option><option value="browser"${account.execution_mode === "browser" ? " selected" : ""}>网页提交</option></select><button class="link-button" data-action="cli-auth" data-id="${account.id}"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}>CLI 授权</button></div><span class="cell-sub" title="${escapeHtml(account.cli_auth_error || account.cli_user_id || "")}">${escapeHtml(availability.summary)}${account.execution_mode === "browser" ? ` · CDP ${account.cdp_port || "按需启动"}` : ""}</span></td><td>${fmtTime(account.updated_at)}</td>
       <td><div class="row-actions">${account.password_configured ? `<button class="icon-button" data-action="auto-login" data-id="${account.id}" title="自动登录并完成去水印 / AI 协议设置"${account.status === "logging_in" ? " disabled" : ""}><i data-lucide="log-in"></i></button>` : ""}<button class="icon-button" data-action="check" data-id="${account.id}" title="检测"><i data-lucide="activity"></i></button><button class="icon-button" data-action="login" data-id="${account.id}" title="CDP 登录"><i data-lucide="monitor-up"></i></button><button class="icon-button" data-action="web-login" data-id="${account.id}" title="网页登录 / 打开账号网页"><i data-lucide="monitor"></i></button><button class="icon-button${account.status === "challenge_required" ? " needs-verification" : ""}" data-action="browser-assist" data-id="${account.id}" title="人工验证"><i data-lucide="mouse-pointer-2"></i></button><button class="icon-button" data-action="reset-profile" data-id="${account.id}" title="重置 Profile"><i data-lucide="fingerprint"></i></button><button class="icon-button" data-action="toggle" data-id="${account.id}" data-enabled="${account.enabled}" title="${account.enabled ? "禁用" : "启用"}"><i data-lucide="${account.enabled ? "pause" : "play"}"></i></button>${account.enabled ? "" : `<button class="icon-button danger" data-action="delete" data-id="${account.id}" title="删除"><i data-lucide="trash-2"></i></button>`}</div></td></tr>`;
   }).join("");
-  $("#accountsEmpty").classList.toggle("show", !items.length); $("#metricAccounts").textContent = `${enabled.filter((item) => item.status === "active").length} / ${state.accounts.length}`;
+  $("#accountsEmpty").classList.toggle("show", !items.length); $("#metricAccounts").textContent = `${state.accounts.filter((item) => accountAvailability(item).available).length} / ${state.accounts.length}`;
   $("#metricBalance").textContent = state.accounts.reduce((sum, item) => sum + Number(item.last_balance || 0), 0).toLocaleString(); icons();
 }
 

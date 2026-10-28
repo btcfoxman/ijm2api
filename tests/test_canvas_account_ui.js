@@ -100,3 +100,72 @@ test('authorization dialog presents remote assistance, never a local navigation 
   assert.doesNotMatch(displayed, /PRIVATE/);
   assert.equal(ui.element('#cliAuthAssist').href, undefined);
 });
+
+function loadAccountRenderer(ui, accounts, settings) {
+  Object.assign(ui.context, {
+    state: { accounts, settings, accountFilter: 'enabled' },
+    escapeHtml: value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[char])),
+    badge: status => `<span data-status="${status}">${status}</span>`,
+    loginProgress: () => '', proxyLabel: value => value, fmtTime: () => '-', icons() {},
+  });
+  const script = fs.readFileSync(path.join(__dirname, '../app/static/app.js'), 'utf8');
+  ui.run(script.slice(script.indexOf('function executionLabel('), script.indexOf('function mediaFromTask(')));
+  ui.run('renderAccounts()');
+}
+
+function account(id, values = {}) {
+  return { id, name: `Synthetic ${id}`, enabled: true, status: 'active', execution_mode: 'canvas_cli',
+    cli_auth_status: 'ready', proxy_url: 'socks5://proxy.test:20001', balance_details: {},
+    max_concurrency: 1, priority: 0, ...values };
+}
+
+test('migrated enabled accounts waiting for authorization are not reported as available', () => {
+  const ui = harness();
+  const accounts = Array.from({ length: 19 }, (_, i) => account(i + 1, {
+    enabled: i < 17, status: i < 17 ? 'active' : 'login_required', cli_auth_status: 'pending',
+  }));
+  const before = JSON.stringify(accounts);
+  loadAccountRenderer(ui, accounts, { canvas_cli_enabled: false, canvas_cli_runtime: { available: true } });
+  assert.equal(ui.element('#metricAccounts').textContent, '0 / 19');
+  assert.equal(ui.element('#enabledCount').textContent, 17, 'enabled intent remains unchanged');
+  const rows = ui.element('#accountsBody').innerHTML;
+  assert.equal((rows.match(/data-status="cli_auth_required"/g) || []).length, 17);
+  assert.doesNotMatch(rows, /data-status="active"/);
+  assert.match(rows, /接单已关闭/);
+  assert.equal(JSON.stringify(accounts), before);
+  assert.equal(ui.requests.length, 0, 'rendering availability must not patch account configuration');
+});
+
+test('available metric requires effective CLI readiness and keeps browser mode independent', () => {
+  const ui = harness();
+  loadAccountRenderer(ui, [
+    account(1, { execution_mode: 'browser', cli_auth_status: 'pending' }),
+    account(2), account(3, { cli_auth_status: 'expired' }),
+    account(4, { enabled: false }), account(5, { status: 'network_error' }),
+  ], { canvas_cli_enabled: true, canvas_cli_runtime: { available: true } });
+  assert.equal(ui.element('#metricAccounts').textContent, '2 / 5');
+  ui.run('state.settings.canvas_cli_enabled = false; renderAccounts()');
+  assert.equal(ui.element('#metricAccounts').textContent, '1 / 5');
+  assert.match(ui.element('#accountsBody').innerHTML, /接单已关闭/);
+});
+
+test('incompatible CLI runtime is clearly shown without disabling intended accounts', () => {
+  const ui = harness();
+  const accounts = [account(1), account(2, { execution_mode: 'browser' })];
+  const before = JSON.stringify(accounts);
+  loadAccountRenderer(ui, accounts, { canvas_cli_enabled: true,
+    canvas_cli_runtime: { available: false, message: 'Native Canvas runtime version is incompatible' } });
+  assert.equal(ui.element('#metricAccounts').textContent, '1 / 2');
+  assert.match(ui.element('#accountsBody').innerHTML, /CLI 环境不兼容/);
+  assert.match(ui.element('#accountsBody').innerHTML, /暂不能接单/);
+  assert.match(ui.element('#accountsBody').innerHTML, /Native Canvas runtime version is incompatible/);
+  assert.equal(JSON.stringify(accounts), before);
+});
+
+test('runtime unknown follows the available-not-false rule and preserves an unfinished login badge', () => {
+  const ui = harness();
+  loadAccountRenderer(ui, [account(1), account(2, { status: 'logging_in', cli_auth_status: 'pending' })],
+    { canvas_cli_enabled: true, canvas_cli_runtime: { available: null } });
+  assert.equal(ui.element('#metricAccounts').textContent, '1 / 2');
+  assert.match(ui.element('#accountsBody').innerHTML, /data-status="logging_in"/);
+});
