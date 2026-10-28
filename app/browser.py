@@ -43,6 +43,10 @@ class BrowserRejected(BrowserError):
     """A complete HTTP response established that the upstream rejected a call."""
 
 
+class _ResourceTimingContextPending(BrowserError):
+    """The selected page is replacing its normal JavaScript context."""
+
+
 def account_proxy_url(account: dict[str, Any]) -> str:
     value = str(account.get("proxy_url") or "").strip()
     parsed = urllib.parse.urlsplit(value)
@@ -203,16 +207,29 @@ class CDPBrowser:
         identifier = None
         sequence = 0
 
-        def command(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        def command(method: str, params: dict[str, Any] | None = None,
+                    *, deadline: float | None = None) -> dict[str, Any]:
             nonlocal sequence
             sequence += 1
             request_id = sequence
             ws.send(json.dumps({"id": request_id, "method": method, "params": params or {}}))
             while True:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise BrowserError("Dreamina login resource timing page was not ready")
+                    ws.settimeout(min(self.timeout, remaining))
                 response = json.loads(ws.recv())
                 if response.get("id") != request_id:
                     continue
                 if "error" in response:
+                    error = response["error"]
+                    message = str(error.get("message") or "").casefold()
+                    if (method == "Runtime.evaluate" and error.get("code") == -32000
+                            and any(value in message for value in (
+                                "cannot find default execution context", "execution context was destroyed",
+                                "cannot find context with specified id"))):
+                        raise _ResourceTimingContextPending("Dreamina login resource timing page is changing")
                     raise BrowserError("Dreamina login resource timing setup failed")
                 return response.get("result") or {}
 
@@ -225,10 +242,24 @@ class CDPBrowser:
                 identifier = registered.get("identifier")
                 if not isinstance(identifier, str) or not identifier:
                     raise BrowserError("Dreamina login resource timing setup failed")
-                current = command("Runtime.evaluate", {"expression": _RESOURCE_TIMING_BUFFER_SCRIPT,
-                                                        "returnByValue": True})
-                if "exceptionDetails" in current or (current.get("result") or {}).get("value") is not True:
-                    raise BrowserError("Dreamina login resource timing setup failed")
+                # The target URL may already be Dreamina while its initial
+                # about:blank context or a redirect is still being replaced.
+                # Keep the init script attached and wait only on normal
+                # telemetry readiness before any login action is allowed.
+                ready_deadline = time.monotonic() + 30
+                while True:
+                    try:
+                        current = command("Runtime.evaluate", {"expression": _RESOURCE_TIMING_BUFFER_SCRIPT,
+                                                                "returnByValue": True}, deadline=ready_deadline)
+                    except _ResourceTimingContextPending:
+                        current = {}
+                    if "exceptionDetails" not in current and (current.get("result") or {}).get("value") is True:
+                        break
+                    remaining = ready_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise BrowserError("Dreamina login resource timing page was not ready")
+                    time.sleep(min(.2, remaining))
+                ws.settimeout(self.timeout)
             except (OSError, ValueError, websocket.WebSocketException) as error:
                 raise BrowserError("Dreamina login resource timing connection failed") from error
             yield

@@ -373,10 +373,24 @@ class AccountAutomation:
         while time.monotonic() < deadline:
             current = self._watermark_action()
             stage = current.get('stage')
+            view = self.browser.evaluate(_VIEW)
+            observed = view.get('stage') if isinstance(view, dict) else 'unknown'
+            if observed == 'challenge':
+                raise AutomationError('challenge_required', 'Dreamina login requires a human security challenge')
+            if observed == 'verification':
+                raise AutomationError('verification_required', 'Dreamina login requires email or security verification')
             if stage in {'blocked', 'unknown'}:
-                if self._dismiss_promotion():
+                if 'save' in actions and self._settings().get('close_watermark') is True:
+                    return
+                if observed == 'promotion' and self._dismiss_promotion():
                     continue
-                raise AutomationError('setup_required', 'Dreamina watermark setting requires manual review or membership')
+                # Opening/saving the known settings dialog can leave a
+                # temporary wrapper before its controls mount or disappear.
+                # Wait only; never click unknown, subscription, or paid UI.
+                time.sleep(.3)
+                continue
+            if 'save' in actions and self._settings().get('close_watermark') is True:
+                return
             if stage == 'avatar' and 'open_avatar' not in actions:
                 self._watermark_action('open_avatar')
                 actions.add('open_avatar')

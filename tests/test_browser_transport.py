@@ -18,6 +18,10 @@ class TimingSocket:
         self.replies = []
         self.closed = False
         self.scripts = {}
+        self.timeouts = []
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
 
     def send(self, text):
         request = json.loads(text)
@@ -51,6 +55,59 @@ class TimingSocket:
 
 
 class ResourceTimingCaptureTests(unittest.TestCase):
+    def test_cold_document_waits_for_false_and_transient_runtime_context_before_login(self):
+        class ColdSocket(TimingSocket):
+            def send(self, text):
+                request = json.loads(text)
+                if request['method'] == 'Runtime.evaluate':
+                    self.sent.append(request)
+                    self.evaluations = getattr(self, 'evaluations', 0) + 1
+                    if self.evaluations == 1:
+                        response = {'result': {'result': {'value': False}}}
+                    elif self.evaluations == 2:
+                        response = {'error': {'code': -32000, 'message': 'Cannot find default execution context'}}
+                    else:
+                        response = {'result': {'result': {'value': True}}}
+                    self.replies.append({'id': request['id'], **response})
+                    return
+                super().send(text)
+
+        socket, clock = ColdSocket(), [0.0]
+        with patch('app.browser._page', return_value={'webSocketDebuggerUrl': 'ws://127.0.0.1/synthetic'}), \
+             patch('app.browser.websocket.create_connection', return_value=socket), \
+             patch('app.browser.time.monotonic', side_effect=lambda: clock[0]), \
+             patch('app.browser.time.sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+            with CDPBrowser(19301, timeout=15).resource_timing_capture():
+                self.assertEqual(socket.evaluations, 3)
+                self.assertEqual(socket.new_document_scripts(), [_RESOURCE_TIMING_BUFFER_SCRIPT])
+                self.assertFalse(socket.closed)
+                self.assertEqual(socket.timeouts[-1], 15)
+        self.assertAlmostEqual(clock[0], .4)
+        self.assertTrue(socket.closed)
+        self.assertEqual(socket.scripts, {})
+
+    def test_unready_document_wait_is_bounded_without_entering_login(self):
+        class UnreadySocket(TimingSocket):
+            def send(self, text):
+                request = json.loads(text)
+                if request['method'] == 'Runtime.evaluate':
+                    self.sent.append(request)
+                    self.replies.append({'id': request['id'], 'result': {'result': {'value': False}}})
+                    return
+                super().send(text)
+
+        socket, clock = UnreadySocket(), [0.0]
+        with patch('app.browser._page', return_value={'webSocketDebuggerUrl': 'ws://127.0.0.1/synthetic'}), \
+             patch('app.browser.websocket.create_connection', return_value=socket), \
+             patch('app.browser.time.monotonic', side_effect=lambda: clock[0]), \
+             patch('app.browser.time.sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+            with self.assertRaises(BrowserError):
+                with CDPBrowser(19301).resource_timing_capture():
+                    self.fail('login cannot begin before normal telemetry is ready')
+        self.assertEqual(clock[0], 30)
+        self.assertTrue(socket.closed)
+        self.assertEqual(socket.scripts, {})
+
     def test_current_and_future_documents_share_one_live_session_until_cleanup(self):
         socket = TimingSocket()
         with patch('app.browser._page', return_value={'webSocketDebuggerUrl': 'ws://127.0.0.1/synthetic'}), \

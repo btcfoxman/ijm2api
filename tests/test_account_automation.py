@@ -108,11 +108,15 @@ Promise.resolve(vm.runInNewContext(payload.source,context)).then(result=>process
     def test_watermark_membership_popup_stops_without_buying_or_raw_preference_write(self):
         browser = browser_with_settings({**READY, 'close_watermark': False})
         automation = AccountAutomation(ACCOUNT, browser=browser)
-        with patch.object(automation, '_watermark_action', return_value={'stage': 'blocked'}) as action:
+        clock = [0.0]
+        with patch.object(automation, '_watermark_action', return_value={'stage': 'blocked'}) as action, \
+             patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]), \
+             patch('app.account_automation.time.sleep', side_effect=lambda _: clock.__setitem__(0, clock[0] + 1)):
             with self.assertRaises(AutomationError) as caught:
                 automation.ensure_ready()
         self.assertEqual(caught.exception.status, 'setup_required')
-        action.assert_called_once_with()
+        self.assertTrue(all(call.args == () for call in action.call_args_list))
+        self.assertEqual(clock[0], 30)
         browser.post.assert_called_once_with('/mweb/v1/get_settings', {})
 
     def test_watermark_ui_only_opens_known_settings_toggles_and_saves(self):
@@ -138,6 +142,77 @@ Promise.resolve(vm.runInNewContext(payload.source,context)).then(result=>process
              patch('app.account_automation.time.sleep'):
             automation._enable_watermark()
         self.assertEqual(actions, ['open_avatar', 'open_setting', 'toggle', 'save'])
+
+    def test_watermark_known_modal_can_mount_after_blocked_unknown_without_unknown_clicks(self):
+        automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
+        states = iter([{'stage': 'avatar'}, {'stage': 'menu'}, {'stage': 'blocked'}, {'stage': 'unknown'},
+                       {'stage': 'modal', 'checked': False}, {'stage': 'modal', 'checked': True}])
+        actions, clock = [], [0.0]
+
+        def action(command='view'):
+            if command == 'view':
+                return next(states)
+            actions.append(command)
+            return {'stage': 'opened'}
+
+        with patch.object(automation, '_watermark_action', side_effect=action), \
+             patch.object(automation, '_settings', side_effect=lambda: {'close_watermark': 'save' in actions}), \
+             patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]), \
+             patch('app.account_automation.time.sleep', side_effect=lambda _: clock.__setitem__(0, clock[0] + 1)):
+            automation._enable_watermark()
+        self.assertEqual(actions, ['open_avatar', 'open_setting', 'toggle', 'save'])
+        self.assertGreaterEqual(clock[0], 4)
+
+    def test_watermark_saved_readback_wins_over_unknown_close_animation(self):
+        automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
+        stages = iter([{'stage': 'modal', 'checked': True}, {'stage': 'unknown'}])
+        actions = []
+
+        def action(command='view'):
+            if command == 'view':
+                return next(stages)
+            actions.append(command)
+            return {'stage': 'saved'}
+
+        with patch.object(automation, '_watermark_action', side_effect=action), \
+             patch.object(automation, '_settings', side_effect=[{'close_watermark': False}, {'close_watermark': True}]) as readback, \
+             patch('app.account_automation.time.sleep'):
+            automation._enable_watermark()
+        self.assertEqual(actions, ['save'])
+        self.assertEqual(readback.call_count, 2)
+
+    def test_watermark_unknown_controls_never_receive_actions_and_expire(self):
+        automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
+        clock = [0.0]
+        with patch.object(automation, '_watermark_action', return_value={'stage': 'unknown'}) as action, \
+             patch.object(automation, '_settings') as readback, \
+             patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]), \
+             patch('app.account_automation.time.sleep', side_effect=lambda _: clock.__setitem__(0, clock[0] + 1)):
+            with self.assertRaises(AutomationError) as caught:
+                automation._enable_watermark()
+        self.assertEqual(caught.exception.status, 'setup_required')
+        self.assertEqual(clock[0], 30)
+        self.assertTrue(all(call.args == () for call in action.call_args_list))
+        readback.assert_not_called()
+
+    def test_watermark_transition_never_waits_through_challenge_or_verification(self):
+        for stage, status in [('challenge', 'challenge_required'), ('verification', 'verification_required')]:
+            for current in [{'stage': 'blocked'}, {'stage': 'unknown'},
+                            {'stage': 'modal', 'checked': False}, {'stage': 'modal', 'checked': True}]:
+                with self.subTest(stage=stage, current=current):
+                    browser = browser_with_settings(READY)
+                    browser.evaluate.side_effect = None
+                    browser.evaluate.return_value = {'stage': stage}
+                    automation = AccountAutomation(ACCOUNT, browser=browser)
+                    with patch.object(automation, '_watermark_action', return_value=current) as action, \
+                         patch.object(automation, '_settings') as readback, \
+                         patch('app.account_automation.time.sleep') as sleep:
+                        with self.assertRaises(AutomationError) as caught:
+                            automation._enable_watermark()
+                    self.assertEqual(caught.exception.status, status)
+                    action.assert_called_once_with()
+                    readback.assert_not_called()
+                    sleep.assert_not_called()
 
     def test_successful_write_without_confirmed_readback_does_not_mark_ready(self):
         browser = browser_with_settings({**READY, 'aigc_compliance_confirmed': False})
