@@ -1,17 +1,37 @@
 """Online accounts retain one profile and keep task browsers warm."""
 
-import asyncio
 import gc
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 from app.browser import BrowserError, BrowserRejected
-from app.browser_login import BrowserLoginManager, LoginError, _verification_failure
+from app.browser_login import BrowserLoginManager, LoginDesktop, LoginError, _verification_failure
 from app.service import Service
 from app.store import Store
+
+
+class TelemetryDesktop:
+    def __init__(self, profile, proxy):
+        self.profile, self.proxy = profile, proxy
+        self.cdp_port, self.vnc_port, self.password = 29999, 29998, 'synthetic-viewer'
+        self.closed = False
+
+    @staticmethod
+    def available():
+        return True
+
+    async def start(self):
+        pass
+
+    def alive(self):
+        return not self.closed
+
+    async def close(self):
+        self.closed = True
 
 
 class BrowserRuntimeTests(unittest.TestCase):
@@ -47,6 +67,25 @@ class BrowserRuntimeTests(unittest.TestCase):
             stop.assert_called_once_with(self.account['id'])
 
 
+class LoginDesktopCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_owned_desktop_closes_even_when_telemetry_cleanup_fails(self):
+        for failure in (None, BrowserError('synthetic telemetry disconnect')):
+            with self.subTest(failure=type(failure).__name__):
+                with tempfile.TemporaryDirectory() as folder:
+                    desktop = LoginDesktop(Path(folder), 'socks5://proxy.invalid:10000')
+                    desktop.cdp_port = 29999
+                    process = Mock(returncode=None)
+                    process.wait = AsyncMock(return_value=0)
+                    desktop.processes.append(process)
+                    with patch('app.browser_login.close_resource_timing_capture', side_effect=failure) as cleanup:
+                        await desktop.close()
+                    cleanup.assert_called_once_with(29999)
+                    process.terminate.assert_called_once_with()
+                    process.wait.assert_awaited_once()
+                    self.assertEqual(desktop.processes, [])
+                    self.assertIsNone(desktop.cdp_port)
+
+
 class OnlineLoginTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.folder = tempfile.TemporaryDirectory()
@@ -60,12 +99,58 @@ class OnlineLoginTests(unittest.IsolatedAsyncioTestCase):
         self.setup.return_value.ensure_ready.return_value = {'identity_verified': True,
             'watermark_ready': True, 'agreement_ready': True, 'identity': {'user_id': 'synthetic-manual-user'}}
         self.addCleanup(self.setup_check.stop)
+        self.timing_capture_check = patch('app.browser_login.ensure_resource_timing_capture')
+        self.timing_capture = self.timing_capture_check.start()
+        self.addCleanup(self.timing_capture_check.stop)
+        self.native_target_check = patch('app.browser_login.browser_alive', return_value=True)
+        self.native_target = self.native_target_check.start()
+        self.addCleanup(self.native_target_check.stop)
 
     async def asyncTearDown(self):
         await self.manager.close()
         self.service.stop()
         gc.collect()
         self.folder.cleanup()
+
+    async def test_manual_cold_start_waits_for_native_target_before_capture_and_session_return(self):
+        events = []
+        self.native_target.side_effect = [False, False, True]
+        self.timing_capture.side_effect = lambda port: events.append(('capture', port))
+        with patch('app.browser_login.LoginDesktop', TelemetryDesktop), \
+             patch.object(self.service.browser_runtime, 'close_idle'), \
+             patch('app.browser_login.asyncio.sleep', new=AsyncMock()) as sleep:
+            session = await self.manager.start(self.account['id'])
+            events.append(('returned', session['active']['account_id']))
+        self.assertEqual(events, [('capture', 29999), ('returned', self.account['id'])])
+        self.assertEqual(self.native_target.call_count, 3)
+        self.assertEqual(sleep.await_count, 2)
+        self.timing_capture.assert_called_once_with(29999)
+
+    async def test_manual_cold_start_missing_native_target_expires_and_cleans_new_desktop(self):
+        clock, desktops = [0.0], []
+        self.native_target.return_value = False
+
+        def make_desktop(profile, proxy):
+            desktop = TelemetryDesktop(profile, proxy)
+            desktops.append(desktop)
+            return desktop
+
+        make_desktop.available = lambda: True
+
+        async def sleep(_seconds):
+            clock[0] += 1
+
+        with patch('app.browser_login.LoginDesktop', make_desktop), \
+             patch.object(self.service.browser_runtime, 'close_idle'), \
+             patch('app.browser_login.time', SimpleNamespace(monotonic=lambda: clock[0])), \
+             patch('app.browser_login.asyncio.sleep', side_effect=sleep):
+            with self.assertRaises(BrowserError):
+                await self.manager.start(self.account['id'])
+        self.assertEqual(clock[0], 30)
+        self.assertTrue(desktops[0].closed)
+        self.assertIsNone(self.manager.active)
+        self.assertEqual(self.manager.desktops, {})
+        self.timing_capture.assert_not_called()
 
     def active_login(self):
         previous = self.store.account(self.account['id'], private=True)
@@ -208,12 +293,15 @@ class OnlineLoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('synthetic-manual-user', str(result))
         self.assertIs(self.setup.call_args.kwargs['allow_initial_identity'], True)
         self.assertIsNone(self.manager.active)
+        self.assertEqual([call.args for call in self.timing_capture.call_args_list], [(29999,), (29999,)])
         with patch('app.browser_runtime.browser_alive', return_value=True), \
+             patch('app.browser_runtime.ensure_resource_timing_capture') as capture, \
              patch('app.browser_runtime.start_managed_browser') as start:
             current, owned = self.service.browser_runtime.acquire(
                 self.store.account(self.account['id'], private=True))
             self.assertEqual(current['cdp_port'], 29999)
             start.assert_not_called()
+            capture.assert_called_once_with(29999)
             self.service.browser_runtime.release(current, owned)
 
     async def test_active_task_blocks_profile_takeover(self):

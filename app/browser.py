@@ -12,7 +12,7 @@ import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import websocket
 
@@ -25,6 +25,9 @@ COMMERCE_US_API = "https://commerce-us-ttp2.us.capcut.com"
 _PROCESS_LOCK = threading.RLock()
 _PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 _UPLOAD_LOCKS: dict[int, threading.RLock] = {}
+_TIMING_GUARD = threading.Lock()
+_TIMING_LOCKS: dict[int, threading.RLock] = {}
+_TIMING_CAPTURES: dict[int, tuple[str, Any, Any]] = {}
 
 # Retain genuine SDK resource URLs arriving after a cold page's first 250
 # assets. This changes timing storage only, never requests or SDK parameters.
@@ -45,6 +48,52 @@ class BrowserRejected(BrowserError):
 
 class _ResourceTimingContextPending(BrowserError):
     """The selected page is replacing its normal JavaScript context."""
+
+
+class _ResourceTimingHandle:
+    def __init__(self, refresh: Callable[[], None]) -> None:
+        self.refresh = refresh
+
+
+def _timing_lock(port: int) -> threading.RLock:
+    with _TIMING_GUARD:
+        return _TIMING_LOCKS.setdefault(port, threading.RLock())
+
+
+def close_resource_timing_capture(port: int) -> None:
+    """Release only our telemetry session, without closing or navigating a tab."""
+    with _timing_lock(port):
+        current = _TIMING_CAPTURES.pop(port, None)
+        if current:
+            current[1].__exit__(None, None, None)
+
+
+def ensure_resource_timing_capture(port: int, *, _target: dict[str, Any] | None = None,
+                                   _initial_navigation: bool = False) -> None:
+    """Keep each account's genuine SDK timing records across later documents."""
+    with _timing_lock(port):
+        target = _target or _page(port)
+        target_id = str(target.get("id") or "")
+        url = str(target.get("url") or "")
+        parsed = urllib.parse.urlsplit(url)
+        allowed = parsed.scheme == "https" and parsed.hostname == "dreamina.capcut.com"
+        if (not target_id or target.get("type") != "page"
+                or (_initial_navigation and url != "about:blank")
+                or (not _initial_navigation and not allowed)):
+            raise BrowserError("Dreamina resource timing target is not an owned blank or account page")
+        current = _TIMING_CAPTURES.get(port)
+        if current and current[0] == target_id:
+            try:
+                current[2].refresh()
+                return
+            except BrowserError:
+                close_resource_timing_capture(port)
+        elif current:
+            close_resource_timing_capture(port)
+        context = CDPBrowser(port, timeout=15).resource_timing_capture(
+            _target=target, _initial_navigation=_initial_navigation)
+        handle = context.__enter__()
+        _TIMING_CAPTURES[port] = (target_id, context, handle)
 
 
 def account_proxy_url(account: dict[str, Any]) -> str:
@@ -105,9 +154,12 @@ def start_managed_browser(account: dict[str, Any], *, chrome: str, profiles: Pat
         args += ["--no-sandbox", "--disable-dev-shm-usage"]
     proxy_url = account_proxy_url(account)
     args.append("--proxy-server=" + proxy_url)
-    args.append(BASE + "/ai-tool/generate")
+    # The new tab is ours and has not loaded account resources yet. Register
+    # the persistent init script before its first normal website navigation.
+    args.append("about:blank")
     with _PROCESS_LOCK:
         if browser_alive(port):
+            ensure_resource_timing_capture(port)
             return port
         existing = _PROCESSES.get(account_id)
         if existing and existing.poll() is None:
@@ -118,12 +170,25 @@ def start_managed_browser(account: dict[str, Any], *, chrome: str, profiles: Pat
                 existing.kill()
                 existing.wait(timeout=4)
         _remove_stale_profile_locks(profile)
+        close_resource_timing_capture(port)
+        try:
+            previous_targets = {str(target.get("id")) for target in _targets(port)}
+        except BrowserError:
+            previous_targets = set()
         _PROCESSES[account_id] = subprocess.Popen(args, stdout=subprocess.DEVNULL,
                                                   stderr=subprocess.DEVNULL,
                                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            if browser_alive(port):
+            try:
+                targets = _targets(port)
+            except BrowserError:
+                targets = []
+            fresh = next((target for target in targets if target.get("type") == "page"
+                          and target.get("url") == "about:blank"
+                          and str(target.get("id") or "") not in previous_targets), None)
+            if fresh:
+                ensure_resource_timing_capture(port, _target=fresh, _initial_navigation=True)
                 return port
             time.sleep(.1)
         try:
@@ -140,6 +205,7 @@ def start_managed_browser(account: dict[str, Any], *, chrome: str, profiles: Pat
 
 def close_browser_port(port: int) -> None:
     """Ask a local CDP browser to exit, including one orphaned by a restart."""
+    close_resource_timing_capture(port)
     try:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(f"http://127.0.0.1:{port}/json/version", timeout=2) as response:
@@ -200,9 +266,10 @@ class CDPBrowser:
         self.timeout = timeout
 
     @contextmanager
-    def resource_timing_capture(self) -> Iterator[None]:
+    def resource_timing_capture(self, *, _target: dict[str, Any] | None = None,
+                                _initial_navigation: bool = False) -> Iterator[_ResourceTimingHandle]:
         """Keep timing-buffer injection attached across login navigations."""
-        target = _page(self.port)
+        target = _target or _page(self.port)
         ws = None
         identifier = None
         sequence = 0
@@ -233,19 +300,8 @@ class CDPBrowser:
                     raise BrowserError("Dreamina login resource timing setup failed")
                 return response.get("result") or {}
 
-        try:
+        def refresh() -> None:
             try:
-                ws = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=self.timeout,
-                                                 suppress_origin=True)
-                command("Page.enable")
-                registered = command("Page.addScriptToEvaluateOnNewDocument", {"source": _RESOURCE_TIMING_BUFFER_SCRIPT})
-                identifier = registered.get("identifier")
-                if not isinstance(identifier, str) or not identifier:
-                    raise BrowserError("Dreamina login resource timing setup failed")
-                # The target URL may already be Dreamina while its initial
-                # about:blank context or a redirect is still being replaced.
-                # Keep the init script attached and wait only on normal
-                # telemetry readiness before any login action is allowed.
                 ready_deadline = time.monotonic() + 30
                 while True:
                     try:
@@ -262,7 +318,30 @@ class CDPBrowser:
                 ws.settimeout(self.timeout)
             except (OSError, ValueError, websocket.WebSocketException) as error:
                 raise BrowserError("Dreamina login resource timing connection failed") from error
-            yield
+
+        try:
+            try:
+                ws = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=self.timeout,
+                                                 suppress_origin=True)
+                command("Page.enable")
+                registered = command("Page.addScriptToEvaluateOnNewDocument", {"source": _RESOURCE_TIMING_BUFFER_SCRIPT})
+                identifier = registered.get("identifier")
+                if not isinstance(identifier, str) or not identifier:
+                    raise BrowserError("Dreamina login resource timing setup failed")
+                if _initial_navigation:
+                    if target.get("url") != "about:blank":
+                        raise BrowserError("Dreamina initial navigation requires an owned blank tab")
+                    navigation = command("Page.navigate", {"url": BASE + "/ai-tool/generate"})
+                    if navigation.get("errorText"):
+                        raise BrowserError("Dreamina initial page navigation failed")
+                # The target URL may already be Dreamina while its initial
+                # about:blank context or a redirect is still being replaced.
+                # Keep the init script attached and wait only on normal
+                # telemetry readiness before any login action is allowed.
+                refresh()
+            except (OSError, ValueError, websocket.WebSocketException) as error:
+                raise BrowserError("Dreamina login resource timing connection failed") from error
+            yield _ResourceTimingHandle(refresh)
         finally:
             if ws is not None:
                 try:

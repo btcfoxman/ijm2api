@@ -3,9 +3,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from app.browser import BrowserRejected
 from app.catalog import normalize_request
-from app.client import DreaminaClient
+from app.client import DreaminaClient, SubmissionPreflightError
 
 
 def client():
@@ -20,7 +19,8 @@ def client():
 def test_confirmed_settings_are_required_before_the_single_generation_request():
     value = client()
     with patch('app.account_automation.AccountAutomation') as setup:
-        setup.return_value.ensure_ready.return_value = {'watermark_ready': True, 'agreement_ready': True}
+        setup.return_value.ensure_ready.return_value = {'identity_verified': True,
+                                                       'watermark_ready': True, 'agreement_ready': True}
         result = value.submit(normalize_request({'model': 'sd-2-0-mini', 'prompt': 'synthetic', 'duration': 4}),
                               {'images': [], 'videos': [], 'audios': []})
     assert result == {'run_id': 'submit', 'thread_id': 'history'}
@@ -38,7 +38,7 @@ def test_missing_or_unverified_preferences_do_not_reach_generation(ready):
     value = client()
     with patch('app.account_automation.AccountAutomation') as setup:
         setup.return_value.ensure_ready.return_value = ready
-        with pytest.raises(BrowserRejected):
+        with pytest.raises(SubmissionPreflightError):
             value.submit(normalize_request({'model': 'sd-2-0-mini', 'prompt': 'synthetic', 'duration': 4}),
                          {'images': [], 'videos': [], 'audios': []})
     value.browser.post.assert_not_called()

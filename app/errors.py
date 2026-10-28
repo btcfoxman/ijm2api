@@ -17,6 +17,11 @@ def upstream_review_error(code: str, message: str) -> str | None:
 def public_error(code: str, message: str) -> dict[str, str]:
     raw = (message or "").lower()
     kind = (code or "").upper()
+    # This exact legacy signature was emitted only by the account identity
+    # check before the generation POST. Keep stored records unchanged.
+    if (kind == "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN" and message ==
+            "Dreamina identity read could not complete; automatic resubmission is disabled"):
+        kind = "ACCOUNT_VERIFICATION_FAILED"
     if (kind in {"INPUT_AUDIO_DURATION_UNSUPPORTED", "INPUTAUDIODURATIONERROR"} or
             "audio clip is too long or too short" in raw):
         return {"code": "INPUT_AUDIO_DURATION_UNSUPPORTED",
@@ -51,7 +56,7 @@ def public_error(code: str, message: str) -> dict[str, str]:
         return {"code": "MEDIA_FORMAT_UNSUPPORTED", "message": "素材格式不支持，请修改后再试~"}
     if "web upload failed" in raw or kind == "MEDIA_UPLOAD_FAILED":
         return {"code": "MEDIA_UPLOAD_FAILED", "message": "上游维护中，请稍后再试~"}
-    if kind in {"ACCOUNT_POOL_UNAVAILABLE", "BROWSERERROR", "ACCOUNT_MISSING"}:
+    if kind in {"ACCOUNT_POOL_UNAVAILABLE", "BROWSERERROR", "ACCOUNT_MISSING", "ACCOUNT_VERIFICATION_FAILED"}:
         return {"code": kind, "message": "上游维护中，请稍后再试~"}
     review_kind = kind if kind in {"UPSTREAM_REVIEW_FAILED", "UPSTREAM_REVIEW_SERVICE_ERROR",
                                   "UPSTREAM_IMAGE_REVIEW_FAILED"} else None

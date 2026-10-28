@@ -24,6 +24,10 @@ class InputAudioDurationError(DreaminaError):
     pass
 
 
+class SubmissionPreflightError(BrowserError):
+    """Account verification failed before the generation POST was attempted."""
+
+
 _UPLOAD_LOCKS_GUARD = threading.RLock()
 _UPLOAD_LOCKS: dict[int, threading.RLock] = {}
 
@@ -298,9 +302,14 @@ class DreaminaClient:
         # These ordinary account-setting requests never invoke the Generate UI:
         # confirming its modal can otherwise resume a paid pending submission.
         from .account_automation import AccountAutomation
-        ready = AccountAutomation(self.account).ensure_ready()
-        if ready.get('watermark_ready') is not True or ready.get('agreement_ready') is not True:
-            raise BrowserRejected('Dreamina generation preferences require account setup')
+        try:
+            ready = AccountAutomation(self.account).ensure_ready()
+        except BrowserError as exc:
+            raise SubmissionPreflightError(str(exc)) from exc
+        if (not isinstance(ready, dict) or ready.get('identity_verified') is not True
+                or ready.get('watermark_ready') is not True
+                or ready.get('agreement_ready') is not True):
+            raise SubmissionPreflightError('Dreamina generation preferences require account setup')
         query = {"aid": "513695", "device_platform": "web", "region": "SG",
                  "os": "windows", "web_component_open_flag": "1",
                  "aigc_features": "app_lip_sync",
@@ -308,10 +317,10 @@ class DreaminaClient:
                  "generate_id": submit_id,
                  "commerce_with_input_video": "1" if assets["videos"] else "0"}
         data = self.browser.post("/mweb/v1/aigc_draft/generate", body, query=query)
-        record = data.get("aigc_data") or {}
-        task = record.get("task") or {}
-        if not task.get("task_id") or not task.get("submit_id"):
-            raise DreaminaError("Dreamina submit response has no task ID")
+        record = data.get("aigc_data") if isinstance(data, dict) else None
+        task = record.get("task") if isinstance(record, dict) else None
+        if not isinstance(task, dict) or not task.get("task_id") or not task.get("submit_id"):
+            raise BrowserError("Dreamina submit response has no task ID")
         return {"run_id": str(task["submit_id"]),
                 "thread_id": str(record.get("history_record_id") or task.get("history_id") or "")}
 

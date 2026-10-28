@@ -19,7 +19,7 @@ from typing import Any
 from .browser import BrowserError, BrowserRejected, browser_alive
 from .browser_runtime import BrowserRuntime
 from .catalog import MODELS, normalize_request
-from .client import DreaminaClient, DreaminaError, InputAudioDurationError
+from .client import DreaminaClient, DreaminaError, InputAudioDurationError, SubmissionPreflightError
 from .image_client import DreaminaImageClient, resolve_image_model
 from .image_request import normalize_image_request
 from .errors import public_error, upstream_review_error
@@ -515,6 +515,9 @@ class Service:
                     self.store.update_task(task_id, {"attempted_account_ids": attempted})
                     try:
                         submitted = client.submit(task["normalized"], assets)
+                    except SubmissionPreflightError as exc:
+                        self._fail(task_id, "ACCOUNT_VERIFICATION_FAILED", str(exc))
+                        return
                     except InputAudioDurationError as exc:
                         self._fail(task_id, "INPUT_AUDIO_DURATION_UNSUPPORTED", str(exc))
                         return

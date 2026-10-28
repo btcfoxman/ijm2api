@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-from .browser import BrowserError, BrowserRejected
+from .browser import BrowserError, BrowserRejected, browser_alive, close_resource_timing_capture, ensure_resource_timing_capture
 from .client import DreaminaClient as UpstreamClient
 from .account_automation import AccountAutomation
 from .auto_login import verified_login_user_id
@@ -203,6 +203,13 @@ class LoginDesktop:
         return bool(self.processes) and all(process.returncode is None for process in self.processes)
 
     async def close(self) -> None:
+        if self.cdp_port:
+            try:
+                await asyncio.to_thread(close_resource_timing_capture, self.cdp_port)
+            except Exception:
+                # Telemetry cleanup must never prevent the existing owned
+                # desktop/process cleanup from completing.
+                pass
         for process in reversed(self.processes):
             if process.returncode is None:
                 try:
@@ -316,6 +323,12 @@ class BrowserLoginManager:
                 if active["new_desktop"]:
                     await desktop.start()
                     self.desktops[account_id] = desktop
+                target_deadline = time.monotonic() + 30
+                while not await asyncio.to_thread(browser_alive, desktop.cdp_port):
+                    if time.monotonic() >= target_deadline:
+                        raise BrowserError("Dreamina login page target did not become ready")
+                    await asyncio.sleep(.1)
+                await asyncio.to_thread(ensure_resource_timing_capture, desktop.cdp_port)
                 active["phase"] = "login"
                 return self.status()
             except BaseException:
