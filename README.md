@@ -60,6 +60,15 @@ queries its original operation and never starts a second paid generation.
 Existing task records retain the browser backend; every new bound task stores
 its backend and recovery identifiers independently of subsequent settings.
 
+Lost generation receipts retain the original account, submission UUID and
+credit protection. Three explicit `operation_submission_absent` responses
+pause observation; missing records never authorize another paid generation.
+The fixed observation deadline survives restarts. Administrator task details
+show the first submission error, latest query error and reconciliation state.
+**核实原提交** and `POST /api/tasks/{id}/reconcile` only query that original
+operation once and can retrieve its completed original output.
+
+
 CLI result downloads preserve original media bytes and are published through
 the existing s3-center configuration. Signed URLs are renewed on queries.
 The optional `sd-2-5-480p-x` alias retains its explicit 720p-to-480p conversion.

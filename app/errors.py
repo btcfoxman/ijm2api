@@ -17,6 +17,9 @@ def upstream_review_error(code: str, message: str) -> str | None:
 def public_error(code: str, message: str) -> dict[str, str]:
     raw = (message or "").lower()
     kind = (code or "").upper()
+    if (kind == 'OPERATOR_CONTENT_RESTRICTED' and message ==
+            '检测到内容可能涉及版权或受限内容，请修改后重试，额度已返还~~'):
+        return {'code': kind, 'message': message}
     # This exact legacy signature was emitted only by the account identity
     # check before the generation POST. Keep stored records unchanged.
     if (kind == "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN" and message ==

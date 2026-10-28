@@ -9,7 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .canvas_cli import CanvasCLIError
+from .canvas_cli import CanvasCLIError, sanitize
 from .canvas_client import CanvasClient
 from .account_policy import credit_rejected
 from .cost_adapter import input_evidence, number
@@ -25,6 +25,74 @@ def execution_mode(account: dict) -> str:
 
 
 class CanvasServiceMixin:
+    def _canvas_context(self, task_id: str, changes: dict | None = None,
+                        remove: tuple[str, ...] = ()) -> dict:
+        with self._lock:
+            task = self.store.task(task_id) or {}
+            context = dict(task.get('upstream_context') or {})
+            context.update(changes or {})
+            for key in remove:
+                context.pop(key, None)
+            self.store.update_task(task_id, {'upstream_context': context})
+            return context
+
+    @staticmethod
+    def _canvas_diagnostic(error, phase: str) -> dict:
+        """Keep useful scalar evidence, never a raw CLI envelope or credential."""
+        details = getattr(error, 'details', None) or {}
+        details = details if isinstance(details, dict) else {}
+        source = details.get('error')
+        source = source if isinstance(source, dict) else {}
+        values = {key: source[key] for key in ('code', 'message', 'class', 'reason', 'serviceCode',
+            'traceId', 'exit_code', 'dispatch_started', 'outcome_unknown') if key in source}
+        values.update(code=getattr(error, 'code', type(error).__name__), message=str(error), phase=phase)
+        exit_code = getattr(error, 'exit_code', None)
+        if exit_code is not None:
+            values['exit_code'] = exit_code
+        if hasattr(error, 'outcome_unknown'):
+            values['outcome_unknown'] = error.outcome_unknown
+        for key in ('dispatch_started', 'outcome_unknown'):
+            if key in details:
+                values[key] = details[key]
+        diagnostic = {key: sanitize(value)[:600] if isinstance(value, str) else value
+            for key, value in values.items() if isinstance(value, (str, int, float, bool)) or value is None}
+        diagnostic['at'] = time.time()
+        return diagnostic
+
+    def _canvas_observation_deadline(self, task_id: str) -> float:
+        task = self.store.task(task_id) or {}
+        context = task.get('upstream_context') or {}
+        deadline = number(context.get('observation_deadline'))
+        if deadline is None:
+            # Legacy records have no reliable submission timestamp. A restart
+            # must not grant another full observation window to an empty run.
+            resolution = context.get('recovery_resolution') or {}
+            started = number(resolution.get('attempt_started_at')) if isinstance(resolution, dict) else None
+            started = number(task.get('created_at')) if started is None else started
+            started = time.time() if started is None else started
+            deadline = started + int(self.settings()['task_timeout_seconds'])
+            self._canvas_context(task_id, {'observation_started_at': started,
+                                          'observation_deadline': deadline})
+        return deadline
+
+    def _canvas_pending_message(self, task_id: str, fallback: str) -> str:
+        context = (self.store.task(task_id) or {}).get('upstream_context') or {}
+        original = context.get('submit_error') or {}
+        original = original if isinstance(original, dict) else {}
+        return str(original.get('message') or fallback)[:600]
+
+    def _park_canvas_task(self, task_id: str, reason: str, message: str | None = None) -> dict:
+        task = self.store.task(task_id) or {}
+        context = task.get('upstream_context') or {}
+        self._canvas_context(task_id, {'reconciliation_paused': True,
+            'reconciliation_pause_reason': reason,
+            'reconciliation_paused_at': context.get('reconciliation_paused_at') or time.time()})
+        return self.store.update_task(task_id, {'status': 'submitted',
+            'progress': min(40, int(task.get('progress') or 40)), 'completed_at': None,
+            'error_code': 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN',
+            'error_message': message or self._canvas_pending_message(task_id,
+                'Canvas submission requires verification; original operation and credit hold retained')})
+
     def _refresh_canvas_result_urls(self, task: dict) -> dict:
         if task.get('status') != 'succeeded':
             return task
@@ -109,11 +177,20 @@ class CanvasServiceMixin:
         account_id = int(account["id"])
         client = self.canvas_client(account)
         submission_started = False
-        context = {}
+        context = {key: value for key, value in (task.get('upstream_context') or {}).items()
+                   if key in {'previous_submissions', 'recovery_resolution'}}
+        resolution = context.get('recovery_resolution') or {}
+        attempt_started = number(resolution.get('attempt_started_at')) if isinstance(resolution, dict) else None
+        if attempt_started is not None:
+            deadline = min(deadline, time.monotonic() + max(0,
+                attempt_started + int(self.settings()['task_timeout_seconds']) - time.time()))
 
         def persist(value):
             nonlocal context
             context = {**context, **value}
+            old_error = ((self.store.task(task_id) or {}).get('upstream_context') or {}).get('submit_error')
+            if old_error:
+                context['submit_error'] = old_error
             self.store.update_task(task_id, {"execution_backend": "canvas_cli",
                                            "upstream_context": context})
 
@@ -151,6 +228,10 @@ class CanvasServiceMixin:
             if quote is None:
                 self._fail(task_id, "CLI_QUOTE_UNAVAILABLE", "Canvas could not establish the complete task quote")
                 return True
+            ceiling = number(normalized.get('_canvas_credit_ceiling'))
+            if ceiling is not None and quote > ceiling:
+                self._fail(task_id, 'CLI_CREDIT_CEILING_EXCEEDED', 'Canvas quote exceeds the explicitly authorized recovery credit ceiling')
+                return True
             with self._lock:
                 self.store.update_task(task_id, {"estimated_cost": quote,
                     "cost_evidence": {"canvas_quote": {"amount": quote, "source": "node.quote"},
@@ -159,7 +240,9 @@ class CanvasServiceMixin:
                 funded, _ = self._submission_budget_status(account, task_id, quote, before)
                 if not funded:
                     self.store.update_task(task_id, {"status": "queued", "account_id": None,
-                        "progress": 0, "balance_before": None, "upstream_context": {},
+                        "progress": 0, "balance_before": None, "upstream_context": {
+                            key: value for key, value in context.items()
+                            if key in {'previous_submissions', 'recovery_resolution'}},
                         "execution_backend": "canvas_cli", "error_code": "INSUFFICIENT_CREDITS",
                         "error_message": "Canvas quote exceeds available unreserved credits"})
                     return False
@@ -176,22 +259,32 @@ class CanvasServiceMixin:
                     self.store.update_task(task_id, {'cost_evidence': {'canvas_budget_checked': True}})
                     if candidates:
                         self.store.update_task(task_id, {'status': 'queued', 'account_id': None,
-                            'progress': 0, 'balance_before': None, 'upstream_context': {},
+                            'progress': 0, 'balance_before': None, 'upstream_context': {
+                                key: value for key, value in context.items()
+                                if key in {'previous_submissions', 'recovery_resolution'}},
                             'execution_backend': 'canvas_cli'})
                         return 'reselect'
                 attempts = list(task.get("attempted_account_ids") or [])
                 if account_id not in attempts:
                     attempts.append(account_id)
                 # The durable record is committed before any paid run request.
-                persist({"submission_phase": "submitting", "expected_user_id": identity})
+                began_at = time.time() if attempt_started is None else attempt_started
+                persist({"submission_phase": "confirming", "expected_user_id": identity,
+                    'observation_started_at': began_at,
+                    'observation_deadline': began_at + int(self.settings()['task_timeout_seconds'])})
                 self.store.update_task(task_id, {"attempted_account_ids": attempts, "progress": 30})
             submission_started = True
-            submitted = client.submit(context, int(math.ceil(quote)))
+            submitted = client.submit(context, int(math.ceil(quote)), persist=persist, deadline=deadline)
             persist({**submitted, "submission_phase": "submitted"})
             self.store.update_task(task_id, {"status": "submitted", "progress": 40})
             self._poll_canvas(task_id, client, deadline)
             return True
         except CanvasCLIError as exc:
+            if submission_started:
+                current = (self.store.task(task_id) or {}).get('upstream_context') or {}
+                if not current.get('submit_error'):
+                    self._canvas_context(task_id, {'submit_error': self._canvas_diagnostic(exc,
+                        str(current.get('submission_phase') or 'submitting'))})
             error = (getattr(exc, 'details', None) or {}).get('error') or {}
             rejected_credit = (credit_rejected(str(exc))
                 or str(error.get('serviceCode') or error.get('code')) == '1006'
@@ -202,7 +295,8 @@ class CanvasServiceMixin:
                 # A lost receipt is reconciled by original operation identity.
                 self.store.update_task(task_id, {"status": "submitted", "progress": 40,
                     "error_code": "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
-                    "error_message": "Canvas submission receipt unavailable; querying original operation"})
+                    "error_message": self._canvas_pending_message(task_id,
+                        "Canvas submission receipt unavailable; querying original operation")})
                 self._poll_canvas(task_id, client, deadline)
             else:
                 self._fail(task_id, exc.code, str(exc))
@@ -210,7 +304,14 @@ class CanvasServiceMixin:
         except Exception as exc:
             code = "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN" if submission_started else (
                 "MEDIA_DOWNLOAD_FAILED" if isinstance(exc, MediaError) else "CLI_PREPARATION_FAILED")
-            self._fail(task_id, code, f"{type(exc).__name__}: Canvas {'submission outcome unknown' if submission_started else 'preparation failed'}")
+            if submission_started:
+                current = (self.store.task(task_id) or {}).get('upstream_context') or {}
+                if not current.get('submit_error'):
+                    self._canvas_context(task_id, {'submit_error': self._canvas_diagnostic(exc,
+                        str(current.get('submission_phase') or 'submitting'))})
+                self._park_canvas_task(task_id, 'submission_interrupted')
+            else:
+                self._fail(task_id, code, f"{type(exc).__name__}: Canvas preparation failed")
             logger.warning("Canvas task %s failed in %s (%s)", task_id,
                            "submission" if submission_started else "preparation", type(exc).__name__)
             return True
@@ -236,31 +337,76 @@ class CanvasServiceMixin:
             pass
         return values
 
-    def _poll_canvas(self, task_id: str, client, deadline: float) -> None:
+    def _poll_canvas(self, task_id: str, client, deadline: float, *,
+                     one_shot: bool = False) -> None:
         errors = 0
         transfer_errors = 0
-        while not self._stop.is_set() and time.monotonic() < deadline:
+        result_storage_pending = False
+        task = self.store.task(task_id)
+        if not task or (task.get('upstream_context') or {}).get('reconciliation_paused') and not one_shot:
+            return
+        absolute_deadline = self._canvas_observation_deadline(task_id)
+        queried = False
+        while not self._stop.is_set() and (one_shot and not queried or not one_shot
+                and time.monotonic() < deadline and time.time() < absolute_deadline):
             task = self.store.task(task_id)
             if not task or (task["status"] in {"failed", "expired", "succeeded"}
                             and task.get("error_code") != "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN"):
                 return
             context = task.get("upstream_context") or {}
+            if context.get('reconciliation_paused') and not one_shot:
+                return
+            queried = True
             try:
                 state = client.poll(context)
                 errors = 0
             except CanvasCLIError as exc:
                 errors += 1
+                absent = str(exc.code).lower() == 'cli.operation_submission_absent'
+                count = int(context.get('consecutive_submission_absent') or 0) + 1 if absent else 0
+                self._canvas_context(task_id, {'last_query_error': self._canvas_diagnostic(exc, 'query'),
+                    'consecutive_submission_absent': count})
                 self.store.update_task(task_id, {"error_code": "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
-                    "error_message": "Canvas operation query interrupted; original submission retained"})
+                    "error_message": self._canvas_pending_message(task_id,
+                        "Canvas operation query interrupted; original submission retained")})
+                if count >= 3 or one_shot:
+                    self._park_canvas_task(task_id, 'operation_submission_absent' if count >= 3
+                        else context.get('reconciliation_pause_reason') or 'manual_verification_unresolved')
+                    return
                 self._stop.wait(min(60, 2 ** min(errors, 6)))
                 continue
             status = state.get("status")
+            if status == 'unknown':
+                absent = str(state.get('error_code') or '').lower() == 'cli.operation_submission_absent'
+                count = int(context.get('consecutive_submission_absent') or 0) + 1 if absent else 0
+                diagnostic = CanvasCLIError(state.get('error_code') or 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN',
+                    state.get('error_message') or 'Canvas original submission could not be matched')
+                self._canvas_context(task_id, {'last_query_error': self._canvas_diagnostic(diagnostic, 'query'),
+                    'consecutive_submission_absent': count})
+                self.store.update_task(task_id, {'status': 'submitted', 'progress': min(40, task['progress']),
+                    'error_code': 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN',
+                    'error_message': self._canvas_pending_message(task_id, str(diagnostic))})
+                if count >= 3 or one_shot:
+                    self._park_canvas_task(task_id, 'operation_submission_absent' if count >= 3
+                        else context.get('reconciliation_pause_reason') or 'manual_verification_unresolved')
+                    return
+                self._stop.wait(max(2, int(self.settings()['poll_interval_seconds'])))
+                continue
+            # A positive operation match clears only obsolete query errors.
+            # Preserve the original submission diagnostic as durable evidence.
+            self._canvas_context(task_id, {'consecutive_submission_absent': 0,
+                'reconciliation_paused': False, 'submission_phase': 'accepted', 'phase': 'accepted'}, remove=('last_query_error',
+                'reconciliation_pause_reason', 'reconciliation_paused_at'))
             facts = [item for item in (state.get('credit_facts') or [])
                 if isinstance(item, dict) and item.get('source') == 'precharge'
                 and item.get('settled') is False]
             if facts:
                 self.store.update_task(task_id, {'cost_evidence': {'canvas_resource_snapshots': facts}})
             if status == "succeeded":
+                resource_ids = [item.get('resource_id') for item in state.get('result_files') or []
+                    if isinstance(item, dict) and item.get('resource_id')]
+                if resource_ids:
+                    self._canvas_context(task_id, {'resource_ids': resource_ids})
                 urls = state.get("result_urls") or []
                 metadata = {}
                 if state.get('result_paths'):
@@ -280,16 +426,29 @@ class CanvasServiceMixin:
                         metadata = {'items': receipts, 'original_bytes': True}
                     except (ResultTransferError, OSError, TypeError) as exc:
                         transfer_errors += 1
+                        result_storage_pending = True
                         self.store.update_task(task_id, {'progress': 95, 'error_code': 'RESULT_TRANSFER_FAILED',
                             'error_message': 'Canvas generation complete; original result storage is being retried'})
                         if transfer_errors >= 8:
                             self.store.update_task(task_id, self._canvas_settlement(task, client))
-                            self._fail(task_id, 'RESULT_TRANSFER_FAILED', 'Canvas result storage could not complete; generation was not resubmitted')
+                            self._park_canvas_task(task_id, 'result_transfer_failed',
+                                'Canvas generation completed; original result storage remains unavailable; generation was not resubmitted')
+                            return
+                        if one_shot:
+                            self._park_canvas_task(task_id, 'result_transfer_failed',
+                                'Canvas generation completed; original result storage remains unavailable; retry result storage only')
                             return
                         self._stop.wait(min(60, 2 ** min(transfer_errors, 6)))
                         continue
                 if not urls:
-                    self._fail(task_id, "RESULT_MISSING", "Canvas completed without downloadable result URLs")
+                    pending = CanvasCLIError('CLI_RESULT_PENDING',
+                        'Canvas reported completion before the final output became available', outcome_unknown=True)
+                    self._canvas_context(task_id, {'last_query_error': self._canvas_diagnostic(pending, 'query')})
+                    self.store.update_task(task_id, {'status': 'submitted', 'progress': min(40, task['progress']),
+                        'error_code': 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN',
+                        'error_message': str(pending)})
+                    self._park_canvas_task(task_id, 'result_pending',
+                        'Canvas generation completed; the final output has not been retrieved; retry the original result only')
                     return
                 values = {"status": "succeeded", "progress": 100, "error_code": "", "error_message": "",
                           "result_urls": urls, 'result_transfer': metadata,
@@ -313,21 +472,23 @@ class CanvasServiceMixin:
                 self._fail(task_id, state.get("error_code") or "UPSTREAM_FAILED",
                     state.get("error_message") or "Canvas generation failed")
                 return
-            self.store.update_task(task_id, {"status": "running",
+            self.store.update_task(task_id, {"status": "running", 'error_code': '', 'error_message': '',
                 "progress": max(45, min(95, int(number(state.get("progress")) or 45))),
-                **({'error_code': 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN',
-                    'error_message': state.get('error_message') or 'Canvas original submission is being reconciled'}
-                   if status == 'unknown' else {})})
+                })
+            if one_shot:
+                return
             self._stop.wait(max(2, int(self.settings()["poll_interval_seconds"])))
-        if not self._stop.is_set():
-            self.store.update_task(task_id, {"status": "expired", "progress": 100,
-                "error_code": "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
-                "error_message": "Canvas task observation timed out; original upstream operation may continue",
-                "completed_at": time.time()})
+        if not self._stop.is_set() and not one_shot:
+            if result_storage_pending:
+                self._park_canvas_task(task_id, 'result_transfer_failed',
+                    'Canvas generation completed; the result storage observation window expired; retry original result storage only')
+            else:
+                self._park_canvas_task(task_id, 'observation_deadline_reached')
 
     def _resume_canvas_poll(self, task_id: str) -> None:
         task = self.store.task(task_id)
-        if not task or not task.get("account_id"):
+        if (not task or not task.get("account_id")
+                or (task.get('upstream_context') or {}).get('reconciliation_paused')):
             return
         account = self.store.account(int(task["account_id"]), private=True)
         if not account:
@@ -340,7 +501,37 @@ class CanvasServiceMixin:
             self._poll_canvas(task_id, self.canvas_client(account),
                 time.monotonic() + int(self.settings()["task_timeout_seconds"]))
         except Exception as exc:
-            self._fail(task_id, "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", f"{type(exc).__name__}: Canvas recovery interrupted")
+            self._canvas_context(task_id, {'last_query_error': self._canvas_diagnostic(exc, 'query')})
+            self._park_canvas_task(task_id, 'recovery_interrupted')
         finally:
             self._release_account(int(account["id"]), task_id)
             self._worker_slots.release()
+
+    def reconcile_canvas_task(self, task_id: str) -> dict:
+        """Query the retained operation once; never prepare, confirm or run it."""
+        with self._lock:
+            task = self.store.task(task_id)
+            if not task or task.get('execution_backend') != 'canvas_cli' or not task.get('account_id'):
+                raise ValueError('task has no Canvas operation to verify')
+            context = task.get('upstream_context') or {}
+            if not all(context.get(key) for key in ('project_id', 'node_id', 'submit_id')):
+                raise ValueError('task has no retained Canvas operation identifiers')
+            if task['status'] in {'failed', 'expired', 'succeeded'} and task.get('error_code') != 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN':
+                raise ValueError('task no longer requires Canvas verification')
+            account_id = int(task['account_id'])
+            account = self.store.account(account_id, private=True)
+            if not account:
+                raise ValueError('task account is unavailable')
+            if self._active.get(account_id, 0) or not self._worker_slots.acquire(blocking=False):
+                raise RuntimeError('task account is busy')
+            self._active[account_id] = self._active.get(account_id, 0) + 1
+        try:
+            self._poll_canvas(task_id, self.canvas_client(account), time.monotonic(), one_shot=True)
+        except Exception as exc:
+            self._canvas_context(task_id, {'last_query_error': self._canvas_diagnostic(exc, 'query')})
+            self._park_canvas_task(task_id, 'manual_verification_interrupted')
+        finally:
+            with self._lock:
+                self._active[account_id] = max(0, self._active.get(account_id, 1) - 1)
+            self._worker_slots.release()
+        return self.store.task(task_id) or {}

@@ -1,6 +1,8 @@
 """CLI execution preserves paid-operation identity and account credit safety."""
 from copy import deepcopy
+import json
 import time
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import uuid
 
@@ -10,6 +12,7 @@ from app.canvas_cli import CanvasCLIError
 from app.catalog import normalize_request
 from app.service import Service
 from app.store import Store
+from app.result_transfer import ResultTransferError
 
 
 @pytest.fixture
@@ -58,14 +61,16 @@ def fake_client(store, service, account, *, quote=10, actual=None, kind="video")
 
     client.prepare.side_effect = prepare
 
-    def submit(context, ceiling):
+    def submit(context, ceiling, *, persist, deadline):
         durable = store.task(context["task_id"])
         assert durable["execution_backend"] == "canvas_cli"
         assert durable["upstream_context"]["submit_id"] == context["submit_id"]
-        assert durable["upstream_context"]["submission_phase"] == "submitting"
+        assert durable["upstream_context"]["submission_phase"] == "confirming"
         assert durable["estimated_cost"] == quote
         assert durable["actual_cost"] is None
         assert ceiling >= quote
+        assert deadline > time.monotonic()
+        persist({'submission_phase': 'run_dispatching'})
         return {**context, "phase": "accepted", "resource_ids": ["accepted-resource"]}
 
     client.submit.side_effect = submit
@@ -94,7 +99,7 @@ def test_cli_video_runs_without_browser_and_stores_original_output_before_return
     assert result["result_urls"][0].startswith("https://results.example.test/")
     assert result["result_transfer"]["original_bytes"] is True
     assert result["estimated_cost"] == result["actual_cost"] == 10
-    assert result["upstream_context"]["submission_phase"] == "submitted"
+    assert result["upstream_context"]["submission_phase"] == "accepted"
     client.submit.assert_called_once()
     service.browser_runtime.acquire.assert_not_called()
     stored.assert_called_once()
@@ -381,5 +386,417 @@ def test_canvas_restart_uses_retained_original_operation_without_preparing_or_su
     assert store.task("task")["status"] == "succeeded"
     client.prepare.assert_not_called()
     client.submit.assert_not_called()
-    assert client.poll.call_args.args[0] == original
+    assert {key: client.poll.call_args.args[0][key] for key in original} == original
+    assert client.poll.call_args.args[0]['observation_deadline'] == pytest.approx(
+        store.task('task')['created_at'] + service.settings()['task_timeout_seconds'])
     service.browser_runtime.acquire.assert_not_called()
+
+
+def test_three_explicit_absences_park_original_binding_and_keep_first_submit_diagnostic(context):
+    store, service, _ = context
+    account = owner(store)
+    task(store)
+    client = fake_client(store, service, account)
+    client.submit.side_effect = CanvasCLIError('cli.invalid_service_response', 'original receipt lost; token=private',
+        details={'error': {'class': 'transport_error', 'traceId': 'original-trace', 'accessToken': 'private'}},
+        outcome_unknown=True)
+    client.poll.side_effect = [CanvasCLIError('cli.operation_submission_absent', f'lookup {index} absent') for index in range(3)]
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._run('task')
+    result = store.task('task')
+    context = result['upstream_context']
+    assert result['status'] == 'submitted' and result['error_code'] == 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'
+    assert context['reconciliation_paused'] is True
+    assert context['reconciliation_pause_reason'] == 'operation_submission_absent'
+    assert context['consecutive_submission_absent'] == 3
+    assert context['submit_error']['code'] == 'cli.invalid_service_response'
+    assert context['submit_error']['traceId'] == 'original-trace'
+    assert 'original receipt lost' in result['error_message']
+    assert 'private' not in str(context)
+    assert context['last_query_error']['code'] == 'cli.operation_submission_absent'
+    assert result['account_id'] == account['id'] and result['estimated_cost'] == 10
+    assert result['actual_cost'] is None
+    assert store.active_account_count(account['id']) == 1
+    assert store.scheduling_rows()['inflight'][0]['id'] == 'task'
+    assert service._active[account['id']] == 0 and not service._credit_reservations
+    client.submit.assert_called_once()
+    assert client.poll.call_count == 3
+
+
+def test_network_errors_do_not_count_as_explicit_absence_or_cause_premature_parking(context):
+    store, service, _ = context
+    account = owner(store)
+    task(store)
+    client = fake_client(store, service, account)
+    success = client.poll.return_value
+    client.poll.side_effect = [CanvasCLIError('CLI_NETWORK_ERROR', 'temporary query error') for _ in range(3)] + [success]
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._run('task')
+    result = store.task('task')
+    assert result['status'] == 'succeeded'
+    assert result['upstream_context']['reconciliation_paused'] is False
+    assert result['upstream_context']['consecutive_submission_absent'] == 0
+    assert 'last_query_error' not in result['upstream_context']
+    assert client.poll.call_count == 4
+    client.submit.assert_called_once()
+
+
+def test_known_running_clears_obsolete_query_error_but_keeps_first_submit_error(context):
+    store, service, _ = context
+    account = owner(store)
+    task(store)
+    client = fake_client(store, service, account)
+    success = client.poll.return_value
+    client.submit.side_effect = CanvasCLIError('CLI_TIMEOUT', 'original receipt unavailable', outcome_unknown=True)
+    client.poll.side_effect = [CanvasCLIError('CLI_NETWORK_ERROR', 'query broke'),
+                               {'status': 'running', 'progress': 52}, success]
+    inspected = []
+    def observe(_seconds):
+        current = store.task('task')
+        if current['status'] == 'running':
+            assert current['error_code'] == current['error_message'] == ''
+            assert 'last_query_error' not in current['upstream_context']
+            assert current['upstream_context']['submit_error']['code'] == 'CLI_TIMEOUT'
+            inspected.append(True)
+        return False
+    with patch.object(service, 'canvas_client', return_value=client), patch.object(service._stop, 'wait', side_effect=observe):
+        service._run('task')
+    assert inspected == [True]
+    assert store.task('task')['status'] == 'succeeded'
+
+
+def test_absence_streak_is_reset_by_network_error_and_positive_running_match(context):
+    store, service, _ = context
+    account = owner(store)
+    task(store)
+    client = fake_client(store, service, account)
+    success = client.poll.return_value
+    absent = lambda: CanvasCLIError('cli.operation_submission_absent', 'not resolved')
+    client.poll.side_effect = [absent(), CanvasCLIError('CLI_NETWORK_ERROR', 'query broke'), absent(),
+        {'status': 'running', 'progress': 50}, absent(), absent(), success]
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._run('task')
+    assert store.task('task')['status'] == 'succeeded'
+    assert client.poll.call_count == 7
+    client.submit.assert_called_once()
+
+
+def retained_operation(store, account, *, paused=True, deadline=None):
+    task(store, backend='canvas_cli')
+    context = {'project_id': 'retained-project', 'node_id': 'retained-node', 'submit_id': 'retained-submit',
+        'submission_phase': 'submitting', 'phase': 'quoted', 'expected_user_id': account['login_user_id'],
+        'reconciliation_paused': paused, 'submit_error': {'code': 'original-error', 'message': 'original diagnostic'}}
+    if deadline is not None:
+        context['observation_deadline'] = deadline
+    store.update_task('task', {'status': 'submitted', 'account_id': account['id'], 'upstream_context': context,
+        'estimated_cost': 10, 'balance_before': 100, 'error_code': 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'})
+    return store.task('task')
+
+
+def test_legacy_restart_uses_created_deadline_and_never_grants_a_new_window(context):
+    store, service, _ = context
+    account = owner(store)
+    retained_operation(store, account, paused=False)
+    created = time.time() - 1200
+    with store._connect() as db:
+        db.execute('UPDATE tasks SET created_at=? WHERE id=?', (created, 'task'))
+    client = fake_client(store, service, account)
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._resume_canvas_poll('task')
+    result = store.task('task')
+    assert result['status'] == 'submitted'
+    assert result['upstream_context']['reconciliation_paused'] is True
+    assert result['upstream_context']['observation_deadline'] == pytest.approx(created + 5)
+    first = result['upstream_context']['observation_deadline']
+    store.update_settings({'task_timeout_seconds': 3000})
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._resume_canvas_poll('task')
+    assert store.task('task')['upstream_context']['observation_deadline'] == first
+    client.poll.assert_not_called()
+    client.submit.assert_not_called()
+
+
+def test_manual_reconciliation_queries_once_without_extending_deadline_or_releasing_hold(context):
+    store, service, _ = context
+    account = owner(store)
+    deadline = time.time() - 1200
+    retained_operation(store, account, deadline=deadline)
+    client = fake_client(store, service, account)
+    client.poll.side_effect = CanvasCLIError('cli.operation_submission_absent', 'still absent')
+    with patch.object(service, 'canvas_client', return_value=client):
+        result = service.reconcile_canvas_task('task')
+    assert result['status'] == 'submitted' and result['upstream_context']['reconciliation_paused'] is True
+    assert result['upstream_context']['observation_deadline'] == deadline
+    assert result['upstream_context']['submit_id'] == 'retained-submit'
+    assert result['upstream_context']['submit_error']['message'] == 'original diagnostic'
+    assert store.active_account_count(account['id']) == 1
+    assert service._worker_slots._value == 50 and service._active[account['id']] == 0
+    client.poll.assert_called_once()
+    client.prepare.assert_not_called()
+    client.submit.assert_not_called()
+
+
+def test_manual_reconciliation_can_publish_positive_original_result_without_generation(context):
+    store, service, stored = context
+    account = owner(store)
+    deadline = time.time() - 1200
+    retained_operation(store, account, deadline=deadline)
+    client = fake_client(store, service, account)
+    with patch.object(service, 'canvas_client', return_value=client):
+        result = service.reconcile_canvas_task('task')
+    assert result['status'] == 'succeeded'
+    assert result['upstream_context']['observation_deadline'] == deadline
+    assert result['result_urls'][0].startswith('https://results.example.test/')
+    assert result['error_code'] == '' and store.active_account_count(account['id']) == 0
+    client.poll.assert_called_once()
+    client.submit.assert_not_called()
+    stored.assert_called_once()
+
+
+def test_manual_reconciliation_rejects_busy_account_before_any_query(context):
+    store, service, _ = context
+    account = owner(store)
+    retained_operation(store, account)
+    service._active[account['id']] = 1
+    before = service._worker_slots._value
+    with patch.object(service, 'canvas_client') as client, pytest.raises(RuntimeError, match='busy'):
+        service.reconcile_canvas_task('task')
+    client.assert_not_called()
+    assert service._worker_slots._value == before
+
+
+def test_positive_confirmation_failure_releases_credit_and_keeps_typed_original_error(context):
+    store, service, _ = context
+    account = owner(store)
+    task(store)
+    client = fake_client(store, service, account)
+    client.submit.side_effect = CanvasCLIError('CLI_CONFIRMATION_INVALID', 'no confirmation token',
+        details={'dispatch_started': False, 'error': {'class': 'invalid_response'}}, outcome_unknown=False)
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._run('task')
+    result = store.task('task')
+    assert result['status'] == 'failed' and result['error_code'] == 'CLI_CONFIRMATION_INVALID'
+    assert result['upstream_context']['submit_error']['dispatch_started'] is False
+    assert store.active_account_count(account['id']) == 0
+    assert store.scheduling_rows()['inflight'] == []
+    client.poll.assert_not_called()
+
+
+def test_query_diagnostics_only_keep_whitelisted_scalars(context):
+    _, service, _ = context
+    error = CanvasCLIError('original.code', 'safe failure', exit_code=21, details={'error': {
+        'class': 'transport_error', 'reason': 'network_error', 'serviceCode': '55', 'traceId': 'trace',
+        'authorization': 'private', 'deviceCode': 'private', 'untrusted': 'drop', 'debug': {'token': 'private'}}})
+    saved = service._canvas_diagnostic(error, 'query')
+    assert saved['traceId'] == 'trace' and saved['exit_code'] == 21
+    assert saved['phase'] == 'query'
+    assert 'private' not in str(saved) and 'untrusted' not in saved and 'debug' not in saved
+
+
+def test_explicit_recovery_ceiling_is_checked_before_confirm_or_paid_run(context):
+    store, service, _ = context
+    account = owner(store)
+    row = task(store)
+    normalized = {**row['normalized'], '_canvas_credit_ceiling': 9, '_canvas_attempt_id': 'new-attempt'}
+    with store._connect() as db:
+        db.execute('UPDATE tasks SET normalized_json=? WHERE id=?', (json.dumps(normalized), 'task'))
+    client = fake_client(store, service, account, quote=10)
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._run('task')
+    assert store.task('task')['error_code'] == 'CLI_CREDIT_CEILING_EXCEEDED'
+    assert store.task('task')['status'] == 'failed'
+    client.submit.assert_not_called()
+    client.poll.assert_not_called()
+    assert store.scheduling_rows()['inflight'] == []
+
+
+def test_new_explicit_attempt_preserves_recovery_history_without_reusing_old_active_ids(context):
+    store, service, _ = context
+    account = owner(store)
+    task(store)
+    archive = [{'submit_id': 'old-submit', 'account_id': account['id'], 'outcome': 'unresolved'}]
+    started = time.time()
+    resolution = {'type': 'duplicate_charge_risk_acknowledged', 'risk_acknowledged': True,
+                  'attempt_started_at': started}
+    store.update_task('task', {'upstream_context': {'previous_submissions': archive,
+        'recovery_resolution': resolution, 'submit_id': 'must-not-reuse', 'reconciliation_paused': True,
+        'observation_deadline': 1, 'last_query_error': {'code': 'old-query'}}})
+    client = fake_client(store, service, account)
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._run('task')
+    result = store.task('task')
+    assert result['status'] == 'succeeded', result['error_message']
+    saved = result['upstream_context']
+    assert saved['previous_submissions'] == archive and saved['recovery_resolution'] == resolution
+    assert saved['submit_id'] != 'must-not-reuse'
+    assert saved['observation_deadline'] == pytest.approx(started + 5)
+    assert 'last_query_error' not in saved
+    client.submit.assert_called_once()
+
+
+def test_acknowledged_new_attempt_already_out_of_time_never_prepares_or_runs(context):
+    store, service, _ = context
+    account = owner(store)
+    task(store)
+    store.update_task('task', {'upstream_context': {'recovery_resolution': {
+        'type': 'duplicate_charge_risk_acknowledged', 'risk_acknowledged': True,
+        'attempt_started_at': time.time() - 1200}}})
+    client = fake_client(store, service, account)
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._run('task')
+    assert store.task('task')['error_code'] == 'CLI_PREPARATION_TIMEOUT'
+    client.identity.assert_not_called()
+    client.prepare.assert_not_called()
+    client.submit.assert_not_called()
+
+
+@pytest.mark.parametrize('state', ['running', 'unknown'])
+def test_observation_timeout_parks_pending_result_without_failure_or_credit_release(context, monkeypatch, state):
+    store, service, _ = context
+    account = owner(store)
+    wall = {'now': time.time()}
+    deadline = wall['now'] + 5
+    retained_operation(store, account, paused=False, deadline=deadline)
+    original = store.task('task')['upstream_context']
+    client = Mock(account=account)
+    client.poll.return_value = {'status': state, 'result_urls': [], 'result_paths': [], 'progress': 55}
+    # Advance only this module's observation clock after one query. A deadline
+    # does not become a provider failure, even after a positive running match.
+    monkeypatch.setattr('app.canvas_service.time', SimpleNamespace(
+        time=lambda: wall['now'], monotonic=lambda: 1))
+    service._stop.wait.side_effect = lambda _: wall.update(now=deadline + 1)
+    service._poll_canvas('task', client, 100)
+    result = store.task('task')
+    saved = result['upstream_context']
+    assert result['status'] == 'submitted' and result['error_code'] == 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'
+    assert result['completed_at'] is None and result['actual_cost'] is None
+    assert saved['reconciliation_paused'] is True
+    assert saved['reconciliation_pause_reason'] == 'observation_deadline_reached'
+    assert saved['observation_deadline'] == deadline
+    assert saved['submit_id'] == original['submit_id']
+    assert store.active_account_count(account['id']) == 1
+    assert store.scheduling_rows()['inflight'][0]['id'] == 'task'
+    client.poll.assert_called_once()
+    client.submit.assert_not_called()
+    client.prepare.assert_not_called()
+
+
+def test_manual_completed_without_final_output_remains_pending_and_keeps_hold(context):
+    store, service, _ = context
+    account = owner(store)
+    retained_operation(store, account, deadline=time.time() - 1200)
+    client = Mock(account=account)
+    client.poll.return_value = {'status': 'succeeded', 'result_urls': [], 'result_paths': []}
+    with patch.object(service, 'canvas_client', return_value=client):
+        result = service.reconcile_canvas_task('task')
+    assert result['status'] == 'submitted' and result['completed_at'] is None
+    assert result['error_code'] == 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'
+    assert result['upstream_context']['reconciliation_pause_reason'] == 'result_pending'
+    assert result['upstream_context']['submission_phase'] == 'accepted'
+    assert 'generation completed' in result['error_message']
+    assert store.active_account_count(account['id']) == 1
+    client.poll.assert_called_once()
+    client.submit.assert_not_called()
+
+
+def test_confirmed_completion_without_result_parks_without_repeating_generation(context):
+    store, service, _ = context
+    account = owner(store)
+    retained_operation(store, account, paused=False, deadline=time.time() + 60)
+    client = Mock(account=account)
+    client.poll.return_value = {'status': 'succeeded', 'result_urls': [], 'result_paths': []}
+    service._poll_canvas('task', client, time.monotonic() + 60)
+    result = store.task('task')
+    assert result['status'] == 'submitted' and result['completed_at'] is None
+    assert result['upstream_context']['reconciliation_pause_reason'] == 'result_pending'
+    assert result['upstream_context']['submission_phase'] == 'accepted'
+    assert store.active_account_count(account['id']) == 1
+    client.poll.assert_called_once()
+    client.submit.assert_not_called()
+
+
+def test_completed_generation_with_repeated_storage_errors_parks_original_result(context):
+    store, service, stored = context
+    account = owner(store)
+    retained_operation(store, account, paused=False, deadline=time.time() + 120)
+    client = fake_client(store, service, account)
+    stored.side_effect = ResultTransferError('synthetic S3 unavailable')
+    service._poll_canvas('task', client, time.monotonic() + 120)
+    result = store.task('task')
+    assert result['status'] == 'submitted' and result['error_code'] == 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'
+    assert result['completed_at'] is None and result['upstream_context']['reconciliation_paused']
+    assert result['upstream_context']['reconciliation_pause_reason'] == 'result_transfer_failed'
+    assert result['upstream_context']['submission_phase'] == 'accepted'
+    assert result['upstream_context']['resource_ids']
+    assert 'generation completed' in result['error_message']
+    assert 'unavailable' in result['error_message']
+    assert store.active_account_count(account['id']) == 1
+    assert stored.call_count == client.poll.call_count == 8
+    client.submit.assert_not_called()
+
+
+def test_manual_result_storage_failure_keeps_confirmed_operation_and_credit_hold(context):
+    store, service, stored = context
+    account = owner(store)
+    retained_operation(store, account, deadline=time.time() - 1200)
+    client = fake_client(store, service, account)
+    stored.side_effect = ResultTransferError('synthetic S3 unavailable')
+    with patch.object(service, 'canvas_client', return_value=client):
+        result = service.reconcile_canvas_task('task')
+    assert result['status'] == 'submitted' and result['completed_at'] is None
+    assert result['upstream_context']['reconciliation_pause_reason'] == 'result_transfer_failed'
+    assert result['upstream_context']['submission_phase'] == 'accepted'
+    assert store.active_account_count(account['id']) == 1
+    client.poll.assert_called_once()
+    stored.assert_called_once()
+    client.submit.assert_not_called()
+
+
+@pytest.mark.parametrize('transition', ['funding', 'reselect'])
+def test_pre_run_account_change_keeps_acknowledged_history_and_attempt_deadline(context, transition):
+    store, service, _ = context
+    first = owner(store, 'first', balance=5 if transition == 'funding' else 100,
+                  priority=5 if transition == 'funding' else 0)
+    second = owner(store, 'second', balance=15, priority=4 if transition == 'funding' else 0)
+    task(store)
+    archive = [{'submit_id': 'old-submit', 'outcome': 'unresolved'}]
+    resolution = {'type': 'duplicate_charge_risk_acknowledged', 'risk_acknowledged': True,
+                  'attempt_started_at': time.time()}
+    store.update_task('task', {'upstream_context': {'previous_submissions': archive,
+                                                 'recovery_resolution': resolution}})
+    clients = {a['id']: fake_client(store, service, a, quote=10) for a in (first, second)}
+    original_prepare = clients[second['id']].prepare.side_effect
+    def verify_history(*args, **kwargs):
+        preserved = store.task('task')['upstream_context']
+        assert preserved['previous_submissions'] == archive
+        assert preserved['recovery_resolution'] == resolution
+        assert 'submit_id' not in preserved, 'a new account must not inherit the preceding active binding'
+        return original_prepare(*args, **kwargs)
+    clients[second['id']].prepare.side_effect = verify_history
+    with patch.object(service, 'canvas_client', side_effect=lambda a: clients[a['id']]):
+        service._run('task')
+    result = store.task('task')
+    assert result['status'] == 'succeeded', result['error_message']
+    assert result['account_id'] == second['id']
+    assert result['upstream_context']['previous_submissions'] == archive
+    assert result['upstream_context']['recovery_resolution'] == resolution
+    assert result['upstream_context']['observation_deadline'] == pytest.approx(resolution['attempt_started_at'] + 5)
+    clients[first['id']].submit.assert_not_called()
+    clients[second['id']].submit.assert_called_once()
+
+
+def test_explicit_confirmed_upstream_failure_still_completes_as_failure(context):
+    store, service, _ = context
+    account = owner(store)
+    retained_operation(store, account, deadline=time.time() - 1200)
+    client = fake_client(store, service, account)
+    client.poll.return_value = {'status': 'failed', 'error_code': 'CONTENT_MODERATION_FAILED',
+                                'error_message': 'explicit terminal provider rejection'}
+    with patch.object(service, 'canvas_client', return_value=client):
+        result = service.reconcile_canvas_task('task')
+    assert result['status'] == 'failed' and result['completed_at'] is not None
+    assert result['error_code'] == 'CONTENT_MODERATION_FAILED'
+    assert not result['upstream_context']['reconciliation_paused']
+    assert store.active_account_count(account['id']) == 0
+    client.poll.assert_called_once()
+    client.submit.assert_not_called()

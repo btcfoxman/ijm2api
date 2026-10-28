@@ -513,6 +513,16 @@ def retry_task(task_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@app.post('/api/tasks/{task_id}/reconcile', dependencies=[Depends(admin_auth)])
+def reconcile_canvas_task(task_id: str) -> dict[str, Any]:
+    try:
+        return _with_cost_observations(service.reconcile_canvas_task(task_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail='task not found') from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.delete("/api/tasks", dependencies=[Depends(admin_auth)])
 def clear_tasks() -> dict[str, Any]:
     return {"deleted": store.clear_terminal_tasks()}
@@ -601,6 +611,13 @@ def get_generic(task_id: str) -> dict[str, Any]:
 def _with_cost_observations(task: dict[str, Any]) -> dict[str, Any]:
     full_task = task
     task = {key: value for key, value in task.items() if key != 'upstream_context'}
+    if task.get('execution_backend') == 'canvas_cli':
+        from .canvas_cli import sanitize
+        context = full_task.get('upstream_context') or {}
+        diagnostic_keys = ('submission_phase', 'submit_id', 'submit_error', 'last_query_error',
+            'observation_deadline', 'reconciliation_paused', 'reconciliation_pause_reason',
+            'reconciliation_paused_at', 'consecutive_submission_absent')
+        task['execution_diagnostics'] = sanitize({key: context[key] for key in diagnostic_keys if key in context})
     return {**task, "cost_observations": [{key: value for key, value in row.items() if not key.startswith("_")}
                                         for row in build_observations(full_task or task)]}
 

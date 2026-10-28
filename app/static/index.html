@@ -8,7 +8,8 @@
   <link rel="stylesheet" href="/static/styles.css?v=ijm-canvas-20261029-1">
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
   <script src="/api/cost-reference/assets/task-cost.js"></script>
-<script src="/static/app.js?v=ijm-canvas-20261029-1" defer></script>
+<script src="/static/canvas-task-state.js?v=20261029-reconcile" defer></script>
+<script src="/static/app.js?v=20261029-reconcile" defer></script>
   <script src="/static/browser-assist.js?v=ijm-canvas-20261029-1" defer></script>
   <script src="/static/account-login.js?v=20261014-2" defer></script>
 </head>
@@ -133,7 +134,8 @@
   <dialog id="detailDialog" class="detail-dialog"><div class="dialog-form">
     <header><div><p class="eyebrow" id="detailId">TASK</p><h2 id="detailTitle">任务详情</h2></div><button class="icon-button close" type="button"><i data-lucide="x"></i></button></header>
     <div class="facts" id="detailFacts"></div><section class="prompt-panel"><div><span>提示词</span><b id="detailMeta"></b></div><p id="detailPrompt">-</p><div class="media-list" id="detailMedia"></div></section>
-    <div class="audit-tabs segmented" id="auditTabs"><button class="active" type="button" data-key="caller_request">调用者请求</button><button type="button" data-key="upstream_request">Dreamina 请求摘要</button><button type="button" data-key="upstream_response">Dreamina 响应摘要</button><button type="button" data-key="caller_response">调用者响应</button></div><pre class="audit-code" id="auditCode"></pre>
+    <div class="audit-tabs segmented" id="auditTabs"><button type="button" data-key="execution_diagnostics">提交核实</button><button class="active" type="button" data-key="caller_request">调用者请求</button><button type="button" data-key="upstream_request">Dreamina 请求摘要</button><button type="button" data-key="upstream_response">Dreamina 响应摘要</button><button type="button" data-key="caller_response">调用者响应</button></div><pre class="audit-code" id="auditCode"></pre>
+    <button id="reconcileSubmission" class="button secondary" type="button" hidden>核实原提交（不重新生成）</button>
   </div></dialog>
 
   <dialog id="settingsDialog" class="settings-dialog"><form class="dialog-form" id="settingsForm">

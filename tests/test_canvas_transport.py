@@ -94,8 +94,9 @@ class FakeRunner:
                                "submitId": args[args.index("--submit-id") + 1], "state": "accepted",
                                "resources": [{"resourceId": "11111111-1111-4111-8111-111111111111", "state": "running"}]}]}
         elif action == ["operation", "status"]:
+            resource_state = {"partial_failed": "succeeded", "absent": "running", "unknown": "running"}.get(self.state, self.state)
             data = {"operationRef": args[2], "state": self.state, "resources": [{
-                "resourceId": "11111111-1111-4111-8111-111111111111", "state": self.state}]}
+                "resourceId": "11111111-1111-4111-8111-111111111111", "state": resource_state}]}
         elif action == ["resource", "download"]:
             output = Path(args[-1])
             output.write_bytes(b"\x00\x00\x00\x20ftypisom" + b"original-bytes" if self.media_type == "video"
@@ -187,6 +188,11 @@ def test_prepare_upload_timeout_checks_same_resource_before_continue(tmp_path):
     assert all("never-save-this-token" not in json.dumps(x) for x in runner.persisted)
 
 
+@pytest.mark.parametrize("name", ["token", "creditConfirmationToken", "creditToken", "deviceCode"])
+def test_cli_diagnostic_redacts_plain_and_camel_case_secret_assignments(name):
+    assert "private" not in sanitize(f"Original receipt lost; {name}=private")
+
+
 def test_submit_query_download_preserves_original_and_precharge(tmp_path):
     runner, client, context = prepare(tmp_path)
     accepted = client.submit(context, 20)
@@ -215,6 +221,52 @@ def test_unknown_query_never_replays_submission(tmp_path):
     runner.state = "absent"
     assert client.poll(context)["status"] == "unknown"
     assert not any(x[:2] == ["node", "run"] for x in runner.calls)
+
+
+@pytest.mark.parametrize("malformed", [
+    {}, {"state": "running", "resources": []}, {"operationRef": "", "state": "running", "resources": []},
+    {"operationRef": "$original", "resources": []},
+    {"operationRef": "$original", "state": "", "resources": []},
+    {"operationRef": "$original", "state": "unrecognized", "resources": []},
+    {"operationRef": "$original", "state": "running"},
+    {"operationRef": "$original", "state": "running", "resources": None},
+    {"operationRef": "$original", "state": "running", "resources": [None]},
+    {"operationRef": "$original", "state": "running", "resources": [{}]},
+    {"operationRef": "$original", "state": "running", "resources": [{"resourceId": "", "state": "running"}]},
+    {"operationRef": "$original", "state": "running", "resources": [{"resourceId": "original", "state": ""}]},
+    {"operationRef": "$original", "state": "running", "resources": [{"resourceId": "original", "state": "unrecognized"}]},
+])
+def test_poll_malformed_success_response_never_claims_matching_running(tmp_path, malformed):
+    runner, client, context = prepare(tmp_path)
+    runner.calls.clear()
+    original = runner.run
+    def invalid(account, args, timeout=None):
+        if args[:2] == ["operation", "status"]:
+            runner.calls.append(args)
+            data = dict(malformed)
+            if data.get("operationRef") == "$original":
+                data["operationRef"] = context["submit_id"]
+            return {"ok": True, "data": data}
+        return original(account, args, timeout=timeout)
+    runner.run = invalid
+    with pytest.raises(CanvasCLIError) as found:
+        client.poll(context)
+    assert found.value.code == "CLI_INVALID_RESPONSE" and found.value.outcome_unknown
+    assert len(runner.calls) == 1 and runner.calls[0][:3] == ["operation", "status", context["submit_id"]]
+
+
+def test_poll_wrong_operation_identity_stays_unknown(tmp_path):
+    runner, client, context = prepare(tmp_path)
+    original = runner.run
+    def wrong(account, args, timeout=None):
+        if args[:2] == ["operation", "status"]:
+            return {"ok": True, "data": {"operationRef": "another-submission", "state": "running", "resources": []}}
+        return original(account, args, timeout=timeout)
+    runner.run = wrong
+    with pytest.raises(CanvasCLIError) as found:
+        client.poll(context)
+    assert found.value.code == "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN" and found.value.outcome_unknown
+    assert not any(args[:2] == ["node", "run"] for args in runner.calls)
 
 
 def test_image_canonical_mapping_is_exact_and_live():
@@ -529,6 +581,120 @@ def test_invalid_paid_run_response_is_not_replayed(tmp_path):
         client.submit(context, 20)
     assert found.value.outcome_unknown
     assert sum(args[:2] == ["node", "confirm"] for args in runner.calls) == 1
+    assert sum(args[:2] == ["node", "run"] for args in runner.calls) == 1
+
+
+def test_submit_persists_exact_confirmation_and_dispatch_boundaries(tmp_path):
+    runner, client, context = prepare(tmp_path)
+    original = runner.run
+    events, durable = [], []
+    def record(account, args, timeout=None):
+        events.append("command:" + " ".join(args[:2]))
+        return original(account, args, timeout=timeout)
+    def persist(value):
+        events.append("persist:" + value["submission_phase"])
+        durable.append(value)
+    runner.run = record
+    accepted = client.submit(context, 20, persist=persist)
+    assert events == ["persist:confirming", "command:node confirm", "persist:run_dispatching",
+                      "command:node run", "persist:accepted"]
+    assert accepted["submission_phase"] == accepted["phase"] == "accepted"
+    assert accepted["submit_id"] == context["submit_id"]
+    assert accepted["resource_ids"] == ["11111111-1111-4111-8111-111111111111"]
+    assert "never-save-this-token" not in json.dumps(durable)
+    assert all("creditConfirmationToken" not in json.dumps(value) for value in durable)
+
+
+@pytest.mark.parametrize("failed_phase", ["confirming", "run_dispatching"])
+def test_submit_persistence_failure_never_runs_generation(tmp_path, failed_phase):
+    runner, client, context = prepare(tmp_path)
+    def persist(value):
+        if value["submission_phase"] == failed_phase:
+            raise OSError("private database failure")
+    with pytest.raises(CanvasCLIError) as found:
+        client.submit(context, 20, persist=persist)
+    assert found.value.code == "CLI_SUBMISSION_PERSIST_FAILED"
+    assert found.value.outcome_unknown is False
+    assert found.value.details["dispatch_started"] is False
+    assert found.value.details["phase"] == failed_phase
+    assert not any(args[:2] == ["node", "run"] for args in runner.calls)
+    assert "private database failure" not in json.dumps(found.value.details)
+
+
+def test_unacknowledged_dispatch_persistence_does_not_run(tmp_path):
+    runner, client, context = prepare(tmp_path)
+    with pytest.raises(CanvasCLIError, match="could not be persisted") as found:
+        client.submit(context, 20, persist=lambda value: False if value["submission_phase"] == "run_dispatching" else None)
+    assert not found.value.outcome_unknown
+    assert not any(args[:2] == ["node", "run"] for args in runner.calls)
+
+
+@pytest.mark.parametrize("expires_during", ["confirm", "dispatch_persist"])
+def test_submit_never_runs_after_confirmation_deadline(tmp_path, monkeypatch, expires_during):
+    runner, client, context = prepare(tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr("app.canvas_client.time.monotonic", lambda: clock[0])
+    original = runner.run
+    def confirm(account, args, timeout=None):
+        value = original(account, args, timeout=timeout)
+        if args[:2] == ["node", "confirm"] and expires_during == "confirm":
+            assert timeout == 5
+            clock[0] = 6
+        return value
+    def persist(value):
+        if value["submission_phase"] == "run_dispatching" and expires_during == "dispatch_persist":
+            clock[0] = 6
+    runner.run = confirm
+    with pytest.raises(CanvasCLIError) as found:
+        client.submit(context, 20, persist=persist, deadline=5)
+    assert found.value.code == "CLI_SUBMISSION_DEADLINE_EXCEEDED"
+    assert not found.value.outcome_unknown
+    assert found.value.details["dispatch_started"] is False
+    assert sum(args[:2] == ["node", "confirm"] for args in runner.calls) == 1
+    assert not any(args[:2] == ["node", "run"] for args in runner.calls)
+
+
+def test_run_error_persists_only_safe_original_diagnostic_and_cannot_replay(tmp_path):
+    runner, client, context = prepare(tmp_path)
+    runner.run_failure = CanvasCLIError("cli.invalid_service_response", "Service returned an invalid response",
+        details={"error": {"code": "cli.invalid_service_response", "class": "operation_incomplete",
+                           "reason": "transport_error", "serviceCode": "upstream_busy", "traceId": "trace-public",
+                           "message": "credit_token=never-save-this-token", "accessToken": "do-not-save",
+                           "nested": {"password": "do-not-save"}}, "data": {"token": "do-not-save"}},
+        exit_code=20, outcome_unknown=True)
+    durable = []
+    with pytest.raises(CanvasCLIError) as found:
+        client.submit(context, 20, persist=durable.append)
+    diagnostic = durable[-1]["submit_error"]
+    assert diagnostic["code"] == "cli.invalid_service_response"
+    assert diagnostic["reason"] == "transport_error"
+    assert diagnostic["serviceCode"] == "upstream_busy"
+    assert diagnostic["traceId"] == "trace-public"
+    assert diagnostic["exit_code"] == 20
+    assert diagnostic["outcome_unknown"] and diagnostic["dispatch_started"]
+    assert diagnostic["phase"] == "run_dispatching"
+    assert set(diagnostic) == {"code", "class", "reason", "serviceCode", "traceId", "message", "exit_code",
+                               "outcome_unknown", "dispatch_started", "phase"}
+    assert "do-not-save" not in json.dumps(durable)
+    assert "never-save-this-token" not in json.dumps(found.value.details)
+    assert "accessToken" not in json.dumps(found.value.details)
+    with pytest.raises(CanvasCLIError) as replay:
+        client.submit(context, 20)
+    assert replay.value.outcome_unknown
+    assert sum(args[:2] == ["node", "run"] for args in runner.calls) == 1
+
+
+def test_persistence_failure_after_acceptance_preserves_paid_result_ids(tmp_path):
+    runner, client, context = prepare(tmp_path)
+    def persist(value):
+        if value["submission_phase"] == "accepted":
+            raise OSError("write failed")
+    with pytest.raises(CanvasCLIError) as found:
+        client.submit(context, 20, persist=persist)
+    assert found.value.code == "CLI_SUBMISSION_PERSIST_FAILED"
+    assert found.value.outcome_unknown and found.value.details["dispatch_started"]
+    assert context["phase"] == "accepted"
+    assert context["resource_ids"] == ["11111111-1111-4111-8111-111111111111"]
     assert sum(args[:2] == ["node", "run"] for args in runner.calls) == 1
 
 

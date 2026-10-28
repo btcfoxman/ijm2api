@@ -124,14 +124,17 @@ class Service(CanvasServiceMixin):
                                              name="ijm-account-maintenance")
         self._maintenance.start()
         for task in reversed(self.store.tasks(1000)):
+            if (task.get('execution_backend') == 'canvas_cli'
+                    and (task.get('upstream_context') or {}).get('reconciliation_paused') is True):
+                continue
             if task["status"] == "queued":
                 self._pool.submit(self._run, task["id"])
             elif task.get("execution_backend") == "canvas_cli" and task.get("upstream_context"):
                 phase = task["upstream_context"].get("submission_phase")
-                if phase in {"submitting", "submitted"} and (task["status"] not in TERMINAL
+                if phase in {"submitting", "submitted", "run_dispatching", "accepted"} and (task["status"] not in TERMINAL
                         or task.get("error_code") == "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN"):
                     self._pool.submit(self._resume_canvas_poll, task["id"])
-                elif task["status"] == "preparing":
+                elif task['status'] not in TERMINAL and (phase == 'confirming' or task["status"] == "preparing"):
                     self._fail(task["id"], "CLI_PREPARATION_INTERRUPTED",
                                "service restarted before Canvas paid submission")
             elif task["status"] in {"submitted", "running"} and task["run_id"] and task["thread_id"]:

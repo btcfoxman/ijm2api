@@ -40,7 +40,7 @@ def sanitize(value: Any) -> Any:
         return value
     value = re.sub(r"(?i)(https?|socks5h?)://[^\s/@]+:[^\s/@]+@", r"\1://[redacted]@", value)
     value = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/-]+=*", r"\1[redacted]", value)
-    value = re.sub(r"(?i)((?:access[_-]?token|refresh[_-]?token|password|secret|device[_-]?code|credit[_-]?token)\s*[=:]\s*)[^\s,;&\"']+", r"\1[redacted]", value)
+    value = re.sub(r"(?i)((?:access[_-]?token|refresh[_-]?token|password|secret|device[_-]?code|credit[_-]?(?:confirmation[_-]?)?token|token)\s*[=:]\s*)[^\s,;&\"']+", r"\1[redacted]", value)
     value = re.sub(r"(https?://[^\s?#]+)\?[^\s]+", r"\1?[redacted]", value)
     return value[:3000]
 

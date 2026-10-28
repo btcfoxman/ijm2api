@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from .canvas_cli import CanvasCLI, CanvasCLIError, account_profile
+from .canvas_cli import CanvasCLI, CanvasCLIError, account_profile, sanitize
 from .catalog import ALIASES, media_alias_kind
 from .errors import public_error, upstream_review_error
 
@@ -26,6 +26,28 @@ _MODEL_NAMES = {
 }
 _TRANSIENT = {"network_timeout", "dns_resolution_failed", "network_error",
               "service_unavailable", "rate_limited", "transport_error"}
+
+
+def safe_cli_diagnostic(exc: CanvasCLIError, *, secrets: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Keep failure facts without persisting an envelope or its credentials."""
+    source = exc.details.get("error", exc.details)
+    source = source if isinstance(source, dict) else {}
+    result = {}
+    for key in ("code", "class", "reason", "serviceCode", "traceId", "message"):
+        value = source.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            result[key] = sanitize(value)
+    result.setdefault("code", exc.code)
+    result.setdefault("message", exc.message)
+    result["exit_code"] = exc.exit_code
+    result["outcome_unknown"] = exc.outcome_unknown
+    for key, value in result.items():
+        if isinstance(value, str):
+            for secret in secrets:
+                if secret:
+                    value = value.replace(secret, "[redacted]")
+            result[key] = sanitize(value)
+    return result
 
 
 def _number(value: Any) -> float | None:
@@ -380,7 +402,7 @@ class CanvasClient:
                        "mode": str(mode["name"]), "resources": {
                            group: [_stable(self.account["id"], task_id, group, index) for index in range(counts[group])]
                            for group in counts}, "uploaded_resources": [], "resource_ids": [], "phase": "prepared"}
-        if context.get("submission_phase") in {"submitting", "accepted", "unknown"}:
+        if context.get("submission_phase") in {"submitting", "run_dispatching", "submitted", "accepted", "unknown"}:
             raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas submission must be resumed by its original submit ID", outcome_unknown=True)
         def save(phase: str) -> None:
             context["phase"] = phase
@@ -425,47 +447,101 @@ class CanvasClient:
         save("quoted")
         return context
 
-    def submit(self, context: dict[str, Any], ceiling: int) -> dict[str, Any]:
+    def submit(self, context: dict[str, Any], ceiling: int, *,
+               persist: Callable[[dict[str, Any]], Any] | None = None,
+               deadline: float | None = None) -> dict[str, Any]:
         self._check_context(context)
-        if context.get("phase") in {"accepted", "unknown"}:
+        if (context.get("phase") in {"accepted", "unknown"}
+                or context.get("submission_phase") in {"run_dispatching", "submitted", "accepted", "unknown"}):
             raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "An existing Canvas submission must only be queried", outcome_unknown=True)
         if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < int(context["quoted_credits"]):
             raise CanvasCLIError("CLI_CREDIT_CEILING_EXCEEDED", "Canvas quote exceeds the authorized credit ceiling")
-        # Official node confirm mints only a spending-ceiling token. It never
-        # launches generation; a lost/invalid confirmation response may be
-        # retried for the same node and ceiling. This exception must not extend
-        # to node run, whose acceptance could have been lost after charging.
-        for attempt in range(3):
-            try:
-                confirmed = self._call(["node", "confirm", "--project-id", context["project_id"],
-                                        "--node-id", context["node_id"], "--credit-ceiling", str(ceiling)])
-                break
-            except CanvasCLIError as exc:
-                if exc.code != "cli.invalid_service_response" or attempt == 2:
-                    raise
-                time.sleep(0.25 * 2 ** attempt)
-        token = confirmed.get("creditConfirmationToken")
-        if not isinstance(token, str) or not token:
-            raise CanvasCLIError("CLI_CONFIRMATION_INVALID", "Canvas did not issue a credit confirmation token")
-        result = self._call(["node", "run", "--project-id", context["project_id"],
-                             "--node-id", context["node_id"], "--submit-id", context["submit_id"],
-                             "--credit-token", token])
-        items = result.get("items")
-        if not isinstance(items, list) or len(items) != 1:
-            raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas acceptance result is incomplete", outcome_unknown=True)
-        item = items[0]
-        if item.get("nodeId") != context["node_id"] or item.get("submitId") != context["submit_id"]:
-            raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas acceptance identities do not match", outcome_unknown=True)
-        state = str(item.get("state") or "").lower()
-        if item.get("error") or state in {"failed", "rejected", "canceled", "cancelled"}:
-            error = item.get("error") or {}
-            raise CanvasCLIError("UPSTREAM_REJECTED", str(error.get("message") or "Canvas rejected the generation"), details={"error": error})
-        if state not in {"accepted", "running", "in_progress", "processing", "completed", "succeeded", "success"}:
-            raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas returned an uncertain submission state", outcome_unknown=True)
-        context = copy.deepcopy(context)
-        context["resource_ids"] = [str(x["resourceId"]) for x in item.get("resources", []) if x.get("resourceId")]
-        context["phase"] = "accepted"
-        return context
+        dispatched = False
+        token = ""
+
+        def remaining() -> float | None:
+            if deadline is None:
+                return None
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise CanvasCLIError("CLI_SUBMISSION_DEADLINE_EXCEEDED",
+                                     "Canvas submission deadline expired before generation was dispatched")
+            return budget
+
+        def save(stage: str) -> None:
+            context["submission_phase"] = stage
+            if persist:
+                try:
+                    if persist(copy.deepcopy(context)) is False:
+                        raise RuntimeError("Persistence was not acknowledged")
+                except Exception as cause:
+                    raise CanvasCLIError("CLI_SUBMISSION_PERSIST_FAILED",
+                                         "Canvas submission boundary could not be persisted",
+                                         outcome_unknown=dispatched) from cause
+
+        try:
+            save("confirming")
+            # Confirmation only mints a spending-ceiling token. Retrying it
+            # never starts generation; node run below is attempted once only.
+            for attempt in range(3):
+                try:
+                    confirmed = self._call(["node", "confirm", "--project-id", context["project_id"],
+                                            "--node-id", context["node_id"], "--credit-ceiling", str(ceiling)],
+                                           timeout=remaining())
+                    break
+                except CanvasCLIError as exc:
+                    if exc.code != "cli.invalid_service_response" or attempt == 2:
+                        raise
+                    time.sleep(0.25 * 2 ** attempt)
+            token = confirmed.get("creditConfirmationToken")
+            if not isinstance(token, str) or not token:
+                raise CanvasCLIError("CLI_CONFIRMATION_INVALID", "Canvas did not issue a credit confirmation token")
+            remaining()
+            save("run_dispatching")
+            budget = remaining()  # Persistence itself may consume the budget.
+            dispatched = True
+            result = self._call(["node", "run", "--project-id", context["project_id"],
+                                 "--node-id", context["node_id"], "--submit-id", context["submit_id"],
+                                 "--credit-token", token], timeout=budget)
+            items = result.get("items")
+            if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+                raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas acceptance result is incomplete", outcome_unknown=True)
+            item = items[0]
+            if item.get("nodeId") != context["node_id"] or item.get("submitId") != context["submit_id"]:
+                raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas acceptance identities do not match", outcome_unknown=True)
+            state = str(item.get("state") or "").lower()
+            if item.get("error") or state in {"failed", "rejected", "canceled", "cancelled"}:
+                error = item.get("error") or {}
+                raise CanvasCLIError("UPSTREAM_REJECTED", str(error.get("message") or "Canvas rejected the generation"), details={"error": error},
+                                     outcome_unknown=bool(item.get("resources")) or state in {"accepted", "running", "in_progress", "processing", "completed", "succeeded", "success"})
+            if state not in {"accepted", "running", "in_progress", "processing", "completed", "succeeded", "success"}:
+                raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas returned an uncertain submission state", outcome_unknown=True)
+            context["resource_ids"] = [str(x["resourceId"]) for x in item.get("resources", []) if isinstance(x, dict) and x.get("resourceId")]
+            context["phase"] = "accepted"
+            context.pop("submit_error", None)
+            save("accepted")
+            return copy.deepcopy(context)
+        except Exception as caught:
+            exc = caught if isinstance(caught, CanvasCLIError) else CanvasCLIError(
+                "CLI_SUBMISSION_INTERRUPTED", "Canvas submission was interrupted", outcome_unknown=dispatched)
+            # A pre-run failure cannot be a paid outcome, even if a callback
+            # already changed the caller's in-memory phase before failing.
+            if not dispatched:
+                exc.outcome_unknown = False
+            diagnostic = safe_cli_diagnostic(exc, secrets=(token,) if isinstance(token, str) else ())
+            diagnostic.update({"dispatch_started": dispatched, "phase": context.get("submission_phase", "confirming")})
+            context["submit_error"] = diagnostic
+            exc.message = str(diagnostic["message"])
+            exc.args = (exc.message,)
+            exc.details = {"error": diagnostic, "dispatch_started": dispatched, "phase": diagnostic["phase"]}
+            if persist:
+                try:
+                    persist(copy.deepcopy(context))
+                except Exception:
+                    pass  # Preserve the original failure and dispatch fact.
+            if exc is caught:
+                raise
+            raise exc from caught
 
     def download_result(self, context: dict[str, Any], resource_id: str, media_type: str) -> dict[str, Any]:
         if (not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", str(context["task_id"]))
@@ -562,9 +638,27 @@ class CanvasClient:
         self._check_context(context)
         data = self._call(["operation", "status", context["submit_id"],
                            "--project-id", context["project_id"]], read_only=True)
-        if data.get("operationRef") and data["operationRef"] != context["submit_id"]:
+        reference = data.get("operationRef")
+        if not isinstance(reference, str) or not reference.strip():
+            raise CanvasCLIError("CLI_INVALID_RESPONSE", "Canvas operation response omitted its submission identity", outcome_unknown=True)
+        if reference != context["submit_id"]:
             raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas returned another submission identity", outcome_unknown=True)
-        state = str(data.get("state") or "").lower()
+        raw_state = data.get("state")
+        state = raw_state.strip().lower() if isinstance(raw_state, str) else ""
+        if state not in {"pending", "queued", "accepted", "running", "in_progress", "processing",
+                         "completed", "success", "succeeded", "partial_failed", "failed", "rejected",
+                         "error", "canceled", "cancelled", "absent", "unknown"}:
+            raise CanvasCLIError("CLI_INVALID_RESPONSE", "Canvas operation response has no valid state", outcome_unknown=True)
+        resources = data.get("resources")
+        if not isinstance(resources, list):
+            raise CanvasCLIError("CLI_INVALID_RESPONSE", "Canvas operation response omitted its resource list", outcome_unknown=True)
+        resource_states = {"pending", "queued", "running", "in_progress", "processing", "completed", "success", "succeeded",
+                           "failed", "rejected", "error", "canceled", "cancelled"}
+        for resource in resources:
+            if (not isinstance(resource, dict)
+                    or not isinstance(resource.get("resourceId"), str) or not resource["resourceId"].strip()
+                    or not isinstance(resource.get("state"), str) or resource["state"].strip().lower() not in resource_states):
+                raise CanvasCLIError("CLI_INVALID_RESPONSE", "Canvas operation response contains an invalid resource", outcome_unknown=True)
         submission = data.get("submission") if isinstance(data.get("submission"), dict) else {}
         result: dict[str, Any] = {"status": "running", "progress": 45, "result_urls": [],
                                   "result_paths": [], "result_files": [], "credit_facts": [],
@@ -573,7 +667,6 @@ class CanvasClient:
             result.update(status="unknown", error_code="UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
                           error_message="Canvas submission could not be resolved; automatic resubmission is disabled")
             return result
-        resources = data.get("resources") if isinstance(data.get("resources"), list) else []
         failed = [x for x in resources if str(x.get("state") or "").lower() in {"failed", "rejected", "error", "canceled", "cancelled"}]
         if state in {"failed", "partial_failed", "rejected", "error", "canceled", "cancelled"} or failed or data.get("submissionError"):
             result.update(self._failure_details(context, data, resources, failed))
