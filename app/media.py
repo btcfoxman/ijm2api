@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 import requests
 from urllib3.exceptions import HTTPError as Urllib3HTTPError
+from urllib3.response import _get_decoder
 from urllib3.util import Timeout
 
 from .browser import BrowserError, BrowserRejected, CDPBrowser
@@ -122,26 +123,43 @@ def _deadline_chunks(response: requests.Response, deadline: float):
         file_pointer = getattr(getattr(raw, '_fp', None), 'fp', None)
         stream_socket = getattr(getattr(file_pointer, 'raw', None), '_sock', None)
     encoding = response.headers.get('Content-Encoding', '').lower().strip()
-    decoder = (zlib.decompressobj(16 + zlib.MAX_WBITS) if encoding == 'gzip' else
-               zlib.decompressobj() if encoding == 'deflate' else None)
-    if encoding not in {'', 'identity', 'gzip', 'deflate'}:
+    if encoding not in {'', 'identity', 'gzip', 'x-gzip', 'deflate'}:
         raise MediaError('reference server ignored identity encoding; bounded download requires gzip, deflate or identity')
+    # Reuse urllib3's established content decoding: it handles concatenated
+    # gzip members and both zlib-wrapped and raw DEFLATE just like requests.
+    # Its private factory is covered by real-response compatibility tests and
+    # the explicitly bounded urllib3 2.x dependency. Keep decoding outside
+    # read1(), whose decode loop could otherwise perform multiple socket reads
+    # before the task's remaining budget can be checked again.
+    decoder = _get_decoder(encoding) if encoding in {'gzip', 'x-gzip', 'deflate'} else None
     if not callable(getattr(raw, 'read1', None)) or stream_socket is None and not raw.closed:
         raise MediaError('reference response does not support a bounded streaming read')
     while True:
         remaining = _media_remaining(deadline)
+        # read1() closes the underlying socket immediately after consuming a
+        # Content-Length response. Do not touch that saved socket on the next
+        # iteration, even though the final data chunk was nonempty.
+        if raw.closed:
+            break
         if stream_socket is not None:
             stream_socket.settimeout(min(45, remaining))
         chunk = raw.read1(64 * 1024, decode_content=False)
         _media_remaining(deadline)
         if not chunk:
-            if decoder:
-                yield decoder.flush()
-            return
+            break
         if decoder:
-            chunk = decoder.decompress(chunk, MAX_MEDIA_BYTES + 1)
-            if decoder.unconsumed_tail:
-                raise MediaError('reference media exceeds 200 MB')
+            try:
+                chunk = decoder.decompress(chunk)
+            except zlib.error as exc:
+                raise MediaError('reference media content decoding failed') from exc
+        _media_remaining(deadline)
+        yield chunk
+    if decoder:
+        try:
+            chunk = decoder.flush()
+        except zlib.error as exc:
+            raise MediaError('reference media content decoding failed') from exc
+        _media_remaining(deadline)
         yield chunk
 
 
