@@ -17,6 +17,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import requests
+from urllib3.exceptions import HTTPError as Urllib3HTTPError
+from urllib3.util import Timeout
 
 from .browser import BrowserError, BrowserRejected, CDPBrowser
 
@@ -97,8 +99,55 @@ def _allow_direct_media_fallback(host: str | None) -> bool:
         return "." in host
 
 
+def _media_remaining(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise MediaError("reference media download deadline exceeded")
+    return remaining
+
+
+def _deadline_chunks(response: requests.Response, deadline: float):
+    """Read one available socket buffer, rather than waiting to fill a MiB.
+
+    A stream that continuously drips bytes must not renew the task budget.
+    Limit each actual socket read to the remaining time, and check it again
+    after the read. The normal browser download path remains unchanged.
+    """
+    raw = response.raw
+    connection = getattr(raw, '_connection', None)
+    stream_socket = getattr(connection, 'sock', None)
+    if stream_socket is None:
+        file_pointer = getattr(getattr(raw, '_fp', None), 'fp', None)
+        stream_socket = getattr(getattr(file_pointer, 'raw', None), '_sock', None)
+    encoding = response.headers.get('Content-Encoding', '').lower().strip()
+    decoder = (zlib.decompressobj(16 + zlib.MAX_WBITS) if encoding == 'gzip' else
+               zlib.decompressobj() if encoding == 'deflate' else None)
+    if encoding not in {'', 'identity', 'gzip', 'deflate'}:
+        raise MediaError('reference server ignored identity encoding; bounded download requires gzip, deflate or identity')
+    if not callable(getattr(raw, 'read1', None)) or stream_socket is None and not raw.closed:
+        raise MediaError('reference response does not support a bounded streaming read')
+    while True:
+        remaining = _media_remaining(deadline)
+        if stream_socket is not None:
+            stream_socket.settimeout(min(45, remaining))
+        chunk = raw.read1(64 * 1024, decode_content=False)
+        _media_remaining(deadline)
+        if not chunk:
+            if decoder:
+                yield decoder.flush()
+            return
+        if decoder:
+            chunk = decoder.decompress(chunk, MAX_MEDIA_BYTES + 1)
+            if decoder.unconsumed_tail:
+                raise MediaError('reference media exceeds 200 MB')
+        yield chunk
+
+
 def _download(source: str, kind: str, proxy_url: str = "", *,
-              allow_direct_fallback: bool = True) -> tuple[bytes, str, str]:
+              allow_direct_fallback: bool = True, deadline: float | None = None) -> tuple[bytes, str, str]:
+    _media_remaining(deadline)
     if source.startswith("data:"):
         header, separator, payload = source.partition(",")
         if not separator or ";base64" not in header:
@@ -133,19 +182,28 @@ def _download(source: str, kind: str, proxy_url: str = "", *,
             # media host at the mercy of a consistently timing-out proxy.
             routes = ([direct_route] + routes + [direct_route]) if direct_first else (routes + [direct_route])
         for index, (route_name, route_proxy) in enumerate(routes):
+            remaining = _media_remaining(deadline)
             session = requests.Session()
             session.trust_env = False
             try:
-                with session.get(source, timeout=(10, 45) if route_proxy else (10, 60), stream=True,
+                timeout = ((10, 45) if route_proxy else (10, 60)) if remaining is None else Timeout(
+                    total=remaining, connect=min(10, remaining), read=min(45, remaining))
+                headers = {"User-Agent": "Mozilla/5.0"}
+                if deadline is not None:
+                    headers['Accept-Encoding'] = 'identity'
+                with session.get(source, timeout=timeout, stream=True,
                                  proxies=route_proxy,
                                  allow_redirects=bool(route_proxy),
-                                 headers={"User-Agent": "Mozilla/5.0"}) as response:
+                                 headers=headers) as response:
+                    _media_remaining(deadline)
                     if not route_proxy and 300 <= response.status_code < 400:
                         raise MediaError("direct media fallback redirected; account proxy is required")
                     response.raise_for_status()
                     chunks = []
                     total = 0
-                    for chunk in response.iter_content(1024 * 1024):
+                    chunks_source = (response.iter_content(1024 * 1024) if deadline is None
+                                     else _deadline_chunks(response, deadline))
+                    for chunk in chunks_source:
                         total += len(chunk)
                         if total > MAX_MEDIA_BYTES:
                             raise MediaError("reference media exceeds 200 MB")
@@ -160,14 +218,15 @@ def _download(source: str, kind: str, proxy_url: str = "", *,
                             else:
                                 _DIRECT_MEDIA_UNTIL[parsed.hostname] = time.monotonic() + 120
                     break
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, Urllib3HTTPError,
                     requests.exceptions.ChunkedEncodingError) as exc:
                 if direct_allowed and not route_proxy:
                     with _MEDIA_ROUTE_LOCK:
                         _DIRECT_MEDIA_UNTIL.pop(parsed.hostname, None)
                 if index == len(routes) - 1:
                     raise MediaError(f"media download failed via {route_name}: {type(exc).__name__}") from exc
-                time.sleep(0.5 * (index + 1))
+                delay = 0.5 * (index + 1)
+                time.sleep(delay if deadline is None else min(delay, _media_remaining(deadline)))
             except requests.exceptions.HTTPError as exc:
                 status = exc.response.status_code if exc.response is not None else 0
                 if direct_allowed and not route_proxy and index < len(routes) - 1:
@@ -176,7 +235,8 @@ def _download(source: str, kind: str, proxy_url: str = "", *,
                     continue
                 if status not in {429, 500, 502, 503, 504} or index == len(routes) - 1:
                     raise MediaError(f"media download failed via {route_name}: HTTP {status}") from exc
-                time.sleep(0.5 * (index + 1))
+                delay = 0.5 * (index + 1)
+                time.sleep(delay if deadline is None else min(delay, _media_remaining(deadline)))
             except requests.RequestException as exc:
                 if direct_allowed and not route_proxy and index < len(routes) - 1:
                     with _MEDIA_ROUTE_LOCK:
@@ -202,4 +262,5 @@ def _download(source: str, kind: str, proxy_url: str = "", *,
         if not guessed.startswith({"images": "image/", "videos": "video/", "audios": "audio/"}[kind]):
             raise MediaError(f"{kind} reference has the wrong content type")
         mime = guessed
+    _media_remaining(deadline)
     return data, mime, filename

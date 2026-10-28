@@ -262,23 +262,47 @@ class CanvasClient:
         self.account = dict(account)
         self._capabilities = capabilities or {}
 
+    @staticmethod
+    def _remaining(deadline: float | None, timeout: float | None = None) -> float | None:
+        if deadline is None:
+            return timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise CanvasCLIError("CLI_TASK_DEADLINE_EXCEEDED", "Canvas task observation deadline was reached")
+        return min(remaining, timeout) if timeout is not None else remaining
+
+    @classmethod
+    def _sleep(cls, delay: float, deadline: float | None) -> None:
+        time.sleep(cls._remaining(deadline, delay))
+        cls._remaining(deadline)
+
     def _call(self, args: list[str], *, timeout: float | None = None,
-              read_only: bool = False) -> dict[str, Any]:
+              read_only: bool = False, deadline: float | None = None) -> dict[str, Any]:
         for attempt in range(3):
             try:
-                return _data(self.runner.run(self.account, args, timeout=timeout))
+                budget = self._remaining(deadline, timeout if timeout is not None
+                                         else getattr(self.runner, 'timeout', 120) if deadline is not None else None)
+                kwargs = {'timeout': budget}
+                if deadline is not None:
+                    kwargs['deadline'] = deadline
+                result = _data(self.runner.run(self.account, args, **kwargs))
+                # A paid receipt must remain accepted even if processing it
+                # reaches the clock boundary. submit() owns that safety edge.
+                if args[:2] not in (["node", "confirm"], ["node", "run"]):
+                    self._remaining(deadline)
+                return result
             except CanvasCLIError as exc:
                 error = exc.details.get("error", {})
                 transient = (exc.code in {"CLI_COMMAND_TIMEOUT", "CLI_INVALID_RESPONSE", "cli.invalid_service_response"}
                              or bool(error.get("retryable")) and error.get("reason") in _TRANSIENT)
                 if not read_only or attempt == 2 or not transient:
                     raise
-                time.sleep(0.25 * 2 ** attempt)
+                self._sleep(0.25 * 2 ** attempt, deadline)
         raise AssertionError("unreachable")
 
-    def identity(self) -> dict[str, Any]:
+    def identity(self, *, deadline: float | None = None) -> dict[str, Any]:
         for attempt in range(3):
-            data = self._call(["auth", "account"], timeout=10, read_only=(attempt == 0))
+            data = self._call(["auth", "account"], timeout=10, read_only=(attempt == 0), deadline=deadline)
             user_id = str(data.get("userId") or "")
             if not user_id:
                 raise CanvasCLIError("CLI_IDENTITY_INVALID", "Canvas did not return a service-authenticated user ID")
@@ -288,7 +312,7 @@ class CanvasClient:
             balance = _available_balance(data)
             if balance is not None or attempt == 2:
                 break
-            time.sleep(0.25 * 2 ** attempt)
+            self._sleep(0.25 * 2 ** attempt, deadline)
         credits = data.get("credits") if isinstance(data.get("credits"), dict) else {}
         return {"user_id": user_id, "id": user_id, "name": str(data.get("displayName") or ""),
                 "available_balance": balance, "credits": balance,
@@ -309,63 +333,71 @@ class CanvasClient:
     def auth_refresh(self) -> dict[str, Any]:
         return self._call(["auth", "refresh"])
 
-    def capabilities(self, kind: str = "video") -> list[dict[str, Any]]:
+    def capabilities(self, kind: str = "video", *, deadline: float | None = None) -> list[dict[str, Any]]:
         if kind not in {"image", "video"}:
             raise ValueError("Canvas capability type must be image or video")
         if kind not in self._capabilities:
-            data = self._call(["model", "list", "--type", kind], read_only=True)
+            data = self._call(["model", "list", "--type", kind], read_only=True, deadline=deadline)
             items = data.get("items")
             if not isinstance(items, list):
                 raise CanvasCLIError("CLI_CAPABILITIES_INVALID", "Canvas returned an invalid model catalog")
             self._capabilities[kind] = [x for x in items if isinstance(x, dict) and x.get("model")]
         return self._capabilities[kind]
 
-    def _ensure_project(self, context: dict[str, Any]) -> None:
+    def _ensure_project(self, context: dict[str, Any], *, deadline: float | None = None) -> None:
         wanted = context["project_id"]
         args = ["canvas", "ls", "--limit", "100"]
         for _ in range(20):
-            data = self._call(args, read_only=True)
+            data = self._call(args, read_only=True, deadline=deadline)
             if any(x.get("projectId") == wanted for x in data.get("items", []) if isinstance(x, dict)):
                 return
             if not data.get("hasMore") or not data.get("nextCursor"):
                 break
             args = ["canvas", "ls", "--limit", "100", "--cursor", str(data["nextCursor"])]
         try:
-            self._call(["canvas", "create", f"IJM account {self.account['id']}", "--project-id", wanted])
+            self._call(["canvas", "create", f"IJM account {self.account['id']}", "--project-id", wanted], deadline=deadline)
         except CanvasCLIError:
             # Creation is idempotent by the already persisted project UUID.
             # Re-read once after a lost response; never allocate another ID.
-            data = self._call(["canvas", "ls", "--limit", "100"], read_only=True)
+            data = self._call(["canvas", "ls", "--limit", "100"], read_only=True, deadline=deadline)
             if not any(x.get("projectId") == wanted for x in data.get("items", []) if isinstance(x, dict)):
                 raise
 
-    def _resource_ready(self, resource_id: str, project_id: str, *, timeout: float = 120) -> dict[str, Any]:
-        deadline = time.monotonic() + timeout
-        while True:
-            data = self._call(["resource", "get", resource_id, "--project-id", project_id], read_only=True)
-            state = str(data.get("status") or "").lower()
-            if state in {"success", "succeeded", "completed"}:
-                return data
-            if state in {"failed", "error", "canceled", "cancelled", "rejected"}:
-                raise CanvasCLIError("MEDIA_UPLOAD_FAILED", f"Canvas reference upload failed ({data.get('errorCode', state)})")
-            if time.monotonic() >= deadline:
-                raise CanvasCLIError("MEDIA_UPLOAD_PENDING", "Canvas reference upload is not ready; retained original resource ID")
-            time.sleep(1)
+    def _resource_ready(self, resource_id: str, project_id: str, *, timeout: float = 120,
+                        deadline: float | None = None) -> dict[str, Any]:
+        ready_deadline = time.monotonic() + timeout
+        if deadline is not None:
+            ready_deadline = min(ready_deadline, deadline)
+        try:
+            while True:
+                data = self._call(["resource", "get", resource_id, "--project-id", project_id],
+                                  read_only=True, deadline=ready_deadline)
+                state = str(data.get("status") or "").lower()
+                if state in {"success", "succeeded", "completed"}:
+                    return data
+                if state in {"failed", "error", "canceled", "cancelled", "rejected"}:
+                    raise CanvasCLIError("MEDIA_UPLOAD_FAILED", f"Canvas reference upload failed ({data.get('errorCode', state)})")
+                self._sleep(1, ready_deadline)
+        except CanvasCLIError as exc:
+            if exc.code == 'CLI_TASK_DEADLINE_EXCEEDED' and (deadline is None or time.monotonic() < deadline):
+                raise CanvasCLIError("MEDIA_UPLOAD_PENDING", "Canvas reference upload is not ready; retained original resource ID") from exc
+            raise
 
-    def _upload_resource(self, path: Path, media_type: str, resource_id: str, project_id: str) -> None:
+    def _upload_resource(self, path: Path, media_type: str, resource_id: str, project_id: str, *,
+                         deadline: float | None = None) -> None:
         """Retries keep the same documented registration idempotency key."""
         for attempt in range(3):
             try:
                 self._call(["resource", "upload", "--file", str(path.resolve()),
                             "--type", media_type, "--project-id", project_id,
-                            "--resource-id", resource_id], timeout=180)
-                self._resource_ready(resource_id, project_id)
+                            "--resource-id", resource_id], timeout=180, deadline=deadline)
+                self._resource_ready(resource_id, project_id, deadline=deadline)
                 return
             except CanvasCLIError as exc:
                 # A lost response can follow successful storage/registration.
                 # Observe the persisted ID before another same-ID upload.
                 try:
-                    self._resource_ready(resource_id, project_id, timeout=5)
+                    self._resource_ready(resource_id, project_id, timeout=5, deadline=deadline)
                     return
                 except CanvasCLIError as check:
                     if check.code == "MEDIA_UPLOAD_FAILED":
@@ -375,14 +407,15 @@ class CanvasClient:
                              or bool(error.get("retryable")))
                 if attempt == 2 or not retryable:
                     raise
-                time.sleep(0.5 * 2 ** attempt)
+                self._sleep(0.5 * 2 ** attempt, deadline)
 
     def prepare(self, normalized: dict[str, Any], task_id: str,
                 assets: dict[str, list[Any]], *,
-                persist: Callable[[dict[str, Any]], Any] | None = None) -> dict[str, Any]:
+                persist: Callable[[dict[str, Any]], Any] | None = None,
+                deadline: float | None = None) -> dict[str, Any]:
         kind = "image" if normalized.get("kind") == "image" else "video"
         counts = {x: len(assets.get(x, [])) for x in ("images", "videos", "audios")}
-        model = select_model(self.capabilities(kind), normalized)
+        model = select_model(self.capabilities(kind, deadline=deadline), normalized)
         mode = select_mode(model, normalized, counts)
         flags = generation_flags(mode, normalized)
         old = normalized.get("_execution")
@@ -409,7 +442,7 @@ class CanvasClient:
             if persist:
                 persist(copy.deepcopy(context))
         save("preparing")
-        self._ensure_project(context)
+        self._ensure_project(context, deadline=deadline)
         for group, media_type in (("images", "image"), ("videos", "video"), ("audios", "audio")):
             for index, asset in enumerate(assets.get(group, [])):
                 resource_id = context["resources"][group][index]
@@ -417,7 +450,7 @@ class CanvasClient:
                     path = asset.get("path") if isinstance(asset, dict) else asset
                     if not isinstance(path, (str, Path)) or not Path(path).is_file():
                         raise CanvasCLIError("MEDIA_INPUT_MISSING", "Canvas reference file is missing")
-                    self._upload_resource(Path(path), media_type, resource_id, context["project_id"])
+                    self._upload_resource(Path(path), media_type, resource_id, context["project_id"], deadline=deadline)
                     context["uploaded_resources"].append(resource_id)
                     save("uploading")
         args = ["node", "create", kind, "--project-id", context["project_id"],
@@ -429,10 +462,10 @@ class CanvasClient:
             for resource_id in context["resources"][group]:
                 args.extend(["--ref", "res:" + resource_id])
         save("saving")
-        self._call(args)
+        self._call(args, deadline=deadline)
         save("quoting")
         quote = self._call(["node", "quote", "--project-id", context["project_id"],
-                            "--node-id", context["node_id"]], read_only=True)
+                            "--node-id", context["node_id"]], read_only=True, deadline=deadline)
         items = quote.get("items")
         if (not isinstance(items, list) or len(items) != 1 or items[0].get("nodeId") != context["node_id"]
                 or items[0].get("error") or items[0].get("generationDiff") or not quote.get("confirmable", False)):
@@ -487,12 +520,15 @@ class CanvasClient:
                 try:
                     confirmed = self._call(["node", "confirm", "--project-id", context["project_id"],
                                             "--node-id", context["node_id"], "--credit-ceiling", str(ceiling)],
-                                           timeout=remaining())
+                                           timeout=remaining(), deadline=deadline)
                     break
                 except CanvasCLIError as exc:
                     if exc.code != "cli.invalid_service_response" or attempt == 2:
                         raise
-                    time.sleep(0.25 * 2 ** attempt)
+                    # Keep confirmation's established pre-dispatch deadline error.
+                    time.sleep(min(0.25 * 2 ** attempt, remaining()) if deadline is not None
+                               else 0.25 * 2 ** attempt)
+                    remaining()
             token = confirmed.get("creditConfirmationToken")
             if not isinstance(token, str) or not token:
                 raise CanvasCLIError("CLI_CONFIRMATION_INVALID", "Canvas did not issue a credit confirmation token")
@@ -502,7 +538,7 @@ class CanvasClient:
             dispatched = True
             result = self._call(["node", "run", "--project-id", context["project_id"],
                                  "--node-id", context["node_id"], "--submit-id", context["submit_id"],
-                                 "--credit-token", token], timeout=budget)
+                                 "--credit-token", token], timeout=budget, deadline=deadline)
             items = result.get("items")
             if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
                 raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas acceptance result is incomplete", outcome_unknown=True)
@@ -543,7 +579,8 @@ class CanvasClient:
                 raise
             raise exc from caught
 
-    def download_result(self, context: dict[str, Any], resource_id: str, media_type: str) -> dict[str, Any]:
+    def download_result(self, context: dict[str, Any], resource_id: str, media_type: str, *,
+                        deadline: float | None = None) -> dict[str, Any]:
         if (not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", str(context["task_id"]))
                 or not re.fullmatch(r"[a-f0-9-]{36}", resource_id)):
             raise CanvasCLIError("CLI_RESULT_INVALID", "Canvas result identifiers are invalid")
@@ -560,7 +597,7 @@ class CanvasClient:
             try:
                 data = self._call(["resource", "download", resource_id,
                     "--project-id", context["project_id"], "--output", str(partial)],
-                    timeout=180, read_only=False)
+                    timeout=180, read_only=False, deadline=deadline)
                 returned = Path(str(data.get("path") or "")).resolve()
                 size, expected_hash = data.get("size"), data.get("sha256")
                 if (data.get("resourceId") != resource_id or returned != partial.resolve() or not partial.is_file()
@@ -572,6 +609,7 @@ class CanvasClient:
                 digest = hashlib.sha256()
                 with partial.open("rb") as stream:
                     for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        self._remaining(deadline)
                         digest.update(block)
                 if digest.hexdigest() != expected_hash.lower():
                     raise CanvasCLIError("CLI_RESULT_DOWNLOAD_FAILED", "Canvas result download checksum did not match")
@@ -584,13 +622,14 @@ class CanvasClient:
                              or bool(error.get("retryable")) and error.get("reason") in _TRANSIENT)
                 if attempt == 2 or not transient:
                     raise
-                time.sleep(0.25 * 2 ** attempt)
+                self._sleep(0.25 * 2 ** attempt, deadline)
             finally:
                 partial.unlink(missing_ok=True)
         raise AssertionError("unreachable")
 
     def _failure_details(self, context: dict[str, Any], data: dict[str, Any],
-                         resources: list[dict[str, Any]], failed: list[dict[str, Any]]) -> dict[str, Any]:
+                         resources: list[dict[str, Any]], failed: list[dict[str, Any]], *,
+                         deadline: float | None = None) -> dict[str, Any]:
         error = data.get("submissionError") or (failed[0] if failed else {})
         code = error.get("serviceCode") or error.get("errorCode") or error.get("code") or ""
         message = str(error.get("message") or error.get("reason") or "")
@@ -602,7 +641,7 @@ class CanvasClient:
                 continue
             try:
                 resource = self._call(["resource", "get", resource_id,
-                    "--project-id", context["project_id"]], timeout=10, read_only=True)
+                    "--project-id", context["project_id"]], timeout=10, read_only=True, deadline=deadline)
                 if resource.get("resourceId") != resource_id:
                     continue
                 if not code and resource.get("errorCode"):
@@ -617,7 +656,7 @@ class CanvasClient:
         if not code:
             try:
                 view = self._call(["node", "show", "--project-id", context["project_id"],
-                    "--node-id", context["node_id"]], timeout=10, read_only=True)
+                    "--node-id", context["node_id"]], timeout=10, read_only=True, deadline=deadline)
                 for item in view.get("nodes", []):
                     node = item.get("node") or {}
                     if node.get("nodeId") != context["node_id"]:
@@ -634,10 +673,10 @@ class CanvasClient:
                 "error_message": message or f"Canvas generation failed ({code or data.get('state') or 'unknown'})",
                 "upstream_error_code": str(code or ""), "credit_facts": facts}
 
-    def poll(self, context: dict[str, Any]) -> dict[str, Any]:
+    def poll(self, context: dict[str, Any], *, deadline: float | None = None) -> dict[str, Any]:
         self._check_context(context)
         data = self._call(["operation", "status", context["submit_id"],
-                           "--project-id", context["project_id"]], read_only=True)
+                           "--project-id", context["project_id"]], read_only=True, deadline=deadline)
         reference = data.get("operationRef")
         if not isinstance(reference, str) or not reference.strip():
             raise CanvasCLIError("CLI_INVALID_RESPONSE", "Canvas operation response omitted its submission identity", outcome_unknown=True)
@@ -669,7 +708,7 @@ class CanvasClient:
             return result
         failed = [x for x in resources if str(x.get("state") or "").lower() in {"failed", "rejected", "error", "canceled", "cancelled"}]
         if state in {"failed", "partial_failed", "rejected", "error", "canceled", "cancelled"} or failed or data.get("submissionError"):
-            result.update(self._failure_details(context, data, resources, failed))
+            result.update(self._failure_details(context, data, resources, failed, deadline=deadline))
             return result
         terminal = state in {"completed", "success", "succeeded"}
         successful = [x for x in resources if str(x.get("state") or "").lower() in {"success", "succeeded", "completed"}]
@@ -683,7 +722,8 @@ class CanvasClient:
             resource_id = str(resource.get("resourceId") or "")
             if not resource_id:
                 raise CanvasCLIError("CLI_RESULT_INVALID", "Canvas completed a task without its output resource ID")
-            facts = self._call(["resource", "get", resource_id, "--project-id", context["project_id"]], read_only=True)
+            facts = self._call(["resource", "get", resource_id, "--project-id", context["project_id"]],
+                               read_only=True, deadline=deadline)
             if facts.get("resourceId") != resource_id or facts.get("type") != context["kind"]:
                 raise CanvasCLIError("CLI_RESULT_INVALID", "Canvas returned another output resource or media type")
             amount = _number(facts.get("creditsAmount"))
@@ -691,7 +731,7 @@ class CanvasClient:
                 result["credit_facts"].append({"source": "precharge", "amount": amount,
                     "field": "resource.creditsAmount", "resource_id": resource_id,
                     "submit_id": context["submit_id"], "settled": False})
-            downloaded = self.download_result(context, resource_id, str(facts.get("type") or context["kind"]))
+            downloaded = self.download_result(context, resource_id, str(facts.get("type") or context["kind"]), deadline=deadline)
             result["result_files"].append(downloaded)
             result["result_paths"].append(downloaded["path"])
         result.update(status="succeeded", progress=100)

@@ -187,14 +187,15 @@ class CanvasServiceMixin:
                 "cli_auth_status": "expired" if auth_error else account.get("cli_auth_status", "pending"),
                 "cli_auth_error": str(exc)[:300], "last_error": str(exc)[:300]})
 
-    def _canvas_local_assets(self, normalized: dict, account: dict, directory: Path) -> dict:
+    def _canvas_local_assets(self, normalized: dict, account: dict, directory: Path, *,
+                             deadline: float | None = None) -> dict:
         assets = {kind: [] for kind in ("images", "videos", "audios")}
         for kind in assets:
             for index, source in enumerate(normalized.get(kind) or []):
                 if not str(source).startswith(("https://", "http://", "data:")):
                     raise MediaError("Canvas reference requires a media URL; browser asset IDs cannot be reused")
                 contents, mime, filename = _download(str(source), kind,
-                    str(account["proxy_url"]), allow_direct_fallback=False)
+                    str(account["proxy_url"]), allow_direct_fallback=False, deadline=deadline)
                 suffix = Path(filename).suffix.lower()
                 if not suffix or len(suffix) > 12 or not suffix[1:].isalnum():
                     suffix = {"images": ".png", "videos": ".mp4", "audios": ".mp3"}[kind]
@@ -237,7 +238,7 @@ class CanvasServiceMixin:
                 self._fail_canvas_task(task_id, 'CLI_PREPARATION_TIMEOUT', 'Task deadline passed before Canvas preparation; no generation was submitted')
                 return True
             self._update_canvas_task(task_id, {"execution_backend": "canvas_cli"})
-            state = client.identity()
+            state = client.identity(deadline=deadline)
             identity = str(state.get("user_id") or "")
             if not identity or identity != str(account.get("login_user_id") or account.get("cli_user_id") or ""):
                 self.store.update_account(account_id, {"cli_auth_status": "error",
@@ -255,9 +256,9 @@ class CanvasServiceMixin:
             if task['model'] == 'sd-2-5-480p-x':
                 normalized['resolution'] = '720p'
             with tempfile.TemporaryDirectory(prefix=f"ijm-canvas-{task_id}-") as directory:
-                assets = self._canvas_local_assets(normalized, account, Path(directory))
+                assets = self._canvas_local_assets(normalized, account, Path(directory), deadline=deadline)
                 self._update_canvas_task(task_id, {"cost_evidence": input_evidence(assets), "progress": 15})
-                prepared = client.prepare(normalized, task_id, assets, persist=persist)
+                prepared = client.prepare(normalized, task_id, assets, persist=persist, deadline=deadline)
                 persist(prepared)
             if time.monotonic() >= deadline:
                 self._fail_canvas_task(task_id, 'CLI_PREPARATION_TIMEOUT', 'Task deadline passed during Canvas preparation; no generation was submitted')
@@ -339,12 +340,16 @@ class CanvasServiceMixin:
                         "Canvas submission receipt unavailable; querying original operation")})
                 self._poll_canvas(task_id, client, deadline)
             else:
-                self._fail_canvas_task(task_id, exc.code, str(exc))
+                expired_preparation = not submission_started and time.monotonic() >= deadline
+                self._fail_canvas_task(task_id, 'CLI_PREPARATION_TIMEOUT' if expired_preparation else exc.code,
+                    'Task deadline passed during Canvas preparation; no generation was submitted'
+                    if expired_preparation else str(exc))
             return True
         except Exception as exc:
             if self._canvas_task_terminated(self.store.task(task_id)):
                 return True
             code = "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN" if submission_started else (
+                'CLI_PREPARATION_TIMEOUT' if time.monotonic() >= deadline else
                 "MEDIA_DOWNLOAD_FAILED" if isinstance(exc, MediaError) else "CLI_PREPARATION_FAILED")
             if submission_started:
                 current = (self.store.task(task_id) or {}).get('upstream_context') or {}
@@ -358,10 +363,10 @@ class CanvasServiceMixin:
                            "submission" if submission_started else "preparation", type(exc).__name__)
             return True
 
-    def _canvas_settlement(self, task: dict, client) -> dict:
+    def _canvas_settlement(self, task: dict, client, *, deadline: float | None = None) -> dict:
         values = {}
         try:
-            state = client.identity()
+            state = client.identity(deadline=deadline)
             if str(state.get("user_id") or "") != str((task.get("upstream_context") or {}).get("expected_user_id") or ""):
                 return values
             after = number(state.get("available_balance"))
@@ -393,9 +398,19 @@ class CanvasServiceMixin:
                 return
             self._canvas_context(task_id, {'reconciliation_paused': False})
         absolute_deadline = self._canvas_observation_deadline(task_id)
+        if one_shot:
+            # An explicit read of an old result has its own bounded request
+            # budget; it never changes the original observation deadline.
+            query_deadline = time.monotonic() + float(getattr(self.canvas_cli, 'timeout', 120))
+        else:
+            query_deadline = min(deadline, time.monotonic() + max(0, absolute_deadline - time.time()))
+
+        def wait(delay):
+            self._stop.wait(min(delay, max(0, query_deadline - time.monotonic())))
+
         queried = False
         while not self._stop.is_set() and (one_shot and not queried or not one_shot
-                and time.monotonic() < deadline and time.time() < absolute_deadline):
+                and time.monotonic() < query_deadline and time.time() < absolute_deadline):
             task = self.store.task(task_id)
             if self._canvas_task_terminated(task):
                 return
@@ -404,7 +419,7 @@ class CanvasServiceMixin:
                 return
             queried = True
             try:
-                state = client.poll(context)
+                state = client.poll(context, deadline=query_deadline)
                 if self._canvas_task_terminated(self.store.task(task_id)):
                     return
                 errors = 0
@@ -423,7 +438,7 @@ class CanvasServiceMixin:
                     self._close_unconfirmed_canvas_task(task_id, 'operation_submission_absent' if count >= 3
                         else context.get('reconciliation_pause_reason') or 'manual_verification_unresolved')
                     return
-                self._stop.wait(min(60, 2 ** min(errors, 6)))
+                wait(min(60, 2 ** min(errors, 6)))
                 continue
             status = state.get("status")
             if status == 'unknown':
@@ -440,7 +455,7 @@ class CanvasServiceMixin:
                     self._close_unconfirmed_canvas_task(task_id, 'operation_submission_absent' if count >= 3
                         else context.get('reconciliation_pause_reason') or 'manual_verification_unresolved')
                     return
-                self._stop.wait(max(2, int(self.settings()['poll_interval_seconds'])))
+                wait(max(2, int(self.settings()['poll_interval_seconds'])))
                 continue
             # A positive operation match clears only obsolete query errors.
             # Preserve the original submission diagnostic as durable evidence.
@@ -480,7 +495,7 @@ class CanvasServiceMixin:
                         self._update_canvas_task(task_id, {'progress': 95, 'error_code': 'RESULT_TRANSFER_FAILED',
                             'error_message': 'Canvas generation complete; original result storage is being retried'})
                         if transfer_errors >= 8:
-                            self._update_canvas_task(task_id, self._canvas_settlement(task, client))
+                            self._update_canvas_task(task_id, self._canvas_settlement(task, client, deadline=query_deadline))
                             self._park_canvas_task(task_id, 'result_transfer_failed',
                                 'Canvas generation completed; original result storage remains unavailable; generation was not resubmitted')
                             return
@@ -488,7 +503,7 @@ class CanvasServiceMixin:
                             self._park_canvas_task(task_id, 'result_transfer_failed',
                                 'Canvas generation completed; original result storage remains unavailable; retry result storage only')
                             return
-                        self._stop.wait(min(60, 2 ** min(transfer_errors, 6)))
+                        wait(min(60, 2 ** min(transfer_errors, 6)))
                         continue
                 if not urls:
                     pending = CanvasCLIError('CLI_RESULT_PENDING',
@@ -502,7 +517,7 @@ class CanvasServiceMixin:
                     return
                 values = {"status": "succeeded", "progress": 100, "error_code": "", "error_message": "",
                           "result_urls": urls, 'result_transfer': metadata,
-                          "completed_at": time.time(), **self._canvas_settlement(task, client)}
+                          "completed_at": time.time(), **self._canvas_settlement(task, client, deadline=query_deadline)}
                 if task["model"] == "sd-2-5-480p-x":
                     from .result_transfer import transfer
                     signed, metadata = transfer(urls[0], str(client.account["proxy_url"]), task_id,
@@ -520,7 +535,7 @@ class CanvasServiceMixin:
                         pass
                 return
             if status in {"failed", "cancelled", "canceled"}:
-                self._update_canvas_task(task_id, self._canvas_settlement(task, client))
+                self._update_canvas_task(task_id, self._canvas_settlement(task, client, deadline=query_deadline))
                 self._fail_canvas_task(task_id, state.get("error_code") or "UPSTREAM_FAILED",
                     state.get("error_message") or "Canvas generation failed")
                 return
@@ -530,7 +545,7 @@ class CanvasServiceMixin:
                 })
             if one_shot:
                 return
-            self._stop.wait(max(2, int(self.settings()["poll_interval_seconds"])))
+            wait(max(2, int(self.settings()["poll_interval_seconds"])))
         if not self._stop.is_set() and not one_shot:
             if result_storage_pending:
                 self._park_canvas_task(task_id, 'result_transfer_failed',

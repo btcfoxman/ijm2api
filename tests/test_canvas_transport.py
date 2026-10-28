@@ -5,7 +5,11 @@ import hashlib
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -54,7 +58,7 @@ class FakeRunner:
     def profile(self, account):
         return "test-account-5"
 
-    def run(self, account, args, timeout=None):
+    def run(self, account, args, timeout=None, deadline=None):
         self.calls.append(args)
         action = args[:2]
         if action == ["auth", "account"]:
@@ -178,6 +182,107 @@ def test_runner_output_limit(monkeypatch, tmp_path):
     assert found.value.code == "CLI_OUTPUT_LIMIT" and found.value.outcome_unknown
 
 
+def test_account_lock_wait_consumes_task_deadline_without_spawning(tmp_path):
+    runner = CanvasCLI(tmp_path, allow_unwrapped_for_tests=True)
+    acquired, release = threading.Event(), threading.Event()
+    def hold():
+        with runner._lock(ACCOUNT['id']):
+            acquired.set()
+            release.wait(2)
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert acquired.wait(1)
+    try:
+        with patch('app.canvas_cli.subprocess.Popen') as spawn:
+            with pytest.raises(CanvasCLIError) as error:
+                runner.run(ACCOUNT, ['operation', 'status', 'synthetic'], deadline=time.monotonic() + 0.03)
+            assert error.value.code == 'CLI_TASK_DEADLINE_EXCEEDED'
+            spawn.assert_not_called()
+    finally:
+        release.set()
+        holder.join(2)
+        runner.close()
+
+
+def test_account_lock_recalculates_command_budget_after_acquiring(tmp_path):
+    runner = CanvasCLI(tmp_path, allow_unwrapped_for_tests=True)
+    clock = {'now': 0.0}
+    lock = Mock()
+    def acquire(**kwargs):
+        assert kwargs['timeout'] == 1
+        clock['now'] += 0.8
+        return True
+    lock.acquire.side_effect = acquire
+    runner._locks[ACCOUNT['id']] = lock
+    with patch('app.canvas_cli.time.monotonic', side_effect=lambda: clock['now']), \
+            patch.object(runner, '_execute', return_value={'ok': True}) as execute:
+        runner.run(ACCOUNT, ['version'], timeout=120, deadline=1)
+    assert execute.call_args.args[2] == pytest.approx(0.2)
+    lock.release.assert_called_once()
+
+
+def test_read_only_retries_share_deadline_instead_of_renewing_timeout(tmp_path, monkeypatch):
+    clock = {'now': 0.0}
+    budgets = []
+    class TimedRunner:
+        timeout = 120
+        def run(self, account, args, *, timeout, deadline):
+            budgets.append(timeout)
+            clock['now'] += min(2, timeout)
+            raise CanvasCLIError('CLI_COMMAND_TIMEOUT', 'synthetic read interruption')
+    monkeypatch.setattr('app.canvas_client.time', SimpleNamespace(
+        monotonic=lambda: clock['now'], sleep=lambda delay: clock.update(now=clock['now'] + delay)))
+    with pytest.raises(CanvasCLIError):
+        CanvasClient(TimedRunner(), ACCOUNT).capabilities(deadline=5)
+    assert clock['now'] == 5
+    assert budgets == [5, 2.75, 0.25]
+
+
+def test_resource_readiness_stops_upload_retries_at_task_deadline(tmp_path, monkeypatch):
+    clock = {'now': 0.0}
+    runner = FakeRunner(tmp_path)
+    original = runner.run
+    def pending(account, args, timeout=None, deadline=None):
+        result = original(account, args, timeout=timeout)
+        if args[:2] == ['resource', 'get']:
+            result['data']['status'] = 'pending'
+        return result
+    runner.run = pending
+    monkeypatch.setattr('app.canvas_client.time', SimpleNamespace(monotonic=lambda: clock['now'],
+        sleep=lambda delay: clock.update(now=clock['now'] + delay)))
+    with pytest.raises(CanvasCLIError) as error:
+        CanvasClient(runner, ACCOUNT)._upload_resource(tmp_path / 'synthetic', 'image', 'resource', 'project', deadline=5)
+    assert error.value.code == 'CLI_TASK_DEADLINE_EXCEEDED'
+    assert clock['now'] == 5
+    assert sum(args[:2] == ['resource', 'upload'] for args in runner.calls) == 1
+    assert sum(args[:2] == ['resource', 'get'] for args in runner.calls) == 5
+
+
+def test_result_download_shares_query_deadline_without_restarting_180_second_budget(tmp_path, monkeypatch):
+    runner, client, context = prepare(tmp_path)
+    runner.calls.clear()
+    clock = {'now': 0.0}
+    budgets = []
+    original = runner.run
+    def interrupted(account, args, timeout=None, deadline=None):
+        budgets.append((args[:2], timeout))
+        if args[:2] == ['resource', 'get']:
+            clock['now'] += 2
+        if args[:2] == ['resource', 'download']:
+            clock['now'] += timeout
+            raise CanvasCLIError('CLI_COMMAND_TIMEOUT', 'synthetic result download timed out')
+        return original(account, args, timeout=timeout)
+    runner.run = interrupted
+    monkeypatch.setattr('app.canvas_client.time', SimpleNamespace(monotonic=lambda: clock['now'],
+        sleep=lambda delay: clock.update(now=clock['now'] + delay)))
+    with pytest.raises(CanvasCLIError):
+        client.poll(context, deadline=5)
+    assert clock['now'] == 5
+    assert budgets == [(['operation', 'status'], 5), (['resource', 'get'], 5), (['resource', 'download'], 3)]
+    assert not list((tmp_path / 'results').rglob('*.part'))
+    assert not any(args[:2] in (['node', 'confirm'], ['node', 'run']) for args in runner.calls)
+
+
 def test_prepare_upload_timeout_checks_same_resource_before_continue(tmp_path):
     runner, client, context = prepare(tmp_path, upload_timeout=True)
     assert context["quoted_credits"] == 20
@@ -240,7 +345,7 @@ def test_poll_malformed_success_response_never_claims_matching_running(tmp_path,
     runner, client, context = prepare(tmp_path)
     runner.calls.clear()
     original = runner.run
-    def invalid(account, args, timeout=None):
+    def invalid(account, args, timeout=None, deadline=None):
         if args[:2] == ["operation", "status"]:
             runner.calls.append(args)
             data = dict(malformed)
@@ -258,7 +363,7 @@ def test_poll_malformed_success_response_never_claims_matching_running(tmp_path,
 def test_poll_wrong_operation_identity_stays_unknown(tmp_path):
     runner, client, context = prepare(tmp_path)
     original = runner.run
-    def wrong(account, args, timeout=None):
+    def wrong(account, args, timeout=None, deadline=None):
         if args[:2] == ["operation", "status"]:
             return {"ok": True, "data": {"operationRef": "another-submission", "state": "running", "resources": []}}
         return original(account, args, timeout=timeout)
@@ -397,7 +502,7 @@ class IdentityRunner:
         self.responses = responses
         self.calls = []
 
-    def run(self, account, args, timeout=None):
+    def run(self, account, args, timeout=None, deadline=None):
         self.calls.append(args)
         assert args == ["auth", "account"]
         return {"ok": True, "data": self.responses[min(len(self.calls) - 1, len(self.responses) - 1)]}
@@ -510,7 +615,7 @@ def test_invalid_service_response_retries_only_read_calls(tmp_path, monkeypatch)
     runner = FakeRunner(tmp_path)
     original = runner.run
     failures = 2
-    def interrupted(account, args, timeout=None):
+    def interrupted(account, args, timeout=None, deadline=None):
         nonlocal failures
         if args[:2] == ["model", "list"] and failures:
             runner.calls.append(args)
@@ -529,7 +634,7 @@ def test_invalid_upload_response_looks_up_then_retries_original_id(tmp_path, mon
     original = runner.run
     first = True
     lookup_missing = False
-    def interrupted(account, args, timeout=None):
+    def interrupted(account, args, timeout=None, deadline=None):
         nonlocal first, lookup_missing
         if args[:2] == ["resource", "upload"] and first:
             first, lookup_missing = False, True
@@ -558,7 +663,7 @@ def test_invalid_confirmation_response_retries_tokens_then_runs_once(tmp_path, m
     runner, client, context = prepare(tmp_path)
     original = runner.run
     failures = 2
-    def interrupted(account, args, timeout=None):
+    def interrupted(account, args, timeout=None, deadline=None):
         nonlocal failures
         if args[:2] == ["node", "confirm"] and failures:
             runner.calls.append(args)
@@ -588,7 +693,7 @@ def test_submit_persists_exact_confirmation_and_dispatch_boundaries(tmp_path):
     runner, client, context = prepare(tmp_path)
     original = runner.run
     events, durable = [], []
-    def record(account, args, timeout=None):
+    def record(account, args, timeout=None, deadline=None):
         events.append("command:" + " ".join(args[:2]))
         return original(account, args, timeout=timeout)
     def persist(value):
@@ -635,7 +740,7 @@ def test_submit_never_runs_after_confirmation_deadline(tmp_path, monkeypatch, ex
     clock = [0.0]
     monkeypatch.setattr("app.canvas_client.time.monotonic", lambda: clock[0])
     original = runner.run
-    def confirm(account, args, timeout=None):
+    def confirm(account, args, timeout=None, deadline=None):
         value = original(account, args, timeout=timeout)
         if args[:2] == ["node", "confirm"] and expires_during == "confirm":
             assert timeout == 5
@@ -716,7 +821,7 @@ def test_timed_out_partial_download_is_removed_before_same_resource_retry(tmp_pa
     runner, client, context = prepare(tmp_path)
     original = runner.run
     attempted = []
-    def interrupted(account, args, timeout=None):
+    def interrupted(account, args, timeout=None, deadline=None):
         if args[:2] == ["resource", "download"]:
             output = Path(args[-1])
             assert not output.exists()
@@ -738,7 +843,7 @@ def test_timed_out_partial_download_is_removed_before_same_resource_retry(tmp_pa
 def test_download_cannot_publish_without_matching_receipt(tmp_path, invalid):
     runner, client, context = prepare(tmp_path)
     original = runner.run
-    def corrupt(account, args, timeout=None):
+    def corrupt(account, args, timeout=None, deadline=None):
         value = original(account, args, timeout=timeout)
         if args[:2] == ["resource", "download"]:
             if invalid == "missing_checksum":

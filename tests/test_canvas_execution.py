@@ -48,10 +48,10 @@ def task(store, identifier="task", *, backend="", **request):
 
 def fake_client(store, service, account, *, quote=10, actual=None, kind="video"):
     client = Mock(account=account)
-    client.identity.side_effect = lambda: {"user_id": account["login_user_id"],
+    client.identity.side_effect = lambda **kwargs: {"user_id": account["login_user_id"],
         "available_balance": account["balance"] - (actual if actual is not None else quote) if client.submit.call_count else account["balance"]}
 
-    def prepare(normalized, task_id, assets, *, persist):
+    def prepare(normalized, task_id, assets, *, persist, deadline=None):
         context = {"backend": "canvas_cli", "account_id": account["id"], "task_id": task_id,
             "profile": f"synthetic-{account['id']}", "project_id": f"project-{account['id']}",
             "node_id": f"node-{task_id}-{account['id']}", "submit_id": f"submit-{task_id}-{account['id']}",
@@ -810,7 +810,7 @@ def test_manual_stop_during_query_is_never_overwritten_by_late_provider_response
     client = fake_client(store, service, account)
     output = client.poll.return_value
     stopped = []
-    def late_response(_context):
+    def late_response(_context, *, deadline=None):
         stopped.append(manually_stop(store))
         if state == 'query_error':
             raise CanvasCLIError('CLI_NETWORK_ERROR', 'late query failed')
@@ -963,3 +963,73 @@ def test_explicit_confirmed_upstream_failure_still_completes_as_failure(context)
     assert store.active_account_count(account['id']) == 0
     client.poll.assert_called_once()
     client.submit.assert_not_called()
+
+
+def test_full_reference_preparation_stops_at_shared_deadline_and_releases_worker(context, tmp_path):
+    """Fifteen individually legal uploads cannot each renew a 30-minute task."""
+    from app.canvas_client import CanvasClient
+    from test_canvas_transport import FakeRunner
+
+    store, service, _ = context
+    store.update_settings({'task_timeout_seconds': 1800})
+    account = owner(store)
+    store.update_account(account['id'], {'login_user_id': '42', 'cli_user_id': '42'})
+    account = store.account(account['id'], private=True)
+    task(store)
+    clock = {'now': 100.0}
+    fake_time = SimpleNamespace(monotonic=lambda: clock['now'],
+        time=lambda: 1700000000 + clock['now'],
+        sleep=lambda delay: clock.update(now=clock['now'] + delay))
+    input_file = tmp_path / 'synthetic-input.bin'
+    input_file.write_bytes(b'fixture only; never sent to a network')
+    assets = {group: [{'path': str(input_file)} for _ in range(count)]
+              for group, count in [('images', 9), ('videos', 3), ('audios', 3)]}
+
+    class TimedRunner(FakeRunner):
+        def __init__(self):
+            super().__init__(tmp_path)
+            self.upload_budgets = []
+            self.persisted.append({'fixture': True})
+
+        def run(self, account, args, timeout=None, deadline=None):
+            if args[:2] == ['resource', 'upload']:
+                self.upload_budgets.append(timeout)
+                assert service._active[account['id']] == 1
+                clock['now'] += min(179, timeout)
+                if timeout < 179:
+                    raise CanvasCLIError('CLI_COMMAND_TIMEOUT', 'synthetic upload reached its bounded timeout')
+            return super().run(account, args, timeout=timeout)
+
+    runner = TimedRunner()
+    client = CanvasClient(runner, account)
+    free_slots = service._worker_slots._value
+    with patch.object(service, 'canvas_client', return_value=client), \
+            patch.object(service, '_canvas_local_assets', return_value=assets), \
+            patch('app.canvas_client.time', fake_time), patch('app.canvas_service.time', fake_time), \
+            patch('app.service.time', fake_time):
+        service._run('task')
+    result = store.task('task')
+    assert clock['now'] == 1900
+    assert runner.upload_budgets == [180] * 10 + [10]
+    assert not any(args[:2] in (['node', 'confirm'], ['node', 'run'], ['node', 'quote']) for args in runner.calls)
+    assert result['status'] == 'failed' and result['error_code'] == 'CLI_PREPARATION_TIMEOUT'
+    assert result['actual_cost'] is None and not result['attempted_account_ids']
+    assert sum(service._active.values()) == 0 and not service._credit_reservations
+    assert service._worker_slots._value == free_slots
+
+
+def test_poll_budget_uses_original_wall_deadline_and_still_accepts_running(context):
+    store, service, _ = context
+    account = owner(store)
+    retained_operation(store, account, paused=False, deadline=time.time() + 5)
+    client = fake_client(store, service, account)
+    client.poll.return_value = {'status': 'running', 'progress': 60}
+    # Stop after the positive response to inspect the passed budget without
+    # adding a synthetic second query or extending the original window.
+    service._stop.wait.side_effect = lambda delay: service._stop.set()
+    before = time.monotonic()
+    service._poll_canvas('task', client, before + 1800)
+    passed = client.poll.call_args.kwargs['deadline']
+    assert before < passed <= before + 5.1
+    assert store.task('task')['status'] == 'running'
+    assert not store.task('task')['error_code']

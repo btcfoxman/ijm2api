@@ -326,19 +326,34 @@ class CanvasCLI:
             self._terminate(process)
 
     def run(self, account: dict[str, Any], args: list[str], *,
-            timeout: float | None = None) -> dict[str, Any]:
+            timeout: float | None = None, deadline: float | None = None) -> dict[str, Any]:
         """Return the complete JSON envelope; raise a typed, sanitized failure."""
         account_id = _account_id(account)
         if not args or any(not isinstance(a, str) or "\x00" in a for a in args):
             raise CanvasCLIError("CLI_ARGUMENT_INVALID", "Canvas command arguments are invalid")
         if any(a in {"--profile", "--format", "--yes"} or a.startswith("--profile=") for a in args):
             raise CanvasCLIError("CLI_ARGUMENT_INVALID", "Canvas transport controls profile and output flags")
-        with self._lock(account_id):
+        lock = self._lock(account_id)
+        remaining = deadline - time.monotonic() if deadline is not None else None
+        if remaining is not None and remaining <= 0:
+            raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas task deadline expired before acquiring its account')
+        acquired = lock.acquire() if remaining is None else lock.acquire(timeout=remaining)
+        if not acquired:
+            raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas task deadline expired while waiting for its account')
+        try:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas task deadline expired before starting its command')
+                timeout = min(self.timeout if timeout is None else timeout, remaining)
             if self._closed.is_set():
                 raise CanvasCLIError("CLI_STOPPING", "Canvas CLI transport is stopping")
-            return self._execute(account, args, timeout)
+            return self._execute(account, args, timeout, deadline=deadline)
+        finally:
+            lock.release()
 
-    def _execute(self, account: dict[str, Any], args: list[str], timeout: float | None) -> dict[str, Any]:
+    def _execute(self, account: dict[str, Any], args: list[str], timeout: float | None, *,
+                 deadline: float | None = None) -> dict[str, Any]:
         account_id = _account_id(account)
         command = [self.binary, "--format", "json", "--non-interactive",
                    "--profile", self.profile(account), *args]
@@ -357,6 +372,10 @@ class CanvasCLI:
                                         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
         else:
             kwargs["start_new_session"] = True
+        if deadline is not None and time.monotonic() >= deadline:
+            if proxy_config:
+                proxy_config.unlink(missing_ok=True)
+            raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas task deadline expired before starting its command')
         try:
             process = subprocess.Popen(command, **kwargs)
         except OSError as exc:
@@ -385,7 +404,7 @@ class CanvasCLI:
         for reader in readers:
             reader.start()
         budget = max(0.1, float(timeout if timeout is not None else self.timeout))
-        deadline = time.monotonic() + budget
+        deadline = min(deadline, time.monotonic() + budget) if deadline is not None else time.monotonic() + budget
         timed_out = False
         try:
             while process.poll() is None:
