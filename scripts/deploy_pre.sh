@@ -77,6 +77,9 @@ import os,sqlite3
 database=sqlite3.connect('file:'+os.environ.get('IJM_DATA_DIR','/app/data')+'/ijm2api.db?mode=ro',uri=True,timeout=5)
 tasks=database.execute("SELECT count(*) FROM tasks WHERE status IN ('queued','preparing','submitting','submitted','running')").fetchone()[0]
 logins=database.execute("SELECT count(*) FROM accounts WHERE status='logging_in'").fetchone()[0]
+columns={row[1] for row in database.execute('PRAGMA table_info(accounts)')}
+if 'cli_auth_status' in columns:
+ logins+=database.execute("SELECT count(*) FROM accounts WHERE cli_auth_status IN ('queued','authorizing','manual_required')").fetchone()[0]
 database.close()
 print(tasks+logins)
 PY

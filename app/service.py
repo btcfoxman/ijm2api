@@ -18,6 +18,9 @@ from typing import Any
 
 from .browser import BrowserError, BrowserRejected, browser_alive
 from .browser_runtime import BrowserRuntime
+from .canvas_cli import CanvasCLI, CanvasCLIError
+from .canvas_service import CanvasServiceMixin, execution_mode
+from .account_policy import credit_rejected as _credit_rejected
 from .catalog import MODELS, normalize_request
 from .client import DreaminaClient, DreaminaError, InputAudioDurationError, SubmissionPreflightError
 from .image_client import DreaminaImageClient, resolve_image_model
@@ -40,13 +43,8 @@ def _credential_setup_ready(account: dict[str, Any]) -> bool:
     return not account.get('login_email') or bool(account.get('watermark_ready') and account.get('agreement_ready'))
 
 
-def _credit_rejected(message: str) -> bool:
-    value = message.lower()
-    return ("ret=1006" in value or "not enough credits left" in value
-            or "no relevant benefits" in value)
-
-
 DEFAULT_SETTINGS: dict[str, Any] = {
+    "canvas_cli_enabled": False,
     "task_workers": 10,
     "task_queue_capacity": 100,
     "poll_interval_seconds": 8,
@@ -69,7 +67,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 
-class Service:
+class Service(CanvasServiceMixin):
     def __init__(self, store: Store):
         self.store = store
         self._pool = ThreadPoolExecutor(max_workers=50, thread_name_prefix="ijm-task")
@@ -81,6 +79,10 @@ class Service:
         self._stop = threading.Event()
         self._maintenance: threading.Thread | None = None
         self.browser_runtime = BrowserRuntime(store, self.settings)
+        self.canvas_cli = CanvasCLI(store.path.parent)
+        self.canvas_runtime: dict[str, Any] = {'available': None, 'status': 'not_checked'}
+        self._browser_aux_slots = threading.BoundedSemaphore(2)
+        self._maintenance_failures: dict[int, tuple[int, float]] = {}
         self._browser_views: dict[int, tuple[dict[str, Any], bool, float]] = {}
         self._browser_views_lock = threading.RLock()
 
@@ -91,6 +93,7 @@ class Service:
         values = self.settings()
         values["result_s3_center_token_configured"] = bool(values.get("result_s3_center_token"))
         values["result_s3_center_token"] = ""
+        values['canvas_cli_runtime'] = dict(self.canvas_runtime)
         return values
 
     def update_settings(self, values: dict[str, Any]) -> dict[str, Any]:
@@ -111,6 +114,11 @@ class Service:
         return self.public_settings()
 
     def start(self) -> None:
+        try:
+            self.canvas_runtime = self.canvas_cli.verify_runtime()
+        except CanvasCLIError as exc:
+            self.canvas_runtime = {'available': False, 'error_code': exc.code, 'message': str(exc)}
+            logger.error('Canvas runtime unavailable (%s); browser backend remains available', exc.code)
         self._started = True
         self._maintenance = threading.Thread(target=self._maintain_accounts, daemon=True,
                                              name="ijm-account-maintenance")
@@ -118,6 +126,14 @@ class Service:
         for task in reversed(self.store.tasks(1000)):
             if task["status"] == "queued":
                 self._pool.submit(self._run, task["id"])
+            elif task.get("execution_backend") == "canvas_cli" and task.get("upstream_context"):
+                phase = task["upstream_context"].get("submission_phase")
+                if phase in {"submitting", "submitted"} and (task["status"] not in TERMINAL
+                        or task.get("error_code") == "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN"):
+                    self._pool.submit(self._resume_canvas_poll, task["id"])
+                elif task["status"] == "preparing":
+                    self._fail(task["id"], "CLI_PREPARATION_INTERRUPTED",
+                               "service restarted before Canvas paid submission")
             elif task["status"] in {"submitted", "running"} and task["run_id"] and task["thread_id"]:
                 self._pool.submit(self._resume_poll, task["id"])
             elif task["status"] in {"submitted", "running"} and task["run_id"] and task["normalized"].get("kind") == "image":
@@ -136,6 +152,7 @@ class Service:
         for account_id in list(self._browser_views):
             self.close_browser_view(account_id)
         self.browser_runtime.close_all_idle()
+        self.canvas_cli.close()
 
     def open_browser_view(self, account_id: int) -> dict[str, Any]:
         with self._browser_views_lock:
@@ -176,22 +193,39 @@ class Service:
             for account in self.store.accounts(private=True):
                 if self._stop.is_set():
                     break
-                if not account["enabled"] or not int(account["cdp_port"] or 0):
+                account_id = int(account["id"])
+                if not account["enabled"] or account["status"] == "logging_in":
+                    continue
+                failed, retry_at = self._maintenance_failures.get(account_id, (0, 0))
+                if time.monotonic() < retry_at:
                     continue
                 try:
-                    checked = self.check_account(int(account["id"]))
+                    # CLI accounts without credentials wait for authorization;
+                    # routine maintenance must not open Chrome for them.
+                    if execution_mode(account) == "canvas_cli" and account.get("cli_auth_status") != "ready":
+                        checked = account
+                    elif execution_mode(account) == "browser":
+                        # Web quota checks share the short-lived auxiliary budget.
+                        with self._browser_aux_slots:
+                            checked = self.check_account(account_id)
+                    else:
+                        checked = self.check_account(account_id)
                     if checked["status"] == "login_required":
                         needs_rapid_recheck = True
-                    if checked["status"] == "active" and settings["daily_checkin_enabled"]:
-                        self.checkin_account(int(account["id"]))
-                except (BrowserError, ValueError, KeyError):
-                    needs_rapid_recheck = True
+                    if settings["daily_checkin_enabled"] and checked['status'] in {'active', 'cli_auth_required'}:
+                        with self._browser_aux_slots:
+                            self.checkin_account(account_id)
+                    self._maintenance_failures.pop(account_id, None)
+                except (BrowserError, CanvasCLIError, ValueError, KeyError):
+                    failed += 1
+                    self._maintenance_failures[account_id] = (failed,
+                        time.monotonic() + min(1800, 60 * 2 ** min(failed - 1, 5)))
                     continue
             interval = max(30, int(settings["account_maintenance_interval_seconds"]))
             # A restarted Chrome often exposes its tab before the app can make
             # authenticated requests. Retry that state promptly instead of
             # leaving a valid account unavailable for the full interval.
-            self._stop.wait(min(15, interval) if needs_rapid_recheck else interval)
+            self._stop.wait(interval)
 
     def checkin_account(self, account_id: int) -> dict[str, Any]:
         account = self.store.account(account_id, private=True)
@@ -221,8 +255,10 @@ class Service:
             raise RuntimeError("IJMAPI queue is full")
         task_id = "ijm_" + uuid.uuid4().hex[:16]
         task = self.store.create_task(task_id, request, normalized)
+        configured_modes = {execution_mode(a) for a in self.store.accounts(private=True) if a['enabled']}
         try:
             estimates = [item for item in self.store.model_costs() if
+                         configured_modes == {'browser'} and item.get('execution_backend', 'browser') == 'browser' and
                          item["model"] == ("sd-2-5" if normalized["model"] == "sd-2-5-480p-x" else normalized["model"]) and
                          item["duration"] == normalized["duration"] and
                          item["resolution"] == ("720p" if normalized["model"] == "sd-2-5-480p-x" else normalized["resolution"]) and
@@ -292,7 +328,10 @@ class Service:
         counts = tuple(len(normalized.get(kind) or []) for kind in ('images', 'videos', 'audios'))
         exact, compatible, covering = [], [], []
         now = time.time()
+        backend = (normalized.get('_cost_evidence') or {}).get('execution_backend', 'browser')
         for row in rows['history']:
+            if (row.get('execution_backend') or 'browser') != backend:
+                continue
             cost, before, after = (number(row.get(key)) for key in ('actual_cost', 'balance_before', 'balance_after'))
             stamp = number(row.get('completed_at')) or number(row.get('updated_at')) or 0
             if (row.get('status') != 'succeeded' or not cost
@@ -340,6 +379,13 @@ class Service:
 
     def _update_cost_estimate(self, task: dict) -> dict:
         with self._lock:
+            if task.get('execution_backend') == '':
+                modes = {execution_mode(a) for a in self.store.accounts(private=True) if a['enabled']}
+                if len(modes) != 1:
+                    return self.store.update_task(task['id'], {'estimated_cost': 0,
+                        'cost_evidence': {'scheduling_estimate': {'source': 'unknown', 'sample_count': 0}}})
+                backend = next(iter(modes))
+                task = self.store.update_task(task['id'], {'cost_evidence': {'execution_backend': backend}})
             try:
                 cost, metadata = self._cost_estimate(task['normalized'], task.get('estimated_cost'), self.store.scheduling_rows())
             except Exception as exc:
@@ -367,11 +413,19 @@ class Service:
         uncertain = any(amount <= 0 for amount in amounts) or balance is None and bool(amounts)
         return (None if balance is None else balance - sum(amounts), uncertain)
 
-    def _funded_accounts(self, estimated_cost: float, excluded: set[int], pending: dict) -> list[dict]:
+    def _funded_accounts(self, estimated_cost: float, excluded: set[int], pending: dict,
+                         backend: str | None = None) -> list[dict]:
         accounts = []
         for item in self.store.accounts(private=True):
             if (int(item['id']) in excluded or not item['enabled'] or item['status'] != 'active'
                     or not item['proxy_url'] or not _credential_setup_ready(item)):
+                continue
+            if execution_mode(item) == 'canvas_cli' and item.get('cli_auth_status') != 'ready':
+                continue
+            if execution_mode(item) == 'canvas_cli' and (not self.settings()['canvas_cli_enabled']
+                    or self.canvas_runtime.get('available') is False):
+                continue
+            if backend and execution_mode(item) != backend:
                 continue
             available, unknown_hold = self._available_credits(item, pending)
             if unknown_hold or available is not None and (available < estimated_cost or available <= 0):
@@ -387,7 +441,8 @@ class Service:
             if sum(self._active.values()) >= int(self.settings()["task_workers"]):
                 return None
             pending = self._pending_credits(self.store.scheduling_rows(), task_id)
-            accounts = self._funded_accounts(estimated_cost, excluded, pending)
+            backend = (self.store.task(task_id) or {}).get('execution_backend') if task_id else None
+            accounts = self._funded_accounts(estimated_cost, excluded, pending, backend)
             # Unknown cost is not a free task: probe a larger balance until a
             # measured budget exists. Explicit priority always remains first.
             accounts.sort(key=lambda item: (-int(item['priority']), item['_available_credits'] is None,
@@ -406,7 +461,8 @@ class Service:
     def _has_eligible_account(self, estimated_cost: float, excluded: set[int], task_id: str | None = None) -> bool:
         with self._lock:
             pending = self._pending_credits(self.store.scheduling_rows(), task_id)
-            return bool(self._funded_accounts(estimated_cost, excluded, pending))
+            backend = (self.store.task(task_id) or {}).get('execution_backend') if task_id else None
+            return bool(self._funded_accounts(estimated_cost, excluded, pending, backend))
 
     def _release_account(self, account_id: int, task_id: str | None = None) -> None:
         with self._lock:
@@ -414,6 +470,22 @@ class Service:
             key = task_id or next((key for key, (owner, _) in self._credit_reservations.items() if owner == account_id), None)
             if key:
                 self._credit_reservations.pop(key, None)
+
+    def _handle_credit_rejection(self, task_id: str, account_id: int, reason: str) -> bool:
+        """One admission-rejection policy for browser, Canvas, image and video."""
+        task = self.store.task(task_id) or {}
+        attempted = list(task.get('attempted_account_ids') or [])
+        if account_id not in attempted:
+            attempted.append(account_id)
+        self.store.update_task(task_id, {'attempted_account_ids': attempted})
+        self.store.update_account(account_id, {'last_error': reason[:300]})
+        if len(attempted) >= MAX_CREDIT_ACCOUNT_ATTEMPTS:
+            self._fail(task_id, 'INSUFFICIENT_CREDITS', reason)
+            return False
+        self.store.update_task(task_id, {'status': 'queued', 'progress': 0,
+            'account_id': None, 'balance_before': None, 'upstream_context': {},
+            'error_code': 'INSUFFICIENT_CREDITS', 'error_message': reason})
+        return True
 
     def _submission_funded(self, account: dict, task_id: str, estimated_cost: float, balance: Any) -> bool:
         with self._lock:
@@ -433,12 +505,18 @@ class Service:
         with self._lock:
             pending = self._pending_credits(self.store.scheduling_rows(), task_id)
             return any(any(owner == int(account['id']) for owner, _ in pending.values())
-                       for account in self._funded_accounts(estimated_cost, excluded, {}))
+                       for account in self._funded_accounts(estimated_cost, excluded, {},
+                           (self.store.task(task_id) or {}).get('execution_backend') if task_id else None))
 
     def check_account(self, account_id: int, *, start_browser: bool = False) -> dict[str, Any]:
         account = self.store.account(account_id, private=True)
         if not account:
             raise KeyError(account_id)
+        if not start_browser and execution_mode(account) == 'canvas_cli':
+            if account.get('cli_auth_status') != 'ready':
+                return self.store.update_account(account_id, {'status': 'cli_auth_required',
+                    'last_error': 'CLI authorization is required before accepting tasks'})
+            return self._check_cli_account(account)
         account, owned = self.browser_runtime.acquire(account, force_managed=start_browser)
         try:
             return self._check_account_live(account)
@@ -483,6 +561,9 @@ class Service:
     def _run(self, task_id: str) -> None:
         task = self.store.task(task_id)
         if not task or task["status"] != "queued":
+            return
+        if self._cli_authorization_missing():
+            self._fail(task_id, 'ACCOUNT_POOL_UNAVAILABLE', 'CLI authorization is required for the enabled accounts')
             return
         if task["normalized"].get("kind") == "image":
             self._run_image(task_id)
@@ -529,9 +610,24 @@ class Service:
                 account_id = int(account["id"])
                 owned = False
                 try:
+                    backend = execution_mode(account)
                     self.store.update_task(task_id, {"account_id": account_id,
                         "status": "preparing", "progress": 5, "balance_before": None,
+                        "execution_backend": backend, "cost_evidence": {'execution_backend': backend},
                         "error_code": "", "error_message": ""})
+                    if backend == 'canvas_cli':
+                        result = self._execute_canvas(task_id, account, deadline)
+                        if result is True:
+                            return
+                        if result == 'retry':
+                            retry = self.store.task(task_id) or {}
+                            attempted = list(retry.get('attempted_account_ids') or [])
+                            credit_reason = retry.get('error_message') or credit_reason
+                            deadline = time.monotonic() + int(self.settings()['task_timeout_seconds'])
+                        elif result != 'reselect':
+                            funding_excluded.add(account_id)
+                        estimated_cost = float((self.store.task(task_id) or {}).get('estimated_cost') or 0)
+                        continue
                     account, owned = self.browser_runtime.acquire(account)
                     client = DreaminaClient(account, store=self.store)
                     before = None
@@ -579,15 +675,8 @@ class Service:
                             self._fail(task_id, "UPSTREAM_REJECTED", str(exc))
                             return
                         credit_reason = str(exc)
-                        self.store.update_account(account_id, {"last_error": credit_reason[:300]})
-                        logger.warning("IJM task %s credit rejection on account %s (attempt %s/%s)",
-                                       task_id, account_id, len(attempted), MAX_CREDIT_ACCOUNT_ATTEMPTS)
-                        if len(attempted) >= MAX_CREDIT_ACCOUNT_ATTEMPTS:
-                            self._fail(task_id, "INSUFFICIENT_CREDITS", credit_reason)
+                        if not self._handle_credit_rejection(task_id, account_id, credit_reason):
                             return
-                        self.store.update_task(task_id, {"status": "queued", "progress": 0,
-                            "account_id": None, "balance_before": None,
-                            "error_code": "INSUFFICIENT_CREDITS", "error_message": credit_reason})
                         deadline = time.monotonic() + int(self.settings()["task_timeout_seconds"])
                         continue
                     except BrowserError as exc:
@@ -620,6 +709,9 @@ class Service:
         task = self.store.task(task_id)
         if not task or task["status"] != "queued":
             return
+        if self._cli_authorization_missing():
+            self._fail(task_id, 'ACCOUNT_POOL_UNAVAILABLE', 'CLI authorization is required for the enabled accounts')
+            return
         deadline = time.monotonic() + int(self.settings()["task_timeout_seconds"])
         while not self._stop.is_set():
             if not self._worker_slots.acquire(timeout=1):
@@ -648,8 +740,19 @@ class Service:
                 account_id = int(account["id"])
                 owned = False
                 try:
+                    backend = execution_mode(account)
                     self.store.update_task(task_id, {"account_id": account_id,
-                        "status": "preparing", "progress": 5, "error_code": "", "error_message": ""})
+                        "status": "preparing", "progress": 5, "error_code": "", "error_message": "",
+                        "execution_backend": backend, 'cost_evidence': {'execution_backend': backend}})
+                    if backend == 'canvas_cli':
+                        result = self._execute_canvas(task_id, account, deadline)
+                        if result is True:
+                            return
+                        if result == 'retry':
+                            attempted = list((self.store.task(task_id) or {}).get('attempted_account_ids') or [])
+                        elif result != 'reselect':
+                            funding_excluded.add(account_id)
+                        continue
                     account, owned = self.browser_runtime.acquire(account)
                     video_client = DreaminaClient(account, store=self.store)
                     balance = None
@@ -671,12 +774,10 @@ class Service:
                         submitted = DreaminaImageClient(int(account["cdp_port"])).submit(
                             task["normalized"], assets)
                     except BrowserRejected as exc:
-                        if _credit_rejected(str(exc)) and len(attempted) < MAX_CREDIT_ACCOUNT_ATTEMPTS:
-                            self.store.update_account(account_id, {"last_error": str(exc)[:300]})
-                            self.store.update_task(task_id, {"status": "queued", "progress": 0,
-                                "account_id": None, "error_code": "INSUFFICIENT_CREDITS",
-                                "error_message": str(exc)})
-                            continue
+                        if _credit_rejected(str(exc)):
+                            if self._handle_credit_rejection(task_id, account_id, str(exc)):
+                                continue
+                            return
                         self._fail(task_id, "INSUFFICIENT_CREDITS" if _credit_rejected(str(exc))
                                    else "UPSTREAM_REJECTED", str(exc))
                         return
@@ -759,6 +860,9 @@ class Service:
     def _resume_poll(self, task_id: str) -> None:
         task = self.store.task(task_id)
         if not task or not task["account_id"]:
+            return
+        if task.get('execution_backend') == 'canvas_cli':
+            self._resume_canvas_poll(task_id)
             return
         if task["normalized"].get("kind") == "image":
             self._resume_image_poll(task_id)
@@ -900,6 +1004,7 @@ class Service:
             "error_code": code, "error_message": message[:600], "completed_at": time.time()})
 
     def image_response(self, task: dict[str, Any]) -> dict[str, Any]:
+        task = self._refresh_canvas_result_urls(task)
         status = {"succeeded": "completed", "failed": "failed",
                   "expired": "failed"}.get(task["status"], "in_progress")
         result: dict[str, Any] = {
@@ -916,6 +1021,7 @@ class Service:
         return result
 
     def public_task(self, task: dict[str, Any]) -> dict[str, Any]:
+        task = self._refresh_canvas_result_urls(task)
         if task["normalized"].get("kind") == "image":
             result = self.image_response(task)
             result["progress"] = task["progress"]

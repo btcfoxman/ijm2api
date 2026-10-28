@@ -18,7 +18,7 @@ class AccountPriorityTests(unittest.TestCase):
         self.store = Store(str(Path(directory.name) / "tasks.db"))
 
     def account(self, name, balance, priority=0):
-        saved = self.store.upsert_account({"name": name, "proxy_url": "socks5://proxy.test:20002",
+        saved = self.store.upsert_account({"execution_mode": "browser", "name": name, "proxy_url": "socks5://proxy.test:20002",
                                            "priority": priority})
         self.store.update_account(saved["id"], {"status": "active", "balance": balance})
         return saved["id"]
@@ -27,7 +27,7 @@ class AccountPriorityTests(unittest.TestCase):
         account_id = self.account("one", 100)
         self.assertEqual(self.store.account(account_id)["priority"], 0)
         self.store.update_account(account_id, {"priority": "3"})
-        self.store.upsert_account({"name": "one", "proxy_url": "socks5://proxy.test:20002"})
+        self.store.upsert_account({"execution_mode": "browser", "name": "one", "proxy_url": "socks5://proxy.test:20002"})
         self.assertEqual(self.store.account(account_id)["priority"], 3)
         for invalid in (-1, 1.5, True, None):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):

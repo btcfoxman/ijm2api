@@ -14,7 +14,10 @@ from app.store import Store
 
 
 @pytest.fixture
-def context():
+def context(monkeypatch):
+    # These jobs use mocked Chrome startup; teardown must not contact a real
+    # CDP port belonging to another browser on the developer workstation.
+    monkeypatch.setattr('app.browser_runtime.stop_managed_browser', Mock())
     with tempfile.TemporaryDirectory() as directory:
         store = Store(str(Path(directory) / 'data.db'))
         service = Service(store)
@@ -27,7 +30,8 @@ def context():
 
 def account(store, index=1):
     return store.upsert_account({'name': f'synthetic-{index}', 'proxy_url': f'socks5://proxy.test:{20000 + index}',
-        'login_email': f'person{index}@example.test', 'login_password': 'Synthetic private password'})
+        'login_email': f'person{index}@example.test', 'login_password': 'Synthetic private password',
+        'execution_mode': 'browser'})
 
 
 def queued(manager):
@@ -238,3 +242,43 @@ def test_balance_check_cannot_promote_unprepared_credentials(context):
     assert saved['status'] == 'setup_required' and not saved['enabled']
     store.update_account(item['id'], {'enabled': True, 'status': 'active'})
     assert service._reserve_account() is None
+
+
+def test_cli_login_stays_disabled_and_starts_auth_after_browser_cleanup(context):
+    store, service, manager = context
+    item = account(store)
+    store.update_account(item['id'], {'execution_mode': 'canvas_cli'})
+    pool = queued(manager)
+    manager.start(item['id'])
+    ready = {'identity_verified': True, 'watermark_ready': True, 'agreement_ready': True,
+             'identity': {'user_id': 'synthetic-user-1'}}
+    client = Mock()
+    client.account_state.return_value = {'available_balance': 20, 'buckets': {'gift_credit': 20}}
+    events = []
+    service.browser_runtime.close_idle = Mock(side_effect=lambda identifier: events.append('closed'))
+
+    def begin(identifier):
+        assert not manager.busy(identifier)
+        assert store.account(identifier)['status'] == 'cli_auth_required'
+        assert not store.account(identifier)['enabled']
+        assert events == ['closed']
+        events.append('authorize')
+
+    service.begin_cli_authorization = begin
+    with patch('app.auto_login.start_managed_browser', return_value=19301), \
+         patch('app.auto_login.AccountAutomation') as automation, \
+         patch('app.auto_login.DreaminaClient', return_value=client):
+        automation.return_value.run.return_value = ready
+        fn, identifier, enable = pool.submit.call_args.args
+        fn(identifier, enable)
+    assert events == ['closed', 'authorize']
+    assert not store.account(item['id'])['enabled']
+
+
+def test_authorization_blocks_automatic_browser_takeover(context):
+    store, service, manager = context
+    item = account(store)
+    service.canvas_auth = Mock()
+    service.canvas_auth.busy.return_value = True
+    with pytest.raises(ValueError, match='Canvas CLI authorization'):
+        manager.start(item['id'])

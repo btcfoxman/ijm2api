@@ -285,6 +285,9 @@ class BrowserLoginManager:
                 raise LoginError("account not found", 404)
             if getattr(self.service, 'auto_login_busy', lambda _: False)(account_id):
                 raise LoginError('account is in automatic login')
+            cli_auth = getattr(self.service, 'canvas_auth', None)
+            if cli_auth and cli_auth.busy(account_id):
+                raise LoginError('account is in Canvas CLI authorization')
             proxy = browser_proxy(str(account["proxy_url"]))
             desktop = self.desktops.get(account_id)
             if desktop and desktop.proxy != proxy:
@@ -296,6 +299,8 @@ class BrowserLoginManager:
             with self.service._lock:
                 if getattr(self.service, 'auto_login_busy', lambda _: False)(account_id):
                     raise LoginError('account is in automatic login')
+                if cli_auth and cli_auth.busy(account_id):
+                    raise LoginError('account is in Canvas CLI authorization')
                 if self.service._active.get(account_id, 0) or self.store.active_account_count(account_id):
                     raise LoginError("account has active tasks")
                 try:
@@ -318,6 +323,12 @@ class BrowserLoginManager:
                                        else bool(account["enabled"] or account["status"] in
                                            {"pending", "login_required", "logging_in"})),
                       "deadline": time.monotonic() + self.LEASE_SECONDS, "phase": "starting"}
+            slot = getattr(self.service, '_browser_aux_slots', None)
+            if slot is not None:
+                if not slot.acquire(blocking=False):
+                    self.store.update_account(account_id, {'enabled': bool(account['enabled']), 'status': account['status']})
+                    raise LoginError('other account browser operations are busy; retry shortly')
+                active['aux_slot'] = slot
             self.active = active
             try:
                 if active["new_desktop"]:
@@ -336,6 +347,7 @@ class BrowserLoginManager:
                     await desktop.close()
                     self.desktops.pop(account_id, None)
                 self.active = None
+                self._release_slot(active)
                 self.store.update_account(account_id, {"enabled": bool(account["enabled"]),
                                                        "status": account["status"]})
                 raise
@@ -368,23 +380,36 @@ class BrowserLoginManager:
                 if REQUIRES_PROJECT and not (project_id or account["project_id"]):
                     raise LoginError("open the Dreamina generation page before finishing login")
                 stage = "account update"
-                values = {"cdp_port": active["desktop"].cdp_port,
-                          "managed_profile": True, "enabled": active["enable_after"],
-                          "status": "active" if active["enable_after"] else "disabled",
+                needs_cli = account.get('execution_mode', 'canvas_cli') == 'canvas_cli'
+                values = {"cdp_port": 19300 + account_id,
+                          "managed_profile": True, "enabled": False if needs_cli else active["enable_after"],
+                          "status": "cli_auth_required" if needs_cli else "active" if active["enable_after"] else "disabled",
                           "balance": state["available_balance"],
                           "balance_details": state["buckets"], "last_error": "", "login_stage": "ready",
                           "watermark_ready": True, "agreement_ready": True, "setup_checked_at": time.time(),
-                          "login_user_id": login_user_id}
+                          "login_user_id": login_user_id, "login_enable_after": active['enable_after']}
                 if project_id:
                     values["project_id"] = project_id
                 threshold = float(self.service.settings()["low_balance_disable_threshold"] or 0)
-                if threshold > 0 and float(state["available_balance"]) < threshold:
+                if not needs_cli and threshold > 0 and float(state["available_balance"]) < threshold:
                     values.update({"enabled": False, "status": "disabled_low_balance",
                                    "last_error": f"credit balance below {threshold}"})
+                # The profile persists; the browser and its private desktop do not.
+                await self._close_desktop(account_id, active['desktop'])
+                self._release_slot(active)
                 with self.service._lock:
                     self.store.clear_media_cache(account_id)
                     result = self.store.update_account(account_id, values)
-                    self.active = None  # Viewer ticket expires; Chrome stays online.
+                    self.active = None
+                if needs_cli:
+                    begin = getattr(self.service, 'begin_cli_authorization', None)
+                    if begin:
+                        try:
+                            await asyncio.to_thread(begin, account_id)
+                        except Exception:
+                            self.store.update_account(account_id, {'enabled': False, 'status': 'cli_auth_required',
+                                'cli_auth_status': 'failed', 'cli_auth_error': 'CLI 授权未启动，请重试'})
+                        result = self.store.account(account_id)
                 return result
             except asyncio.CancelledError:
                 active["phase"] = "login"
@@ -399,20 +424,36 @@ class BrowserLoginManager:
     async def cancel(self, session_id: str) -> None:
         async with self.lock:
             active = self._owned(session_id)
-            self._end_viewer(active)
+            await self._end_viewer(active)
 
-    def _end_viewer(self, active: dict) -> None:
+    async def _close_desktop(self, account_id: int, desktop: LoginDesktop) -> None:
+        await desktop.close()
+        if self.desktops.get(account_id) is desktop:
+            self.desktops.pop(account_id, None)
+
+    @staticmethod
+    def _release_slot(active: dict) -> None:
+        slot = active.pop('aux_slot', None)
+        if slot is not None:
+            slot.release()
+
+    async def _end_viewer(self, active: dict) -> None:
         previous = active["previous"]
         desktop = active["desktop"]
+        await self._close_desktop(active['account_id'], desktop)
+        self._release_slot(active)
         with self.service._lock:
             self.active = None
             self.store.update_account(active["account_id"],
                 {"enabled": bool(previous["enabled"]), "status": previous["status"],
-                 "cdp_port": desktop.cdp_port if desktop.alive() else 19300 + active["account_id"],
+                 "cdp_port": 19300 + active["account_id"],
                  "managed_profile": True})
 
     async def close_account(self, account_id: int) -> None:
         async with self.lock:
+            cli_auth = getattr(self.service, 'canvas_auth', None)
+            if cli_auth and cli_auth.busy(account_id):
+                raise LoginError('account is in Canvas CLI authorization')
             if getattr(self.service, 'auto_login_busy', lambda _: False)(account_id):
                 raise LoginError('account is in automatic login')
             if self.active and self.active["account_id"] == account_id:
@@ -437,7 +478,7 @@ class BrowserLoginManager:
             async with self.lock:
                 active = self.active
                 if active and (time.monotonic() >= active["deadline"] or not active["desktop"].alive()):
-                    self._end_viewer(active)
+                    await self._end_viewer(active)
 
     async def close(self) -> None:
         self.closed = True
@@ -446,8 +487,8 @@ class BrowserLoginManager:
             await asyncio.gather(self.maintenance, return_exceptions=True)
         async with self.lock:
             if self.active:
-                self._end_viewer(self.active)
-            for account_id, desktop in self.desktops.items():
+                await self._end_viewer(self.active)
+            for account_id, desktop in list(self.desktops.items()):
                 old_port = desktop.cdp_port
                 await desktop.close()
                 account = self.store.account(account_id, private=True)

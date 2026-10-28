@@ -183,6 +183,9 @@ input, textarea, select {
   background: #0d1114; color: var(--text); padding: 7px 8px;
 }
 input:focus, textarea:focus, select:focus { border-color: #3b9e80; }
+.execution-controls { display: flex; align-items: center; gap: 6px; }
+.execution-select { width: 115px; padding: 4px 6px; font-size: 10px; }
+.execution-controls .link-button { white-space: nowrap; font-size: 10px; }
 textarea { resize: vertical; }
 .check { display: flex; grid-column: 1 / -1; flex-direction: row; align-items: center; gap: 6px; }
 .check input { width: 14px; height: 14px; padding: 0; accent-color: var(--mint); }

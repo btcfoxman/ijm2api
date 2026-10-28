@@ -59,6 +59,9 @@ class AutoLoginManager:
                 raise KeyError(account_id)
             if account_id in self._pending:
                 return self.store.account(account_id)
+            cli_auth = getattr(self.service, 'canvas_auth', None)
+            if cli_auth and cli_auth.busy(account_id):
+                raise ValueError('account is in Canvas CLI authorization')
             active = self.manual_active()
             if account['status'] in {'logging_in', 'profile_resetting'} or active and active['account_id'] == account_id:
                 raise ValueError('account is already in browser login')
@@ -98,7 +101,17 @@ class AutoLoginManager:
             if value in AUTO_STAGES:
                 self.store.update_account(account_id, {'login_stage': value})
 
+        completed = False
+        browser_slots = getattr(self.service, '_browser_aux_slots', None)
+        owns_slot = False
         try:
+            if browser_slots is not None:
+                while not self._closed:
+                    if browser_slots.acquire(timeout=.25):
+                        owns_slot = True
+                        break
+                if not owns_slot:
+                    return
             stage('opening_browser')
             account = self.store.account(account_id, private=True)
             settings = self.service.settings()
@@ -124,11 +137,14 @@ class AutoLoginManager:
             balance = state['available_balance']
             threshold = float(settings.get('low_balance_disable_threshold') or 0)
             low = threshold > 0 and balance < threshold
-            self.store.update_account(account_id, {'status': 'disabled_low_balance' if low else 'active' if enable_after else 'disabled',
-                'enabled': enable_after and not low, 'login_stage': 'ready', 'watermark_ready': True,
+            needs_cli = account.get('execution_mode', 'canvas_cli') == 'canvas_cli'
+            self.store.update_account(account_id, {'status': 'cli_auth_required' if needs_cli else 'disabled_low_balance' if low else 'active' if enable_after else 'disabled',
+                'enabled': False if needs_cli else enable_after and not low, 'login_stage': 'ready', 'watermark_ready': True,
                 'agreement_ready': True, 'setup_checked_at': time.time(), 'balance': balance,
                 'balance_details': state['buckets'], 'login_user_id': login_user_id,
+                'login_enable_after': enable_after,
                 'last_error': '账号额度低于启用阈值' if low else ''})
+            completed = True
         except Exception as error:
             status = getattr(error, 'status', '')
             if status not in SAFE_FAILURES:
@@ -136,8 +152,23 @@ class AutoLoginManager:
             self.store.update_account(account_id, {'status': status, 'enabled': False,
                 'login_stage': status, 'last_error': SAFE_FAILURES[status]})
         finally:
+            try:
+                self.service.browser_runtime.close_idle(account_id)
+            except Exception:
+                # Releasing the login queue must not depend on CDP health.
+                pass
+            if owns_slot:
+                browser_slots.release()
             with self.service._lock:
                 self._pending.discard(account_id)
+        if completed and account.get('execution_mode', 'canvas_cli') == 'canvas_cli':
+            begin = getattr(self.service, 'begin_cli_authorization', None)
+            if begin:
+                try:
+                    begin(account_id)
+                except Exception:
+                    self.store.update_account(account_id, {'enabled': False, 'status': 'cli_auth_required',
+                        'cli_auth_status': 'failed', 'cli_auth_error': 'CLI 授权未启动，请重试'})
 
     def close(self):
         with self.service._lock:

@@ -20,7 +20,7 @@ class CreditFailoverTests(unittest.TestCase):
             accounts = []
             clients = {}
             for index, (balance, priority) in enumerate(((100, 2), (90, 2), (1000, 1)), 1):
-                account = store.upsert_account({"name": f"account-{index}",
+                account = store.upsert_account({"execution_mode": "browser", "name": f"account-{index}",
                     "cdp_port": 19300 + index, "proxy_url": "socks5://proxy.test:20002",
                     "priority": priority})
                 store.update_account(account["id"], {"status": "active", "balance": balance})
@@ -35,7 +35,7 @@ class CreditFailoverTests(unittest.TestCase):
             clients[accounts[0]].submit.side_effect = BrowserRejected(
                 "Dreamina ret=1006: Not enough credits left or no relevant benefits")
             request = {"model": "sd-2-5", "prompt": "A blue sky", "duration": 4}
-            store.create_task("ijm_credit_test", request, normalize_request(request))
+            store.create_task("ijm_credit_test", request, normalize_request(request), execution_backend='browser')
             with patch.object(service.browser_runtime, "acquire", side_effect=lambda account: (account, False)), \
                  patch.object(service.browser_runtime, "release"), \
                  patch("app.service.DreaminaClient", side_effect=lambda account, **_: clients[account["id"]]):
@@ -58,7 +58,7 @@ class CreditFailoverTests(unittest.TestCase):
             service = Service(store)
             clients = {}
             for index in range(3):
-                account = store.upsert_account({"name": f"account-{index}",
+                account = store.upsert_account({"execution_mode": "browser", "name": f"account-{index}",
                     "cdp_port": 19301 + index, "proxy_url": "socks5://proxy.test:20002"})
                 store.update_account(account["id"], {"status": "active", "balance": 100 - index})
                 client = Mock()
@@ -67,7 +67,7 @@ class CreditFailoverTests(unittest.TestCase):
                 client.submit.side_effect = BrowserRejected("Dreamina ret=1006: Not enough credits left")
                 clients[account["id"]] = client
             request = {"model": "sd-2-5", "prompt": "A blue sky", "duration": 4}
-            store.create_task("ijm_credit_limit", request, normalize_request(request))
+            store.create_task("ijm_credit_limit", request, normalize_request(request), execution_backend='browser')
             with patch.object(service.browser_runtime, "acquire", side_effect=lambda account: (account, False)), \
                  patch.object(service.browser_runtime, "release"), \
                  patch("app.service.DreaminaClient", side_effect=lambda account, **_: clients[account["id"]]):
@@ -85,11 +85,11 @@ class CreditFailoverTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = Store(str(Path(directory) / "tasks.db"))
             service = Service(store)
-            account = store.upsert_account({"name": "account-1", "cdp_port": 19301,
+            account = store.upsert_account({"execution_mode": "browser", "name": "account-1", "cdp_port": 19301,
                 "proxy_url": "socks5://proxy.test:20002"})
             store.update_account(account["id"], {"status": "active", "balance": 100})
             request = {"model": "sd-2-5", "prompt": "A blue sky", "duration": 4}
-            store.create_task("ijm_ambiguous", request, normalize_request(request))
+            store.create_task("ijm_ambiguous", request, normalize_request(request), execution_backend='browser')
             client = Mock()
             client.account_state.return_value = {"available_balance": 100}
             client.upload_inputs.return_value = {"images": [], "videos": [], "audios": []}

@@ -1,9 +1,10 @@
-"""Convert an upstream 720p video to 480p and store it in s3-center."""
+"""Store original Canvas files and explicitly requested 480p results in s3-center."""
 
 from __future__ import annotations
 
 import json
 import hashlib
+import mimetypes
 import os
 import re
 import subprocess
@@ -300,3 +301,67 @@ def transfer(url: str, proxy_url: str, task_id: str,
         metadata["aspect_ratio"] = aspect_ratio
         metadata["fit"] = "center_crop"
         return signed_url, metadata
+
+
+def store_original(path: Path, task_id: str, storage: dict | None = None, *,
+                   index: int = 0, content_type: str = 'video/mp4') -> tuple[str, dict]:
+    """Publish the CLI's original bytes; never re-encode or use a preview URL."""
+    base, token, bucket, prefix = _config(storage)
+    path = Path(path)
+    size = path.stat().st_size
+    if not path.is_file() or not 0 < size <= MAX_SINGLE_UPLOAD_BYTES:
+        raise ResultTransferError('Canvas result exceeds s3-center single-upload limit or is empty')
+    suffix = (mimetypes.guess_extension(content_type) or path.suffix).lower()
+    if suffix not in {'.mp4', '.mov', '.webm', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.avif'}:
+        raise ResultTransferError('Canvas result format is unsupported')
+    key = f'{prefix}/{task_id}/original-{index}{suffix}'
+    hasher = hashlib.sha256()
+    with path.open('rb') as contents:
+        for chunk in iter(lambda: contents.read(1024 * 1024), b''):
+            hasher.update(chunk)
+    digest = hasher.hexdigest()
+    idempotency = 'ijm2api:' + hashlib.sha256(f'{task_id}:{bucket}:{key}:{digest}'.encode()).hexdigest()
+    with requests.Session() as http:
+        http.trust_env = False
+        created = _post(http, f'{base}/v1/uploads', token,
+            {'bucket': bucket, 'key': key, 'size': size, 'content_type': content_type},
+            's3-center create', {'Idempotency-Key': idempotency})
+        upload_id = str(created.get('id') or '')
+        upload = created.get('upload') or {}
+        if (created.get('status') == 'committed'
+                and created.get('logical_key') == f'{bucket}/{key}'
+                and int(created.get('declared_bytes') or -1) == size):
+            url, metadata = presign(bucket, key, size, storage)
+            metadata.update(upload_id=upload_id, sha256=digest, original_bytes=True,
+                            content_type=content_type)
+            return url, metadata
+        if (not re.fullmatch(r'du_[a-f0-9]{32}', upload_id)
+                or created.get('status') != 'url_issued'
+                or int(created.get('declared_bytes') or -1) != size
+                or upload.get('method') != 'PUT'
+                or not str(upload.get('url') or '').startswith('https://')):
+            raise ResultTransferError('s3-center create response is invalid')
+        headers = _upload_headers(upload.get('headers'))
+        for attempt in range(3):
+            try:
+                with path.open('rb') as contents:
+                    response = http.put(upload['url'], headers=headers, data=contents,
+                                        timeout=(30, 300), allow_redirects=False)
+                if 200 <= response.status_code < 300:
+                    break
+                if response.status_code not in {408, 425, 429, 500, 502, 503, 504} or attempt == 2:
+                    raise ResultTransferError(f's3-center upload HTTP {response.status_code}')
+            except requests.RequestException as exc:
+                if attempt == 2:
+                    raise ResultTransferError(f's3-center upload failed: {type(exc).__name__}') from exc
+            time.sleep(2 ** attempt)
+        committed = _post(http, f'{base}/v1/uploads/{quote(upload_id, safe="")}/complete',
+                          token, None, 's3-center complete')
+        if (committed.get('id') != upload_id or committed.get('status') != 'committed'
+                or committed.get('logical_key') != f'{bucket}/{key}'
+                or int(committed.get('declared_bytes') or -1) != size):
+            raise ResultTransferError('s3-center committed object does not match upload')
+    url, metadata = presign(bucket, key, size, storage)
+    metadata.update(upload_id=upload_id, sha256=digest, original_bytes=True,
+                    content_type=content_type)
+    return url, metadata

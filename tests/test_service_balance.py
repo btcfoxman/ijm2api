@@ -22,14 +22,14 @@ class ServiceBalanceTests(unittest.TestCase):
         self.store = Store(str(Path(directory.name) / "tasks.db"))
         self.service = Service(self.store)
         self.addCleanup(self.service.stop)
-        account = self.store.upsert_account({
+        account = self.store.upsert_account({"execution_mode": "browser",
             "name": "test-account", "cdp_port": 19301,
             "proxy_url": "socks5://proxy.test:20002",
         })
         self.account_id = account["id"]
         self.store.update_account(self.account_id, {"status": "active", "balance": 100})
         request = {"model": "sd-2-5", "prompt": "A blue sky", "duration": 4}
-        self.task = self.store.create_task("ijm_balance_test", request, normalize_request(request))
+        self.task = self.store.create_task("ijm_balance_test", request, normalize_request(request), execution_backend='browser')
         self.client = Mock()
         self.client.account = self.store.account(self.account_id, private=True)
         self.client.upload_inputs.return_value = {"images": [], "videos": [], "audios": []}

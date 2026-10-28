@@ -97,7 +97,8 @@ def _allow_direct_media_fallback(host: str | None) -> bool:
         return "." in host
 
 
-def _download(source: str, kind: str, proxy_url: str = "") -> tuple[bytes, str, str]:
+def _download(source: str, kind: str, proxy_url: str = "", *,
+              allow_direct_fallback: bool = True) -> tuple[bytes, str, str]:
     if source.startswith("data:"):
         header, separator, payload = source.partition(",")
         if not separator or ";base64" not in header:
@@ -121,7 +122,7 @@ def _download(source: str, kind: str, proxy_url: str = "") -> tuple[bytes, str, 
         routes = [("account proxy", account_route), ("account proxy", account_route)]
         # Caller-owned public media can use a direct route if the account proxy
         # repeatedly fails; Dreamina and local hosts never use that route.
-        direct_allowed = _allow_direct_media_fallback(parsed.hostname)
+        direct_allowed = allow_direct_fallback and _allow_direct_media_fallback(parsed.hostname)
         direct_first = False
         if direct_allowed:
             with _MEDIA_ROUTE_LOCK:

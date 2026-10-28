@@ -14,8 +14,35 @@ from .catalog import MODELS
 from .account_import import masked_email, normalize_email
 
 
-ACCOUNT_SECRET_FIELDS = {"login_email", "login_password", "login_user_id", "login_enable_after", "cookie", "cookies", "user_agent"}
+ACCOUNT_SECRET_FIELDS = {"login_email", "login_password", "login_user_id", "login_enable_after", "cookie", "cookies", "user_agent", "cli_user_id"}
 ACCOUNT_SETUP_FIELDS = {"login_stage", "watermark_ready", "agreement_ready", "setup_checked_at"}
+EXECUTION_MODES = {"canvas_cli", "browser"}
+CLI_AUTH_STATUSES = {"pending", "ready", "expired", "error", "required", "queued", "authorizing",
+                     "manual_required", "failed", "cancelled"}
+
+
+def _execution_mode(value: Any, *, unbound: bool = False) -> str:
+    if not isinstance(value, str) or value not in EXECUTION_MODES | ({""} if unbound else set()):
+        raise ValueError("execution mode must be canvas_cli or browser")
+    return value
+
+
+def _upstream_context(value: Any) -> str:
+    if not isinstance(value, dict):
+        raise ValueError("upstream context must be an object")
+    forbidden = {"token", "accesstoken", "refreshtoken", "authorization", "cookie", "cookies",
+                 "password", "clientsecret", "devicecode", "creditconfirmationtoken", "credittoken"}
+    def validate(item: Any) -> None:
+        if isinstance(item, dict):
+            for key, nested in item.items():
+                if ''.join(c for c in str(key).lower() if c.isalnum()) in forbidden:
+                    raise ValueError("upstream context must not contain credentials")
+                validate(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                validate(nested)
+    validate(value)
+    return _json(value)
 
 
 def _json(value: Any) -> str:
@@ -100,14 +127,20 @@ class Store:
                     ("login_password", "TEXT NOT NULL DEFAULT ''"), ("login_stage", "TEXT NOT NULL DEFAULT ''"),
                     ("watermark_ready", "INTEGER NOT NULL DEFAULT 0"), ("agreement_ready", "INTEGER NOT NULL DEFAULT 0"),
                     ("setup_checked_at", "REAL NOT NULL DEFAULT 0"), ("login_enable_after", "INTEGER DEFAULT NULL"),
-                    ("login_user_id", "TEXT NOT NULL DEFAULT ''")):
+                    ("login_user_id", "TEXT NOT NULL DEFAULT ''"),
+                    ("execution_mode", "TEXT NOT NULL DEFAULT 'canvas_cli'"),
+                    ("cli_auth_status", "TEXT NOT NULL DEFAULT 'pending'"),
+                    ("cli_auth_error", "TEXT NOT NULL DEFAULT ''"),
+                    ("cli_user_id", "TEXT NOT NULL DEFAULT ''")):
                 if name not in account_columns:
                     db.execute(f"ALTER TABLE accounts ADD COLUMN {name} {declaration}")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS accounts_login_email ON accounts(LOWER(login_email)) WHERE login_email<>''")
             columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
             for name, default in (("upstream_result_json", "[]"),
                                   ("result_transfer_json", "{}"),
-                                  ("attempted_account_ids_json", "[]")):
+                                  ("attempted_account_ids_json", "[]"),
+                                  ("execution_backend", "browser"),
+                                  ("upstream_context_json", "{}")):
                 if name not in columns:
                     db.execute(f"ALTER TABLE tasks ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'")
         try:
@@ -151,6 +184,7 @@ class Store:
         value["upstream_result_urls"] = json.loads(value.pop("upstream_result_json"))
         value["result_transfer"] = json.loads(value.pop("result_transfer_json"))
         value["media_inputs"] = json.loads(value.pop("media_inputs_json"))
+        value["upstream_context"] = json.loads(value.pop("upstream_context_json"))
         value["prompt"] = value["request"].get("prompt", "")
         value["channel"] = "ijmapi"
         value["generation_id"] = value["run_id"]
@@ -195,6 +229,7 @@ class Store:
         if not 1 <= max_concurrency <= 50:
             raise ValueError("max_concurrency must be between 1 and 50")
         priority = _priority(payload["priority"]) if "priority" in payload else None
+        execution_mode = _execution_mode(payload["execution_mode"]) if "execution_mode" in payload else None
         credentials = self._credential_values(payload)
         now = time.time()
         with self._lock, self._connect() as db:
@@ -209,19 +244,20 @@ class Store:
                           "cdp_port": int(payload.get("cdp_port") or old["cdp_port"]),
                           "max_concurrency": max_concurrency,
                           "priority": old["priority"] if priority is None else priority,
-                          "enabled": int(bool(payload.get("enabled", old["enabled"]))) }
+                          "enabled": int(bool(payload.get("enabled", old["enabled"]))),
+                          "execution_mode": execution_mode or old["execution_mode"]}
                 db.execute("""UPDATE accounts SET proxy_url=:proxy_url,project_id=:project_id,
                     cdp_port=:cdp_port,max_concurrency=:max_concurrency,priority=:priority,
-                    enabled=:enabled,updated_at=:updated_at WHERE id=:id""",
+                    enabled=:enabled,execution_mode=:execution_mode,updated_at=:updated_at WHERE id=:id""",
                     {**values, "updated_at": now, "id": old["id"]})
                 account_id = int(old["id"])
             else:
                 cursor = db.execute("""INSERT INTO accounts(name,cdp_port,proxy_url,project_id,
-                    max_concurrency,priority,enabled,updated_at) VALUES(?,?,?,?,?,?,?,?)""",
+                    max_concurrency,priority,enabled,execution_mode,updated_at) VALUES(?,?,?,?,?,?,?,?,?)""",
                     (name, int(payload.get("cdp_port") or 0), str(payload.get("proxy_url") or ""),
                      str(payload.get("project_id") or ""),
                      max_concurrency, priority if priority is not None else 0,
-                     int(bool(payload.get("enabled", True))), now))
+                     int(bool(payload.get("enabled", True))), execution_mode or "canvas_cli", now))
                 account_id = int(cursor.lastrowid)
                 if credentials:
                     db.execute("UPDATE accounts SET enabled=0,status='pending',managed_profile=1 WHERE id=?", (account_id,))
@@ -252,8 +288,10 @@ class Store:
     def _assert_credentials_idle(db: sqlite3.Connection, old: sqlite3.Row, values: dict[str, Any]) -> None:
         if not any(old[key] != value for key, value in values.items()):
             return
-        busy = db.execute("SELECT COUNT(*) FROM tasks WHERE account_id=? AND status IN ('preparing','submitted','running','submission_unknown')",
-                          (old["id"],)).fetchone()[0]
+        busy = db.execute("""SELECT COUNT(*) FROM tasks WHERE account_id=? AND
+            (status IN ('preparing','submitted','running','submission_unknown') OR
+             (status IN ('failed','expired') AND error_code='UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'))""",
+            (old["id"],)).fetchone()[0]
         if busy or old["status"] in {"active", "login_pending", "logging_in", "profile_resetting"}:
             raise ValueError("account identity is protected while active or in use")
         if old["cdp_port"] and not old["managed_profile"]:
@@ -324,12 +362,14 @@ class Store:
     def active_account_count(self, account_id: int) -> int:
         with self._connect() as db:
             return int(db.execute("""SELECT COUNT(*) FROM tasks WHERE account_id=?
-                AND status IN ('preparing','submitted','running','submission_unknown')""", (account_id,)).fetchone()[0])
+                AND (status IN ('preparing','submitted','running','submission_unknown') OR
+                 (status IN ('failed','expired') AND error_code='UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'))""",
+                (account_id,)).fetchone()[0])
 
     def scheduling_rows(self) -> dict[str, list[dict[str, Any]]]:
         """Return bounded raw history and every bound unresolved credit hold."""
         columns = ("id,account_id,model,status,run_id,normalized_json,request_json,estimated_cost,actual_cost,"
-                   "balance_before,balance_after,created_at,completed_at,updated_at")
+                   "balance_before,balance_after,created_at,completed_at,updated_at,execution_backend,upstream_context_json")
         with self._connect() as db:
             history = db.execute(f"""SELECT {columns} FROM tasks
                 WHERE status='succeeded' AND actual_cost IS NOT NULL
@@ -342,12 +382,20 @@ class Store:
 
     def update_account(self, account_id: int, values: dict[str, Any]) -> dict[str, Any]:
         allowed = {"name", "cdp_port", "proxy_url", "project_id", "max_concurrency", "priority", "managed_profile",
-                   "enabled", "status", "balance", "last_error", "last_checkin_date", "login_user_id", "login_enable_after", *ACCOUNT_SETUP_FIELDS}
+                   "enabled", "status", "balance", "last_error", "last_checkin_date", "login_user_id", "login_enable_after",
+                   "execution_mode", "cli_auth_status", "cli_auth_error", "cli_user_id", *ACCOUNT_SETUP_FIELDS}
         data = {key: value for key, value in values.items() if key in allowed}
         if "max_concurrency" in data and not 1 <= int(data["max_concurrency"]) <= 50:
             raise ValueError("max_concurrency must be between 1 and 50")
         if "priority" in data:
             data["priority"] = _priority(data["priority"])
+        if "execution_mode" in data:
+            data["execution_mode"] = _execution_mode(data["execution_mode"])
+        if "cli_auth_status" in data and data["cli_auth_status"] not in CLI_AUTH_STATUSES:
+            raise ValueError("invalid CLI authorization status")
+        for key in ("cli_auth_error", "cli_user_id"):
+            if key in data and (not isinstance(data[key], str) or "\x00" in data[key]):
+                raise ValueError(f"invalid {key}")
         if "balance_details" in values:
             data["balance_details_json"] = _json(values["balance_details"])
         for key in ("watermark_ready", "agreement_ready"):
@@ -392,14 +440,22 @@ class Store:
             db.execute("DELETE FROM media_cache WHERE account_id=?", (account_id,))
             return bool(db.execute("DELETE FROM accounts WHERE id=?", (account_id,)).rowcount)
 
-    def media_cache_get(self, account_id: int, kind: str, digest: str) -> dict[str, Any] | None:
+    @staticmethod
+    def _cache_kind(kind: str, backend: str) -> str:
+        _execution_mode(backend)
+        return kind if backend == "browser" else backend + ":" + kind
+
+    def media_cache_get(self, account_id: int, kind: str, digest: str, *,
+                        backend: str = "browser") -> dict[str, Any] | None:
+        kind = self._cache_kind(kind, backend)
         with self._connect() as db:
             row = db.execute("""SELECT asset_json FROM media_cache
                 WHERE account_id=? AND kind=? AND digest=?""", (account_id, kind, digest)).fetchone()
         return json.loads(row["asset_json"]) if row else None
 
     def media_cache_put(self, account_id: int, kind: str, digest: str,
-                        uploaded: dict[str, Any]) -> None:
+                        uploaded: dict[str, Any], *, backend: str = "browser") -> None:
+        kind = self._cache_kind(kind, backend)
         with self._lock, self._connect() as db:
             db.execute("""INSERT INTO media_cache(account_id,kind,digest,asset_json,created_at)
                 VALUES(?,?,?,?,?)
@@ -407,7 +463,9 @@ class Store:
                 asset_json=excluded.asset_json,created_at=excluded.created_at""",
                 (account_id, kind, digest, _json(uploaded), time.time()))
 
-    def media_cache_delete(self, account_id: int, kind: str, digest: str) -> None:
+    def media_cache_delete(self, account_id: int, kind: str, digest: str, *,
+                           backend: str = "browser") -> None:
+        kind = self._cache_kind(kind, backend)
         with self._lock, self._connect() as db:
             db.execute("DELETE FROM media_cache WHERE account_id=? AND kind=? AND digest=?",
                        (account_id, kind, digest))
@@ -416,16 +474,18 @@ class Store:
         with self._lock, self._connect() as db:
             db.execute("DELETE FROM media_cache WHERE account_id=?", (account_id,))
 
-    def create_task(self, task_id: str, request: dict[str, Any], normalized: dict[str, Any]) -> dict[str, Any]:
+    def create_task(self, task_id: str, request: dict[str, Any], normalized: dict[str, Any], *,
+                    execution_backend: str = "") -> dict[str, Any]:
+        _execution_mode(execution_backend, unbound=True)
         now = time.time()
         media = [{"kind": kind[:-1] if kind != "images" else "image", "label": index + 1, "url": source}
                  for kind in ("images", "videos", "audios")
                  for index, source in enumerate(normalized[kind])]
         with self._lock, self._connect() as db:
             db.execute("""INSERT INTO tasks(id,model,status,request_json,normalized_json,media_inputs_json,
-                        created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)""",
+                        created_at,updated_at,execution_backend) VALUES(?,?,?,?,?,?,?,?,?)""",
                        (task_id, normalized["model"], "queued", _json(request), _json(normalized),
-                        _json(media), now, now))
+                        _json(media), now, now, execution_backend))
         return self.task(task_id) or {}
 
     def task(self, task_id: str) -> dict[str, Any] | None:
@@ -443,13 +503,14 @@ class Store:
                 raise KeyError(task_id)
             try:
                 attempts = json.loads(row["attempted_account_ids_json"])
+                context = json.loads(row["upstream_context_json"])
                 results = json.loads(row["result_json"])
                 upstream_results = json.loads(row["upstream_result_json"])
                 age = now - float(row["created_at"])
             except (ValueError, TypeError, OverflowError) as exc:
                 raise ValueError("task is not safe to retry") from exc
             if (row["status"] != "failed" or row["error_code"] != "ACCOUNT_POOL_UNAVAILABLE"
-                    or row["run_id"] or row["thread_id"] or attempts != []
+                    or row["run_id"] or row["thread_id"] or attempts != [] or context != {}
                     or not math.isfinite(age) or not 0 <= age < 3600
                     or row["actual_cost"] is not None or results != [] or upstream_results != []):
                 raise ValueError("task is not safe to retry")
@@ -472,7 +533,11 @@ class Store:
     def update_task(self, task_id: str, values: dict[str, Any]) -> dict[str, Any]:
         data = {key: value for key, value in values.items() if key in {"account_id", "status", "progress",
             "thread_id", "run_id", "error_code", "error_message", "estimated_cost", "actual_cost",
-            "balance_before", "balance_after", "completed_at"}}
+            "balance_before", "balance_after", "completed_at", "execution_backend"}}
+        if "execution_backend" in data:
+            data["execution_backend"] = _execution_mode(data["execution_backend"], unbound=True)
+        if "upstream_context" in values:
+            data["upstream_context_json"] = _upstream_context(values["upstream_context"])
         if "result_urls" in values:
             data["result_json"] = _json(values["result_urls"])
         if "upstream_result_urls" in values:
@@ -507,27 +572,28 @@ class Store:
 
     def clear_terminal_tasks(self) -> int:
         with self._lock, self._connect() as db:
-            return db.execute("DELETE FROM tasks WHERE status IN ('succeeded','failed','expired')").rowcount
+            return db.execute("""DELETE FROM tasks WHERE status IN ('succeeded','failed','expired')
+                AND error_code<>'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'""").rowcount
 
     def model_costs(self) -> list[dict[str, Any]]:
         with self._connect() as db:
-            rows = db.execute("""SELECT t.id,t.model,t.normalized_json,t.actual_cost,t.updated_at
+            rows = db.execute("""SELECT t.id,t.model,t.normalized_json,t.actual_cost,t.updated_at,t.execution_backend
                 FROM tasks AS t WHERE t.status='succeeded' AND t.actual_cost IS NOT NULL
                   AND NOT EXISTS (SELECT 1 FROM tasks AS peer
                     WHERE peer.account_id=t.account_id AND peer.id<>t.id
                       AND peer.created_at<t.completed_at
                       AND COALESCE(peer.completed_at, 9999999999)>t.created_at)
                 ORDER BY t.updated_at DESC LIMIT 1000""").fetchall()
-        grouped: dict[tuple[str, int, str, int, int, int], dict[str, Any]] = {}
+        grouped: dict[tuple[str, int, str, int, int, int, str], dict[str, Any]] = {}
         for row in rows:
             request = json.loads(row["normalized_json"])
             if request.get("kind") == "image":
                 continue
             key = (row["model"], int(request["duration"]), request["resolution"],
-                   len(request["images"]), len(request["videos"]), len(request["audios"]))
+                   len(request["images"]), len(request["videos"]), len(request["audios"]), row["execution_backend"])
             item = grouped.setdefault(key, {"model": key[0], "duration": key[1],
                 "resolution": key[2], "image_count": key[3], "video_count": key[4],
-                "audio_count": key[5], "cost": 0, "latest_cost": float(row["actual_cost"]),
+                "audio_count": key[5], "execution_backend": key[6], "cost": 0, "latest_cost": float(row["actual_cost"]),
                 "samples": 0, "updated_at": row["updated_at"], "last_task_id": row["id"],
                 "source": "observed"})
             item["cost"] += float(row["actual_cost"])

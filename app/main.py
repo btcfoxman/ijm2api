@@ -22,6 +22,8 @@ from .browser_login import BrowserLoginManager, LoginError
 from .browser_login_api import register_browser_login
 from .account_import import AccountImporter
 from .auto_login import AutoLoginManager
+from .canvas_auth import CanvasAuthManager
+from .canvas_cli import CanvasCLIError
 from .catalog import public_models
 from .image_client import IMAGE_MODELS
 from .service import Service
@@ -42,17 +44,21 @@ service = Service(store)
 browser_login = BrowserLoginManager(store, service)
 auto_login = AutoLoginManager(store, service, manual_active=lambda: browser_login.active)
 service.auto_login_busy = auto_login.busy
+canvas_auth = CanvasAuthManager(store, service, client_factory=service.canvas_client)
+service.canvas_auth = canvas_auth
 STATIC = Path(__file__).parent / "static"
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     auto_login.recover_interrupted()
+    canvas_auth.recover_interrupted()
     service.start()
     browser_login.start_maintenance()
     try:
         yield
     finally:
+        canvas_auth.close()
         auto_login.close()
         service.stop()
         await browser_login.close()
@@ -181,7 +187,7 @@ def accounts() -> list[dict[str, Any]]:
 
 @app.post("/api/accounts", dependencies=[Depends(admin_auth)])
 def add_account(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    if (ACCOUNT_SECRET_FIELDS | ACCOUNT_SETUP_FIELDS) & body.keys():
+    if (ACCOUNT_SECRET_FIELDS | ACCOUNT_SETUP_FIELDS | {'cli_auth_status', 'cli_auth_error', 'cli_user_id'}) & body.keys():
         raise HTTPException(status_code=422, detail='use batch import for login credentials; setup state is service-managed')
     try:
         with service._lock:
@@ -237,10 +243,10 @@ def account_login_results() -> dict[str, Any]:
 def _assert_account_mutable(account: dict[str, Any], body: dict[str, Any]) -> None:
     """Call under service._lock to protect the browser identity during work."""
     account_id = int(account['id'])
-    if (auto_login.busy(account_id) or account['status'] == 'logging_in'
+    if (auto_login.busy(account_id) or canvas_auth.busy(account_id) or account['status'] == 'logging_in'
             or browser_login.active and browser_login.active['account_id'] == account_id):
         raise HTTPException(status_code=409, detail='account is in browser login')
-    identity = {'cdp_port', 'proxy_url', 'project_id', 'managed_profile'}
+    identity = {'cdp_port', 'proxy_url', 'project_id', 'managed_profile', 'execution_mode'}
     if any(key in body and body[key] != account.get(key) for key in identity):
         if service._active.get(account_id, 0) or store.active_account_count(account_id):
             raise HTTPException(status_code=409, detail='account has active tasks')
@@ -251,11 +257,13 @@ async def patch_account(account_id: int, body: dict[str, Any] = Body(...)) -> di
     try:
         if auto_login.busy(account_id):
             raise HTTPException(status_code=409, detail='account is in automatic login')
-        if (ACCOUNT_SECRET_FIELDS | ACCOUNT_SETUP_FIELDS) & body.keys():
+        if (ACCOUNT_SECRET_FIELDS | ACCOUNT_SETUP_FIELDS | {'cli_auth_status', 'cli_auth_error', 'cli_user_id'}) & body.keys():
             raise HTTPException(status_code=422, detail='use batch import for login credentials; setup state is service-managed')
         if 'enabled' in body:
             body = {**body, 'login_enable_after': False if body['enabled'] is False else None}
         account = _account(account_id, private=True)
+        with service._lock:
+            _assert_account_mutable(account, body)
         if "proxy_url" in body and str(body["proxy_url"]).strip() != str(account["proxy_url"]).strip():
             if browser_login.active and browser_login.active["account_id"] == account_id:
                 raise HTTPException(status_code=409, detail="finish or cancel online login first")
@@ -268,7 +276,12 @@ async def patch_account(account_id: int, body: dict[str, Any] = Body(...)) -> di
             body = {**body, "cdp_port": 0, "status": "pending", "last_error": ""}
         with service._lock:
             _assert_account_mutable(_account(account_id, private=True), body)
-            return store.update_account(account_id, body)
+            result = store.update_account(account_id, body)
+        if 'proxy_url' in body:
+            service.canvas_cli.invalidate(account_id)
+            store.clear_media_cache(account_id)
+            result = store.update_account(account_id, {'cli_auth_status': 'pending', 'cli_auth_error': '', 'cli_user_id': ''})
+        return result
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="account not found") from exc
     except ValueError as exc:
@@ -277,37 +290,37 @@ async def patch_account(account_id: int, body: dict[str, Any] = Body(...)) -> di
 
 @app.delete("/api/accounts/{account_id}", dependencies=[Depends(admin_auth)])
 async def delete_account(account_id: int) -> dict[str, Any]:
-    if auto_login.busy(account_id):
+    if auto_login.busy(account_id) or canvas_auth.busy(account_id):
         raise HTTPException(status_code=409, detail='account is in automatic login')
     if browser_login.active and browser_login.active["account_id"] == account_id:
         raise HTTPException(status_code=409, detail="finish or cancel online login first")
-    if any(task["account_id"] == account_id and task["status"] not in {"succeeded", "failed", "expired"}
-           for task in store.tasks(10000)):
+    if store.active_account_count(account_id):
         raise HTTPException(status_code=409, detail="account has active tasks")
     account = _account(account_id, private=True)
     await _close_online_account(account_id)
     clear_managed_profile(account, Path(str(service.settings()["chrome_user_data_root"])))
+    service.canvas_cli.invalidate(account_id)
     deleted = store.delete_account(account_id)
     return {"deleted": deleted}
 
 
 @app.post("/api/accounts/{account_id}/profile/reset", dependencies=[Depends(admin_auth)])
 async def reset_profile(account_id: int, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-    if auto_login.busy(account_id):
+    if auto_login.busy(account_id) or canvas_auth.busy(account_id):
         raise HTTPException(status_code=409, detail='account is in automatic login')
     if browser_login.active and browser_login.active["account_id"] == account_id:
         raise HTTPException(status_code=409, detail="finish or cancel online login first")
     account = _account(account_id, private=True)
-    if any(task["account_id"] == account_id and task["status"] not in {"succeeded", "failed", "expired"}
-           for task in store.tasks(10000)):
+    if store.active_account_count(account_id):
         raise HTTPException(status_code=409, detail="account has active tasks")
     await _close_online_account(account_id)
     clear_managed_profile(account, Path(str(service.settings()["chrome_user_data_root"])))
     store.clear_media_cache(account_id)
+    service.canvas_cli.invalidate(account_id)
     values: dict[str, Any] = {"cdp_port": 0, "project_id": "", "status": "pending",
                               "last_error": "", "login_stage": "", "watermark_ready": False,
                               "agreement_ready": False, "setup_checked_at": None, "login_enable_after": None,
-                              "login_user_id": ""}
+                              "login_user_id": "", 'cli_user_id': '', 'cli_auth_status': 'pending', 'cli_auth_error': ''}
     if body.get("proxy_url") is not None:
         values["proxy_url"] = str(body["proxy_url"])
     result = store.update_account(account_id, values)
@@ -315,6 +328,37 @@ async def reset_profile(account_id: int, body: dict[str, Any] = Body(default={})
         service.check_account(account_id, start_browser=True)
         result = _account(account_id)
     return result
+
+
+@app.post('/api/accounts/{account_id}/cli-auth', dependencies=[Depends(admin_auth)])
+def start_cli_auth(account_id: int, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    _account(account_id)
+    try:
+        return canvas_auth.start(account_id, force=bool(body.get('force', False)))
+    except (ValueError, BrowserError, CanvasCLIError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get('/api/accounts/{account_id}/cli-auth', dependencies=[Depends(admin_auth)])
+def cli_auth_status(account_id: int) -> dict[str, Any]:
+    _account(account_id)
+    return canvas_auth.status(account_id)
+
+
+@app.delete('/api/accounts/{account_id}/cli-auth', dependencies=[Depends(admin_auth)])
+def cancel_cli_auth(account_id: int) -> dict[str, Any]:
+    _account(account_id)
+    return canvas_auth.cancel(account_id)
+
+
+@app.post('/api/accounts/{account_id}/cli-auth/browser', dependencies=[Depends(admin_auth)])
+def cli_auth_browser(account_id: int) -> dict[str, Any]:
+    _account(account_id)
+    try:
+        canvas_auth.open_assist(account_id)
+        return _frame(_browser(account_id)[1])
+    except (ValueError, BrowserError, CanvasCLIError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/accounts/{account_id}/check", dependencies=[Depends(admin_auth)])
@@ -556,6 +600,7 @@ def get_generic(task_id: str) -> dict[str, Any]:
 
 def _with_cost_observations(task: dict[str, Any]) -> dict[str, Any]:
     full_task = task
+    task = {key: value for key, value in task.items() if key != 'upstream_context'}
     return {**task, "cost_observations": [{key: value for key, value in row.items() if not key.startswith("_")}
                                         for row in build_observations(full_task or task)]}
 

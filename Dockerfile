@@ -8,10 +8,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 COPY requirements.txt .
+COPY tools/install_canvas_cli.py /tmp/install_canvas_cli.py
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates chromium xauth xvfb x11vnc fluxbox novnc fonts-liberation fonts-noto-cjk ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt \
+    && python /tmp/install_canvas_cli.py \
+    && /usr/local/bin/dreamina-canvas --format json version \
+    && rm /tmp/install_canvas_cli.py
 COPY app ./app
 RUN mkdir -p /app/data/chrome-profiles
 

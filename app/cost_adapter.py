@@ -128,6 +128,11 @@ def build_observations(task: dict[str, Any]) -> list[dict[str, Any]]:
     quoted = number(task.get("estimated_cost"))
     quoted = quoted if quoted is not None and quoted > 0 else None
     source = "formula" if quoted is not None else "unknown"
+    if SERVICE == 'ijm2api':
+        context['execution_backend'] = str(task.get('execution_backend') or 'browser')
+        quote = mapping(evidence.get('canvas_quote'))
+        if quote.get('source') == 'node.quote' and number(quote.get('amount')) is not None:
+            quoted, source = number(quote['amount']), 'quote'
     if SERVICE in {"ak2api", "mag2api"}:
         quotes = [number(mapping(item).get("fee")) for item in attempts if "calculate_fee" in mapping(item)]
         if quotes:

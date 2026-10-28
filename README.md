@@ -2,8 +2,10 @@
 
 IJM2API serves Dreamina's logged-in video workflow through a task API. Its
 account pool, queue, browser login and management console follow PIP2API.
-Dreamina requests use each account's native Chromium session; ImageX and VOD
-uploads use the same account's configured SOCKS/HTTP proxy. The account
+Generation defaults to the pinned official international Canvas CLI, with a
+separate credential profile, private state directory, short-lived process and
+HTTP/SOCKS proxy for each account. Accounts can explicitly choose the original
+Chromium generation backend. The account
 launcher `ijm.bat` uses port 20002, so the matching server proxy is
 `socks5://host.docker.internal:20002`.
 
@@ -20,11 +22,55 @@ page redirects to `/login`; `/health` is unauthenticated.
 
 Use **在线添加账号** with a name and account proxy, sign in through the embedded
 noVNC browser, then click **完成登录并验证**. The account row's **网页登录**
-action reconnects to that same Chrome. The verified browser stays running;
-video submission, polling, credit checks and daily check-in share its CDP
-session. A service restart restores it from the persisted profile. Existing
-sessions can also be copied into the account's managed profile by an
-administrator. API credentials and Chrome profiles must stay outside Git.
+action reopens the persisted profile. Login, content agreement, watermark
+preferences, official CLI authorization and daily check-in use Chrome only
+while needed; the last consumer closes Chrome and its desktop processes.
+CLI generation and polling do not open Chrome. API credentials, CLI credentials
+and Chrome profiles must stay outside Git.
+
+### Canvas authorization and execution modes
+
+Both existing and new accounts default to `canvas_cli`. Complete the existing
+browser identity and preference checks, then use **CLI 授权**. The service opens
+the official device authorization in that same account profile and proxy. If
+confirmation requires interaction, **远端授权** opens the existing screenshot
+and mouse control window; do not authorize through a different account.
+The CLI identity must equal the verified browser identity before the account
+can accept tasks. Login success alone does not establish CLI authorization.
+
+The global **Canvas CLI 接单** switch defaults off. Enable it only after
+verifying two independent account identities and proxy coverage, including
+uploads, queries and result downloads. Unsupported model/parameter combinations
+return a specific administrator diagnostic; explicitly choose `browser` for
+accounts that should execute these through the old backend. No automatic
+browser resubmission occurs after a CLI failure.
+
+Management API: `POST/GET/DELETE /api/accounts/{id}/cli-auth` starts, reads or
+cancels authorization. `POST /api/accounts/{id}/cli-auth/browser` opens the
+remote authorization view. Cancelling a pending flow does not log out an
+existing upstream session. `execution_mode` is writable on an idle account;
+authorization state is service-managed.
+
+Generation uses the same account priorities, smallest sufficient balance at
+equal priority, concurrency limits, reservations and maximum two-account
+credit-rejection policy as the browser backend. Canvas saves the requested
+node, obtains the complete quote and runs within that credit ceiling. Upload
+and query retries reuse original identities; a lost submission receipt only
+queries its original operation and never starts a second paid generation.
+Existing task records retain the browser backend; every new bound task stores
+its backend and recovery identifiers independently of subsequent settings.
+
+CLI result downloads preserve original media bytes and are published through
+the existing s3-center configuration. Signed URLs are renewed on queries.
+The optional `sd-2-5-480p-x` alias retains its explicit 720p-to-480p conversion.
+Canvas resource `creditsAmount` is a pre-charge snapshot, not proof of final
+net spend; isolated account balance evidence remains necessary for actual cost.
+Cost history and upload caches are separated by execution backend.
+
+The image build downloads official CLI 1.2.0 from its immutable release
+directory and verifies SHA256 using `tools/install_canvas_cli.py`. The running
+service never downloads or upgrades the CLI. Builds and full validation run on
+GitHub Actions; the deployment host only pulls and restarts the built image.
 
 ### Batch account login
 

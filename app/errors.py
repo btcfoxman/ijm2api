@@ -44,6 +44,12 @@ def public_error(code: str, message: str) -> dict[str, str]:
     )):
         return {"code": "CONTENT_MODERATION_FAILED",
                 "message": "检测到内容有敏感或违规情况，请修改后重试，积分已返还～"}
+    if kind in {'12009', '12011', '2052'} or any(token in raw for token in (
+        'this generation may violate our terms of service', 'generation has been blocked')):
+        return {'code': 'CONTENT_MODERATION_FAILED',
+                'message': '检测到内容有敏感或违规情况，请修改后重试，积分已返还～'}
+    if kind == 'CLI_CAPABILITY_UNAVAILABLE' and 'does not support duration=' in raw:
+        return {'code': 'INPUT_AUDIO_DURATION_UNSUPPORTED', 'message': '素材时长不支持，请修改后再试~'}
     if kind == "VIDEO_EDIT_CONSTRAINT" or "video editing task" in raw:
         return {"code": "VIDEO_EDIT_CONSTRAINT", "message": "素材时长不支持，请修改后再试~"}
     if kind == "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN" or kind == "UPSTREAM_TIMEOUT":
@@ -58,6 +64,8 @@ def public_error(code: str, message: str) -> dict[str, str]:
         return {"code": "MEDIA_UPLOAD_FAILED", "message": "上游维护中，请稍后再试~"}
     if kind in {"ACCOUNT_POOL_UNAVAILABLE", "BROWSERERROR", "ACCOUNT_MISSING", "ACCOUNT_VERIFICATION_FAILED"}:
         return {"code": kind, "message": "上游维护中，请稍后再试~"}
+    if kind.startswith(('CLI_', 'CLI.')) or kind in {'RESULT_TRANSFER_FAILED', 'MEDIA_UPLOAD_PENDING'}:
+        return {'code': kind, 'message': '上游维护中，请稍后再试~'}
     review_kind = kind if kind in {"UPSTREAM_REVIEW_FAILED", "UPSTREAM_REVIEW_SERVICE_ERROR",
                                   "UPSTREAM_IMAGE_REVIEW_FAILED"} else None
     if not review_kind and kind in {"UPSTREAM_FAILED", "2059", "1064", "2041", ""}:

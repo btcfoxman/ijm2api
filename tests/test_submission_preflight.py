@@ -23,11 +23,11 @@ def execution(tmp_path):
     service = Service(store)
     accounts = []
     for index in (1, 2):
-        account = store.upsert_account({"name": f"synthetic-{index}",
+        account = store.upsert_account({"execution_mode": "browser", "name": f"synthetic-{index}",
             "cdp_port": 19300 + index, "proxy_url": "socks5://proxy.invalid:20002"})
         accounts.append(store.update_account(account["id"], {"status": "active", "balance": index * 100}))
     request = {"model": "sd-2-5", "prompt": "A synthetic landscape", "duration": 4}
-    store.create_task("synthetic-preflight", request, normalize_request(request))
+    store.create_task("synthetic-preflight", request, normalize_request(request), execution_backend='browser')
     client = DreaminaClient(accounts[0])
     client.browser = Mock()
     with patch.object(client, "account_state", return_value={"available_balance": 100}), \

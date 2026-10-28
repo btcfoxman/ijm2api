@@ -25,7 +25,7 @@ def request(**values):
 
 
 def account(store, name, balance, priority=0, concurrency=3):
-    value = store.upsert_account({'name': name, 'proxy_url': 'socks5://proxy.test:20002',
+    value = store.upsert_account({"execution_mode": "browser", 'name': name, 'proxy_url': 'socks5://proxy.test:20002',
                                  'priority': priority, 'max_concurrency': concurrency})
     return store.update_account(value['id'], {'status': 'active', 'balance': balance})
 
@@ -35,7 +35,7 @@ def history(store, identifier, cost, *, body=None, age=0, isolated=True, status=
     normalized = normalize_request(body)
     reference = body.get('_reference_seconds')
     normalized['_cost_evidence'] = {'balance_isolated': isolated, 'reference_seconds': reference or 0}
-    store.create_task(identifier, body, normalized)
+    store.create_task(identifier, body, normalized, execution_backend='browser')
     return store.update_task(identifier, {'status': status, 'actual_cost': cost, 'balance_before': 1000,
         'balance_after': 1000 - cost if after is None else after, 'completed_at': time.time() - age})
 
@@ -140,7 +140,7 @@ def test_inflight_and_memory_reservations_are_merged_once_and_released(context):
     owner = account(store, 'owner', 100)
     assert service._reserve_account(70, task_id='in-flight')['id'] == owner['id']
     body = request()
-    store.create_task('in-flight', body, normalize_request(body))
+    store.create_task('in-flight', body, normalize_request(body), execution_backend='browser')
     store.update_task('in-flight', {'account_id': owner['id'], 'status': 'running', 'estimated_cost': 70})
     assert service._reserve_account(40, task_id='too-much') is None
     assert service._reserve_account(30, task_id='fits-exactly')['id'] == owner['id']
@@ -155,7 +155,7 @@ def test_restart_and_unknown_submit_keep_persistent_budget_without_replaying(con
     store, service = context
     owner = account(store, 'owner', 100)
     body = request()
-    store.create_task('unknown', body, normalize_request(body))
+    store.create_task('unknown', body, normalize_request(body), execution_backend='browser')
     store.update_task('unknown', {'account_id': owner['id'], 'status': 'failed', 'estimated_cost': 70,
                                  'error_code': 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'})
     assert service._reserve_account(40) is None
@@ -167,7 +167,7 @@ def test_unknown_live_and_cached_balance_never_reaches_generation(context):
     store, service = context
     owner = account(store, 'unknown-balance', None)
     body = request()
-    store.create_task('new-task', body, normalize_request(body))
+    store.create_task('new-task', body, normalize_request(body), execution_backend='browser')
     client = Mock()
     client.account_state.side_effect = BrowserError('synthetic credit read failed')
     with patch.object(service.browser_runtime, 'acquire', side_effect=lambda value: (value, False)), \
@@ -185,7 +185,7 @@ def test_uploaded_reference_reestimation_switches_before_any_paid_submit(context
     body = request(video_urls=['https://source.test/video.mp4'])
     history(store, 'reference-cost', 40, body={**body, '_reference_seconds': 4})
     first, second = account(store, 'first', 30), account(store, 'second', 60)
-    task = store.create_task('new-task', body, normalize_request(body))
+    task = store.create_task('new-task', body, normalize_request(body), execution_backend='browser')
     store.update_task(task['id'], {'estimated_cost': 13})
     original = deepcopy(task['request'])
     clients = {}
@@ -211,7 +211,7 @@ def test_uploaded_reference_reestimation_switches_before_any_paid_submit(context
 def test_estimation_failure_releases_worker_slot_and_records_failure(context):
     store, service = context
     body = request()
-    store.create_task('new-task', body, normalize_request(body))
+    store.create_task('new-task', body, normalize_request(body), execution_backend='browser')
     before = service._worker_slots._value
     with patch.object(service, '_update_cost_estimate', side_effect=RuntimeError('synthetic history failure')):
         service._run('new-task')

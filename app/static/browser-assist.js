@@ -15,7 +15,9 @@ function assistFrame(session, frame) {
   assistImage.src = frame.image;
   assistImage.hidden = false;
   $("#browserAssistPlaceholder").hidden = true;
-  $("#browserAssistStatus").textContent = `已连接 · ${frame.width} × ${frame.height} · 登录并进入视频项目后保存会话`;
+  $("#browserAssistStatus").textContent = session.cliAuth
+    ? `已连接账号代理 · ${frame.width} × ${frame.height} · 请在此页面确认 CLI 授权，完成后自动保存`
+    : `已连接 · ${frame.width} × ${frame.height} · 登录并进入视频项目后保存会话`;
 }
 
 async function refreshAssistFrame(session) {
@@ -26,10 +28,17 @@ async function refreshAssistFrame(session) {
   finally { session.refreshing = false; }
 }
 
-async function openBrowserAssist(id) {
+async function openBrowserAssist(id, { cliAuth = false } = {}) {
   if (browserAssistSession) return;
-  const session = { id, busy: false, refreshing: false, frame: null };
+  const session = { id, cliAuth, busy: false, refreshing: false, frame: null };
   browserAssistSession = session;
+  $("#browserAssistComplete").hidden = cliAuth;
+  $(".browser-assist-toolbar > p").textContent = cliAuth
+    ? "在当前账号的代理浏览器中确认授权；无需重新登录或点击保存登录会话。"
+    : "点击画面后输入文本或按键，登录并打开一个视频项目，然后保存会话。";
+  $(".browser-assist-footer > span").textContent = cliAuth
+    ? "授权在后台继续，完成或到期后自动关闭浏览器"
+    : "关闭窗口后释放浏览器，登录进度保存在账号 Profile";
   $("#browserAssistAccount").textContent = `#${id}`;
   $("#browserAssistStatus").textContent = "正在连接账号浏览器…";
   $("#browserAssistPlaceholder").hidden = false;
@@ -37,7 +46,8 @@ async function openBrowserAssist(id) {
   assistDialog.showModal();
   assistBusy(session, true);
   try {
-    assistFrame(session, await api(`/api/accounts/${id}/browser/open`, { method: "POST" }));
+    const endpoint = cliAuth ? `/api/accounts/${id}/cli-auth/browser` : `/api/accounts/${id}/browser/open`;
+    assistFrame(session, await api(endpoint, { method: "POST" }));
     if (browserAssistSession === session) session.timer = setInterval(() => refreshAssistFrame(session), 2000);
   } catch (error) { if (browserAssistSession === session) { toast(error.message, true); assistDialog.close(); } }
   finally { assistBusy(session, false); }
@@ -74,7 +84,7 @@ $("#browserAssistDown").addEventListener("click", () => assistAction({ action: "
 $("#browserAssistRefresh").addEventListener("click", () => { if (browserAssistSession) refreshAssistFrame(browserAssistSession); });
 $("#browserAssistComplete").addEventListener("click", async () => {
   const session = browserAssistSession;
-  if (!session || session.busy) return;
+  if (!session || session.busy || session.cliAuth) return;
   assistBusy(session, true);
   try {
     const account = await api(`/api/accounts/${session.id}/browser/complete`, { method: "POST" });
@@ -93,6 +103,9 @@ function closeBrowserAssist() {
   assistImage.removeAttribute("src");
   assistImage.hidden = true;
   fetch(`/api/accounts/${session.id}/browser/close`, { method: "POST", keepalive: true }).catch(() => {});
+}
+function closeCanvasAuthAssist(id) {
+  if (browserAssistSession?.cliAuth && browserAssistSession.id === id) assistDialog.close();
 }
 assistDialog.addEventListener("close", closeBrowserAssist);
 window.addEventListener("pagehide", closeBrowserAssist);

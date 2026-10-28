@@ -25,7 +25,7 @@ def context(tmp_path, monkeypatch):
 def failed_task(store, task_id="synthetic-task"):
     request = {"model": "sd-2-0-mini", "duration": 4, "resolution": "720p",
                "prompt": "A synthetic landscape", "image_urls": ["https://media.example.test/image.png"]}
-    store.create_task(task_id, request, normalize_request(request))
+    store.create_task(task_id, request, normalize_request(request), execution_backend='browser')
     return store.update_task(task_id, {"status": "failed", "progress": 100,
         "error_code": "ACCOUNT_POOL_UNAVAILABLE", "error_message": "no account before submission",
         "estimated_cost": 42, "completed_at": time.time()})
@@ -144,7 +144,7 @@ def test_retry_respects_existing_queue_capacity(context):
     old = failed_task(store)
     store.update_settings({"task_workers": 1, "task_queue_capacity": 1})
     for index in range(2):
-        store.create_task(f"queued-{index}", old["request"], old["normalized"])
+        store.create_task(f"queued-{index}", old["request"], old["normalized"], execution_backend='browser')
     with pytest.raises(ValueError, match="queue is full"):
         service.retry_unsubmitted_task(old["id"])
     assert store.task(old["id"]) == old

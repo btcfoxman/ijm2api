@@ -27,7 +27,7 @@ function toast(message, error = false) { const item = $("#toast"); item.textCont
 function fmtTime(value) { return value ? new Date(Number(value) * 1000).toLocaleString() : "-"; }
 function fmtCost(value) { const number = Number(value || 0); return Number.isInteger(number) ? String(number) : number.toFixed(2).replace(/0+$/, "").replace(/\.$/, ""); }
 function elapsed(task) { const end = Number(task.completed_at || Date.now() / 1000); const total = Math.max(Math.floor(end - Number(task.created_at || end)), 0); return total < 60 ? `${total}秒` : `${Math.floor(total / 60)}分${total % 60}秒`; }
-function badge(status) { const labels = { active: "可用", pending: "待检测", login_pending: "待登录", logging_in: "登录中", login_failed: "登录失败", challenge_required: "需验证", verification_required: "需安全验证", setup_required: "需设置", agreement_required: "待确认协议", profile_resetting: "重置中", queued: "排队", preparing: "准备", submitted: "已提交", running: "生成中", succeeded: "完成", failed: "失败", expired: "超时", login_required: "需登录", network_error: "网络异常", suspended: "上游封禁", disabled: "禁用", disabled_low_balance: "低额度" }; return `<span class="badge ${escapeHtml(status)}">${escapeHtml(labels[status] || status || "未知")}</span>`; }
+function badge(status) { const labels = { cli_auth_required: "\u5f85 CLI \u6388\u6743", active: "可用", pending: "待检测", login_pending: "待登录", logging_in: "登录中", login_failed: "登录失败", challenge_required: "需验证", verification_required: "需安全验证", setup_required: "需设置", agreement_required: "待确认协议", profile_resetting: "重置中", queued: "排队", preparing: "准备", submitted: "已提交", running: "生成中", succeeded: "完成", failed: "失败", expired: "超时", login_required: "需登录", network_error: "网络异常", suspended: "上游封禁", disabled: "禁用", disabled_low_balance: "低额度" }; return `<span class="badge ${escapeHtml(status)}">${escapeHtml(labels[status] || status || "未知")}</span>`; }
 function loginStageLabel(stage) { const labels = { queued: "等待自动登录", opening_browser: "准备浏览器", browser: "准备浏览器", starting: "准备浏览器", login: "模拟登录", email: "输入邮箱", password: "输入密码", settings: "设置去水印和协议", logging_in: "模拟登录", authenticating: "验证登录", watermark: "关闭水印", agreement: "确认 AI 生成协议", verifying: "核验账号设置", ready: "登录及设置完成", interrupted: "已中断，可重试", setup_required: "设置未完成", agreement_required: "协议待确认", challenge_required: "需人工验证", verification_required: "需安全验证", login_required: "需重新登录", login_failed: "登录失败", network_error: "网络异常" }; return labels[stage] || stage || ""; }
 function loginProgress(account) {
   const stage = loginStageLabel(account.login_stage);
@@ -60,21 +60,26 @@ function failureMessage(task) {
   return publicErrors[String(task.error_code || "").toUpperCase()] || "生成失败，积分已返还，请重试~";
 }
 
+function executionLabel(backend) { return backend === "canvas_cli" ? "Canvas CLI" : backend === "browser" ? "网页" : "待分配"; }
+function cliAuthLabel(status) { return ({ pending: "待授权", required: "待授权", ready: "已授权", expired: "授权已过期", error: "授权异常", queued: "等待授权", authorizing: "授权中", manual_required: "等待确认授权", failed: "授权失败", cancelled: "已取消授权" })[status] || "待授权"; }
+
 function renderAccounts() {
   const enabled = state.accounts.filter((item) => item.enabled); const disabled = state.accounts.filter((item) => !item.enabled);
   const items = state.accountFilter === "enabled" ? enabled : disabled;
   $("#enabledCount").textContent = enabled.length; $("#disabledCount").textContent = disabled.length;
   $("#accountsBody").innerHTML = items.map((account) => {
     const quota = account.balance_details || {};
-    const detail = `VIP ${quota.vip_credit ?? 0} / Gift ${quota.gift_credit ?? 0} / Add-on ${quota.purchase_credit ?? 0}`;
+    const detail = Array.isArray(quota.details)
+      ? quota.details.map((item) => `${item.available ?? "-"}${item.expiresAt ? ` · 到期 ${item.expiresAt}` : ""}`).join(" / ") || "CLI 积分明细未提供"
+      : `VIP ${quota.vip_credit ?? 0} / Gift ${quota.gift_credit ?? 0} / Add-on ${quota.purchase_credit ?? 0}`;
     const progress = loginProgress(account);
-    const visibleStatus = account.enabled || ["disabled_low_balance", "suspended", "logging_in", "login_pending", "login_required", "login_failed", "challenge_required", "verification_required", "setup_required", "agreement_required", "network_error"].includes(account.status) ? account.status : "disabled";
+    const visibleStatus = account.enabled || account.status === "cli_auth_required" || ["disabled_low_balance", "suspended", "logging_in", "login_pending", "login_required", "login_failed", "challenge_required", "verification_required", "setup_required", "agreement_required", "network_error"].includes(account.status) ? account.status : "disabled";
     return `<tr><td><span class="cell-title"><span class="account-id mono">#${account.id}</span>${escapeHtml(account.name)}</span><span class="cell-sub">${escapeHtml(account.login_identifier || account.email || account.user_id || "")}</span></td>
       <td>${badge(visibleStatus)}<span class="cell-sub" title="${escapeHtml([progress, account.last_error].filter(Boolean).join(" · "))}">${escapeHtml(account.last_error || progress)}</span></td>
       <td title="${escapeHtml(detail)}"><span class="cell-title mono">${escapeHtml(account.last_balance ?? "-")}</span><span class="cell-sub">${escapeHtml(detail)}</span></td>
       <td><input class="priority-input mono" data-account-priority="${account.id}" type="number" min="0" max="2147483647" step="1" value="${account.priority ?? 0}" title="优先级越高越先执行；相同优先级按余额和账号编号排序" aria-label="账号 #${account.id} 执行优先级"></td>
       <td><span class="slots ${account.active_tasks ? "busy" : ""}"><i></i><b class="mono">${account.active_tasks || 0} /</b><input class="concurrency-input mono" data-account-concurrency="${account.id}" type="number" min="1" value="${account.max_concurrency}" title="修改账号并发"></span></td><td class="mono">${account.total_uses || 0}</td>
-      <td><span class="cell-title mono proxy" title="${escapeHtml(account.proxy_url)}">${escapeHtml(proxyLabel(account.proxy_url))}</span></td><td><span class="cell-title mono">${account.cdp_port || "自动"}</span><span class="cell-sub">${account.project_id || "打开视频项目"}</span></td><td>${fmtTime(account.updated_at)}</td>
+      <td><span class="cell-title mono proxy" title="${escapeHtml(account.proxy_url)}">${escapeHtml(proxyLabel(account.proxy_url))}</span></td><td><div class="execution-controls"><select class="execution-select" data-account-mode="${account.id}" aria-label="账号 #${account.id} 提交模式"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}><option value="canvas_cli"${account.execution_mode !== "browser" ? " selected" : ""}>Canvas CLI</option><option value="browser"${account.execution_mode === "browser" ? " selected" : ""}>网页提交</option></select><button class="link-button" data-action="cli-auth" data-id="${account.id}"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}>CLI 授权</button></div><span class="cell-sub" title="${escapeHtml(account.cli_auth_error || account.cli_user_id || "")}">${escapeHtml(cliAuthLabel(account.cli_auth_status))}${account.execution_mode !== "browser" && !state.settings.canvas_cli_enabled ? " \u00b7 \u63a5\u5355\u5df2\u5173\u95ed" : ""}${account.execution_mode === "browser" ? ` · CDP ${account.cdp_port || "按需启动"}` : ""}</span></td><td>${fmtTime(account.updated_at)}</td>
       <td><div class="row-actions">${account.password_configured ? `<button class="icon-button" data-action="auto-login" data-id="${account.id}" title="自动登录并完成去水印 / AI 协议设置"${account.status === "logging_in" ? " disabled" : ""}><i data-lucide="log-in"></i></button>` : ""}<button class="icon-button" data-action="check" data-id="${account.id}" title="检测"><i data-lucide="activity"></i></button><button class="icon-button" data-action="login" data-id="${account.id}" title="CDP 登录"><i data-lucide="monitor-up"></i></button><button class="icon-button" data-action="web-login" data-id="${account.id}" title="网页登录 / 打开账号网页"><i data-lucide="monitor"></i></button><button class="icon-button${account.status === "challenge_required" ? " needs-verification" : ""}" data-action="browser-assist" data-id="${account.id}" title="人工验证"><i data-lucide="mouse-pointer-2"></i></button><button class="icon-button" data-action="reset-profile" data-id="${account.id}" title="重置 Profile"><i data-lucide="fingerprint"></i></button><button class="icon-button" data-action="toggle" data-id="${account.id}" data-enabled="${account.enabled}" title="${account.enabled ? "禁用" : "启用"}"><i data-lucide="${account.enabled ? "pause" : "play"}"></i></button>${account.enabled ? "" : `<button class="icon-button danger" data-action="delete" data-id="${account.id}" title="删除"><i data-lucide="trash-2"></i></button>`}</div></td></tr>`;
   }).join("");
   $("#accountsEmpty").classList.toggle("show", !items.length); $("#metricAccounts").textContent = `${enabled.filter((item) => item.status === "active").length} / ${state.accounts.length}`;
@@ -94,7 +99,7 @@ function renderTasks() {
   const items = state.tasks.slice(0, 20); $("#tasksBody").innerHTML = items.map((task) => {
     const media = mediaFromTask(task); const inputs = media.filter((item) => !item.result); const results = media.filter((item) => item.result);
     const result = task.status === "failed" || task.status === "expired" ? `<span class="error-stack"><span class="error-public">响应：${escapeHtml(failureMessage(task))}</span><span class="error-upstream" title="${escapeHtml(task.error_message)}">上游：${escapeHtml(task.error_message || "未知错误")}</span></span>` : `<span class="result-links">${results.map((item) => `<a href="${escapeHtml(item.url)}" target="_blank">视${results.length > 1 ? results.indexOf(item) + 1 : ""}</a>`).join("")}</span>`;
-    return `<tr><td><button class="cell-title link-button mono" data-action="detail" data-id="${escapeHtml(task.id)}">${escapeHtml(task.id.slice(0, 20))}</button><span class="cell-sub mono">${escapeHtml((task.channel || "待分配").toUpperCase())}${task.account_id ? ` · #${task.account_id} · ${escapeHtml(task.account_name || "")}` : ""}</span></td>
+    return `<tr><td><button class="cell-title link-button mono" data-action="detail" data-id="${escapeHtml(task.id)}">${escapeHtml(task.id.slice(0, 20))}</button><span class="cell-sub mono">${escapeHtml((task.channel || "待分配").toUpperCase())} · ${executionLabel(task.execution_backend)}${task.account_id ? ` · #${task.account_id} · ${escapeHtml(task.account_name || "")}` : ""}</span></td>
       <td class="prompt-cell"><span class="cell-title" title="${escapeHtml(task.prompt)}">${escapeHtml(task.prompt || "-")}</span><span class="task-meta-line"><span class="task-spec">${escapeHtml(taskSpec(task))}</span>${inputs.length ? `<span class="media-text">${inputs.map((item, index) => `<button data-action="media" data-id="${escapeHtml(task.id)}" data-media-index="${index}">${{ image: "图", video: "视", audio: "音" }[item.kind]}${item.label}</button>`).join(" ")}</span>` : ""}</span></td><td class="task-cost-column">${costObservationCell(task)}</td>
       <td>${badge(task.status)}</td><td><div class="progress-stack"><span class="progress-value"><b class="mono">${task.progress || 0}%</b><span class="progress-track"><i style="width:${Math.min(Number(task.progress || 0), 100)}%"></i></span></span><span class="elapsed">${terminal.has(task.status) ? "耗时" : "已用"} ${elapsed(task)}</span></div></td>
       <td><span class="time-stack"><span>创建 ${fmtTime(task.created_at)}</span><span>更新 ${fmtTime(task.updated_at)}</span></span></td><td>${result}</td></tr>`;
@@ -126,14 +131,14 @@ function callerResponse(task) { const value = { id: task.id, object: "video.gene
 function renderAudit() { const values = { caller_request: state.detail?.caller_request, upstream_request: state.detail?.upstream_request, upstream_response: state.detail?.upstream_response, caller_response: state.detail ? callerResponse(state.detail) : {} }; $("#auditCode").textContent = JSON.stringify(values[state.auditKey] || {}, null, 2); }
 function showDetail(task) {
   state.detail = task; state.auditKey = "caller_request"; $("#detailId").textContent = task.id; $("#detailTitle").textContent = `${task.model} · 视频`;
-  const facts = [["状态", task.status], ["进度", `${task.progress || 0}%`], ["耗时", elapsed(task)], ["渠道", (task.channel || "-").toUpperCase()], ["账号", task.account_id ? `#${task.account_id}` : "-"], ["上游任务", task.generation_id || "-"]];
+  const facts = [["提交模式", executionLabel(task.execution_backend)], ["状态", task.status], ["进度", `${task.progress || 0}%`], ["耗时", elapsed(task)], ["渠道", (task.channel || "-").toUpperCase()], ["账号", task.account_id ? `#${task.account_id}` : "-"], ["上游任务", task.generation_id || "-"]];
   $("#detailFacts").innerHTML = facts.map(([key, value]) => `<div><span>${key}</span><b title="${escapeHtml(value)}">${escapeHtml(value)}</b></div>`).join(""); $("#detailPrompt").textContent = task.prompt || "-"; $("#detailMeta").textContent = taskSpec(task);
   const request = task.request || {}; const media = [...(request._images || []).map((item) => ({ ...item, kind: "image" })), ...(request._videos || []).map((item) => ({ ...item, kind: "video" })), ...(request._audio || []).map((item) => ({ ...item, kind: "audio" }))];
   $("#detailMedia").innerHTML = media.map((item, index) => `<button data-detail-media="${index}">${{ image: "图", video: "视", audio: "音" }[item.kind]}${index + 1}</button>`).join(""); $$("#auditTabs button").forEach((button) => button.classList.toggle("active", button.dataset.key === state.auditKey)); renderAudit(); $("#detailDialog").showModal(); icons();
 }
 function previewMedia(item, anchor) { if (!item) return; const popover = $("#mediaPopover"); const url = escapeHtml(item.url || item.value || ""); popover.innerHTML = item.kind === "video" ? `<video src="${url}" controls autoplay muted></video>` : item.kind === "audio" ? `<audio src="${url}" controls autoplay></audio>` : `<img src="${url}" alt="素材预览">`; const rect = anchor.getBoundingClientRect(); popover.style.left = `${Math.min(rect.left, innerWidth - 340)}px`; popover.style.top = `${Math.min(rect.bottom + 6, innerHeight - 260)}px`; popover.hidden = false; }
 
-function renderCosts() { const rows = state.costReferences || []; $("#costReferenceBody").innerHTML = rows.map((item) => { const builtin = item.source === "builtin_rate"; return `<tr><td class="mono">${escapeHtml(item.model)}</td><td class="mono">${builtin ? "按整秒" : `${item.duration || 0}S`}</td><td>${escapeHtml(item.resolution || "-")}</td><td><strong class="cost-value mono">${builtin ? `⌊${fmtCost(item.rate_per_second)} × 秒数⌋` : fmtCost(item.cost)}</strong></td><td class="mono">${builtin ? "-" : fmtCost(item.latest_cost)}</td><td>${builtin ? "内置" : item.samples || 0}</td><td>${fmtTime(item.updated_at)}</td><td class="mono">${escapeHtml(String(item.last_task_id || "-").slice(0, 18))}</td></tr>`; }).join(""); $("#costReferenceEmpty").classList.toggle("show", !rows.length); $("#costReferenceStatus").textContent = `${rows.length} 条参考`; }
+function renderCosts() { const rows = state.costReferences || []; $("#costReferenceBody").innerHTML = rows.map((item) => { const builtin = item.source === "builtin_rate"; return `<tr><td class="mono">${escapeHtml(item.model)}<span class="cell-sub">${executionLabel(item.execution_backend || "browser")}</span></td><td class="mono">${builtin ? "按整秒" : `${item.duration || 0}S`}</td><td>${escapeHtml(item.resolution || "-")}</td><td><strong class="cost-value mono">${builtin ? `⌊${fmtCost(item.rate_per_second)} × 秒数⌋` : fmtCost(item.cost)}</strong></td><td class="mono">${builtin ? "-" : fmtCost(item.latest_cost)}</td><td>${builtin ? "内置" : item.samples || 0}</td><td>${fmtTime(item.updated_at)}</td><td class="mono">${escapeHtml(String(item.last_task_id || "-").slice(0, 18))}</td></tr>`; }).join(""); $("#costReferenceEmpty").classList.toggle("show", !rows.length); $("#costReferenceStatus").textContent = `${rows.length} 条参考`; }
 
 async function refresh() {
   $("#refreshStatus").textContent = "刷新中...";
@@ -145,17 +150,71 @@ async function refresh() {
     $("#refreshStatus").textContent = `更新于 ${new Date().toLocaleTimeString()}`;
   } catch (error) { toast(error.message, true); $("#refreshStatus").textContent = "刷新失败"; }
 }
-async function accountAction(button) { const id = Number(button.dataset.id); try { if (button.dataset.action === "delete") { if (!confirm("确认删除该账号及托管 Profile？")) return; await api(`/api/accounts/${id}`, { method: "DELETE" }); } else if (button.dataset.action === "toggle") await api(`/api/accounts/${id}`, { method: "PATCH", body: JSON.stringify({ enabled: button.dataset.enabled !== "true" }) }); else if (button.dataset.action === "auto-login") await api(`/api/accounts/${id}/auto-login`, { method: "POST" }); else if (button.dataset.action === "login") await api(`/api/accounts/${id}/cdp/reconnect`, { method: "POST" }); else if (button.dataset.action === "check") await api(`/api/accounts/${id}/check`, { method: "POST" }); else if (button.dataset.action === "reset-profile") { const account = state.accounts.find((item) => item.id === id); const form = $("#profileResetForm"); form.account_id.value = id; form.proxy_url.value = account.proxy_url || ""; $("#profileResetAccount").textContent = `#${id} · ${account.name}`; $("#profileResetStatus").textContent = account.status; $("#profileResetDialog").showModal(); return; } toast("操作已提交"); await refresh(); } catch (error) { toast(error.message, true); } }
+async function accountAction(button) { const id = Number(button.dataset.id); try { if (button.dataset.action === "cli-auth") { await startCliAuth(id); return; } else if (button.dataset.action === "delete") { if (!confirm("确认删除该账号及托管 Profile？")) return; await api(`/api/accounts/${id}`, { method: "DELETE" }); } else if (button.dataset.action === "toggle") await api(`/api/accounts/${id}`, { method: "PATCH", body: JSON.stringify({ enabled: button.dataset.enabled !== "true" }) }); else if (button.dataset.action === "auto-login") await api(`/api/accounts/${id}/auto-login`, { method: "POST" }); else if (button.dataset.action === "login") await api(`/api/accounts/${id}/cdp/reconnect`, { method: "POST" }); else if (button.dataset.action === "check") await api(`/api/accounts/${id}/check`, { method: "POST" }); else if (button.dataset.action === "reset-profile") { const account = state.accounts.find((item) => item.id === id); const form = $("#profileResetForm"); form.account_id.value = id; form.proxy_url.value = account.proxy_url || ""; $("#profileResetAccount").textContent = `#${id} · ${account.name}`; $("#profileResetStatus").textContent = account.status; $("#profileResetDialog").showModal(); return; } toast("操作已提交"); await refresh(); } catch (error) { toast(error.message, true); } }
+
+let cliAuthAccountId = null;
+let cliAuthPollTimer = null;
+function renderCliAuth(payload) {
+  const status = payload.status || payload.state || "pending";
+  const message = payload.message || payload.error || (["ready", "authorized"].includes(status) ? "CLI 授权完成。" : "等待完成账号授权…");
+  $("#cliAuthMessage").textContent = typeof message === "string" ? message : "请查看账号授权状态";
+  const code = payload.user_code || "";
+  $("#cliAuthCode").textContent = code ? `授权码：${code}` : ""; $("#cliAuthCode").hidden = !code;
+  const hasAuthorizationPage = Boolean(payload.verification_uri_complete || payload.verification_uri);
+  $("#cliAuthAssist").hidden = !hasAuthorizationPage || ["ready", "authorized", "expired", "error", "failed", "cancelled", "required"].includes(status);
+  $("#cliAuthCancel").hidden = ["ready", "authorized", "expired", "error", "failed", "cancelled", "required"].includes(status);
+  return status;
+}
+async function startCliAuth(id) {
+  clearTimeout(cliAuthPollTimer); cliAuthAccountId = id;
+  $("#cliAuthTitle").textContent = `账号 #${id} CLI 授权`;
+  renderCliAuth({ message: "正在准备账号授权…" }); $("#cliAuthDialog").showModal();
+  try { const payload = await api(`/api/accounts/${id}/cli-auth`, { method: "POST" }); if (cliAuthAccountId !== id) return; renderCliAuth(payload); await pollCliAuth(); }
+  catch (error) { renderCliAuth({ status: "error", message: error.message }); }
+}
+async function pollCliAuth() {
+  if (!$("#cliAuthDialog").open || cliAuthAccountId === null) return;
+  const id = cliAuthAccountId;
+  try {
+    const payload = await api(`/api/accounts/${id}/cli-auth`);
+    if (cliAuthAccountId !== id || !$("#cliAuthDialog").open) return;
+    const status = renderCliAuth(payload);
+    if (["ready", "authorized", "expired", "error", "failed", "cancelled", "required"].includes(status)) {
+      if (typeof closeCanvasAuthAssist === "function") closeCanvasAuthAssist(id);
+      await refresh(); return;
+    }
+    cliAuthPollTimer = setTimeout(pollCliAuth, 3000);
+  } catch (error) { renderCliAuth({ status: "error", message: error.message }); }
+}
+$("#cliAuthDialog").addEventListener("close", () => { clearTimeout(cliAuthPollTimer); cliAuthAccountId = null; });
+$("#cliAuthAssist").addEventListener("click", async () => {
+  if (cliAuthAccountId === null) return;
+  try { await openBrowserAssist(cliAuthAccountId, { cliAuth: true }); }
+  catch (error) { toast(error.message, true); }
+});
+$("#cliAuthCancel").addEventListener("click", async () => {
+  clearTimeout(cliAuthPollTimer);
+  if (cliAuthAccountId === null) return;
+  try { await api(`/api/accounts/${cliAuthAccountId}/cli-auth`, { method: "DELETE" }); renderCliAuth({ status: "cancelled", message: "授权已取消" }); await refresh(); }
+  catch (error) { renderCliAuth({ status: "error", message: error.message }); }
+});
 
 document.addEventListener("click", async (event) => {
   const close = event.target.closest(".close"); if (close) close.closest("dialog")?.close();
-  const accountButton = event.target.closest("[data-action='auto-login'],[data-action='check'],[data-action='login'],[data-action='reset-profile'],[data-action='toggle'],[data-action='delete']"); if (accountButton) await accountAction(accountButton);
+  const accountButton = event.target.closest("[data-action='cli-auth'],[data-action='auto-login'],[data-action='check'],[data-action='login'],[data-action='reset-profile'],[data-action='toggle'],[data-action='delete']"); if (accountButton) await accountAction(accountButton);
   const detail = event.target.closest("[data-action='detail']"); if (detail) try { showDetail(await api(`/api/tasks/${detail.dataset.id}`)); } catch (error) { toast(error.message, true); }
   const media = event.target.closest("[data-action='media']"); if (media) { const task = state.tasks.find((item) => item.id === media.dataset.id); previewMedia(mediaFromTask(task).filter((item) => !item.result)[Number(media.dataset.mediaIndex)], media); }
   const detailMedia = event.target.closest("[data-detail-media]"); if (detailMedia) { const request = state.detail.request || {}; const items = [...(request._images || []).map((item) => ({ ...item, kind: "image" })), ...(request._videos || []).map((item) => ({ ...item, kind: "video" })), ...(request._audio || []).map((item) => ({ ...item, kind: "audio" }))]; previewMedia(items[Number(detailMedia.dataset.detailMedia)], detailMedia); }
   if (!event.target.closest("#mediaPopover,[data-action='media'],[data-detail-media]")) $("#mediaPopover").hidden = true;
 });
 document.addEventListener("change", async (event) => {
+  const modeInput = event.target.closest("[data-account-mode]");
+  if (modeInput) {
+    modeInput.disabled = true;
+    try { await api(`/api/accounts/${Number(modeInput.dataset.accountMode)}`, { method: "PATCH", body: JSON.stringify({ execution_mode: modeInput.value }) }); toast("账号提交模式已更新"); }
+    catch (error) { toast(error.message, true); }
+    await refresh(); return;
+  }
   const priorityInput = event.target.closest("[data-account-priority]");
   if (priorityInput) {
     const id = Number(priorityInput.dataset.accountPriority); const value = Number(priorityInput.value);
@@ -227,6 +286,7 @@ $("#settingsForm").addEventListener("submit", async (event) => {
   const form = event.currentTarget;
   const field = (name) => form.elements.namedItem(name);
   const payload = {
+    canvas_cli_enabled: field("canvas_cli_enabled").checked,
     task_workers: Number(field("task_workers").value),
     task_queue_capacity: Number(field("task_queue_capacity").value),
     poll_interval_seconds: Number(field("poll_interval_seconds").value),

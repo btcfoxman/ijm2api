@@ -1,4 +1,4 @@
-"""Start managed profiles on first use and share them across account operations."""
+"""Lease service-owned profiles and close them after their last consumer."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
-from .browser import BrowserError, browser_alive, ensure_resource_timing_capture, start_managed_browser, stop_managed_browser
+from .browser import BrowserError, browser_alive, close_browser_port, ensure_resource_timing_capture, start_managed_browser, stop_managed_browser
 
 
 class BrowserRuntime:
@@ -60,10 +60,20 @@ class BrowserRuntime:
         account_id = int(account["id"])
         with self._lock(account_id):
             count = self._leases.get(account_id, 0)
-            if count <= 1:
+            if count == 1:
                 self._leases.pop(account_id, None)
-            else:
+                self._close_owned(account_id, account)
+            elif count > 1:
                 self._leases[account_id] = count - 1
+
+    def _close_owned(self, account_id: int, account: dict[str, Any] | None = None) -> None:
+        """Called under the account lock so a new lease cannot race shutdown."""
+        current = self.store.account(account_id, private=True) or account or {}
+        port = int(current.get('cdp_port') or 0)
+        if current.get('managed_profile') and port and port != 19300 + account_id:
+            close_browser_port(port)
+            self.store.update_account(account_id, {'cdp_port': 19300 + account_id})
+        stop_managed_browser(account_id)
 
     @contextmanager
     def lease(self, account: dict[str, Any], *, force_managed: bool = False):
@@ -76,7 +86,11 @@ class BrowserRuntime:
     def close_idle(self, account_id: int) -> None:
         with self._lock(account_id):
             self.assert_idle(account_id)
-            stop_managed_browser(account_id)
+            self._close_owned(account_id)
+
+    def busy(self, account_id: int) -> bool:
+        with self._lock(account_id):
+            return bool(self._leases.get(account_id, 0))
 
     def assert_idle(self, account_id: int) -> None:
         with self._lock(account_id):

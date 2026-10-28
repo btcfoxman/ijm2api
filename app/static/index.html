@@ -5,11 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" href="data:,">
   <title>IJM2API Console</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20261014-3">
+  <link rel="stylesheet" href="/static/styles.css?v=ijm-canvas-20261029-1">
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
   <script src="/api/cost-reference/assets/task-cost.js"></script>
-<script src="/static/app.js?v=ijm-batch-login-20261027" defer></script>
-  <script src="/static/browser-assist.js?v=20261011-1" defer></script>
+<script src="/static/app.js?v=ijm-canvas-20261029-1" defer></script>
+  <script src="/static/browser-assist.js?v=ijm-canvas-20261029-1" defer></script>
   <script src="/static/account-login.js?v=20261014-2" defer></script>
 </head>
 <body>
@@ -52,7 +52,7 @@
         <button class="icon-button" id="accountsRefresh" type="button" title="刷新账号"><i data-lucide="refresh-cw"></i></button>
       </div>
       <div class="table-wrap">
-        <table><thead><tr><th>账号</th><th>状态</th><th>余额 / 套餐</th><th>优先级</th><th>并发</th><th>使用</th><th>代理</th><th>CDP</th><th>最近检测</th><th class="actions-col">操作</th></tr></thead><tbody id="accountsBody"></tbody></table>
+        <table><thead><tr><th>账号</th><th>状态</th><th>余额 / 套餐</th><th>优先级</th><th>并发</th><th>使用</th><th>代理</th><th>Canvas CLI / Browser</th><th>最近检测</th><th class="actions-col">操作</th></tr></thead><tbody id="accountsBody"></tbody></table>
         <div class="empty" id="accountsEmpty"><i data-lucide="users"></i><span>暂无账号</span></div>
       </div>
     </section>
@@ -71,7 +71,7 @@
 
   <dialog id="onlineAccountDialog" class="online-account-dialog" aria-labelledby="onlineAccountTitle">
     <div class="online-account-layout">
-      <header><div><p class="eyebrow">BROWSER ACCOUNT</p><h2 id="onlineAccountTitle">在线账号登录</h2></div><span class="caption">独立 Profile · 登录后保持在线</span></header>
+      <header><div><p class="eyebrow">BROWSER ACCOUNT</p><h2 id="onlineAccountTitle">在线账号登录</h2></div><span class="caption">独立账号 · 完成设置后释放浏览器</span></header>
       <form id="onlineAccountForm" class="online-account-fields">
         <div id="onlineAccountFields" class="form-grid">
           <label>账号名称<input name="name" required maxlength="120" placeholder="ijm-new-account"></label>
@@ -80,7 +80,7 @@
           <button class="button primary" type="submit">创建并打开浏览器</button>
         </div>
       </form>
-      <p id="onlineAccountMessage" role="status">登录后进入视频项目，再点击“完成登录并验证”。浏览器会保持在线。</p>
+      <p id="onlineAccountMessage" role="status">完成登录后点击“完成登录并验证”；设置完成后关闭浏览器以释放内存。</p>
       <iframe id="onlineAccountFrame" title="账号浏览器" src="about:blank" allow="clipboard-read; clipboard-write"></iframe>
       <footer><button class="button" id="onlineAccountCancel" type="button">取消</button><button class="button primary" id="onlineAccountFinish" type="button" hidden>完成登录并验证</button></footer>
     </div>
@@ -90,11 +90,21 @@
     <div class="form-grid">
       <label>名称<input name="name" required maxlength="120"></label><label>账号并发<input name="max_concurrency" type="number" min="1" max="50" value="1"></label>
       <label class="wide">代理地址<input name="proxy_url" class="mono" placeholder="socks5://host.docker.internal:20002"></label>
+      <label>提交模式<select name="execution_mode"><option value="canvas_cli" selected>Canvas CLI（默认）</option><option value="browser">网页提交</option></select></label>
       <label>CDP 端口（留空自动分配）<input name="cdp_port" type="number" min="1024" max="65535"></label>
       <label>视频项目 ID（可在登录后自动读取）<input name="project_id" class="mono"></label>
     </div>
     <footer><button class="button close" type="button">取消</button><button class="button primary" type="submit"><i data-lucide="save"></i><span>保存</span></button></footer>
   </form></dialog>
+
+  <dialog id="cliAuthDialog"><div class="dialog-form">
+    <header><div><p class="eyebrow">CANVAS CLI</p><h2 id="cliAuthTitle">账号 CLI 授权</h2></div><button class="icon-button close" type="button"><i data-lucide="x"></i></button></header>
+    <p id="cliAuthMessage" role="status">正在准备账号授权…</p>
+    <p id="cliAuthCode" class="mono" hidden></p>
+    <button id="cliAuthAssist" class="button primary" type="button" hidden>通过账号代理确认授权</button>
+    <p class="caption">网页登录与 CLI 授权分开核验。授权期间保持该账号原代理出口。</p>
+    <footer><button class="button" id="cliAuthCancel" type="button">取消授权</button><button class="button close" type="button">关闭</button></footer>
+  </div></dialog>
 
   <dialog id="profileResetDialog"><form class="dialog-form" id="profileResetForm">
     <header><div><p class="eyebrow">BROWSER PROFILE</p><h2>重置浏览器环境</h2></div><button class="icon-button close" type="button"><i data-lucide="x"></i></button></header>
@@ -129,6 +139,7 @@
   <dialog id="settingsDialog" class="settings-dialog"><form class="dialog-form" id="settingsForm">
     <header class="settings-dialog-header"><div><p class="eyebrow">RUNTIME CONTROL PLANE</p><h2>运行设置</h2><p class="settings-subtitle">任务执行、会话恢复、代理分配与请求归一化实时配置</p></div><button class="icon-button close" type="button"><i data-lucide="x"></i></button></header>
     <div class="settings-sections">
+      <fieldset class="settings-card"><legend>Canvas CLI</legend><div class="form-grid settings-form-grid"><label class="check"><input name="canvas_cli_enabled" type="checkbox">Canvas CLI 接单</label></div><p class="settings-card-note">完成账号授权及代理隔离验收后启用。关闭时 CLI 模式账号不接单；可按账号选择网页提交。</p></fieldset>
       <fieldset class="settings-card account-settings-card"><legend>任务与账号维护</legend><div class="form-grid settings-form-grid"><label>任务并发数<input name="task_workers" type="number" min="1" max="50" required></label><label>排队容量<input name="task_queue_capacity" type="number" min="0" max="10000" required></label><label>轮询间隔（秒）<input name="poll_interval_seconds" type="number" min="2" max="120" required></label><label>任务超时（秒）<input name="task_timeout_seconds" type="number" min="60" max="7200" required></label><label>低余额自动禁用<input name="low_balance_disable_threshold" type="number" min="0" step="0.01" required></label><label class="check"><input name="daily_checkin_enabled" type="checkbox">启用每日签到</label></div></fieldset>
       <fieldset class="settings-card browser-settings-card"><legend>浏览器与 CDP</legend><div class="form-grid settings-form-grid"><label class="wide">Chrome 可执行文件<input name="chrome_executable" class="mono"></label><label class="wide">Chrome Profile 根目录<input name="chrome_user_data_root" class="mono"></label></div></fieldset>
       <fieldset class="settings-card normalization-settings-card"><legend>参考素材</legend><div class="form-grid settings-form-grid"><label class="check"><input name="allow_video_reference_inputs" type="checkbox">允许输入视频参考素材</label><label class="check"><input name="prompt_media_reference_cleanup_enabled" type="checkbox">转换提示词中的素材编号为 Dreamina 引用</label><label class="check"><input name="strict_prompt_media_references" type="checkbox">严格校验提示词素材编号（默认关闭；超出已提供数量时保留为普通文本）</label></div></fieldset>

@@ -45,7 +45,7 @@ def test_conflicting_tasks_input_items_and_forecast_durations_are_not_cost():
 def context(tmp_path):
     store = Store(str(tmp_path / 'tasks.db'))
     service = Service(store)
-    owner = store.upsert_account({'name': 'synthetic', 'proxy_url': 'socks5://proxy.test:20001',
+    owner = store.upsert_account({"execution_mode": "browser", 'name': 'synthetic', 'proxy_url': 'socks5://proxy.test:20001',
                                   'max_concurrency': 3})
     owner = store.update_account(owner['id'], {'status': 'active', 'balance': 1000})
     yield store, service, owner
@@ -54,7 +54,7 @@ def context(tmp_path):
 
 def create(store, identifier='task', **body):
     request = {'model': 'sd-2-0-mini', 'duration': 15, 'prompt': 'Synthetic landscape', **body}
-    return store.create_task(identifier, request, normalize_request(request))
+    return store.create_task(identifier, request, normalize_request(request), execution_backend='browser')
 
 
 @pytest.mark.parametrize('reported', [0, 40])
@@ -162,7 +162,7 @@ def test_temporary_hold_waits_then_submits_once_without_replaying_the_held_task(
 
 def test_permanently_excluded_account_does_not_hide_another_temporarily_held_account(context):
     store, service, owner = context
-    other = store.upsert_account({'name': 'other', 'proxy_url': 'socks5://proxy.test:20002'})
+    other = store.upsert_account({"execution_mode": "browser", 'name': 'other', 'proxy_url': 'socks5://proxy.test:20002'})
     store.update_account(other['id'], {'status': 'active', 'balance': 1000})
     task = create(store, 'held')
     store.update_task(task['id'], {'status': 'failed', 'account_id': owner['id'],

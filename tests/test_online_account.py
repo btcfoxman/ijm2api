@@ -1,4 +1,4 @@
-"""Online accounts retain one profile and keep task browsers warm."""
+"""Online accounts retain profiles while releasing their browser processes."""
 
 import gc
 import tempfile
@@ -48,7 +48,7 @@ class BrowserRuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.create_pending_account('online-one', 'socks5://proxy.test:20002')
 
-    def test_runtime_reuses_browser_and_closes_only_for_exclusive_login(self):
+    def test_runtime_closes_only_after_last_consumer_releases(self):
         runtime = self.service.browser_runtime
         account = self.store.account(self.account['id'], private=True)
         with patch('app.browser_runtime.start_managed_browser', return_value=19301) as start, \
@@ -61,10 +61,13 @@ class BrowserRuntimeTests(unittest.TestCase):
             with self.assertRaises(BrowserError):
                 runtime.close_idle(self.account['id'])
             runtime.release(first, owned1)
-            runtime.release(second, owned2)
             stop.assert_not_called()
-            runtime.close_idle(self.account['id'])
+            runtime.release(second, owned2)
             stop.assert_called_once_with(self.account['id'])
+            runtime.release(second, owned2)
+            stop.assert_called_once_with(self.account['id'])
+            runtime.close_idle(self.account['id'])
+            self.assertEqual(stop.call_count, 2)
 
 
 class LoginDesktopCleanupTests(unittest.IsolatedAsyncioTestCase):
@@ -93,6 +96,7 @@ class OnlineLoginTests(unittest.IsolatedAsyncioTestCase):
         self.service = Service(self.store)
         self.service.update_settings({'chrome_user_data_root': self.folder.name})
         self.account = self.store.create_pending_account('online-two', 'socks5://proxy.test:20002')
+        self.store.update_account(self.account['id'], {'execution_mode': 'browser'})
         self.manager = BrowserLoginManager(self.store, self.service)
         self.setup_check = patch('app.browser_login.AccountAutomation')
         self.setup = self.setup_check.start()
@@ -156,6 +160,7 @@ class OnlineLoginTests(unittest.IsolatedAsyncioTestCase):
         previous = self.store.account(self.account['id'], private=True)
         desktop = Mock(cdp_port=29999)
         desktop.alive.return_value = True
+        desktop.close = AsyncMock()
         self.store.update_account(self.account['id'], {'enabled': False, 'status': 'logging_in'})
         active = {'id': 'test-session', 'ticket': 'test-viewer',
                   'account_id': self.account['id'], 'desktop': desktop,
@@ -279,13 +284,15 @@ class OnlineLoginTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(desktops[0].profile, Path(self.folder.name) / str(self.account['id']))
             self.assertEqual(desktops[0].proxy, 'socks5://proxy.test:20002')
             result = await self.manager.finish(session['active']['session_id'])
-            self.assertFalse(desktops[0].closed)
+            self.assertTrue(desktops[0].closed)
+            self.assertEqual(self.manager.desktops, {})
             self.assertEqual(len(desktops), 1)
             again = await self.manager.start(self.account['id'])
-            self.assertEqual(len(desktops), 1)
+            self.assertEqual(len(desktops), 2)
             await self.manager.cancel(again['active']['session_id'])
+            self.assertTrue(desktops[1].closed)
         self.assertTrue(result['enabled'])
-        self.assertEqual(result['cdp_port'], 29999)
+        self.assertEqual(result['cdp_port'], 19300 + self.account['id'])
         self.assertEqual(result['project_id'], '')
         self.assertEqual(result['balance'], 123)
         self.assertEqual(self.store.account(self.account['id'], private=True)['login_user_id'], 'synthetic-manual-user')
@@ -296,13 +303,15 @@ class OnlineLoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call.args for call in self.timing_capture.call_args_list], [(29999,), (29999,)])
         with patch('app.browser_runtime.browser_alive', return_value=True), \
              patch('app.browser_runtime.ensure_resource_timing_capture') as capture, \
-             patch('app.browser_runtime.start_managed_browser') as start:
+             patch('app.browser_runtime.start_managed_browser', return_value=19300 + self.account['id']) as start, \
+             patch('app.browser_runtime.stop_managed_browser') as stop:
             current, owned = self.service.browser_runtime.acquire(
                 self.store.account(self.account['id'], private=True))
-            self.assertEqual(current['cdp_port'], 29999)
-            start.assert_not_called()
-            capture.assert_called_once_with(29999)
+            self.assertEqual(current['cdp_port'], 19300 + self.account['id'])
+            start.assert_called_once()
+            capture.assert_not_called()
             self.service.browser_runtime.release(current, owned)
+            stop.assert_called_once_with(self.account['id'])
 
     async def test_active_task_blocks_profile_takeover(self):
         self.service._active[self.account['id']] = 1
@@ -311,3 +320,42 @@ class OnlineLoginTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(LoginError):
                 await self.manager.start(self.account['id'])
         self.assertEqual(self.store.account(self.account['id'])['status'], 'pending')
+
+    async def test_cli_finish_stays_disabled_until_auth_and_closes_desktop_first(self):
+        self.store.update_account(self.account['id'], {'execution_mode': 'canvas_cli'})
+        active = self.active_login()
+        self.manager.desktops[self.account['id']] = active['desktop']
+        client = Mock()
+        client.account_state.return_value = {'available_balance': 123, 'buckets': {}}
+        client.browser.project_id.return_value = ''
+
+        def begin(identifier):
+            active['desktop'].close.assert_awaited_once()
+            self.assertIsNone(self.manager.active)
+            self.assertEqual(self.manager.desktops, {})
+            self.assertFalse(self.store.account(identifier)['enabled'])
+            self.assertEqual(self.store.account(identifier)['status'], 'cli_auth_required')
+
+        self.service.begin_cli_authorization = Mock(side_effect=begin)
+        with patch('app.browser_login.UpstreamClient', return_value=client):
+            result = await self.manager.finish(active['id'])
+        self.service.begin_cli_authorization.assert_called_once_with(self.account['id'])
+        self.assertFalse(result['enabled'])
+        self.assertEqual(result['cdp_port'], 19300 + self.account['id'])
+
+    async def test_cancel_closes_private_desktop_and_restores_previous_account_intent(self):
+        active = self.active_login()
+        self.manager.desktops[self.account['id']] = active['desktop']
+        await self.manager.cancel(active['id'])
+        active['desktop'].close.assert_awaited_once()
+        self.assertEqual(self.manager.desktops, {})
+        self.assertEqual(self.store.account(self.account['id'])['enabled'], active['previous']['enabled'])
+        self.assertEqual(self.store.account(self.account['id'])['cdp_port'], 19300 + self.account['id'])
+
+    async def test_cli_authorization_blocks_manual_login(self):
+        self.service.canvas_auth = Mock()
+        self.service.canvas_auth.busy.return_value = True
+        with patch('app.browser_login.LoginDesktop') as desktop:
+            desktop.available.return_value = True
+            with self.assertRaisesRegex(LoginError, 'Canvas CLI authorization'):
+                await self.manager.start(self.account['id'])
