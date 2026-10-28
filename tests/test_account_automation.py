@@ -30,6 +30,57 @@ def browser_with_settings(settings):
 
 
 class ReadinessTests(unittest.TestCase):
+    def test_identity_only_does_not_depend_on_or_request_generation_settings(self):
+        browser = browser_with_settings(READY)
+        browser.post.side_effect = BrowserError('settings are unavailable')
+        automation = AccountAutomation({**ACCOUNT, 'login_user_id': 'synthetic-user'}, browser=browser)
+        with patch.object(automation, '_settings', side_effect=AutomationError('setup_required', 'unavailable')) as settings:
+            identity = automation.read_identity()
+        self.assertEqual(identity, {'user_id': 'synthetic-user', 'email': ACCOUNT['login_email']})
+        settings.assert_not_called()
+        browser.post.assert_not_called()
+        browser.command.assert_not_called()
+
+    def test_read_ready_still_requires_settings_when_identity_succeeds(self):
+        browser = browser_with_settings(READY)
+        browser.post.side_effect = BrowserError('settings are unavailable')
+        automation = AccountAutomation({**ACCOUNT, 'login_user_id': 'synthetic-user'}, browser=browser)
+        with self.assertRaises(AutomationError) as error:
+            automation.read_ready()
+        self.assertEqual(error.exception.status, 'setup_required')
+        browser.post.assert_called_once_with('/mweb/v1/get_settings', {})
+
+    def test_identity_only_preserves_challenge_and_verification_guards(self):
+        for stage, expected in [('challenge', 'challenge_required'), ('verification', 'verification_required')]:
+            with self.subTest(stage=stage):
+                browser = browser_with_settings(READY)
+                browser.evaluate.return_value = {'stage': stage}
+                browser.evaluate.side_effect = None
+                automation = AccountAutomation(ACCOUNT, browser=browser)
+                with patch.object(automation, '_identity') as identity:
+                    with self.assertRaises(AutomationError) as error:
+                        automation.read_identity()
+                self.assertEqual(error.exception.status, expected)
+                identity.assert_not_called()
+                browser.post.assert_not_called()
+
+    def test_identity_only_still_rejects_wrong_identity_email_and_unauthenticated_state(self):
+        variants = [
+            {**IDENTITY, 'user_id': 'other-user'},
+            {**IDENTITY, 'email': 'other@example.invalid'},
+            {**IDENTITY, 'authenticated': False},
+            {'transport_error': True},
+        ]
+        for value in variants:
+            with self.subTest(value=value):
+                browser = browser_with_settings(READY)
+                browser.evaluate.side_effect = lambda expression, **_: value if expression == _IDENTITY else {'stage': 'waiting'}
+                automation = AccountAutomation({**ACCOUNT, 'login_user_id': 'synthetic-user'}, browser=browser)
+                with self.assertRaises(AutomationError) as error:
+                    automation.read_identity()
+                self.assertEqual(error.exception.status, 'login_required')
+                browser.post.assert_not_called()
+
     @unittest.skipUnless(shutil.which('node'), 'Node is needed for identity URL verification')
     def test_identity_reuses_actual_sdk_url_without_region_guess_or_probe_pollution(self):
         program = r'''

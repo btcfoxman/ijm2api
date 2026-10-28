@@ -316,7 +316,7 @@ class Service(CanvasServiceMixin):
                 raise BrowserError('Dreamina check-in identity readiness timed out')
             browser.timeout = min(10, remaining)
             try:
-                ready = automation.read_ready()
+                identity = automation.read_identity()
             except AutomationError as exc:
                 if (exc.status != 'login_required'
                         or str(exc) != 'Dreamina identity read could not complete'):
@@ -327,8 +327,7 @@ class Service(CanvasServiceMixin):
                 raise BrowserError('Dreamina check-in identity readiness timed out')
             if self._stop.is_set():
                 raise BrowserError('Dreamina check-in was cancelled before claiming credits')
-            identity = ready.get('identity') or {}
-            if ready.get('identity_verified') is not True or str(identity.get('user_id') or '') != expected:
+            if not isinstance(identity, dict) or str(identity.get('user_id') or '') != expected:
                 raise BrowserError('Dreamina check-in identity does not match this account')
             return
         raise BrowserError('Dreamina check-in was cancelled before claiming credits')

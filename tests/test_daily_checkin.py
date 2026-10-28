@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.account_automation import AutomationError
+from app.account_automation import AccountAutomation, AutomationError, _IDENTITY
 from app.browser import BrowserError, BrowserRejected
 from app.catalog import normalize_request
 from app.service import AccountMaintenanceBusy, Service
@@ -27,9 +27,9 @@ def context(tmp_path, monkeypatch):
     service.browser_runtime = Mock()
     service.browser_runtime.busy.return_value = False
     service.browser_runtime.acquire.return_value = ({**account, 'cdp_port': 19300 + account['id']}, True)
-    ready = {'identity_verified': True, 'identity': {'user_id': 'synthetic-uid'}}
+    ready = {'user_id': 'synthetic-uid'}
     automation = Mock()
-    automation.read_ready.return_value = ready
+    automation.read_identity.return_value = ready
     monkeypatch.setattr('app.service.AccountAutomation', Mock(return_value=automation))
     client = Mock()
     client.daily_checkin.return_value = {'receive_quota': 10}
@@ -40,15 +40,30 @@ def context(tmp_path, monkeypatch):
 
 def test_cold_sdk_reads_retry_before_one_daily_claim_and_release_browser(context):
     store, service, account, automation, client, ready = context
-    automation.read_ready.side_effect = [
+    automation.read_identity.side_effect = [
         AutomationError('login_required', 'Dreamina identity read could not complete'),
         AutomationError('login_required', 'Dreamina identity read could not complete'), ready]
     service._stop.wait = Mock(return_value=False)
     assert service.checkin_account(account['id'])['received'] == 10
-    assert automation.read_ready.call_count == 3
+    assert automation.read_identity.call_count == 3
     client.daily_checkin.assert_called_once_with()
     assert store.account(account['id'])['last_checkin_date']
     service.browser_runtime.release.assert_called_once()
+
+
+def test_checkin_uses_real_identity_reader_without_requesting_unavailable_settings(context, monkeypatch):
+    store, service, account, _, client, _ = context
+    browser = Mock()
+    browser.evaluate.side_effect = lambda expression, **_: (
+        {'authenticated': True, 'user_id': 'synthetic-uid', 'email': ''}
+        if expression == _IDENTITY else {'stage': 'waiting'})
+    browser.post.side_effect = BrowserError('Dreamina settings endpoint is unavailable')
+    monkeypatch.setattr('app.service.CDPBrowser', Mock(return_value=browser))
+    monkeypatch.setattr('app.service.AccountAutomation', AccountAutomation)
+    assert service.checkin_account(account['id'])['received'] == 10
+    browser.post.assert_not_called()
+    client.daily_checkin.assert_called_once()
+    assert store.account(account['id'])['last_checkin_date']
 
 
 @pytest.mark.parametrize('error', [
@@ -61,23 +76,23 @@ def test_cold_sdk_reads_retry_before_one_daily_claim_and_release_browser(context
 ])
 def test_login_challenge_mismatch_and_business_errors_never_retry_or_claim(context, error):
     store, service, account, automation, client, _ = context
-    automation.read_ready.side_effect = error
+    automation.read_identity.side_effect = error
     with pytest.raises(type(error)):
         service.checkin_account(account['id'])
-    automation.read_ready.assert_called_once()
+    automation.read_identity.assert_called_once()
     client.daily_checkin.assert_not_called()
     assert not store.account(account['id'])['last_checkin_date']
     service.browser_runtime.release.assert_called_once()
 
 
 @pytest.mark.parametrize('ready', [
-    {'identity_verified': True, 'identity': {'user_id': 'other-uid'}},
-    {'identity_verified': False, 'identity': {'user_id': 'synthetic-uid'}},
-    {'identity_verified': True, 'identity': {}},
+    {'user_id': 'other-uid'},
+    None,
+    {},
 ])
 def test_readiness_requires_actual_matching_identity(context, ready):
     store, service, account, automation, client, _ = context
-    automation.read_ready.return_value = ready
+    automation.read_identity.return_value = ready
     with pytest.raises(BrowserError, match='identity does not match'):
         service.checkin_account(account['id'])
     client.daily_checkin.assert_not_called()
@@ -90,16 +105,20 @@ def test_missing_saved_identity_never_claims(context):
     service.browser_runtime.acquire.return_value = ({**current, 'login_user_id': ''}, owned)
     with pytest.raises(BrowserError, match='verified signed-in account'):
         service.checkin_account(account['id'])
-    automation.read_ready.assert_not_called()
+    automation.read_identity.assert_not_called()
     client.daily_checkin.assert_not_called()
 
 
-def test_one_failed_claim_is_not_replayed_and_not_marked_success(context):
+@pytest.mark.parametrize('error', [
+    BrowserError('Dreamina browser fetch failed'),
+    BrowserRejected('Dreamina ret=34070104: shark action check reject'),
+])
+def test_one_failed_claim_is_not_replayed_and_not_marked_success(context, error):
     store, service, account, automation, client, _ = context
-    client.daily_checkin.side_effect = BrowserError('Dreamina browser fetch failed')
+    client.daily_checkin.side_effect = error
     with pytest.raises(BrowserError):
         service.checkin_account(account['id'])
-    automation.read_ready.assert_called_once()
+    automation.read_identity.assert_called_once()
     client.daily_checkin.assert_called_once()
     assert not store.account(account['id'])['last_checkin_date']
     service.browser_runtime.release.assert_called_once()
@@ -110,10 +129,10 @@ def test_readiness_deadline_never_enters_claim(context, monkeypatch):
     clock = {'now': 0.0}
     monkeypatch.setattr('app.service.time', SimpleNamespace(monotonic=lambda: clock['now']))
     service._stop.wait = lambda delay: clock.update(now=clock['now'] + delay)
-    automation.read_ready.side_effect = AutomationError('login_required', 'Dreamina identity read could not complete')
+    automation.read_identity.side_effect = AutomationError('login_required', 'Dreamina identity read could not complete')
     with pytest.raises(BrowserError, match='readiness timed out'):
         service.checkin_account(account['id'])
-    assert clock['now'] == 30 and automation.read_ready.call_count == 60
+    assert clock['now'] == 30 and automation.read_identity.call_count == 60
     client.daily_checkin.assert_not_called()
     assert not store.account(account['id'])['last_checkin_date']
     service.browser_runtime.release.assert_called_once()
@@ -124,7 +143,7 @@ def test_stop_arriving_during_readiness_does_not_claim(context):
     def stop():
         service._stop.set()
         return ready
-    automation.read_ready.side_effect = stop
+    automation.read_identity.side_effect = stop
     with pytest.raises(BrowserError, match='cancelled'):
         service.checkin_account(account['id'])
     client.daily_checkin.assert_not_called()
@@ -138,7 +157,7 @@ def test_already_checked_in_does_not_open_browser(context, monkeypatch):
     store.update_account(account['id'], {'last_checkin_date': today})
     assert service.checkin_account(account['id']) == {'already_checked_in': True, 'date': today}
     service.browser_runtime.acquire.assert_not_called()
-    automation.read_ready.assert_not_called()
+    automation.read_identity.assert_not_called()
     client.daily_checkin.assert_not_called()
 
 
@@ -179,7 +198,7 @@ def test_generation_occupancy_defers_checkin_without_claim_or_reservation_change
     with pytest.raises(AccountMaintenanceBusy, match='deferred'):
         service.checkin_account(account['id'])
     service.browser_runtime.acquire.assert_not_called()
-    automation.read_ready.assert_not_called()
+    automation.read_identity.assert_not_called()
     client.daily_checkin.assert_not_called()
     assert not store.account(account['id'])['last_checkin_date']
     assert service._credit_reservations == before and not service._aux_account_owners
@@ -205,7 +224,7 @@ def test_existing_login_or_browser_lease_defers_checkin(context, source):
     with pytest.raises(AccountMaintenanceBusy, match='deferred'):
         service.checkin_account(account['id'])
     service.browser_runtime.acquire.assert_not_called()
-    automation.read_ready.assert_not_called()
+    automation.read_identity.assert_not_called()
     client.daily_checkin.assert_not_called()
     assert not store.account(account['id'])['last_checkin_date']
     assert not service._aux_account_owners
@@ -265,12 +284,12 @@ def test_aux_owner_cleanup_never_releases_generation_credit_reservations(context
     if failure == 'claim':
         client.daily_checkin.side_effect = BrowserError('synthetic claim error')
     elif failure == 'readiness':
-        automation.read_ready.side_effect = AutomationError('challenge_required', 'human challenge')
+        automation.read_identity.side_effect = AutomationError('challenge_required', 'human challenge')
     else:
         def cancel():
             service._stop.set()
             raise BrowserError('synthetic cancellation')
-        automation.read_ready.side_effect = cancel
+        automation.read_identity.side_effect = cancel
     with pytest.raises(BrowserError):
         service.checkin_account(account['id'])
     assert service._credit_reservations == before

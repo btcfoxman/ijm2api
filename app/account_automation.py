@@ -302,8 +302,8 @@ class AccountAutomation:
                 'agreement_ready': settings.get('aigc_compliance_confirmed') is True,
                 'identity': identity, 'settings': settings}
 
-    def read_ready(self) -> dict[str, Any]:
-        """Read identity and settings only; never mutate a preference or click UI."""
+    def read_identity(self) -> dict[str, Any]:
+        """Read a verified identity without depending on generation preferences."""
         view = self.browser.evaluate(_VIEW)
         if isinstance(view, dict) and view.get('stage') == 'challenge':
             raise AutomationError('challenge_required', 'Dreamina login requires a human security challenge')
@@ -312,6 +312,11 @@ class AccountAutomation:
         identity = self._identity()
         if identity is None:
             raise AutomationError('login_required', 'Dreamina login session has not been verified')
+        return identity
+
+    def read_ready(self) -> dict[str, Any]:
+        """Read identity and settings only; never mutate a preference or click UI."""
+        identity = self.read_identity()
         return self._ready(identity, self._settings())
 
     def ensure_ready(self) -> dict[str, Any]:
