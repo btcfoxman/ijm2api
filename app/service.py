@@ -725,13 +725,14 @@ class Service(CanvasServiceMixin):
             return
         attempted: list[int] = list(task["attempted_account_ids"])
         funding_excluded: set[int] = set()
+        estimated_cost = 0.0
         try:
             while not self._stop.is_set() and time.monotonic() < deadline:
                 excluded = set(attempted) | funding_excluded
-                account = self._reserve_account(0, exclude_ids=excluded,
+                account = self._reserve_account(estimated_cost, exclude_ids=excluded,
                                                 prefer_balance=bool(attempted), task_id=task_id)
                 if not account:
-                    if not self._has_eligible_account(0, excluded, task_id):
+                    if not self._has_eligible_account(estimated_cost, excluded, task_id):
                         self._fail(task_id, "ACCOUNT_POOL_UNAVAILABLE",
                                    "no Dreamina image account has available credits")
                         return
@@ -752,6 +753,7 @@ class Service(CanvasServiceMixin):
                             attempted = list((self.store.task(task_id) or {}).get('attempted_account_ids') or [])
                         elif result != 'reselect':
                             funding_excluded.add(account_id)
+                        estimated_cost = float((self.store.task(task_id) or {}).get('estimated_cost') or 0)
                         continue
                     account, owned = self.browser_runtime.acquire(account)
                     video_client = DreaminaClient(account, store=self.store)

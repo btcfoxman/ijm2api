@@ -43,7 +43,7 @@ def task(store, identifier="task", *, backend="", **request):
     return store.create_task(identifier, body, normalize_request(body), execution_backend=backend)
 
 
-def fake_client(store, service, account, *, quote=10, actual=None):
+def fake_client(store, service, account, *, quote=10, actual=None, kind="video"):
     client = Mock(account=account)
     client.identity.side_effect = lambda: {"user_id": account["login_user_id"],
         "available_balance": account["balance"] - (actual if actual is not None else quote) if client.submit.call_count else account["balance"]}
@@ -52,7 +52,7 @@ def fake_client(store, service, account, *, quote=10, actual=None):
         context = {"backend": "canvas_cli", "account_id": account["id"], "task_id": task_id,
             "profile": f"synthetic-{account['id']}", "project_id": f"project-{account['id']}",
             "node_id": f"node-{task_id}-{account['id']}", "submit_id": f"submit-{task_id}-{account['id']}",
-            "kind": "video", "phase": "quoted", "quoted_credits": quote}
+            "kind": kind, "phase": "quoted", "quoted_credits": quote}
         persist(deepcopy(context))
         return context
 
@@ -69,12 +69,14 @@ def fake_client(store, service, account, *, quote=10, actual=None):
         return {**context, "phase": "accepted", "resource_ids": ["accepted-resource"]}
 
     client.submit.side_effect = submit
-    path = service.canvas_cli.account_directory(account) / "results" / "original.mp4"
+    filename = "original.png" if kind == "image" else "original.mp4"
+    mime = "image/png" if kind == "image" else "video/mp4"
+    path = service.canvas_cli.account_directory(account) / "results" / filename
     path.parent.mkdir(parents=True)
     path.write_bytes(b"synthetic-original-video-bytes")
     client.poll.return_value = {"status": "succeeded", "progress": 100, "result_urls": [],
         "result_paths": [str(path)],
-        "result_files": [{"path": str(path), "mime": "video/mp4", "resource_id": str(uuid.uuid4())}],
+        "result_files": [{"path": str(path), "mime": mime, "resource_id": str(uuid.uuid4())}],
         "credit_facts": [{"source": "precharge", "amount": 777, "field": "resource.creditsAmount", "settled": False}]}
     return client
 
@@ -183,6 +185,45 @@ def test_same_priority_reselects_smallest_funded_account_before_paid_run(context
     clients[big["id"]].submit.assert_not_called()
     clients[tiny["id"]].submit.assert_not_called()
     clients[small["id"]].submit.assert_called_once()
+
+
+def test_cli_image_reselection_retains_quote_and_uses_smallest_funded_account(context):
+    store, service, _ = context
+    big = owner(store, "big", balance=100)
+    small = owner(store, "small", balance=15)
+    tiny = owner(store, "tiny", balance=5)
+    response = service.create_image({"model": "gpt-image-2.5-flare", "prompt": "Synthetic landscape"})
+    clients = {a["id"]: fake_client(store, service, a, quote=10, kind="image") for a in (big, small, tiny)}
+    with patch.object(service, "canvas_client", side_effect=lambda a: clients[a["id"]]):
+        service._run_image(response["id"])
+    result = store.task(response["id"])
+    assert result["status"] == "succeeded", result["error_message"]
+    assert result["account_id"] == small["id"]
+    assert result["estimated_cost"] == 10
+    assert result["attempted_account_ids"] == [small["id"]]
+    clients[big["id"]].prepare.assert_called_once()
+    clients[big["id"]].submit.assert_not_called()
+    clients[tiny["id"]].prepare.assert_not_called()
+    clients[tiny["id"]].submit.assert_not_called()
+    clients[small["id"]].submit.assert_called_once()
+    service.browser_runtime.acquire.assert_not_called()
+
+
+def test_cli_image_unfunded_quote_selects_funded_account_without_paid_retry(context):
+    store, service, _ = context
+    first = owner(store, "primary", balance=5, priority=5)
+    second = owner(store, "fallback", balance=15, priority=4)
+    response = service.create_image({"model": "gpt-image-2.5-flare", "prompt": "Synthetic landscape"})
+    clients = {a["id"]: fake_client(store, service, a, quote=10, kind="image") for a in (first, second)}
+    with patch.object(service, "canvas_client", side_effect=lambda a: clients[a["id"]]):
+        service._run_image(response["id"])
+    result = store.task(response["id"])
+    assert result["status"] == "succeeded", result["error_message"]
+    assert result["account_id"] == second["id"]
+    assert result["attempted_account_ids"] == [second["id"]]
+    clients[first["id"]].submit.assert_not_called()
+    clients[second["id"]].submit.assert_called_once()
+    assert not service._credit_reservations
 
 
 def test_explicit_priority_precedes_same_priority_credit_fit(context):

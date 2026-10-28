@@ -296,3 +296,84 @@ def test_runtime_probe_rejects_wrong_distribution(tmp_path, monkeypatch):
     with pytest.raises(CanvasCLIError) as found:
         runner.verify_runtime()
     assert found.value.code == "CLI_RUNTIME_INCOMPATIBLE"
+
+
+def test_real_image_catalog_null_aliases_keeps_exact_existing_model():
+    flare = {"model": "dreamina_gpt_image_2_5_flare", "aliases": None, "displayName": "GPT Image 2.5 Flare"}
+    sunburst = {"model": "dreamina_gpt_image_2_5_sunburst", "aliases": None, "displayName": "GPT Image 2.5 Sunburst"}
+    for public, canonical in (("gpt-image-2.5-flare", flare["model"]), ("gpt-image-2.5-sunburst-4k", sunburst["model"])):
+        selected = select_model([flare, sunburst], {"kind": "image", "model": public, "upstream_model": canonical})
+        assert selected["model"] == canonical
+
+
+def real_frame_catalog():
+    result = model()
+    result["modes"] = [{"name": "first_last_frame", "flags": [], "references": {
+        "min": n, "max": n, "types": [{"mediaType": "image", "min": n, "max": n}]}}
+        for n in (2, 1)] + [mode for mode in result["modes"] if mode["name"] != "first_last_frame"]
+    return result
+
+
+@pytest.mark.parametrize("image_count", [1, 2])
+def test_real_duplicate_frame_modes_resolve_by_reference_constraints(image_count):
+    selected = select_mode(real_frame_catalog(), {**request(), "mode": "first_last_frame"},
+                           {"images": image_count, "videos": 0, "audios": 0})
+    assert selected["references"]["min"] == selected["references"]["max"] == image_count
+
+
+@pytest.mark.parametrize("counts", [
+    {"images": 0, "videos": 0, "audios": 0}, {"images": 3, "videos": 0, "audios": 0},
+    {"images": 1, "videos": 1, "audios": 0}, {"images": 1, "videos": 0, "audios": 1},
+])
+def test_explicit_frame_mode_does_not_fall_back_to_m2v(counts):
+    with pytest.raises(CanvasCLIError) as found:
+        select_mode(real_frame_catalog(), {**request(), "mode": "i2v"}, counts)
+    assert found.value.code == "CLI_CAPABILITY_UNAVAILABLE"
+
+
+def test_ambiguous_frame_constraints_are_not_resolved_by_first_entry():
+    catalog = real_frame_catalog()
+    catalog["modes"].append(dict(catalog["modes"][0]))
+    with pytest.raises(CanvasCLIError):
+        select_mode(catalog, {**request(), "mode": "first_last_frame"}, {"images": 2, "videos": 0, "audios": 0})
+
+
+class IdentityRunner:
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = []
+
+    def run(self, account, args, timeout=None):
+        self.calls.append(args)
+        assert args == ["auth", "account"]
+        return {"ok": True, "data": self.responses[min(len(self.calls) - 1, len(self.responses) - 1)]}
+
+
+def test_real_identity_partial_credits_read_is_retried_without_login(monkeypatch):
+    monkeypatch.setattr("app.canvas_client.time.sleep", lambda _: None)
+    # Observed live: a successful identity response omitted all optional credit
+    # fields, while the next independent read returned the aggregate normally.
+    runner = IdentityRunner([{"userId": 42, "isVip": True, "vipLevel": "basic"},
+        {"userId": 42, "availableCredits": "47385", "credits": {"available": "47385",
+            "details": [{"available": "47385", "expiresAt": "2026-11-27T11:25:25Z"}]}}])
+    identity = CanvasClient(runner, ACCOUNT).identity()
+    assert identity["available_balance"] == 47385 and len(runner.calls) == 2
+
+
+def test_missing_credits_stays_unknown_after_bounded_read_retries(monkeypatch):
+    monkeypatch.setattr("app.canvas_client.time.sleep", lambda _: None)
+    runner = IdentityRunner([{"userId": 42, "isVip": True, "vipLevel": "basic"}])
+    assert CanvasClient(runner, ACCOUNT).identity()["available_balance"] is None
+    assert len(runner.calls) == 3
+
+
+@pytest.mark.parametrize("fields,expected", [
+    ({"availableCredits": "8", "credits": {"available": None}}, 8),
+    ({"availableCredits": "0", "credits": {"available": "0"}}, 0),
+    ({"availableCredits": "240", "credits": {"available": "225"}}, None),
+    ({"credits": {"details": [{"available": "8"}]}}, None),
+])
+def test_identity_only_uses_consistent_explicit_aggregate_balance(monkeypatch, fields, expected):
+    monkeypatch.setattr("app.canvas_client.time.sleep", lambda _: None)
+    identity = CanvasClient(IdentityRunner([{"userId": 42, **fields}]), ACCOUNT).identity()
+    assert identity["available_balance"] == expected

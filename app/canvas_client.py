@@ -38,6 +38,19 @@ def _number(value: Any) -> float | None:
     return result if math.isfinite(result) and result >= 0 else None
 
 
+def _available_balance(data: dict[str, Any]) -> float | None:
+    """Only the CLI's explicit aggregate available-credit facts are balances.
+
+    auth account can succeed with userId/membership alone when its optional
+    credit dependency is unavailable. Never substitute cached credit, sum an
+    incomplete expiry list, or turn those omitted facts into zero.
+    """
+    credits = data.get("credits") if isinstance(data.get("credits"), dict) else {}
+    values = [_number(credits.get("available")), _number(data.get("availableCredits"))]
+    known = [value for value in values if value is not None]
+    return known[0] if known and all(value == known[0] for value in known) else None
+
+
 def _key(value: Any) -> str:
     return re.sub(r"[^a-z0-9]", "", str(value).lower())
 
@@ -113,7 +126,7 @@ def select_model(items: list[dict[str, Any]], normalized: dict[str, Any]) -> dic
     for candidate in candidates:
         matches = [item for item in items if candidate in {
             _key(item.get("model")), _key(item.get("displayName")),
-            *(_key(alias) for alias in item.get("aliases", []) if isinstance(alias, str))}]
+            *(_key(alias) for alias in (item.get("aliases") or []) if isinstance(alias, str))}]
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:
@@ -127,32 +140,52 @@ def select_mode(model: dict[str, Any], normalized: dict[str, Any], counts: dict[
     desired = ("i2i" if has_refs else "t2i") if image else ("m2v" if has_refs else "t2v")
     requested = str(normalized.get("mode") or "")
     if not image and requested in {"i2v", "i2v_first_last", "first_last_frame"}:
-        if counts["images"] in {1, 2} and not counts["videos"] and not counts["audios"]:
-            desired = "first_last_frame"
-    modes = [mode for mode in model.get("modes", [])
+        desired = "first_last_frame"
+    elif not image and requested in {"t2v", "m2v"}:
+        desired = requested
+    modes = [mode for mode in (model.get("modes") or [])
              if isinstance(mode, dict) and mode.get("name") == desired]
-    if len(modes) != 1:
+    if not modes:
         raise _unsupported(f"Canvas model does not expose {desired} mode")
-    mode = modes[0]
+    # The real catalog has two first_last_frame entries: one for a single
+    # first frame, one for first+last. Their public name is intentionally the
+    # same; resolve by declared media constraints, never by array order.
+    valid = []
+    errors = []
+    for mode in modes:
+        error = _reference_error(mode, counts)
+        if error:
+            errors.append(error)
+        else:
+            valid.append(mode)
+    if len(valid) != 1:
+        message = errors[-1] if not valid and errors else f"Canvas model exposes an ambiguous {desired} mode"
+        raise _unsupported(message)
+    return valid[0]
+
+
+def _reference_error(mode: dict[str, Any], counts: dict[str, int]) -> str | None:
     references = mode.get("references")
     if isinstance(references, dict):
         total = sum(counts.values())
         if total < int(references.get("min", 0)) or total > int(references.get("max", total)):
-            raise _unsupported("Canvas model reference count is outside its live limits")
+            return "Canvas model reference count is outside its live limits"
         types = references.get("types") or []
         for media_type, plural in (("image", "images"), ("video", "videos"), ("audio", "audios")):
             rule = next((x for x in types if x.get("mediaType") == media_type), None)
-            if rule is None and counts[plural] and types:
-                raise _unsupported(f"Canvas model does not accept {media_type} references")
+            if rule is None and counts[plural]:
+                return f"Canvas model does not accept {media_type} references"
             if rule is not None and not int(rule.get("min", 0)) <= counts[plural] <= int(rule.get("max", counts[plural])):
-                raise _unsupported(f"Canvas model {media_type} reference count is outside its live limits")
+                return f"Canvas model {media_type} reference count is outside its live limits"
         required = references.get("requireAnyOfTypes") or []
         if required and not any(counts.get(str(x) + "s", 0) for x in required):
-            raise _unsupported("Canvas model requires another reference media type")
+            return "Canvas model requires another reference media type"
         exclusive = references.get("mutuallyExclusiveTypes") or []
         if sum(bool(counts.get(str(x) + "s", 0)) for x in exclusive) > 1:
-            raise _unsupported("Canvas model does not allow this reference media combination")
-    return mode
+            return "Canvas model does not allow this reference media combination"
+    elif any(counts.values()):
+        return "Canvas model does not declare support for these references"
+    return None
 
 
 def generation_flags(mode: dict[str, Any], normalized: dict[str, Any]) -> list[str]:
@@ -160,7 +193,7 @@ def generation_flags(mode: dict[str, Any], normalized: dict[str, Any]) -> list[s
                  "count": normalized.get("count", 1)}
     if normalized.get("kind") != "image":
         requested["duration"] = normalized.get("duration")
-    rules = {str(x.get("flag", "")).lstrip("-"): x for x in mode.get("flags", []) if isinstance(x, dict)}
+    rules = {str(x.get("flag", "")).lstrip("-"): x for x in (mode.get("flags") or []) if isinstance(x, dict)}
     result: list[str] = []
     for name, value in requested.items():
         if value is None or value == "":
@@ -222,15 +255,19 @@ class CanvasClient:
         raise AssertionError("unreachable")
 
     def identity(self) -> dict[str, Any]:
-        data = self._call(["auth", "account"], read_only=True)
-        user_id = str(data.get("userId") or "")
-        if not user_id:
-            raise CanvasCLIError("CLI_IDENTITY_INVALID", "Canvas did not return a service-authenticated user ID")
-        expected = str(self.account.get("login_user_id") or "")
-        if expected and user_id != expected:
-            raise CanvasCLIError("CLI_ACCOUNT_MISMATCH", "Canvas authorization belongs to another account")
+        for attempt in range(3):
+            data = self._call(["auth", "account"], timeout=10, read_only=(attempt == 0))
+            user_id = str(data.get("userId") or "")
+            if not user_id:
+                raise CanvasCLIError("CLI_IDENTITY_INVALID", "Canvas did not return a service-authenticated user ID")
+            expected = str(self.account.get("login_user_id") or "")
+            if expected and user_id != expected:
+                raise CanvasCLIError("CLI_ACCOUNT_MISMATCH", "Canvas authorization belongs to another account")
+            balance = _available_balance(data)
+            if balance is not None or attempt == 2:
+                break
+            time.sleep(0.25 * 2 ** attempt)
         credits = data.get("credits") if isinstance(data.get("credits"), dict) else {}
-        balance = _number(credits.get("available", data.get("availableCredits")))
         return {"user_id": user_id, "id": user_id, "name": str(data.get("displayName") or ""),
                 "available_balance": balance, "credits": balance,
                 "buckets": {"details": credits.get("details", [])},
