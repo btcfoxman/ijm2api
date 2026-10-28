@@ -21,13 +21,14 @@ from .auto_login import verified_login_user_id
 _PUBLIC_STATES = {'queued', 'authorizing', 'manual_required', 'ready', 'failed', 'cancelled', 'expired'}
 _AUTH_HOSTS = {'dreamina.capcut.com'}
 _CONFIRM = r"""(() => {
+ if(location.protocol!=='https:'||location.hostname!=='dreamina.capcut.com'||!/^\/ai-tool\/cli-auth-os\/?$/.test(location.pathname))return 'manual_required';
  const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>1&&r.height>1&&s.display!=='none'&&s.visibility!=='hidden';};
  const text=(document.body?.innerText||'').slice(0,20000);
  if(document.querySelector('iframe[src*="captcha"],iframe[src*="recaptcha"],[class*="captcha-verify"]')||
     /verify (?:you are|your identity)|security verification|人机验证|安全验证/i.test(text))return 'manual_required';
  if(!/canvas|\bcli\b|命令行/i.test(text))return 'waiting';
  if(/purchase|checkout|subscribe|支付|购买|订阅/i.test(text))return 'manual_required';
- const labels=new Set(['authorize','allow','allow access','confirm','confirm authorization','授权','允许','确认','确认授权','同意授权','授权登录']);
+ const labels=new Set(['agree','authorize','allow','allow access','confirm','confirm authorization','同意','授权','允许','确认','确认授权','同意授权','授权登录']);
  const buttons=[...document.querySelectorAll('button,[role=button]')].filter(e=>visible(e)&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&labels.has((e.innerText||e.textContent||'').trim().toLowerCase()));
  if(buttons.length===1){buttons[0].click();return 'confirmed';}
  return 'waiting';
