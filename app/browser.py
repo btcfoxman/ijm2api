@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -28,6 +29,7 @@ _UPLOAD_LOCKS: dict[int, threading.RLock] = {}
 _TIMING_GUARD = threading.Lock()
 _TIMING_LOCKS: dict[int, threading.RLock] = {}
 _TIMING_CAPTURES: dict[int, tuple[str, Any, Any]] = {}
+logger = logging.getLogger(__name__)
 
 # Retain genuine SDK resource URLs arriving after a cold page's first 250
 # assets. This changes timing storage only, never requests or SDK parameters.
@@ -142,6 +144,40 @@ def _remove_stale_profile_locks(profile: Path) -> None:
             link.unlink()
 
 
+def _cleanup_failed_managed_start(account_id: int, port: int, process: subprocess.Popen[Any]) -> None:
+    """Called under _PROCESS_LOCK; never close a port borrowed from another owner."""
+    if _PROCESSES.get(account_id) is not process:
+        return
+    capture = _TIMING_CAPTURES.get(port)
+    removed = False
+    try:
+        if process.poll() is None:
+            for action in ('terminate', 'kill'):
+                try:
+                    getattr(process, action)()
+                    process.wait(timeout=3)
+                    break
+                except Exception as exc:
+                    logger.warning('Dreamina browser cleanup failed account_id=%s stage=%s error_type=%s',
+                        account_id, action, type(exc).__name__)
+        if process.poll() is not None and _PROCESSES.get(account_id) is process:
+            _PROCESSES.pop(account_id, None)
+            removed = True
+    except Exception as exc:
+        # Keep an unconfirmed child registered so later shutdown can still
+        # find it. A cleanup error must not replace the original start error.
+        logger.warning('Dreamina browser cleanup failed account_id=%s stage=process error_type=%s',
+            account_id, type(exc).__name__)
+    finally:
+        try:
+            if ((_PROCESSES.get(account_id) is process or removed and account_id not in _PROCESSES)
+                    and _TIMING_CAPTURES.get(port) is capture):
+                close_resource_timing_capture(port)
+        except Exception as exc:
+            logger.warning('Dreamina browser cleanup failed account_id=%s stage=telemetry error_type=%s',
+                account_id, type(exc).__name__)
+
+
 def start_managed_browser(account: dict[str, Any], *, chrome: str, profiles: Path) -> int:
     account_id = int(account["id"])
     port = 19300 + account_id
@@ -175,32 +211,50 @@ def start_managed_browser(account: dict[str, Any], *, chrome: str, profiles: Pat
             previous_targets = {str(target.get("id")) for target in _targets(port)}
         except BrowserError:
             previous_targets = set()
-        _PROCESSES[account_id] = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+        process = None
+        ready = False
+        stage = 'spawn'
+        try:
+            process = subprocess.Popen(args, stdout=subprocess.DEVNULL,
                                                   stderr=subprocess.DEVNULL,
                                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
+            _PROCESSES[account_id] = process
+            stage = 'targets'
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                try:
+                    targets = _targets(port)
+                except BrowserError:
+                    targets = []
+                fresh = next((target for target in targets if target.get("type") == "page"
+                              and target.get("url") == "about:blank"
+                              and str(target.get("id") or "") not in previous_targets), None)
+                if fresh:
+                    stage = 'telemetry'
+                    ensure_resource_timing_capture(port, _target=fresh, _initial_navigation=True)
+                    ready = True
+                    return port
+                time.sleep(.1)
+            stage = 'redirect_check'
             try:
-                targets = _targets(port)
-            except BrowserError:
-                targets = []
-            fresh = next((target for target in targets if target.get("type") == "page"
-                          and target.get("url") == "about:blank"
-                          and str(target.get("id") or "") not in previous_targets), None)
-            if fresh:
-                ensure_resource_timing_capture(port, _target=fresh, _initial_navigation=True)
-                return port
-            time.sleep(.1)
-        try:
-            pages = [item for item in _targets(port) if item.get("type") == "page"]
-            hosts = {urllib.parse.urlsplit(str(item.get("url") or "")).hostname for item in pages}
-            redirected = sorted(host for host in hosts if host and host != "dreamina.capcut.com")
-            if redirected:
-                raise BrowserError(f"Dreamina browser reached {redirected[0]}; configure an account proxy")
-        except BrowserError as exc:
-            if "configure an account proxy" in str(exc):
+                pages = [item for item in _targets(port) if item.get("type") == "page"]
+                hosts = {urllib.parse.urlsplit(str(item.get("url") or "")).hostname for item in pages}
+                redirected = sorted(host for host in hosts if host and host != "dreamina.capcut.com")
+                if redirected:
+                    raise BrowserError(f"Dreamina browser reached {redirected[0]}; configure an account proxy")
+            except BrowserError as exc:
+                if "configure an account proxy" in str(exc):
+                    raise
+            raise BrowserError("managed Dreamina Chrome did not start")
+        except Exception as exc:
+            logger.warning('Dreamina browser startup failed account_id=%s stage=%s error_type=%s',
+                account_id, stage, type(exc).__name__)
+            if isinstance(exc, BrowserError):
                 raise
-    raise BrowserError("managed Dreamina Chrome did not start")
+            raise BrowserError('managed Dreamina Chrome startup failed') from exc
+        finally:
+            if process is not None and not ready:
+                _cleanup_failed_managed_start(account_id, port, process)
 
 
 def close_browser_port(port: int) -> None:
