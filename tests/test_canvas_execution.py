@@ -265,6 +265,9 @@ def test_lost_acceptance_receipt_queries_original_ids_and_never_repeats_submit(c
 
 def test_read_only_poll_failure_retries_query_not_generation(context):
     store, service, _ = context
+    # This tests retry identity, not real SQLite/host scheduling latency;
+    # deadline behavior is covered separately with the controlled clock.
+    store.update_settings({'task_timeout_seconds': 30})
     account = owner(store)
     task(store)
     client = fake_client(store, service, account)
@@ -1033,3 +1036,264 @@ def test_poll_budget_uses_original_wall_deadline_and_still_accepts_running(conte
     assert before < passed <= before + 5.1
     assert store.task('task')['status'] == 'running'
     assert not store.task('task')['error_code']
+
+
+def preflight_task(store, service, kind):
+    store.update_settings({'task_timeout_seconds': 30})
+    if kind == 'image':
+        return service.create_image({'model': 'gpt-image-2.5-flare', 'prompt': 'Synthetic landscape'})['id']
+    task(store)
+    return 'task'
+
+
+@pytest.mark.parametrize('kind', ['video', 'image'])
+@pytest.mark.parametrize('code,details', [
+    ('CLI_COMMAND_TIMEOUT', {}),
+    ('cli.api_failed', {'error': {'retryable': True, 'reason': 'network_error'}}),
+])
+def test_identity_network_failure_reselects_once_before_any_paid_dispatch(context, kind, code, details):
+    store, service, _ = context
+    accounts = [owner(store, 'primary', priority=5), owner(store, 'healthy', priority=4)]
+    identifier = preflight_task(store, service, kind)
+    clients = {a['id']: fake_client(store, service, a, kind=kind) for a in accounts}
+    clients[accounts[0]['id']].identity.side_effect = CanvasCLIError(code,
+        'synthetic identity interruption token=private-value', details=details)
+    with patch.object(service, 'canvas_client', side_effect=lambda a: clients[a['id']]):
+        service._run(identifier)
+    result = store.task(identifier)
+    assert result['status'] == 'succeeded', result['error_message']
+    assert result['account_id'] == accounts[1]['id']
+    assert result['attempted_account_ids'] == [a['id'] for a in accounts]
+    failure = result['upstream_context']['preflight_failures'][0]
+    assert failure['account_id'] == accounts[0]['id'] and failure['code'] == code
+    assert failure['phase'] == 'identity' and failure['dispatch_started'] is False
+    assert 'private-value' not in json.dumps(failure)
+    clients[accounts[0]['id']].prepare.assert_not_called()
+    clients[accounts[0]['id']].submit.assert_not_called()
+    clients[accounts[1]['id']].submit.assert_called_once()
+    assert sum(service._active.values()) == 0 and not service._credit_reservations
+
+
+@pytest.mark.parametrize('kind', ['video', 'image'])
+def test_two_identity_failures_keep_last_real_error_and_never_use_third_account(context, kind):
+    store, service, _ = context
+    accounts = [owner(store, f'owner-{i}', priority=5-i) for i in range(3)]
+    identifier = preflight_task(store, service, kind)
+    clients = {a['id']: fake_client(store, service, a, kind=kind) for a in accounts}
+    clients[accounts[0]['id']].identity.side_effect = CanvasCLIError('CLI_COMMAND_TIMEOUT', 'first identity timeout')
+    clients[accounts[1]['id']].identity.side_effect = CanvasCLIError('cli.api_failed', 'last identity connection failure',
+        details={'error': {'retryable': True, 'reason': 'network_error'}})
+    with patch.object(service, 'canvas_client', side_effect=lambda a: clients[a['id']]):
+        service._run(identifier)
+    result = store.task(identifier)
+    assert result['status'] == 'failed' and result['error_code'] == 'cli.api_failed'
+    assert result['error_message'] == 'last identity connection failure'
+    assert result['attempted_account_ids'] == [a['id'] for a in accounts[:2]]
+    assert [x['message'] for x in result['upstream_context']['preflight_failures']] == [
+        'first identity timeout', 'last identity connection failure']
+    clients[accounts[2]['id']].identity.assert_not_called()
+    assert all(not client.prepare.called and not client.submit.called for client in clients.values())
+    assert result['actual_cost'] is None and not service._credit_reservations
+
+
+@pytest.mark.parametrize('kind', ['video', 'image'])
+def test_identity_failure_and_credit_rejection_share_the_existing_two_account_limit(context, kind):
+    store, service, _ = context
+    accounts = [owner(store, f'owner-{i}', priority=5-i) for i in range(3)]
+    identifier = preflight_task(store, service, kind)
+    clients = {a['id']: fake_client(store, service, a, kind=kind) for a in accounts}
+    clients[accounts[0]['id']].identity.side_effect = CanvasCLIError('CLI_COMMAND_TIMEOUT', 'identity timeout')
+    clients[accounts[1]['id']].submit.side_effect = CanvasCLIError('INSUFFICIENT_CREDITS',
+        'not enough credits left', outcome_unknown=False)
+    with patch.object(service, 'canvas_client', side_effect=lambda a: clients[a['id']]):
+        service._run(identifier)
+    result = store.task(identifier)
+    assert result['status'] == 'failed' and result['error_code'] == 'INSUFFICIENT_CREDITS'
+    assert result['attempted_account_ids'] == [a['id'] for a in accounts[:2]]
+    assert result['upstream_context']['preflight_failures'][0]['account_id'] == accounts[0]['id']
+    clients[accounts[0]['id']].submit.assert_not_called()
+    clients[accounts[1]['id']].submit.assert_called_once()
+    clients[accounts[2]['id']].identity.assert_not_called()
+
+
+@pytest.mark.parametrize('kind', ['video', 'image'])
+def test_identity_failover_retains_priority_and_smallest_sufficient_account_selection(context, kind):
+    store, service, _ = context
+    accounts = [owner(store, 'first', balance=100, priority=9),
+                owner(store, 'bigger', balance=30, priority=5),
+                owner(store, 'fitting', balance=20, priority=5),
+                owner(store, 'lower-priority', balance=15, priority=4)]
+    identifier = preflight_task(store, service, kind)
+    clients = {a['id']: fake_client(store, service, a, kind=kind, quote=10) for a in accounts}
+    clients[accounts[0]['id']].identity.side_effect = CanvasCLIError('CLI_COMMAND_TIMEOUT', 'identity timeout')
+    with patch.object(service, 'canvas_client', side_effect=lambda a: clients[a['id']]), \
+            patch.object(service, '_cost_estimate', return_value=(10, {'source': 'synthetic-history'})):
+        service._run(identifier)
+    result = store.task(identifier)
+    assert result['status'] == 'succeeded' and result['account_id'] == accounts[2]['id']
+    assert result['attempted_account_ids'] == [accounts[0]['id'], accounts[2]['id']]
+    assert result['upstream_context']['preflight_failures'][0]['account_id'] == accounts[0]['id']
+    assert sum(client.submit.call_count for client in clients.values()) == 1
+    clients[accounts[0]['id']].identity.assert_called_once()
+    clients[accounts[3]['id']].identity.assert_not_called()
+
+
+@pytest.mark.parametrize('stage', ['auth', 'mismatch', 'missing_balance', 'prepare', 'unknown', 'provider'])
+def test_identity_failover_never_retries_non_network_or_later_stage_failures(context, stage):
+    store, service, _ = context
+    first, backup = owner(store, 'first', priority=5), owner(store, 'backup', priority=4)
+    identifier = preflight_task(store, service, 'video')
+    clients = {a['id']: fake_client(store, service, a) for a in [first, backup]}
+    client = clients[first['id']]
+    if stage == 'auth':
+        client.identity.side_effect = CanvasCLIError('CLI_AUTH_EXPIRED', 'authorization expired')
+    elif stage == 'mismatch':
+        client.identity.side_effect = None
+        client.identity.return_value = {'user_id': 'other-user', 'available_balance': 100}
+    elif stage == 'missing_balance':
+        client.identity.side_effect = None
+        client.identity.return_value = {'user_id': first['login_user_id'], 'available_balance': None}
+    elif stage == 'prepare':
+        client.prepare.side_effect = CanvasCLIError('CLI_COMMAND_TIMEOUT', 'upload timeout')
+    elif stage == 'unknown':
+        client.submit.side_effect = CanvasCLIError('CLI_COMMAND_TIMEOUT', 'lost paid receipt', outcome_unknown=True)
+    else:
+        client.poll.return_value = {'status': 'failed', 'error_code': '20114', 'error_message': 'provider failed'}
+    with patch.object(service, 'canvas_client', side_effect=lambda a: clients[a['id']]):
+        service._run(identifier)
+    result = store.task(identifier)
+    assert result['account_id'] == first['id']
+    assert not result['upstream_context'].get('preflight_failures')
+    clients[backup['id']].identity.assert_not_called()
+    clients[backup['id']].submit.assert_not_called()
+
+
+@pytest.mark.parametrize('binding', ['submit_id', 'resource_ids', 'resources', 'submission_phase', 'run_id', 'thread_id'])
+def test_identity_timeout_does_not_reselect_any_existing_active_operation(context, binding):
+    store, service, _ = context
+    account = owner(store)
+    task(store)
+    values = {'account_id': account['id'], 'status': 'preparing', 'upstream_context': {}}
+    if binding in {'run_id', 'thread_id'}:
+        values[binding] = 'original-accepted-id'
+    else:
+        values['upstream_context'][binding] = 'original-accepted-id'
+    store.update_task('task', values)
+    client = fake_client(store, service, account)
+    client.identity.side_effect = CanvasCLIError('CLI_COMMAND_TIMEOUT', 'read timeout')
+    with patch.object(service, 'canvas_client', return_value=client):
+        assert service._execute_canvas('task', account, time.monotonic() + 30) is True
+    result = store.task('task')
+    assert (result[binding] if binding in {'run_id', 'thread_id'} else result['upstream_context'][binding]) == 'original-accepted-id'
+    assert not result['upstream_context'].get('preflight_failures')
+    assert not result['attempted_account_ids']
+
+
+@pytest.mark.parametrize('kind', ['video', 'image'])
+def test_manual_stop_during_identity_timeout_blocks_safe_account_reselection(context, kind):
+    store, service, _ = context
+    accounts = [owner(store, 'first', priority=5), owner(store, 'backup', priority=4)]
+    identifier = preflight_task(store, service, kind)
+    clients = {a['id']: fake_client(store, service, a, kind=kind) for a in accounts}
+    def stopped(**kwargs):
+        store.update_task(identifier, {'status': 'failed', 'error_code': 'OPERATOR_CONTENT_RESTRICTED',
+            'error_message': 'operator stopped task', 'upstream_context': {'manual_termination': {'reason': 'operator'}}})
+        raise CanvasCLIError('CLI_COMMAND_TIMEOUT', 'late identity timeout')
+    clients[accounts[0]['id']].identity.side_effect = stopped
+    with patch.object(service, 'canvas_client', side_effect=lambda a: clients[a['id']]):
+        service._run(identifier)
+    result = store.task(identifier)
+    assert result['error_code'] == 'OPERATOR_CONTENT_RESTRICTED' and result['error_message'] == 'operator stopped task'
+    assert not result['upstream_context'].get('preflight_failures')
+    clients[accounts[1]['id']].identity.assert_not_called()
+
+
+@pytest.mark.parametrize('kind', ['video', 'image'])
+def test_identity_failure_without_healthy_backup_keeps_real_error(context, kind):
+    store, service, _ = context
+    account = owner(store)
+    identifier = preflight_task(store, service, kind)
+    client = fake_client(store, service, account, kind=kind)
+    client.identity.side_effect = CanvasCLIError('CLI_COMMAND_TIMEOUT', 'original identity timeout')
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._run(identifier)
+    result = store.task(identifier)
+    assert result['status'] == 'failed' and result['error_code'] == 'CLI_COMMAND_TIMEOUT'
+    assert result['error_message'] == 'original identity timeout'
+    assert result['upstream_context']['preflight_failures'][0]['account_id'] == account['id']
+    client.prepare.assert_not_called()
+    client.submit.assert_not_called()
+
+
+@pytest.mark.parametrize('kind', ['video', 'image'])
+def test_identity_reselection_keeps_original_deadline_in_memory_and_durable_context(context, kind):
+    store, service, _ = context
+    accounts = [owner(store, 'first', priority=5), owner(store, 'backup', priority=4)]
+    identifier = preflight_task(store, service, kind)
+    store.update_settings({'task_timeout_seconds': 5})
+    clients = {a['id']: fake_client(store, service, a, kind=kind) for a in accounts}
+    initial_mono, initial_wall = time.monotonic(), time.time()
+    clock = {'elapsed': 0.0}
+    fake_time = SimpleNamespace(monotonic=lambda: initial_mono + clock['elapsed'],
+        time=lambda: initial_wall + clock['elapsed'], sleep=lambda delay: clock.update(elapsed=clock['elapsed'] + delay))
+    deadlines = []
+    def first_identity(*, deadline):
+        deadlines.append(deadline)
+        clock['elapsed'] += 4
+        raise CanvasCLIError('CLI_COMMAND_TIMEOUT', 'first identity timed out')
+    clients[accounts[0]['id']].identity.side_effect = first_identity
+    second = clients[accounts[1]['id']]
+    original_identity = second.identity.side_effect
+    def second_identity(*, deadline):
+        deadlines.append(deadline)
+        return original_identity()
+    second.identity.side_effect = second_identity
+    def paid(context, ceiling, *, persist, deadline):
+        deadlines.append(deadline)
+        assert deadline - fake_time.monotonic() == pytest.approx(1)
+        persist({'submission_phase': 'run_dispatching'})
+        return {**context, 'phase': 'accepted', 'resource_ids': ['original-resource']}
+    second.submit.side_effect = paid
+    with patch.object(service, 'canvas_client', side_effect=lambda a: clients[a['id']]), \
+            patch('app.service.time', fake_time), patch('app.canvas_service.time', fake_time):
+        service._run(identifier)
+    result = store.task(identifier)
+    assert result['status'] == 'succeeded', result['error_message']
+    assert deadlines and all(value == pytest.approx(initial_mono + 5) for value in deadlines)
+    assert result['upstream_context']['preflight_failures'][0]['task_deadline'] == pytest.approx(initial_wall + 5)
+    assert result['upstream_context']['observation_deadline'] == pytest.approx(initial_wall + 5)
+
+
+def test_restart_does_not_renew_budget_after_safe_identity_reselection(context):
+    store, service, _ = context
+    account = owner(store)
+    task(store)
+    prior = {'account_id': 99, 'code': 'CLI_COMMAND_TIMEOUT', 'message': 'first timeout',
+             'task_deadline': time.time() - 1, 'dispatch_started': False, 'phase': 'identity'}
+    store.update_task('task', {'account_id': account['id'], 'status': 'preparing',
+        'upstream_context': {'preflight_failures': [prior]}})
+    client = fake_client(store, service, account)
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._execute_canvas('task', account, time.monotonic() + 1800)
+    assert store.task('task')['error_code'] == 'CLI_PREPARATION_TIMEOUT'
+    assert store.task('task')['upstream_context']['preflight_failures'] == [prior]
+    client.identity.assert_not_called()
+    client.prepare.assert_not_called()
+    client.submit.assert_not_called()
+
+
+@pytest.mark.parametrize('kind', ['video', 'image'])
+def test_queued_identity_retry_without_eligible_accounts_retains_last_error_on_restart(context, kind):
+    store, service, _ = context
+    first = owner(store)
+    identifier = preflight_task(store, service, kind)
+    prior = {'account_id': first['id'], 'code': 'CLI_COMMAND_TIMEOUT', 'phase': 'identity',
+             'message': 'prior identity timeout', 'task_deadline': time.time() + 30}
+    store.update_task(identifier, {'attempted_account_ids': [first['id']], 'error_code': 'CLI_COMMAND_TIMEOUT',
+        'error_message': 'prior identity timeout', 'upstream_context': {'preflight_failures': [prior]}})
+    with patch.object(service, 'canvas_client') as client:
+        service._run(identifier)
+    result = store.task(identifier)
+    assert result['status'] == 'failed' and result['error_code'] == 'CLI_COMMAND_TIMEOUT'
+    assert result['error_message'] == 'prior identity timeout'
+    client.assert_not_called()

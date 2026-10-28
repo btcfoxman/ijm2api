@@ -24,3 +24,20 @@ def test_busy_reconciliation_and_stale_retry_are_conflicts(context):
     main, api, headers, _ = context
     main.service.reconcile_canvas_task = Mock(side_effect=RuntimeError('original operation is being observed'))
     assert api.post('/api/tasks/task/reconcile', headers=headers).status_code == 409
+
+
+def test_admin_preflight_history_is_visible_with_credentials_redacted(context):
+    main, api, headers, _ = context
+    main.service.reconcile_canvas_task = Mock(return_value={
+        'id': 'task', 'status': 'submitted', 'execution_backend': 'canvas_cli',
+        'upstream_context': {'private_identity': 'hidden-account-identity', 'preflight_failures': [{
+            'account_id': 1, 'code': 'CLI_COMMAND_TIMEOUT', 'phase': 'identity',
+            'message': 'network read failed via http://example-user:example-pass@proxy.invalid:20001',
+        }]}})
+    response = api.post('/api/tasks/task/reconcile', headers=headers)
+    assert response.status_code == 200
+    failure = response.json()['execution_diagnostics']['preflight_failures'][0]
+    assert failure['account_id'] == 1 and failure['code'] == 'CLI_COMMAND_TIMEOUT'
+    assert 'example-user' not in response.text and 'example-pass' not in response.text
+    assert 'hidden-account-identity' not in response.text
+    assert 'upstream_context' not in response.json()

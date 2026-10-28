@@ -484,21 +484,35 @@ class Service(CanvasServiceMixin):
 
     def _handle_credit_rejection(self, task_id: str, account_id: int, reason: str) -> bool:
         """One admission-rejection policy for browser, Canvas, image and video."""
+        return self._handle_admission_rejection(task_id, account_id, 'INSUFFICIENT_CREDITS', reason)
+
+    def _handle_admission_rejection(self, task_id: str, account_id: int, code: str,
+                                    reason: str, *, preflight_error: dict | None = None) -> bool:
+        """A proven rejection before paid work shares one two-account budget."""
         task = self.store.task(task_id) or {}
         attempted = list(task.get('attempted_account_ids') or [])
         if account_id not in attempted:
             attempted.append(account_id)
-        task = self.store.update_task(task_id, {'attempted_account_ids': attempted}, preserve_terminal=True)
+        context = task.get('upstream_context') or {}
+        changes = {'attempted_account_ids': attempted}
+        if preflight_error:
+            failures = list(context.get('preflight_failures') or [])
+            failures.append({'account_id': account_id, **preflight_error})
+            changes['upstream_context'] = {**context, 'preflight_failures': failures}
+        task = self.store.update_task(task_id, changes, preserve_terminal=True)
         if (not task or (task.get('upstream_context') or {}).get('manual_termination')
                 or task.get('status') in TERMINAL and task.get('error_code') != 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'):
             return False
         self.store.update_account(account_id, {'last_error': reason[:300]})
         if len(attempted) >= MAX_CREDIT_ACCOUNT_ATTEMPTS:
-            self._fail(task_id, 'INSUFFICIENT_CREDITS', reason)
+            self._fail(task_id, code, reason)
             return False
+        audit = {key: value for key, value in (task.get('upstream_context') or {}).items()
+                 if task.get('execution_backend') == 'canvas_cli'
+                 and key in {'previous_submissions', 'recovery_resolution', 'preflight_failures'}}
         task = self.store.update_task(task_id, {'status': 'queued', 'progress': 0,
-            'account_id': None, 'balance_before': None, 'upstream_context': {},
-            'error_code': 'INSUFFICIENT_CREDITS', 'error_message': reason}, preserve_terminal=True)
+            'account_id': None, 'balance_before': None, 'upstream_context': audit,
+            'error_code': code, 'error_message': reason}, preserve_terminal=True)
         return task.get('status') == 'queued'
 
     def _submission_funded(self, account: dict, task_id: str, estimated_cost: float, balance: Any) -> bool:
@@ -599,12 +613,14 @@ class Service(CanvasServiceMixin):
         attempted = list(task["attempted_account_ids"])
         funding_excluded: set[int] = set()
         credit_reason = task.get("error_message") or "Dreamina account has insufficient credits"
+        admission_code = (task.get('error_code') if (task.get('upstream_context') or {}).get('preflight_failures')
+                          else None) or 'INSUFFICIENT_CREDITS'
         try:
             task = self._update_cost_estimate(self.store.task(task_id) or task)
             estimated_cost = float(task.get('estimated_cost') or 0)
             while not self._stop.is_set() and time.monotonic() < deadline:
                 if len(attempted) >= MAX_CREDIT_ACCOUNT_ATTEMPTS:
-                    self._fail(task_id, "INSUFFICIENT_CREDITS", credit_reason)
+                    self._fail(task_id, admission_code, credit_reason)
                     return
                 account = None
                 while not self._stop.is_set() and time.monotonic() < deadline:
@@ -617,7 +633,7 @@ class Service(CanvasServiceMixin):
                         break
                     self._stop.wait(1)
                 if not account:
-                    code = "INSUFFICIENT_CREDITS" if attempted else "ACCOUNT_POOL_UNAVAILABLE"
+                    code = admission_code if attempted else "ACCOUNT_POOL_UNAVAILABLE"
                     message = credit_reason if attempted else "no available Dreamina account before timeout"
                     self._fail(task_id, code, message)
                     return
@@ -633,11 +649,13 @@ class Service(CanvasServiceMixin):
                         result = self._execute_canvas(task_id, account, deadline)
                         if result is True:
                             return
-                        if result == 'retry':
+                        if result in {'retry', 'retry_preflight'}:
                             retry = self.store.task(task_id) or {}
                             attempted = list(retry.get('attempted_account_ids') or [])
                             credit_reason = retry.get('error_message') or credit_reason
-                            deadline = time.monotonic() + int(self.settings()['task_timeout_seconds'])
+                            admission_code = retry.get('error_code') or 'INSUFFICIENT_CREDITS'
+                            if result == 'retry':
+                                deadline = time.monotonic() + int(self.settings()['task_timeout_seconds'])
                         elif result != 'reselect':
                             funding_excluded.add(account_id)
                         estimated_cost = float((self.store.task(task_id) or {}).get('estimated_cost') or 0)
@@ -712,7 +730,7 @@ class Service(CanvasServiceMixin):
                     self.browser_runtime.release(account, owned)
                     self._release_account(account_id, task_id)
             if not self._stop.is_set():
-                self._fail(task_id, "INSUFFICIENT_CREDITS" if attempted else "ACCOUNT_POOL_UNAVAILABLE",
+                self._fail(task_id, admission_code if attempted else "ACCOUNT_POOL_UNAVAILABLE",
                            credit_reason if attempted else "no available Dreamina account before timeout")
         except Exception as exc:
             self._fail(task_id, 'INTERNAL_ERROR', f'{type(exc).__name__}: task scheduling could not complete')
@@ -740,6 +758,8 @@ class Service(CanvasServiceMixin):
         attempted: list[int] = list(task["attempted_account_ids"])
         funding_excluded: set[int] = set()
         estimated_cost = 0.0
+        preflight_failure = ((task.get('error_code'), task.get('error_message'))
+            if (task.get('upstream_context') or {}).get('preflight_failures') and task.get('error_code') else None)
         try:
             while not self._stop.is_set() and time.monotonic() < deadline:
                 excluded = set(attempted) | funding_excluded
@@ -747,8 +767,8 @@ class Service(CanvasServiceMixin):
                                                 prefer_balance=bool(attempted), task_id=task_id)
                 if not account:
                     if not self._has_eligible_account(estimated_cost, excluded, task_id):
-                        self._fail(task_id, "ACCOUNT_POOL_UNAVAILABLE",
-                                   "no Dreamina image account has available credits")
+                        self._fail(task_id, *(preflight_failure or ("ACCOUNT_POOL_UNAVAILABLE",
+                                   "no Dreamina image account has available credits")))
                         return
                     time.sleep(1)
                     continue
@@ -763,8 +783,11 @@ class Service(CanvasServiceMixin):
                         result = self._execute_canvas(task_id, account, deadline)
                         if result is True:
                             return
-                        if result == 'retry':
-                            attempted = list((self.store.task(task_id) or {}).get('attempted_account_ids') or [])
+                        if result in {'retry', 'retry_preflight'}:
+                            retry = self.store.task(task_id) or {}
+                            attempted = list(retry.get('attempted_account_ids') or [])
+                            preflight_failure = ((retry.get('error_code'), retry.get('error_message'))
+                                if result == 'retry_preflight' else None)
                         elif result != 'reselect':
                             funding_excluded.add(account_id)
                         estimated_cost = float((self.store.task(task_id) or {}).get('estimated_cost') or 0)
@@ -815,7 +838,7 @@ class Service(CanvasServiceMixin):
                     self.browser_runtime.release(account, owned)
                     self._release_account(account_id, task_id)
             if not self._stop.is_set():
-                self._fail(task_id, "UPSTREAM_TIMEOUT", "Dreamina image task timed out")
+                self._fail(task_id, *(preflight_failure or ("UPSTREAM_TIMEOUT", "Dreamina image task timed out")))
         finally:
             self._worker_slots.release()
 

@@ -205,6 +205,26 @@ class CanvasServiceMixin:
                 assets[kind].append({"path": str(path), "mime": mime, **meta})
         return assets
 
+    @staticmethod
+    def _canvas_identity_network_retry(task: dict, exc: CanvasCLIError, deadline: float) -> bool:
+        """Only a read-only identity failure can safely change this account."""
+        if time.monotonic() >= deadline or exc.outcome_unknown or task.get('run_id') or task.get('thread_id'):
+            return False
+        if (task.get('normalized') or {}).get('_execution'):
+            return False
+        context = task.get('upstream_context') or {}
+        if any(key not in {'previous_submissions', 'recovery_resolution', 'preflight_failures'} for key in context):
+            return False
+        code = str(exc.code).upper()
+        if any(word in code for word in ('AUTH', 'IDENTITY', 'CREDENTIAL', 'MISMATCH', 'EXPIRED', 'UNKNOWN')):
+            return False
+        error = exc.details.get('error') or {}
+        if not isinstance(error, dict) or code.isdigit() or str(error.get('serviceCode') or '').isdigit():
+            return False
+        return code == 'CLI_COMMAND_TIMEOUT' or (error.get('retryable') is True
+            and str(error.get('reason') or '').lower() in {
+                'network_timeout', 'dns_resolution_failed', 'network_error', 'transport_error'})
+
     def _execute_canvas(self, task_id: str, account: dict, deadline: float) -> bool | str:
         """Return False only for a verified pre-run funding rejection."""
         task = self.store.task(task_id)
@@ -213,13 +233,18 @@ class CanvasServiceMixin:
         account_id = int(account["id"])
         client = self.canvas_client(account)
         submission_started = False
+        identity_pending = True
         context = {key: value for key, value in (task.get('upstream_context') or {}).items()
-                   if key in {'previous_submissions', 'recovery_resolution'}}
+                   if key in {'previous_submissions', 'recovery_resolution', 'preflight_failures'}}
         resolution = context.get('recovery_resolution') or {}
         attempt_started = number(resolution.get('attempt_started_at')) if isinstance(resolution, dict) else None
         if attempt_started is not None:
             deadline = min(deadline, time.monotonic() + max(0,
                 attempt_started + int(self.settings()['task_timeout_seconds']) - time.time()))
+        preflight_deadlines = [value for entry in context.get('preflight_failures') or []
+            if isinstance(entry, dict) and (value := number(entry.get('task_deadline'))) is not None]
+        if preflight_deadlines:
+            deadline = min(deadline, time.monotonic() + max(0, min(preflight_deadlines) - time.time()))
 
         def persist(value):
             nonlocal context
@@ -239,6 +264,7 @@ class CanvasServiceMixin:
                 return True
             self._update_canvas_task(task_id, {"execution_backend": "canvas_cli"})
             state = client.identity(deadline=deadline)
+            identity_pending = False
             identity = str(state.get("user_id") or "")
             if not identity or identity != str(account.get("login_user_id") or account.get("cli_user_id") or ""):
                 self.store.update_account(account_id, {"cli_auth_status": "error",
@@ -281,14 +307,14 @@ class CanvasServiceMixin:
                     self._update_canvas_task(task_id, {"status": "queued", "account_id": None,
                         "progress": 0, "balance_before": None, "upstream_context": {
                             key: value for key, value in context.items()
-                            if key in {'previous_submissions', 'recovery_resolution'}},
+                            if key in {'previous_submissions', 'recovery_resolution', 'preflight_failures'}},
                         "execution_backend": "canvas_cli", "error_code": "INSUFFICIENT_CREDITS",
                         "error_message": "Canvas quote exceeds available unreserved credits"})
                     return False
                 if not (task['normalized'].get('_cost_evidence') or {}).get('canvas_budget_checked'):
                     pending = self._pending_credits(self.store.scheduling_rows(), task_id)
                     current_available, _ = self._available_credits({**account, 'balance': before}, pending)
-                    candidates = self._funded_accounts(quote, set(), pending, 'canvas_cli')
+                    candidates = self._funded_accounts(quote, set(task.get('attempted_account_ids') or []), pending, 'canvas_cli')
                     candidates = [a for a in candidates if int(a['id']) != account_id
                         and int(a['priority']) == int(account['priority'])
                         and a.get('_available_credits') is not None
@@ -300,7 +326,7 @@ class CanvasServiceMixin:
                         self._update_canvas_task(task_id, {'status': 'queued', 'account_id': None,
                             'progress': 0, 'balance_before': None, 'upstream_context': {
                                 key: value for key, value in context.items()
-                                if key in {'previous_submissions', 'recovery_resolution'}},
+                                if key in {'previous_submissions', 'recovery_resolution', 'preflight_failures'}},
                             'execution_backend': 'canvas_cli'})
                         return 'reselect'
                 attempts = list(task.get("attempted_account_ids") or [])
@@ -308,9 +334,12 @@ class CanvasServiceMixin:
                     attempts.append(account_id)
                 # The durable record is committed before any paid run request.
                 began_at = time.time() if attempt_started is None else attempt_started
+                observation_deadline = began_at + int(self.settings()['task_timeout_seconds'])
+                if preflight_deadlines:
+                    observation_deadline = min(observation_deadline, min(preflight_deadlines))
                 persist({"submission_phase": "confirming", "expected_user_id": identity,
                     'observation_started_at': began_at,
-                    'observation_deadline': began_at + int(self.settings()['task_timeout_seconds'])})
+                    'observation_deadline': observation_deadline})
                 self._update_canvas_task(task_id, {"attempted_account_ids": attempts, "progress": 30})
             submission_started = True
             submitted = client.submit(context, int(math.ceil(quote)), persist=persist, deadline=deadline)
@@ -319,8 +348,16 @@ class CanvasServiceMixin:
             self._poll_canvas(task_id, client, deadline)
             return True
         except CanvasCLIError as exc:
-            if self._canvas_task_terminated(self.store.task(task_id)):
+            current_task = self.store.task(task_id)
+            if self._canvas_task_terminated(current_task):
                 return True
+            if identity_pending and self._canvas_identity_network_retry(current_task, exc, deadline):
+                diagnostic = self._canvas_diagnostic(exc, 'identity')
+                diagnostic.update(dispatch_started=False,
+                    task_deadline=time.time() + max(0, deadline - time.monotonic()))
+                retry = self._handle_admission_rejection(task_id, account_id, exc.code,
+                    str(diagnostic.get('message') or exc), preflight_error=diagnostic)
+                return 'retry_preflight' if retry else True
             if submission_started:
                 current = (self.store.task(task_id) or {}).get('upstream_context') or {}
                 if not current.get('submit_error'):

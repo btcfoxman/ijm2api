@@ -59,6 +59,13 @@ and query retries reuse original identities; a lost submission receipt only
 queries its original operation and never starts a second paid generation.
 Existing task records retain the browser backend; every new bound task stores
 its backend and recovery identifiers independently of subsequent settings.
+An explicit transient network failure during the initial read-only CLI identity
+check may safely select the next account with the same bound execution mode,
+before preparation or any submission/resource identifiers exist. This shares
+the existing two-account admission budget and priority/credit-fit ordering,
+retains the first error for audit, and never renews the original task deadline.
+Failures after preparation starts or an unknown paid outcome do not use this
+identity-only reselection path and never switch automatically to a browser.
 
 Lost generation receipts retain the original account and submission UUID.
 Three explicit `operation_submission_absent` responses, or expiry of the fixed
