@@ -530,7 +530,8 @@ class Store:
             rows = db.execute("SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
         return [self._task(row) for row in rows]
 
-    def update_task(self, task_id: str, values: dict[str, Any]) -> dict[str, Any]:
+    def update_task(self, task_id: str, values: dict[str, Any], *,
+                    preserve_terminal: bool = False) -> dict[str, Any]:
         data = {key: value for key, value in values.items() if key in {"account_id", "status", "progress",
             "thread_id", "run_id", "error_code", "error_message", "estimated_cost", "actual_cost",
             "balance_before", "balance_after", "completed_at", "execution_backend"}}
@@ -554,6 +555,17 @@ class Store:
             data["normalized_json"] = _json(normalized)
         data["updated_at"] = time.time()
         with self._lock, self._connect() as db:
+            # An explicit user stop always wins over stale background work.
+            # Read only control fields until a full returned task is required.
+            db.execute('BEGIN IMMEDIATE')
+            current = db.execute('SELECT status,error_code,upstream_context_json FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if current is None:
+                return {}
+            context = json.loads(current['upstream_context_json'])
+            if (context.get('manual_termination') or preserve_terminal
+                    and current['status'] in {'succeeded', 'failed', 'expired', 'cancelled'}
+                    and current['error_code'] != 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'):
+                return self._task(db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
             db.execute("UPDATE tasks SET " + ",".join(f"{key}=?" for key in data) + " WHERE id=?",
                        (*data.values(), task_id))
         return self.task(task_id) or {}

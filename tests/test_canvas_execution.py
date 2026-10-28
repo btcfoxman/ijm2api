@@ -143,6 +143,7 @@ def test_deadline_reached_while_uploading_and_quoting_never_runs_paid_generation
     original_prepare = client.prepare.side_effect
     clock = Mock()
     clock.monotonic.return_value = 100
+    clock.time.return_value = time.time()
     def prepare(*args, **kwargs):
         value = original_prepare(*args, **kwargs)
         clock.monotonic.return_value = 102
@@ -783,6 +784,120 @@ def test_pre_run_account_change_keeps_acknowledged_history_and_attempt_deadline(
     assert result['upstream_context']['observation_deadline'] == pytest.approx(resolution['attempt_started_at'] + 5)
     clients[first['id']].submit.assert_not_called()
     clients[second['id']].submit.assert_called_once()
+
+
+def manually_stop(store, identifier='task'):
+    current = store.task(identifier)
+    return store.update_task(identifier, {'status': 'failed', 'progress': 100,
+        'error_code': 'OPERATOR_CONTENT_RESTRICTED', 'error_message': 'operator stopped this task',
+        'completed_at': time.time(), 'upstream_context': {**current['upstream_context'],
+            'manual_termination': {'reason': 'content restricted', 'at': time.time()}}})
+
+
+@pytest.mark.parametrize('state', ['running', 'succeeded', 'failed', 'unknown', 'query_error'])
+def test_manual_stop_during_query_is_never_overwritten_by_late_provider_response(context, state):
+    store, service, stored = context
+    account = owner(store)
+    retained_operation(store, account, paused=False, deadline=time.time() + 60)
+    client = fake_client(store, service, account)
+    output = client.poll.return_value
+    stopped = []
+    def late_response(_context):
+        stopped.append(manually_stop(store))
+        if state == 'query_error':
+            raise CanvasCLIError('CLI_NETWORK_ERROR', 'late query failed')
+        if state == 'succeeded':
+            return output
+        return {'status': state, 'progress': 50, 'error_code': 'UPSTREAM_FAILED', 'error_message': 'late error'}
+    client.poll.side_effect = late_response
+    service._poll_canvas('task', client, time.monotonic() + 60)
+    assert store.task('task') == stopped[0]
+    stored.assert_not_called()
+    client.submit.assert_not_called()
+    assert store.active_account_count(account['id']) == 0
+
+
+def test_manual_stop_during_sleep_survives_observation_deadline_exit(context, monkeypatch):
+    store, service, _ = context
+    account = owner(store)
+    wall = {'now': time.time()}
+    deadline = wall['now'] + 5
+    retained_operation(store, account, paused=False, deadline=deadline)
+    client = Mock(account=account)
+    client.poll.return_value = {'status': 'running', 'progress': 50}
+    stopped = []
+    monkeypatch.setattr('app.canvas_service.time', SimpleNamespace(time=lambda: wall['now'], monotonic=lambda: 1))
+    def stop_while_sleeping(_seconds):
+        stopped.append(manually_stop(store))
+        wall['now'] = deadline + 1
+    service._stop.wait.side_effect = stop_while_sleeping
+    service._poll_canvas('task', client, 100)
+    assert store.task('task') == stopped[0]
+    client.poll.assert_called_once()
+    client.submit.assert_not_called()
+
+
+def test_manual_stop_between_park_read_and_atomic_update_keeps_entire_terminal_row(context, monkeypatch):
+    store, service, _ = context
+    account = owner(store)
+    retained_operation(store, account, paused=False, deadline=time.time() - 1)
+    actual_update = store.update_task
+    stopped = []
+    def race(identifier, changes, **kwargs):
+        if kwargs.get('preserve_terminal') and 'upstream_context' in changes and not stopped:
+            stopped.append('in-progress')
+            stopped[0] = manually_stop(store, identifier)
+        return actual_update(identifier, changes, **kwargs)
+    monkeypatch.setattr(store, 'update_task', race)
+    result = service._park_canvas_task('task', 'observation_deadline_reached')
+    assert result == store.task('task') == stopped[0]
+    assert result['error_code'] == 'OPERATOR_CONTENT_RESTRICTED'
+    assert 'reconciliation_pause_reason' not in result['upstream_context']
+
+
+def test_manual_stop_before_paid_boundary_persist_aborts_dispatch_with_typed_error(context):
+    store, service, _ = context
+    account = owner(store)
+    task(store)
+    client = fake_client(store, service, account)
+    paid_run = Mock()
+    stopped = []
+    errors = []
+    def confirm_then_stop(current, ceiling, *, persist, deadline):
+        stopped.append(manually_stop(store))
+        try:
+            persist({**current, 'submission_phase': 'run_dispatching'})
+        except CanvasCLIError as exc:
+            errors.append(exc.code)
+            raise
+        paid_run()
+    client.submit.side_effect = confirm_then_stop
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._run('task')
+    assert store.task('task') == stopped[0]
+    assert errors == ['CLI_TASK_TERMINATED']
+    paid_run.assert_not_called()
+    client.poll.assert_not_called()
+    assert not service._credit_reservations
+
+
+@pytest.mark.parametrize('status', ['failed', 'expired'])
+def test_unknown_terminal_record_can_still_query_its_original_operation(context, status):
+    store, service, _ = context
+    account = owner(store)
+    retained_operation(store, account, paused=False, deadline=time.time() + 60)
+    store.update_task('task', {'status': status, 'completed_at': time.time(),
+                               'error_code': 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'})
+    client = Mock(account=account)
+    client.poll.return_value = {'status': 'running', 'progress': 51}
+    with patch.object(service, 'canvas_client', return_value=client):
+        result = service.reconcile_canvas_task('task')
+    assert result['status'] == 'running' and result['error_code'] == ''
+    assert result['completed_at'] is None
+    assert result['upstream_context']['submit_id'] == 'retained-submit'
+    client.poll.assert_called_once()
+    client.prepare.assert_not_called()
+    client.submit.assert_not_called()
 
 
 def test_explicit_confirmed_upstream_failure_still_completes_as_failure(context):

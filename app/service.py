@@ -480,15 +480,18 @@ class Service(CanvasServiceMixin):
         attempted = list(task.get('attempted_account_ids') or [])
         if account_id not in attempted:
             attempted.append(account_id)
-        self.store.update_task(task_id, {'attempted_account_ids': attempted})
+        task = self.store.update_task(task_id, {'attempted_account_ids': attempted}, preserve_terminal=True)
+        if (not task or (task.get('upstream_context') or {}).get('manual_termination')
+                or task.get('status') in TERMINAL and task.get('error_code') != 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'):
+            return False
         self.store.update_account(account_id, {'last_error': reason[:300]})
         if len(attempted) >= MAX_CREDIT_ACCOUNT_ATTEMPTS:
             self._fail(task_id, 'INSUFFICIENT_CREDITS', reason)
             return False
-        self.store.update_task(task_id, {'status': 'queued', 'progress': 0,
+        task = self.store.update_task(task_id, {'status': 'queued', 'progress': 0,
             'account_id': None, 'balance_before': None, 'upstream_context': {},
-            'error_code': 'INSUFFICIENT_CREDITS', 'error_message': reason})
-        return True
+            'error_code': 'INSUFFICIENT_CREDITS', 'error_message': reason}, preserve_terminal=True)
+        return task.get('status') == 'queued'
 
     def _submission_funded(self, account: dict, task_id: str, estimated_cost: float, balance: Any) -> bool:
         with self._lock:
@@ -1006,7 +1009,7 @@ class Service(CanvasServiceMixin):
 
     def _fail(self, task_id: str, code: str, message: str) -> None:
         self.store.update_task(task_id, {"status": "failed", "progress": 100,
-            "error_code": code, "error_message": message[:600], "completed_at": time.time()})
+            "error_code": code, "error_message": message[:600], "completed_at": time.time()}, preserve_terminal=True)
 
     def image_response(self, task: dict[str, Any]) -> dict[str, Any]:
         task = self._refresh_canvas_result_urls(task)
