@@ -475,19 +475,43 @@ class CanvasClient:
         base.mkdir(parents=True, exist_ok=True, mode=0o700)
         suffix = ".mp4" if media_type == "video" else ".png"
         path = base / (resource_id + suffix)
-        if path.is_file() and path.stat().st_size:
-            return {"path": str(path), "mime": _file_mime(path, media_type),
-                    "resource_id": resource_id}
-        data = self._call(["resource", "download", resource_id, "--project-id", context["project_id"],
-                           "--output", str(path)], timeout=180, read_only=True)
-        returned = Path(str(data.get("path") or "")).resolve()
-        if returned != path.resolve() or not path.is_file() or path.stat().st_size <= 0:
-            raise CanvasCLIError("CLI_RESULT_DOWNLOAD_FAILED", "Canvas result download did not create the expected original media file")
-        expected_hash = data.get("sha256")
-        if expected_hash and hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
-            raise CanvasCLIError("CLI_RESULT_DOWNLOAD_FAILED", "Canvas result download checksum did not match")
-        return {"path": str(path), "mime": _file_mime(path, media_type),
-                "resource_id": resource_id}
+        # An old final file has no authenticated completion receipt after a
+        # process interruption. Always fetch this resource again, using a new
+        # per-attempt partial path, and publish only after validating the CLI's
+        # complete size/checksum receipt. Never reuse magic-valid partial media.
+        for attempt in range(3):
+            partial = base / (resource_id + "." + uuid.uuid4().hex + ".part")
+            try:
+                data = self._call(["resource", "download", resource_id,
+                    "--project-id", context["project_id"], "--output", str(partial)],
+                    timeout=180, read_only=False)
+                returned = Path(str(data.get("path") or "")).resolve()
+                size, expected_hash = data.get("size"), data.get("sha256")
+                if (data.get("resourceId") != resource_id or returned != partial.resolve() or not partial.is_file()
+                        or isinstance(size, bool) or not isinstance(size, int) or size <= 0
+                        or partial.stat().st_size != size
+                        or not isinstance(expected_hash, str)
+                        or re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash) is None):
+                    raise CanvasCLIError("CLI_RESULT_DOWNLOAD_FAILED", "Canvas download did not return a complete original-media receipt")
+                digest = hashlib.sha256()
+                with partial.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(block)
+                if digest.hexdigest() != expected_hash.lower():
+                    raise CanvasCLIError("CLI_RESULT_DOWNLOAD_FAILED", "Canvas result download checksum did not match")
+                mime = _file_mime(partial, media_type)
+                partial.replace(path)
+                return {"path": str(path), "mime": mime, "resource_id": resource_id}
+            except CanvasCLIError as exc:
+                error = exc.details.get("error", {})
+                transient = (exc.code in {"CLI_COMMAND_TIMEOUT", "CLI_INVALID_RESPONSE", "cli.invalid_service_response"}
+                             or bool(error.get("retryable")) and error.get("reason") in _TRANSIENT)
+                if attempt == 2 or not transient:
+                    raise
+                time.sleep(0.25 * 2 ** attempt)
+            finally:
+                partial.unlink(missing_ok=True)
+        raise AssertionError("unreachable")
 
     def _failure_details(self, context: dict[str, Any], data: dict[str, Any],
                          resources: list[dict[str, Any]], failed: list[dict[str, Any]]) -> dict[str, Any]:

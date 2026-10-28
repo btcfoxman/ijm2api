@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -99,7 +100,8 @@ class FakeRunner:
             output = Path(args[-1])
             output.write_bytes(b"\x00\x00\x00\x20ftypisom" + b"original-bytes" if self.media_type == "video"
                                else b"\xff\xd8\xff" + b"original-jpeg")
-            data = {"path": str(output), "size": output.stat().st_size}
+            data = {"resourceId": args[2], "path": str(output), "size": output.stat().st_size,
+                    "sha256": hashlib.sha256(output.read_bytes()).hexdigest()}
         else:
             raise AssertionError(args)
         return {"ok": True, "data": data}
@@ -528,3 +530,62 @@ def test_invalid_paid_run_response_is_not_replayed(tmp_path):
     assert found.value.outcome_unknown
     assert sum(args[:2] == ["node", "confirm"] for args in runner.calls) == 1
     assert sum(args[:2] == ["node", "run"] for args in runner.calls) == 1
+
+
+def test_old_magic_valid_half_video_is_not_reused(tmp_path):
+    runner, client, context = prepare(tmp_path)
+    resource_id = "11111111-1111-4111-8111-111111111111"
+    base = tmp_path / "results" / context["task_id"]
+    base.mkdir(parents=True)
+    final = base / (resource_id + ".mp4")
+    final.write_bytes(b"\x00\x00\x00\x20ftypisom" + b"truncated-old-video")
+    result = client.download_result(context, resource_id, "video")
+    assert Path(result["path"]).read_bytes().endswith(b"original-bytes")
+    assert sum(args[:2] == ["resource", "download"] for args in runner.calls) == 1
+    assert not list(base.glob("*.part"))
+
+
+def test_timed_out_partial_download_is_removed_before_same_resource_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.canvas_client.time.sleep", lambda _: None)
+    runner, client, context = prepare(tmp_path)
+    original = runner.run
+    attempted = []
+    def interrupted(account, args, timeout=None):
+        if args[:2] == ["resource", "download"]:
+            output = Path(args[-1])
+            assert not output.exists()
+            attempted.append((args[2], output))
+            if len(attempted) == 1:
+                output.write_bytes(b"\x00\x00\x00\x20ftypisom" + b"half-download")
+                raise CanvasCLIError("CLI_COMMAND_TIMEOUT", "download timed out")
+            assert not attempted[0][1].exists()
+        return original(account, args, timeout=timeout)
+    runner.run = interrupted
+    result = client.download_result(context, "11111111-1111-4111-8111-111111111111", "video")
+    assert len(attempted) == 2 and attempted[0][0] == attempted[1][0]
+    assert attempted[0][1] != attempted[1][1]
+    assert Path(result["path"]).read_bytes().endswith(b"original-bytes")
+    assert not any(path.exists() for _, path in attempted)
+
+
+@pytest.mark.parametrize("invalid", ["missing_checksum", "wrong_checksum", "wrong_size"])
+def test_download_cannot_publish_without_matching_receipt(tmp_path, invalid):
+    runner, client, context = prepare(tmp_path)
+    original = runner.run
+    def corrupt(account, args, timeout=None):
+        value = original(account, args, timeout=timeout)
+        if args[:2] == ["resource", "download"]:
+            if invalid == "missing_checksum":
+                value["data"].pop("sha256")
+            elif invalid == "wrong_checksum":
+                value["data"]["sha256"] = "0" * 64
+            else:
+                value["data"]["size"] += 1
+        return value
+    runner.run = corrupt
+    resource_id = "11111111-1111-4111-8111-111111111111"
+    with pytest.raises(CanvasCLIError):
+        client.download_result(context, resource_id, "video")
+    base = tmp_path / "results" / context["task_id"]
+    assert not (base / (resource_id + ".mp4")).exists()
+    assert not list(base.glob("*.part"))
