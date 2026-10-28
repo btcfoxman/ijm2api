@@ -459,6 +459,16 @@ def admin_task(task_id: str) -> dict[str, Any]:
     return _with_cost_observations(task)
 
 
+@app.post("/api/tasks/{task_id}/retry", dependencies=[Depends(admin_auth)], status_code=202)
+def retry_task(task_id: str) -> dict[str, Any]:
+    try:
+        return service.retry_unsubmitted_task(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="task not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.delete("/api/tasks", dependencies=[Depends(admin_auth)])
 def clear_tasks() -> dict[str, Any]:
     return {"deleted": store.clear_terminal_tasks()}

@@ -328,7 +328,7 @@ class Store:
 
     def scheduling_rows(self) -> dict[str, list[dict[str, Any]]]:
         """Return bounded raw history and every bound unresolved credit hold."""
-        columns = ("id,account_id,model,status,normalized_json,request_json,estimated_cost,actual_cost,"
+        columns = ("id,account_id,model,status,run_id,normalized_json,request_json,estimated_cost,actual_cost,"
                    "balance_before,balance_after,created_at,completed_at,updated_at")
         with self._connect() as db:
             history = db.execute(f"""SELECT {columns} FROM tasks
@@ -432,6 +432,37 @@ class Store:
         with self._connect() as db:
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return self._task(row) if row else None
+
+    def requeue_unsubmitted_task(self, task_id: str) -> dict[str, Any]:
+        """Retry only a recent pool failure which never attempted generation."""
+        now = time.time()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            try:
+                attempts = json.loads(row["attempted_account_ids_json"])
+                results = json.loads(row["result_json"])
+                upstream_results = json.loads(row["upstream_result_json"])
+                age = now - float(row["created_at"])
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise ValueError("task is not safe to retry") from exc
+            if (row["status"] != "failed" or row["error_code"] != "ACCOUNT_POOL_UNAVAILABLE"
+                    or row["run_id"] or row["thread_id"] or attempts != []
+                    or not math.isfinite(age) or not 0 <= age < 3600
+                    or row["actual_cost"] is not None or results != [] or upstream_results != []):
+                raise ValueError("task is not safe to retry")
+            changed = db.execute("""UPDATE tasks SET status='queued',progress=0,account_id=NULL,
+                error_code='',error_message='',balance_before=NULL,balance_after=NULL,
+                completed_at=NULL,updated_at=? WHERE id=? AND status='failed'
+                AND error_code='ACCOUNT_POOL_UNAVAILABLE' AND run_id='' AND thread_id=''
+                AND attempted_account_ids_json=? AND updated_at=?""",
+                (now, task_id, row["attempted_account_ids_json"], row["updated_at"]))
+            if changed.rowcount != 1:
+                raise ValueError("task changed before retry")
+            result = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return self._task(result)
 
     def tasks(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as db:

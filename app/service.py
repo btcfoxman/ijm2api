@@ -238,6 +238,24 @@ class Service:
         self._pool.submit(self._run, task_id)
         return self.public_task(task)
 
+    def retry_unsubmitted_task(self, task_id: str) -> dict[str, Any]:
+        with self._lock:
+            if self._stop.is_set():
+                raise ValueError('task scheduling is stopped')
+            settings = self.settings()
+            if self.store.active_count() >= int(settings['task_workers']) + int(settings['task_queue_capacity']):
+                raise ValueError('IJMAPI queue is full')
+            task = self.store.requeue_unsubmitted_task(task_id)
+            try:
+                self._pool.submit(self._run, task_id)
+            except RuntimeError:
+                self.store.update_task(task_id, {'status': 'failed', 'progress': 0,
+                    'error_code': 'ACCOUNT_POOL_UNAVAILABLE',
+                    'error_message': 'task dispatch unavailable before submission',
+                    'completed_at': time.time()})
+                raise ValueError('task dispatch unavailable') from None
+            return self.public_task(task)
+
     def create_image(self, request: dict[str, Any]) -> dict[str, Any]:
         model = str(request.get("model") or "").strip()
         normalized = normalize_image_request(request, resolve_image_model(model))
@@ -272,13 +290,12 @@ class Service:
         if dimensions is None:
             return legacy, metadata
         counts = tuple(len(normalized.get(kind) or []) for kind in ('images', 'videos', 'audios'))
-        exact, compatible = [], []
+        exact, compatible, covering = [], [], []
         now = time.time()
         for row in rows['history']:
             cost, before, after = (number(row.get(key)) for key in ('actual_cost', 'balance_before', 'balance_after'))
             stamp = number(row.get('completed_at')) or number(row.get('updated_at')) or 0
-            if (row.get('status') != 'succeeded' or not cost or before is None or after is None
-                    or after > before or not math.isclose(before - after, cost, abs_tol=1e-6, rel_tol=1e-6)
+            if (row.get('status') != 'succeeded' or not cost
                     or not now - HISTORY_COST_WINDOW_SECONDS <= stamp <= now + 60):
                 continue
             try:
@@ -288,8 +305,24 @@ class Service:
             if not isinstance(request, dict):
                 continue
             evidence = request.get('_cost_evidence')
-            if (not isinstance(evidence, dict) or evidence.get('balance_isolated') is not True
-                    or self._cost_dimensions(request) != dimensions):
+            if not isinstance(evidence, dict):
+                continue
+            official = evidence.get('upstream_task_credits')
+            official = official if isinstance(official, dict) else {}
+            task_scoped = (official.get('field') == 'item_list[].extra.credits_consume'
+                           and bool(row.get('run_id')) and official.get('submit_id') == row.get('run_id')
+                           and official.get('phase') == 'succeeded'
+                           and number(official.get('amount')) == cost)
+            isolated = (evidence.get('balance_isolated') is True and before is not None and after is not None
+                        and after <= before and math.isclose(before - after, cost, abs_tol=1e-6, rel_tol=1e-6))
+            if not task_scoped and not isolated:
+                continue
+            previous = self._cost_dimensions(request)
+            if previous != dimensions:
+                if (previous is not None and previous[0] == dimensions[0] and previous[2] == dimensions[2]
+                        and previous[1] >= dimensions[1] and previous[3] >= dimensions[3]
+                        and len(covering) < HISTORY_COST_SAMPLES):
+                    covering.append((cost, row['id']))
                 continue
             if len(compatible) < HISTORY_COST_SAMPLES:
                 compatible.append(cost)
@@ -300,6 +333,9 @@ class Service:
         if samples:
             return max(samples), {'source': 'recent_actual_exact' if exact else 'recent_actual_dimensions',
                                   'sample_count': len(samples), 'window_days': 7}
+        if covering:
+            return max(cost for cost, _ in covering), {'source': 'recent_actual_covering_dimensions',
+                'sample_count': len(covering), 'window_days': 7, 'sample_ids': [identifier for _, identifier in covering]}
         return legacy, metadata
 
     def _update_cost_estimate(self, task: dict) -> dict:
@@ -387,6 +423,18 @@ class Service:
             available, unknown_hold = self._available_credits({**account, 'balance': min(snapshots) if snapshots else None}, pending)
             return not unknown_hold and available is not None and available > 0 and available >= estimated_cost
 
+    def _submission_budget_status(self, account: dict, task_id: str, estimated_cost: float, balance: Any) -> tuple[bool, bool]:
+        with self._lock:
+            funded = self._submission_funded(account, task_id, estimated_cost, balance)
+            pending = self._pending_credits(self.store.scheduling_rows(), task_id)
+            return funded, any(owner == int(account['id']) for owner, _ in pending.values())
+
+    def _has_waiting_credit_account(self, estimated_cost: float, excluded: set[int], task_id: str) -> bool:
+        with self._lock:
+            pending = self._pending_credits(self.store.scheduling_rows(), task_id)
+            return any(any(owner == int(account['id']) for owner, _ in pending.values())
+                       for account in self._funded_accounts(estimated_cost, excluded, {}))
+
     def check_account(self, account_id: int, *, start_browser: bool = False) -> dict[str, Any]:
         account = self.store.account(account_id, private=True)
         if not account:
@@ -469,7 +517,8 @@ class Service:
                     account = self._reserve_account(estimated_cost, exclude_ids=excluded,
                                                     prefer_balance=bool(attempted), task_id=task_id)
                     if account or ((attempted or funding_excluded) and not self._has_eligible_account(
-                            estimated_cost, excluded, task_id)):
+                            estimated_cost, excluded, task_id) and not self._has_waiting_credit_account(
+                                estimated_cost, excluded, task_id)):
                         break
                     self._stop.wait(1)
                 if not account:
@@ -494,9 +543,11 @@ class Service:
                                        type(exc).__name__)
                     if before is not None:
                         self.store.update_account(account_id, {"balance": before, "status": "active"})
-                    if not self._submission_funded(account, task_id, estimated_cost,
-                                                   before if before is not None else account.get('balance')):
-                        funding_excluded.add(account_id)
+                    funded, temporary_hold = self._submission_budget_status(account, task_id, estimated_cost,
+                        before if before is not None else account.get('balance'))
+                    if not funded:
+                        if not temporary_hold:
+                            funding_excluded.add(account_id)
                         self.store.update_task(task_id, {'status': 'queued', 'account_id': None, 'progress': 0})
                         continue
                     self.store.update_task(task_id, {"balance_before": before, "progress": 12})
@@ -504,9 +555,11 @@ class Service:
                     task = self.store.update_task(task_id, {"cost_evidence": input_evidence(assets)})
                     task = self._update_cost_estimate(task)
                     estimated_cost = float(task.get('estimated_cost') or 0)
-                    if not self._submission_funded(account, task_id, estimated_cost,
-                                                   before if before is not None else account.get('balance')):
-                        funding_excluded.add(account_id)
+                    funded, temporary_hold = self._submission_budget_status(account, task_id, estimated_cost,
+                        before if before is not None else account.get('balance'))
+                    if not funded:
+                        if not temporary_hold:
+                            funding_excluded.add(account_id)
                         self.store.update_task(task_id, {'status': 'queued', 'account_id': None,
                                                        'progress': 0, 'balance_before': None})
                         continue
@@ -745,6 +798,21 @@ class Service:
                     raise
                 time.sleep(min(60, 2 ** errors))
                 continue
+            credit = state.get("task_credit_evidence")
+            credit = credit if isinstance(credit, dict) else {}
+            reported = number(credit.get("amount"))
+            if (reported is not None and reported >= 0
+                    and credit.get("field") == "item_list[].extra.credits_consume"
+                    and credit.get("submit_id") == task["run_id"]
+                    and credit.get("phase") == state["status"]):
+                with self._lock:
+                    task = self.store.update_task(task_id, {"estimated_cost": reported if reported > 0 or state["status"] == "succeeded" else task.get("estimated_cost", 0),
+                        "cost_evidence": {"upstream_task_credits": credit}})
+                    if task_id in self._credit_reservations:
+                        owner, _ = self._credit_reservations[task_id]
+                        self._credit_reservations[task_id] = (owner, float(task["estimated_cost"]))
+            else:
+                reported = None
             if state["status"] == "succeeded":
                 if not state["result_urls"]:
                     errors += 1
@@ -781,8 +849,9 @@ class Service:
                 self.store.update_task(task_id, {"status": "succeeded", "progress": 100,
                     "result_urls": result_urls, "result_transfer": transfer_metadata,
                     "balance_after": after,
-                    "actual_cost": max(0, float(before) - float(after))
-                        if isolated and before is not None and after is not None else None,
+                    "actual_cost": reported if reported is not None else (
+                        max(0, float(before) - float(after))
+                        if isolated and before is not None and after is not None else None),
                     "completed_at": finished_at,
                     "cost_evidence": {"balance_isolated": isolated and before is not None and after is not None}})
                 return

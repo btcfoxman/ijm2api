@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import threading
 import time
@@ -26,6 +27,39 @@ class InputAudioDurationError(DreaminaError):
 
 class SubmissionPreflightError(BrowserError):
     """Account verification failed before the generation POST was attempted."""
+
+
+def history_task_credits(record: dict[str, Any], submit_id: str, phase: str) -> dict[str, Any] | None:
+    """The result's explicit task debit is distinct from forecast durations.
+
+    Multiple result views can repeat the same task cost. Never add them, and
+    retain unknown when they disagree or do not belong to the requested task.
+    Input/original items are deliberately excluded.
+    """
+    task = record.get("task") or {}
+    if not isinstance(task, dict) or str(task.get("submit_id") or "") != submit_id:
+        return None
+    amounts = set()
+    for item in record.get("item_list") or []:
+        if not isinstance(item, dict):
+            continue
+        extra = item.get("extra")
+        if not isinstance(extra, dict) or "credits_consume" not in extra:
+            continue
+        value = extra["credits_consume"]
+        if isinstance(value, bool):
+            return None
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(amount) or amount < 0:
+            return None
+        amounts.add(amount)
+    if len(amounts) != 1:
+        return None
+    return {"amount": amounts.pop(), "field": "item_list[].extra.credits_consume",
+            "submit_id": submit_id, "phase": phase}
 
 
 _UPLOAD_LOCKS_GUARD = threading.RLock()
@@ -345,5 +379,9 @@ class DreaminaClient:
             state = "failed"
         else:
             state = "running"
-        return {"status": state, "state": status, "result_urls": urls,
-                "error_code": error_code, "error": error}
+        result = {"status": state, "state": status, "result_urls": urls,
+                  "error_code": error_code, "error": error}
+        credits = history_task_credits(record, submit_id, state)
+        if credits is not None:
+            result["task_credit_evidence"] = credits
+        return result

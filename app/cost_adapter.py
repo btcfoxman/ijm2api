@@ -168,6 +168,12 @@ def build_observations(task: dict[str, Any]) -> list[dict[str, Any]]:
         charged = number(task.get("actual_cost")) if isolated is True else None
         if charged is not None:
             source = "isolated_balance"
+        reported = mapping(evidence.get("upstream_task_credits"))
+        if (SERVICE == "ijm2api" and reported.get("field") == "item_list[].extra.credits_consume"
+                and reported.get("submit_id") == task.get("run_id")
+                and reported.get("phase") == "succeeded" and number(reported.get("amount")) is not None):
+            charged = number(reported["amount"])
+            source = "actual"
     elif SERVICE == "nim2api":
         isolated = task.get("_cost_balance_isolated", evidence.get("balance_isolated"))
         charged = first_number(evidence.get("charged"), task.get("actual_cost") if isolated is True else None)
