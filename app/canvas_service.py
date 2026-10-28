@@ -113,6 +113,19 @@ class CanvasServiceMixin:
             'error_message': message or self._canvas_pending_message(task_id,
                 'Canvas submission requires verification; original operation and credit hold retained')})
 
+    def _close_unconfirmed_canvas_task(self, task_id: str, reason: str) -> dict:
+        task = self.store.task(task_id) or {}
+        if self._canvas_task_terminated(task):
+            return task
+        context = self._canvas_context(task_id, {'reconciliation_closed': True,
+            'reconciliation_close_reason': reason, 'reconciliation_closed_at': time.time(),
+            'reconciliation_paused': False, 'financial_outcome': 'unconfirmed'},
+            remove=('reconciliation_pause_reason', 'reconciliation_paused_at'))
+        return self._update_canvas_task(task_id, {'status': 'failed', 'progress': 100,
+            'completed_at': time.time(), 'error_code': 'CLI_SUBMISSION_UNCONFIRMED',
+            'error_message': 'Canvas submission could not be confirmed within the bounded lookup window; task failed without resubmission',
+            'upstream_context': context})
+
     def _refresh_canvas_result_urls(self, task: dict) -> dict:
         if task.get('status') != 'succeeded':
             return task
@@ -338,7 +351,7 @@ class CanvasServiceMixin:
                 if not current.get('submit_error'):
                     self._canvas_context(task_id, {'submit_error': self._canvas_diagnostic(exc,
                         str(current.get('submission_phase') or 'submitting'))})
-                self._park_canvas_task(task_id, 'submission_interrupted')
+                self._close_unconfirmed_canvas_task(task_id, 'submission_interrupted')
             else:
                 self._fail_canvas_task(task_id, code, f"{type(exc).__name__}: Canvas preparation failed")
             logger.warning("Canvas task %s failed in %s (%s)", task_id,
@@ -372,8 +385,13 @@ class CanvasServiceMixin:
         transfer_errors = 0
         result_storage_pending = False
         task = self.store.task(task_id)
-        if self._canvas_task_terminated(task) or (task.get('upstream_context') or {}).get('reconciliation_paused') and not one_shot:
+        if self._canvas_task_terminated(task):
             return
+        prior = task.get('upstream_context') or {}
+        if prior.get('reconciliation_paused') and not one_shot:
+            if prior.get('reconciliation_pause_reason') in {'result_pending', 'result_transfer_failed'}:
+                return
+            self._canvas_context(task_id, {'reconciliation_paused': False})
         absolute_deadline = self._canvas_observation_deadline(task_id)
         queried = False
         while not self._stop.is_set() and (one_shot and not queried or not one_shot
@@ -402,7 +420,7 @@ class CanvasServiceMixin:
                     "error_message": self._canvas_pending_message(task_id,
                         "Canvas operation query interrupted; original submission retained")})
                 if count >= 3 or one_shot:
-                    self._park_canvas_task(task_id, 'operation_submission_absent' if count >= 3
+                    self._close_unconfirmed_canvas_task(task_id, 'operation_submission_absent' if count >= 3
                         else context.get('reconciliation_pause_reason') or 'manual_verification_unresolved')
                     return
                 self._stop.wait(min(60, 2 ** min(errors, 6)))
@@ -419,7 +437,7 @@ class CanvasServiceMixin:
                     'error_code': 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN',
                     'error_message': self._canvas_pending_message(task_id, str(diagnostic))})
                 if count >= 3 or one_shot:
-                    self._park_canvas_task(task_id, 'operation_submission_absent' if count >= 3
+                    self._close_unconfirmed_canvas_task(task_id, 'operation_submission_absent' if count >= 3
                         else context.get('reconciliation_pause_reason') or 'manual_verification_unresolved')
                     return
                 self._stop.wait(max(2, int(self.settings()['poll_interval_seconds'])))
@@ -518,12 +536,15 @@ class CanvasServiceMixin:
                 self._park_canvas_task(task_id, 'result_transfer_failed',
                     'Canvas generation completed; the result storage observation window expired; retry original result storage only')
             else:
-                self._park_canvas_task(task_id, 'observation_deadline_reached')
+                self._close_unconfirmed_canvas_task(task_id, 'observation_deadline_reached')
 
     def _resume_canvas_poll(self, task_id: str) -> None:
         task = self.store.task(task_id)
-        if (not task or not task.get("account_id")
-                or (task.get('upstream_context') or {}).get('reconciliation_paused')):
+        if self._canvas_task_terminated(task) or not task.get('account_id'):
+            return
+        context = task.get('upstream_context') or {}
+        if context.get('reconciliation_paused') and context.get('reconciliation_pause_reason') in {
+                'result_pending', 'result_transfer_failed'}:
             return
         account = self.store.account(int(task["account_id"]), private=True)
         if not account:
@@ -537,7 +558,7 @@ class CanvasServiceMixin:
                 time.monotonic() + int(self.settings()["task_timeout_seconds"]))
         except Exception as exc:
             self._canvas_context(task_id, {'last_query_error': self._canvas_diagnostic(exc, 'query')})
-            self._park_canvas_task(task_id, 'recovery_interrupted')
+            self._close_unconfirmed_canvas_task(task_id, 'recovery_interrupted')
         finally:
             self._release_account(int(account["id"]), task_id)
             self._worker_slots.release()
@@ -564,7 +585,7 @@ class CanvasServiceMixin:
             self._poll_canvas(task_id, self.canvas_client(account), time.monotonic(), one_shot=True)
         except Exception as exc:
             self._canvas_context(task_id, {'last_query_error': self._canvas_diagnostic(exc, 'query')})
-            self._park_canvas_task(task_id, 'manual_verification_interrupted')
+            self._close_unconfirmed_canvas_task(task_id, 'manual_verification_interrupted')
         finally:
             with self._lock:
                 self._active[account_id] = max(0, self._active.get(account_id, 1) - 1)

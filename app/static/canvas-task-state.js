@@ -3,7 +3,7 @@
     && task?.error_code === 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN';
   const terminal = new Set(['succeeded', 'failed', 'expired', 'cancelled']);
   const label = (task) => ({result_transfer_failed: '结果待转存', result_pending: '结果待取回'}[
-    task?.execution_diagnostics?.reconciliation_pause_reason] || '提交待核实');
+    task?.execution_diagnostics?.reconciliation_pause_reason] || '查询重试中');
   const state = {
     unknown,
     label,

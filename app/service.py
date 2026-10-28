@@ -126,7 +126,15 @@ class Service(CanvasServiceMixin):
         for task in reversed(self.store.tasks(1000)):
             if (task.get('execution_backend') == 'canvas_cli'
                     and (task.get('upstream_context') or {}).get('reconciliation_paused') is True):
-                continue
+                context = task['upstream_context']
+                if (task.get('error_code') != 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'
+                        or context.get('manual_termination') or context.get('reconciliation_closed')
+                        or context.get('reconciliation_pause_reason') in {'result_pending', 'result_transfer_failed'}):
+                    continue
+                # Migrate old unconfirmed submissions into bounded observation.
+                # Keep the original operation and deadline; never submit it again.
+                task = self.store.update_task(task['id'], {'upstream_context': {
+                    **context, 'reconciliation_paused': False}}, preserve_terminal=True)
             if task["status"] == "queued":
                 self._pool.submit(self._run, task["id"])
             elif task.get("execution_backend") == "canvas_cli" and task.get("upstream_context"):

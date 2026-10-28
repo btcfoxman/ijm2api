@@ -60,13 +60,16 @@ queries its original operation and never starts a second paid generation.
 Existing task records retain the browser backend; every new bound task stores
 its backend and recovery identifiers independently of subsequent settings.
 
-Lost generation receipts retain the original account, submission UUID and
-credit protection. Three explicit `operation_submission_absent` responses
-pause observation; missing records never authorize another paid generation.
-The fixed observation deadline survives restarts. Administrator task details
-show the first submission error, latest query error and reconciliation state.
-**核实原提交** and `POST /api/tasks/{id}/reconcile` only query that original
-operation once and can retrieve its completed original output.
+Lost generation receipts retain the original account and submission UUID.
+Three explicit `operation_submission_absent` responses, or expiry of the fixed
+observation deadline, end the task as `failed` (`CLI_SUBMISSION_UNCONFIRMED`).
+No manual verification is required, and the operation is never automatically
+resubmitted. The worker and local
+credit reservation are released; uncertain upstream spend remains recorded
+as unconfirmed, without inventing a zero charge or a refund. The original
+deadline survives restarts. Administrator task details retain the first
+submission error and latest query error. `POST /api/tasks/{id}/reconcile`
+only queries an original operation and cannot revive a closed failure.
 
 
 CLI result downloads preserve original media bytes and are published through

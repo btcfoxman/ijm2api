@@ -393,7 +393,8 @@ def test_canvas_restart_uses_retained_original_operation_without_preparing_or_su
     service.browser_runtime.acquire.assert_not_called()
 
 
-def test_three_explicit_absences_park_original_binding_and_keep_first_submit_diagnostic(context):
+@pytest.mark.parametrize('shape', ['exception', 'status'])
+def test_three_explicit_absences_fail_without_resubmission_and_keep_financial_audit(context, shape):
     store, service, _ = context
     account = owner(store)
     task(store)
@@ -401,24 +402,28 @@ def test_three_explicit_absences_park_original_binding_and_keep_first_submit_dia
     client.submit.side_effect = CanvasCLIError('cli.invalid_service_response', 'original receipt lost; token=private',
         details={'error': {'class': 'transport_error', 'traceId': 'original-trace', 'accessToken': 'private'}},
         outcome_unknown=True)
-    client.poll.side_effect = [CanvasCLIError('cli.operation_submission_absent', f'lookup {index} absent') for index in range(3)]
+    client.poll.side_effect = ([CanvasCLIError('cli.operation_submission_absent', f'lookup {index} absent') for index in range(3)]
+        if shape == 'exception' else [{'status': 'unknown', 'error_code': 'cli.operation_submission_absent',
+                                     'error_message': f'lookup {index} absent'} for index in range(3)])
     with patch.object(service, 'canvas_client', return_value=client):
         service._run('task')
     result = store.task('task')
     context = result['upstream_context']
-    assert result['status'] == 'submitted' and result['error_code'] == 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'
-    assert context['reconciliation_paused'] is True
-    assert context['reconciliation_pause_reason'] == 'operation_submission_absent'
+    assert result['status'] == 'failed' and result['error_code'] == 'CLI_SUBMISSION_UNCONFIRMED'
+    assert context['reconciliation_paused'] is False and context['reconciliation_closed'] is True
+    assert context['reconciliation_close_reason'] == 'operation_submission_absent'
+    assert context['financial_outcome'] == 'unconfirmed' and result['completed_at'] is not None
     assert context['consecutive_submission_absent'] == 3
     assert context['submit_error']['code'] == 'cli.invalid_service_response'
     assert context['submit_error']['traceId'] == 'original-trace'
-    assert 'original receipt lost' in result['error_message']
+    assert 'original receipt lost' in context['submit_error']['message']
+    assert 'requires verification' not in result['error_message']
     assert 'private' not in str(context)
     assert context['last_query_error']['code'] == 'cli.operation_submission_absent'
     assert result['account_id'] == account['id'] and result['estimated_cost'] == 10
     assert result['actual_cost'] is None
-    assert store.active_account_count(account['id']) == 1
-    assert store.scheduling_rows()['inflight'][0]['id'] == 'task'
+    assert store.active_account_count(account['id']) == 0
+    assert store.scheduling_rows()['inflight'] == []
     assert service._active[account['id']] == 0 and not service._credit_reservations
     client.submit.assert_called_once()
     assert client.poll.call_count == 3
@@ -505,8 +510,9 @@ def test_legacy_restart_uses_created_deadline_and_never_grants_a_new_window(cont
     with patch.object(service, 'canvas_client', return_value=client):
         service._resume_canvas_poll('task')
     result = store.task('task')
-    assert result['status'] == 'submitted'
-    assert result['upstream_context']['reconciliation_paused'] is True
+    assert result['status'] == 'failed' and result['error_code'] == 'CLI_SUBMISSION_UNCONFIRMED'
+    assert result['upstream_context']['reconciliation_closed'] is True
+    assert result['upstream_context']['reconciliation_paused'] is False
     assert result['upstream_context']['observation_deadline'] == pytest.approx(created + 5)
     first = result['upstream_context']['observation_deadline']
     store.update_settings({'task_timeout_seconds': 3000})
@@ -517,7 +523,7 @@ def test_legacy_restart_uses_created_deadline_and_never_grants_a_new_window(cont
     client.submit.assert_not_called()
 
 
-def test_manual_reconciliation_queries_once_without_extending_deadline_or_releasing_hold(context):
+def test_legacy_one_shot_unmatched_operation_fails_without_extending_deadline_or_resubmission(context):
     store, service, _ = context
     account = owner(store)
     deadline = time.time() - 1200
@@ -526,11 +532,12 @@ def test_manual_reconciliation_queries_once_without_extending_deadline_or_releas
     client.poll.side_effect = CanvasCLIError('cli.operation_submission_absent', 'still absent')
     with patch.object(service, 'canvas_client', return_value=client):
         result = service.reconcile_canvas_task('task')
-    assert result['status'] == 'submitted' and result['upstream_context']['reconciliation_paused'] is True
+    assert result['status'] == 'failed' and result['error_code'] == 'CLI_SUBMISSION_UNCONFIRMED'
+    assert result['upstream_context']['reconciliation_closed'] is True
     assert result['upstream_context']['observation_deadline'] == deadline
     assert result['upstream_context']['submit_id'] == 'retained-submit'
     assert result['upstream_context']['submit_error']['message'] == 'original diagnostic'
-    assert store.active_account_count(account['id']) == 1
+    assert store.active_account_count(account['id']) == 0
     assert service._worker_slots._value == 50 and service._active[account['id']] == 0
     client.poll.assert_called_once()
     client.prepare.assert_not_called()
@@ -652,7 +659,7 @@ def test_acknowledged_new_attempt_already_out_of_time_never_prepares_or_runs(con
 
 
 @pytest.mark.parametrize('state', ['running', 'unknown'])
-def test_observation_timeout_parks_pending_result_without_failure_or_credit_release(context, monkeypatch, state):
+def test_bounded_observation_timeout_fails_without_resubmission_and_retains_unknown_finance(context, monkeypatch, state):
     store, service, _ = context
     account = owner(store)
     wall = {'now': time.time()}
@@ -661,22 +668,23 @@ def test_observation_timeout_parks_pending_result_without_failure_or_credit_rele
     original = store.task('task')['upstream_context']
     client = Mock(account=account)
     client.poll.return_value = {'status': state, 'result_urls': [], 'result_paths': [], 'progress': 55}
-    # Advance only this module's observation clock after one query. A deadline
-    # does not become a provider failure, even after a positive running match.
+    # The task ends after the bounded window; its financial uncertainty stays
+    # explicit instead of claiming no charge or starting another generation.
     monkeypatch.setattr('app.canvas_service.time', SimpleNamespace(
         time=lambda: wall['now'], monotonic=lambda: 1))
     service._stop.wait.side_effect = lambda _: wall.update(now=deadline + 1)
     service._poll_canvas('task', client, 100)
     result = store.task('task')
     saved = result['upstream_context']
-    assert result['status'] == 'submitted' and result['error_code'] == 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'
-    assert result['completed_at'] is None and result['actual_cost'] is None
-    assert saved['reconciliation_paused'] is True
-    assert saved['reconciliation_pause_reason'] == 'observation_deadline_reached'
+    assert result['status'] == 'failed' and result['error_code'] == 'CLI_SUBMISSION_UNCONFIRMED'
+    assert result['completed_at'] is not None and result['actual_cost'] is None
+    assert saved['reconciliation_closed'] is True and saved['reconciliation_paused'] is False
+    assert saved['reconciliation_close_reason'] == 'observation_deadline_reached'
+    assert saved['financial_outcome'] == 'unconfirmed'
     assert saved['observation_deadline'] == deadline
     assert saved['submit_id'] == original['submit_id']
-    assert store.active_account_count(account['id']) == 1
-    assert store.scheduling_rows()['inflight'][0]['id'] == 'task'
+    assert store.active_account_count(account['id']) == 0
+    assert store.scheduling_rows()['inflight'] == []
     client.poll.assert_called_once()
     client.submit.assert_not_called()
     client.prepare.assert_not_called()
@@ -837,7 +845,7 @@ def test_manual_stop_during_sleep_survives_observation_deadline_exit(context, mo
     client.submit.assert_not_called()
 
 
-def test_manual_stop_between_park_read_and_atomic_update_keeps_entire_terminal_row(context, monkeypatch):
+def test_manual_stop_between_close_read_and_atomic_update_keeps_entire_terminal_row(context, monkeypatch):
     store, service, _ = context
     account = owner(store)
     retained_operation(store, account, paused=False, deadline=time.time() - 1)
@@ -849,7 +857,7 @@ def test_manual_stop_between_park_read_and_atomic_update_keeps_entire_terminal_r
             stopped[0] = manually_stop(store, identifier)
         return actual_update(identifier, changes, **kwargs)
     monkeypatch.setattr(store, 'update_task', race)
-    result = service._park_canvas_task('task', 'observation_deadline_reached')
+    result = service._close_unconfirmed_canvas_task('task', 'observation_deadline_reached')
     assert result == store.task('task') == stopped[0]
     assert result['error_code'] == 'OPERATOR_CONTENT_RESTRICTED'
     assert 'reconciliation_pause_reason' not in result['upstream_context']
@@ -896,6 +904,46 @@ def test_unknown_terminal_record_can_still_query_its_original_operation(context,
     assert result['completed_at'] is None
     assert result['upstream_context']['submit_id'] == 'retained-submit'
     client.poll.assert_called_once()
+    client.prepare.assert_not_called()
+    client.submit.assert_not_called()
+
+
+def test_old_paused_unconfirmed_operation_resumes_bounded_reads_and_ends_without_paid_retry(context):
+    store, service, _ = context
+    account = owner(store)
+    retained_operation(store, account, paused=True, deadline=time.time() + 60)
+    store.update_task('task', {'upstream_context': {**store.task('task')['upstream_context'],
+        'reconciliation_pause_reason': 'operation_submission_absent'}})
+    client = fake_client(store, service, account)
+    client.poll.side_effect = [CanvasCLIError('cli.operation_submission_absent', 'not found') for _ in range(3)]
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._resume_canvas_poll('task')
+    result = store.task('task')
+    assert result['status'] == 'failed' and result['error_code'] == 'CLI_SUBMISSION_UNCONFIRMED'
+    assert result['upstream_context']['reconciliation_closed'] is True
+    assert result['upstream_context']['financial_outcome'] == 'unconfirmed'
+    assert result['upstream_context']['submit_id'] == 'retained-submit'
+    assert client.poll.call_count == 3
+    client.prepare.assert_not_called()
+    client.submit.assert_not_called()
+    assert store.active_account_count(account['id']) == 0
+    assert service._active[account['id']] == 0
+
+
+def test_automatically_closed_unconfirmed_task_cannot_be_revived_by_late_success_or_reconcile(context):
+    store, service, _ = context
+    account = owner(store)
+    retained_operation(store, account, paused=False, deadline=time.time() + 60)
+    closed = service._close_unconfirmed_canvas_task('task', 'operation_submission_absent')
+    client = fake_client(store, service, account)
+    service._poll_canvas('task', client, time.monotonic() + 60, one_shot=True)
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._resume_canvas_poll('task')
+        with pytest.raises(ValueError, match='no longer requires'):
+            service.reconcile_canvas_task('task')
+    assert service._close_unconfirmed_canvas_task('task', 'observation_deadline_reached') == closed
+    assert store.task('task') == closed
+    client.poll.assert_not_called()
     client.prepare.assert_not_called()
     client.submit.assert_not_called()
 
