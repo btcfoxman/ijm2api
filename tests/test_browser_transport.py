@@ -5,8 +5,135 @@ import unittest
 import urllib.parse
 from unittest.mock import Mock, patch
 
-from app.browser import BrowserError, BrowserRejected, CDPBrowser
+from app.browser import BrowserError, BrowserRejected, CDPBrowser, _RESOURCE_TIMING_BUFFER_SCRIPT
 from app.client import DreaminaClient
+
+
+class TimingSocket:
+    """A CDP peer with unsolicited events and document-scoped init scripts."""
+
+    def __init__(self, failure=None):
+        self.failure = failure
+        self.sent = []
+        self.replies = []
+        self.closed = False
+        self.scripts = {}
+
+    def send(self, text):
+        request = json.loads(text)
+        self.sent.append(request)
+        method = request['method']
+        if self.failure == (method, 'socket'):
+            raise OSError('synthetic private transport detail')
+        if self.failure == (method, 'cdp'):
+            self.replies.append({'id': request['id'], 'error': {'message': 'synthetic private CDP detail'}})
+            return
+        if method == 'Page.addScriptToEvaluateOnNewDocument':
+            self.scripts['synthetic-script'] = request['params']['source']
+            result = {'identifier': 'synthetic-script'}
+        elif method == 'Runtime.evaluate':
+            result = {'result': {'value': True}}
+        elif method == 'Page.removeScriptToEvaluateOnNewDocument':
+            self.scripts.pop(request['params']['identifier'], None)
+            result = {}
+        else:
+            result = {}
+        self.replies.extend([{'method': 'Page.frameNavigated', 'params': {}}, {'id': request['id'], 'result': result}])
+
+    def recv(self):
+        return json.dumps(self.replies.pop(0))
+
+    def new_document_scripts(self):
+        return list(self.scripts.values()) if not self.closed else []
+
+    def close(self):
+        self.closed = True
+
+
+class ResourceTimingCaptureTests(unittest.TestCase):
+    def test_current_and_future_documents_share_one_live_session_until_cleanup(self):
+        socket = TimingSocket()
+        with patch('app.browser._page', return_value={'webSocketDebuggerUrl': 'ws://127.0.0.1/synthetic'}), \
+             patch('app.browser.websocket.create_connection', return_value=socket) as connect:
+            with CDPBrowser(19301, timeout=15).resource_timing_capture():
+                self.assertFalse(socket.closed)
+                self.assertEqual(socket.new_document_scripts(), [_RESOURCE_TIMING_BUFFER_SCRIPT])
+                self.assertEqual(socket.sent[-1]['method'], 'Runtime.evaluate')
+                self.assertEqual(socket.sent[-1]['params']['expression'], _RESOURCE_TIMING_BUFFER_SCRIPT)
+                connect.assert_called_once_with('ws://127.0.0.1/synthetic', timeout=15, suppress_origin=True)
+            self.assertTrue(socket.closed)
+            self.assertEqual(socket.scripts, {})
+        self.assertEqual([item['method'] for item in socket.sent], ['Page.enable', 'Page.addScriptToEvaluateOnNewDocument',
+                                                                  'Runtime.evaluate', 'Page.removeScriptToEvaluateOnNewDocument'])
+
+    def test_body_error_is_preserved_and_registration_is_removed(self):
+        socket = TimingSocket()
+        original = RuntimeError('synthetic login interruption')
+        with patch('app.browser._page', return_value={'webSocketDebuggerUrl': 'ws://127.0.0.1/synthetic'}), \
+             patch('app.browser.websocket.create_connection', return_value=socket):
+            with self.assertRaises(RuntimeError) as caught:
+                with CDPBrowser(19301).resource_timing_capture():
+                    raise original
+        self.assertIs(caught.exception, original)
+        self.assertTrue(socket.closed)
+        self.assertEqual(socket.scripts, {})
+
+    def test_setup_failure_never_enters_login_and_cleans_registered_script(self):
+        for method in ('Page.addScriptToEvaluateOnNewDocument', 'Runtime.evaluate'):
+            for failure in ('socket', 'cdp'):
+                with self.subTest(method=method, failure=failure):
+                    socket = TimingSocket((method, failure))
+                    with patch('app.browser._page', return_value={'webSocketDebuggerUrl': 'ws://127.0.0.1/synthetic'}), \
+                         patch('app.browser.websocket.create_connection', return_value=socket):
+                        with self.assertRaises(BrowserError) as caught:
+                            with CDPBrowser(19301).resource_timing_capture():
+                                self.fail('login must not start when timing retention is unavailable')
+                    self.assertNotIn('private', str(caught.exception))
+                    self.assertTrue(socket.closed)
+                    self.assertEqual(socket.scripts, {})
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is required for timing buffer semantics')
+    def test_full_buffer_late_sdk_and_new_document_retention_without_fabricated_identity(self):
+        from app.account_automation import _IDENTITY
+
+        program = r'''
+const vm=require('vm'),payload=JSON.parse(require('fs').readFileSync(0,'utf8'));
+const sdk='https://dreamina.capcut.com/passport/web/account/info/?sdk_version=observed-synthetic&aid=synthetic';
+async function scenario(initial,lateAssets,includeSdk,origin='https://dreamina.capcut.com'){
+ let capacity=250,entries=[],calls=[];
+ const add=name=>{if(entries.length<capacity)entries.push({name});};
+ for(let i=0;i<initial;i++)add('https://dreamina.capcut.com/assets/initial-'+i+'.js');
+ const context={URL,AbortController,setTimeout:()=>0,clearTimeout:()=>{},location:{origin},
+  performance:{getEntriesByType:()=>entries,setResourceTimingBufferSize:n=>{capacity=n}},
+  fetch:async(url)=>{calls.push(url);return {ok:true,json:async()=>({data:{user_id_str:'synthetic-user',email:'operator@example.invalid'}})}}};
+ const before=await vm.runInNewContext(payload.identity,context);
+ const retained=vm.runInNewContext(payload.source,context);
+ for(let i=0;i<lateAssets;i++)add('https://dreamina.capcut.com/assets/late-'+i+'.js');
+ if(includeSdk)add(sdk);
+ const after=await vm.runInNewContext(payload.identity,context);
+ return {capacity,count:entries.length,calls,before,after,retained};
+}
+(async()=>{const results=[await scenario(250,0,true),await scenario(0,300,true),
+ await scenario(250,300,false),await scenario(250,0,true,'https://unrelated.example.invalid')];
+ process.stdout.write(JSON.stringify(results));})();
+'''
+        result = subprocess.run(['node', '-e', program],
+                                input=json.dumps({'source': _RESOURCE_TIMING_BUFFER_SCRIPT, 'identity': _IDENTITY}),
+                                text=True, capture_output=True, timeout=10, check=True)
+        full, new_document, absent, foreign = json.loads(result.stdout)
+        for item, expected_count in [(full, 251), (new_document, 301)]:
+            self.assertEqual(item['capacity'], 5000)
+            self.assertEqual(item['count'], expected_count)
+            self.assertTrue(item['retained'])
+            self.assertTrue(item['before']['transport_error'])
+            self.assertTrue(item['after']['authenticated'])
+            self.assertEqual(len(item['calls']), 1)
+            self.assertIn('sdk_version=observed-synthetic&aid=synthetic', item['calls'][0])
+        self.assertTrue(absent['after']['transport_error'])
+        self.assertEqual(absent['calls'], [])
+        self.assertFalse(foreign['retained'])
+        self.assertEqual(foreign['capacity'], 250)
+        self.assertEqual(foreign['calls'], [])
 
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is required for page-context execution")

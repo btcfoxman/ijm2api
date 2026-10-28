@@ -452,6 +452,14 @@ class AccountAutomation:
 
     def run(self, email: str, password: str,
             on_stage: Callable[[str], Any] | None = None) -> dict[str, Any]:
+        # A cold page can fill the default 250-resource buffer before the
+        # signed-in SDK account/info request. Keep one CDP session attached
+        # so current and replacement documents retain the genuine URL.
+        with self.browser.resource_timing_capture():
+            return self._run_login(email, password, on_stage)
+
+    def _run_login(self, email: str, password: str,
+                   on_stage: Callable[[str], Any] | None = None) -> dict[str, Any]:
         email = str(email).strip()
         if not email or not password:
             raise AutomationError('login_required', 'Dreamina email and password are required')

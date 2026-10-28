@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import shutil
@@ -11,9 +10,9 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import websocket
 
@@ -26,6 +25,14 @@ COMMERCE_US_API = "https://commerce-us-ttp2.us.capcut.com"
 _PROCESS_LOCK = threading.RLock()
 _PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 _UPLOAD_LOCKS: dict[int, threading.RLock] = {}
+
+# Retain genuine SDK resource URLs arriving after a cold page's first 250
+# assets. This changes timing storage only, never requests or SDK parameters.
+_RESOURCE_TIMING_BUFFER_SCRIPT = """(() => {
+ if(location.origin!=='https://dreamina.capcut.com')return false;
+ if(typeof performance.setResourceTimingBufferSize!=='function')return false;
+ performance.setResourceTimingBufferSize(5000);return true;
+})()"""
 
 
 class BrowserError(Exception):
@@ -187,6 +194,56 @@ class CDPBrowser:
     def __init__(self, port: int, timeout: float = 90) -> None:
         self.port = int(port)
         self.timeout = timeout
+
+    @contextmanager
+    def resource_timing_capture(self) -> Iterator[None]:
+        """Keep timing-buffer injection attached across login navigations."""
+        target = _page(self.port)
+        ws = None
+        identifier = None
+        sequence = 0
+
+        def command(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            nonlocal sequence
+            sequence += 1
+            request_id = sequence
+            ws.send(json.dumps({"id": request_id, "method": method, "params": params or {}}))
+            while True:
+                response = json.loads(ws.recv())
+                if response.get("id") != request_id:
+                    continue
+                if "error" in response:
+                    raise BrowserError("Dreamina login resource timing setup failed")
+                return response.get("result") or {}
+
+        try:
+            try:
+                ws = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=self.timeout,
+                                                 suppress_origin=True)
+                command("Page.enable")
+                registered = command("Page.addScriptToEvaluateOnNewDocument", {"source": _RESOURCE_TIMING_BUFFER_SCRIPT})
+                identifier = registered.get("identifier")
+                if not isinstance(identifier, str) or not identifier:
+                    raise BrowserError("Dreamina login resource timing setup failed")
+                current = command("Runtime.evaluate", {"expression": _RESOURCE_TIMING_BUFFER_SCRIPT,
+                                                        "returnByValue": True})
+                if "exceptionDetails" in current or (current.get("result") or {}).get("value") is not True:
+                    raise BrowserError("Dreamina login resource timing setup failed")
+            except (OSError, ValueError, websocket.WebSocketException) as error:
+                raise BrowserError("Dreamina login resource timing connection failed") from error
+            yield
+        finally:
+            if ws is not None:
+                try:
+                    if identifier:
+                        command("Page.removeScriptToEvaluateOnNewDocument", {"identifier": identifier})
+                except (BrowserError, OSError, ValueError, websocket.WebSocketException):
+                    pass
+                finally:
+                    try:
+                        ws.close()
+                    except (OSError, websocket.WebSocketException):
+                        pass
 
     def command(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         target = _page(self.port)

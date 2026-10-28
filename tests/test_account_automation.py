@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 import json
 import shutil
 import subprocess
@@ -22,6 +23,7 @@ READY = {'close_watermark': True, 'close_watermark_popup_tip': True, 'aigc_compl
 
 def browser_with_settings(settings):
     browser = Mock()
+    browser.resource_timing_capture.side_effect = nullcontext
     browser.evaluate.side_effect = lambda expression, **_: IDENTITY.copy() if expression == _IDENTITY else {'stage': 'waiting'}
     browser.post.return_value = {'user_custom_settings': settings.copy()}
     return browser
@@ -359,6 +361,38 @@ Promise.resolve(vm.runInNewContext(payload.source,context)).then(result=>process
 
 
 class LoginTests(unittest.TestCase):
+    def test_resource_timing_session_wraps_entire_login_and_cleans_up_on_failure(self):
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                browser = browser_with_settings(READY)
+                events = []
+
+                @contextmanager
+                def capture():
+                    events.append('enter')
+                    try:
+                        yield
+                    finally:
+                        events.append('exit')
+
+                browser.resource_timing_capture.side_effect = capture
+                automation = AccountAutomation(ACCOUNT, browser=browser)
+
+                def login(*_):
+                    self.assertEqual(events, ['enter'])
+                    if failure:
+                        raise AutomationError('login_required', 'synthetic interrupted login')
+                    return {'identity_verified': True}
+
+                with patch.object(automation, '_run_login', side_effect=login) as run_login:
+                    if failure:
+                        with self.assertRaises(AutomationError):
+                            automation.run(ACCOUNT['login_email'], 'synthetic-password')
+                    else:
+                        self.assertIs(automation.run(ACCOUNT['login_email'], 'synthetic-password')['identity_verified'], True)
+                self.assertEqual(events, ['enter', 'exit'])
+                run_login.assert_called_once_with(ACCOUNT['login_email'], 'synthetic-password', None)
+
     def test_run_waits_for_unknown_promotion_animation_before_identity_ready(self):
         automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
         sequence = [{'stage': 'promotion'}, {'stage': 'unknown'}, {'stage': 'unknown'}, {'stage': 'waiting'}]
