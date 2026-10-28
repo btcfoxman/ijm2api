@@ -114,6 +114,43 @@ def test_quote_and_original_context_are_committed_before_paid_submission(context
     assert durable["actual_cost"] != 777
 
 
+def test_expired_preparation_never_starts_a_paid_generation(context):
+    store, service, _ = context
+    account = owner(store)
+    task(store)
+    client = fake_client(store, service, account)
+    with patch.object(service, 'canvas_client', return_value=client):
+        service._execute_canvas('task', account, time.monotonic() - 1)
+    client.identity.assert_not_called()
+    client.prepare.assert_not_called()
+    client.submit.assert_not_called()
+    assert store.task('task')['error_code'] == 'CLI_PREPARATION_TIMEOUT'
+
+
+def test_deadline_reached_while_uploading_and_quoting_never_runs_paid_generation(context):
+    store, service, _ = context
+    account = owner(store)
+    task(store)
+    store.update_task('task', {'account_id': account['id'], 'status': 'preparing'})
+    client = fake_client(store, service, account)
+    original_prepare = client.prepare.side_effect
+    clock = Mock()
+    clock.monotonic.return_value = 100
+    def prepare(*args, **kwargs):
+        value = original_prepare(*args, **kwargs)
+        clock.monotonic.return_value = 102
+        return value
+    client.prepare.side_effect = prepare
+    with patch.object(service, 'canvas_client', return_value=client), patch('app.canvas_service.time', clock):
+        service._execute_canvas('task', account, 101)
+    client.prepare.assert_called_once()
+    client.submit.assert_not_called()
+    result = store.task('task')
+    assert result['error_code'] == 'CLI_PREPARATION_TIMEOUT'
+    assert result['attempted_account_ids'] == []
+    assert not service._credit_reservations
+
+
 def test_insufficient_quote_never_invokes_paid_run(context):
     store, service, _ = context
     account = owner(store, balance=5)

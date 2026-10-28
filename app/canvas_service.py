@@ -118,6 +118,9 @@ class CanvasServiceMixin:
                                            "upstream_context": context})
 
         try:
+            if time.monotonic() >= deadline:
+                self._fail(task_id, 'CLI_PREPARATION_TIMEOUT', 'Task deadline passed before Canvas preparation; no generation was submitted')
+                return True
             self.store.update_task(task_id, {"execution_backend": "canvas_cli"})
             state = client.identity()
             identity = str(state.get("user_id") or "")
@@ -141,6 +144,9 @@ class CanvasServiceMixin:
                 self.store.update_task(task_id, {"cost_evidence": input_evidence(assets), "progress": 15})
                 prepared = client.prepare(normalized, task_id, assets, persist=persist)
                 persist(prepared)
+            if time.monotonic() >= deadline:
+                self._fail(task_id, 'CLI_PREPARATION_TIMEOUT', 'Task deadline passed during Canvas preparation; no generation was submitted')
+                return True
             quote = number(context.get("quoted_credits"))
             if quote is None:
                 self._fail(task_id, "CLI_QUOTE_UNAVAILABLE", "Canvas could not establish the complete task quote")
