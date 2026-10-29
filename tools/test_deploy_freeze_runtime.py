@@ -75,7 +75,10 @@ def fixture_program(active):
     return """import json,pathlib,sqlite3,subprocess,sys,time
 root=pathlib.Path('/app/data')
 marker=root/'canvas-cli/account-1/credential-profile'
-marker.parent.mkdir(parents=True,exist_ok=True);marker.write_text('synthetic-profile')
+marker.parent.mkdir(parents=True,exist_ok=True)
+# Synthetic root-created directories must allow hosted uid cleanup after Docker.
+marker.parent.parent.chmod(0o777);marker.parent.chmod(0o777)
+marker.write_text('synthetic-profile')
 db=sqlite3.connect(str(root/'ijm2api.db'))
 db.executescript('''CREATE TABLE accounts(id INTEGER,enabled INTEGER,status TEXT,execution_mode TEXT,
 cli_auth_status TEXT,login_user_id TEXT,cli_user_id TEXT,proxy_url TEXT);
