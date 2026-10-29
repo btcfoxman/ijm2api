@@ -13,7 +13,7 @@ from .canvas_cli import CanvasCLIError, sanitize
 from .canvas_client import CanvasClient, identity_network_error
 from .account_policy import credit_rejected
 from .cost_adapter import input_evidence, number
-from .media import MediaError, _download
+from .media import MediaError, _download, media_error_diagnostic
 from .upload import _probe_media
 from .result_transfer import ResultTransferError, store_original
 
@@ -194,10 +194,15 @@ class CanvasServiceMixin:
         assets = {kind: [] for kind in ("images", "videos", "audios")}
         for kind in assets:
             for index, source in enumerate(normalized.get(kind) or []):
-                if not str(source).startswith(("https://", "http://", "data:")):
-                    raise MediaError("Canvas reference requires a media URL; browser asset IDs cannot be reused")
-                contents, mime, filename = _download(str(source), kind,
-                    str(account["proxy_url"]), allow_direct_fallback=False, deadline=deadline)
+                try:
+                    if not str(source).startswith(("https://", "http://", "data:")):
+                        raise MediaError("Canvas reference requires a media URL; browser asset IDs cannot be reused",
+                                         category="invalid_source", attempt_count=0)
+                    contents, mime, filename = _download(str(source), kind,
+                        str(account["proxy_url"]), allow_direct_fallback=False, deadline=deadline)
+                except MediaError as exc:
+                    exc.diagnostic.update(media_kind=kind, media_index=index + 1)
+                    raise
                 suffix = Path(filename).suffix.lower()
                 if not suffix or len(suffix) > 12 or not suffix[1:].isalnum():
                     suffix = {"images": ".png", "videos": ".mp4", "audios": ".mp3"}[kind]
@@ -428,6 +433,11 @@ class CanvasServiceMixin:
                         str(current.get('submission_phase') or 'submitting'))})
                 self._close_unconfirmed_canvas_task(task_id, 'submission_interrupted')
             else:
+                if isinstance(exc, MediaError):
+                    diagnostic = media_error_diagnostic(exc)
+                    self._canvas_context(task_id, {"media_download_error": diagnostic})
+                    logger.warning("Canvas media download failed task=%s account=%s diagnostic=%s",
+                                   task_id, account_id, diagnostic)
                 self._fail_canvas_task(task_id, code, f"{type(exc).__name__}: Canvas preparation failed")
             logger.warning("Canvas task %s failed in %s (%s)", task_id,
                            "submission" if submission_started else "preparation", type(exc).__name__)
