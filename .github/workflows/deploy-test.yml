@@ -110,6 +110,13 @@ jobs:
           file: ./Dockerfile
           push: true
           platforms: linux/amd64
+          build-args: |
+            HTTP_PROXY=http://192.168.3.5:10809
+            HTTPS_PROXY=http://192.168.3.5:10809
+            http_proxy=http://192.168.3.5:10809
+            https_proxy=http://192.168.3.5:10809
+            NO_PROXY=localhost,127.0.0.1,::1,192.168.3.5,pypi.org,files.pythonhosted.org
+            no_proxy=localhost,127.0.0.1,::1,192.168.3.5,pypi.org,files.pythonhosted.org
           tags: |
             ghcr.io/btcfoxman/ijm2api:${{ github.sha }}
             ghcr.io/btcfoxman/ijm2api:pre
