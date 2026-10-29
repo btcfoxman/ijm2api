@@ -44,7 +44,7 @@ def _read_only_transport_retry(args: list[str], exc: CanvasCLIError) -> bool:
     if str(error.get('code') or '') not in {'', 'cli.transport_failed'}:
         return False
     if str(error.get('class') or '').lower() not in {
-            '', 'transport_error', 'transport_failure', 'network_error', 'network_failure', 'internal_failure'}:
+            '', 'transport_error', 'transport_failure', 'network_error', 'network_failure', 'internal_failure', 'retryable_failure'}:
         return False
     reason = str(error.get('reason') or '').lower()
     return not reason or reason in _TRANSIENT
@@ -62,6 +62,29 @@ def identity_network_error(exc: CanvasCLIError) -> bool:
     return code == 'CLI_COMMAND_TIMEOUT' or (error.get('retryable') is True
         and str(error.get('reason') or '').lower() in {
             'network_timeout', 'dns_resolution_failed', 'network_error', 'transport_error'})
+
+
+def _resource_read_intervention(exc: CanvasCLIError) -> bool:
+    error = exc.details.get('error') or {}
+    if not isinstance(error, dict):
+        return False
+    action = str(error.get('requiredAction') or '').lower()
+    classification = ' '.join([str(exc.code).lower(),
+        *(str(error.get(key) or '').lower() for key in ('class', 'reason'))])
+    return (action not in {'', 'retry', 'fix_input'}
+        or any(word in classification for word in ('human_intervention', 'auth', 'identity', 'mismatch', 'permission')))
+
+
+def _planned_resource_not_found(exc: CanvasCLIError, resource_id: str) -> bool:
+    """Observe registration absence only for a previously planned upload ID."""
+    error = exc.details.get('error') or {}
+    return (exc.code == 'service.6' and not exc.outcome_unknown and isinstance(error, dict)
+        and error.get('code') in (None, 'service.6')
+        and error.get('serviceCode') in (6, '6') and error.get('class') == 'invalid_input'
+        and str(error.get('message') or exc.message).strip() == 'The requested resource was not found.'
+        and str(error.get('reason') or '').lower() in {'', 'not_found', 'resource_not_found'}
+        and all(error.get(key) in (None, '', resource_id) for key in ('resourceId', 'resource_id'))
+        and not _resource_read_intervention(exc))
 
 
 def safe_cli_diagnostic(exc: CanvasCLIError, *, secrets: tuple[str, ...] = ()) -> dict[str, Any]:
@@ -432,14 +455,27 @@ class CanvasClient:
                 raise
 
     def _resource_ready(self, resource_id: str, project_id: str, *, timeout: float = 120,
-                        deadline: float | None = None) -> dict[str, Any]:
+                        deadline: float | None = None, media_type: str | None = None) -> dict[str, Any]:
         ready_deadline = time.monotonic() + timeout
+        observed_missing = False
         if deadline is not None:
             ready_deadline = min(ready_deadline, deadline)
         try:
             while True:
-                data = self._call(["resource", "get", resource_id, "--project-id", project_id],
-                                  read_only=True, deadline=ready_deadline)
+                try:
+                    data = self._call(["resource", "get", resource_id, "--project-id", project_id],
+                                      read_only=True, deadline=ready_deadline)
+                except CanvasCLIError as exc:
+                    if not _planned_resource_not_found(exc, resource_id):
+                        raise
+                    observed_missing = True
+                    self._sleep(1, ready_deadline)
+                    continue
+                if data.get('resourceId') != resource_id:
+                    raise CanvasCLIError('CLI_RESOURCE_MISMATCH', 'Canvas returned another reference resource')
+                if media_type and any(value not in (None, '', media_type)
+                                      for value in (data.get('type'), data.get('mediaType'))):
+                    raise CanvasCLIError('CLI_RESOURCE_MISMATCH', 'Canvas returned another reference media type')
                 state = str(data.get("status") or "").lower()
                 if state in {"success", "succeeded", "completed"}:
                     return data
@@ -447,7 +483,7 @@ class CanvasClient:
                     raise CanvasCLIError("MEDIA_UPLOAD_FAILED", f"Canvas reference upload failed ({data.get('errorCode', state)})")
                 self._sleep(1, ready_deadline)
         except CanvasCLIError as exc:
-            if exc.code == 'CLI_TASK_DEADLINE_EXCEEDED' and (deadline is None or time.monotonic() < deadline):
+            if exc.code == 'CLI_TASK_DEADLINE_EXCEEDED' and (observed_missing or deadline is None or time.monotonic() < deadline):
                 raise CanvasCLIError("MEDIA_UPLOAD_PENDING", "Canvas reference upload is not ready; retained original resource ID") from exc
             raise
 
@@ -455,13 +491,17 @@ class CanvasClient:
                          deadline: float | None = None) -> None:
         """Retries keep the same documented registration idempotency key."""
         for attempt in range(3):
+            upload_acknowledged = False
             try:
                 self._call(["resource", "upload", "--file", str(path.resolve()),
                             "--type", media_type, "--project-id", project_id,
                             "--resource-id", resource_id], timeout=180, deadline=deadline)
-                self._resource_ready(resource_id, project_id, deadline=deadline)
+                upload_acknowledged = True
+                self._resource_ready(resource_id, project_id, deadline=deadline, media_type=media_type)
                 return
             except CanvasCLIError as exc:
+                if upload_acknowledged:
+                    raise  # An acknowledged upload only needs observation; never write it again.
                 if exc.code == "MEDIA_UPLOAD_FAILED":
                     raise
                 if exc.code == "cli.upload_state_unknown":
@@ -469,7 +509,7 @@ class CanvasClient:
                     # Only observe its original registration ID; this is not a
                     # node.run recovery and must never allocate another ID.
                     try:
-                        self._observe_unknown_upload(resource_id, project_id, deadline=deadline)
+                        self._observe_unknown_upload(resource_id, project_id, deadline=deadline, media_type=media_type)
                     except CanvasCLIError as observed:
                         if observed.code == "MEDIA_UPLOAD_PENDING":
                             raise exc from observed
@@ -478,10 +518,10 @@ class CanvasClient:
                 # A lost response can follow successful storage/registration.
                 # Observe the persisted ID before another same-ID upload.
                 try:
-                    self._resource_ready(resource_id, project_id, timeout=5, deadline=deadline)
+                    self._resource_ready(resource_id, project_id, timeout=5, deadline=deadline, media_type=media_type)
                     return
                 except CanvasCLIError as check:
-                    if check.code == "MEDIA_UPLOAD_FAILED":
+                    if check.code in {"MEDIA_UPLOAD_FAILED", "CLI_RESOURCE_MISMATCH"} or _resource_read_intervention(check):
                         raise check
                 error = exc.details.get("error", {})
                 retryable = (exc.code in {"CLI_COMMAND_TIMEOUT", "CLI_INVALID_RESPONSE", "MEDIA_UPLOAD_PENDING", "cli.invalid_service_response"}
@@ -491,18 +531,21 @@ class CanvasClient:
                 self._sleep(0.5 * 2 ** attempt, deadline)
 
     def _observe_unknown_upload(self, resource_id: str, project_id: str, *,
-                                deadline: float | None = None) -> None:
+                                deadline: float | None = None, media_type: str | None = None) -> None:
         observation_deadline = time.monotonic() + 120
         if deadline is not None:
             observation_deadline = min(observation_deadline, deadline)
         try:
             while True:
                 try:
-                    data = self._resource_ready(resource_id, project_id, deadline=observation_deadline)
+                    data = self._resource_ready(resource_id, project_id, deadline=observation_deadline,
+                                                media_type=media_type)
                     if data.get("resourceId") != resource_id:
                         raise CanvasCLIError("CLI_RESOURCE_MISMATCH", "Canvas returned another reference resource")
                     return
                 except CanvasCLIError as exc:
+                    if _resource_read_intervention(exc):
+                        raise
                     retryable_read = (not exc.outcome_unknown and (
                         exc.code in {"cli.resource_unavailable", "CLI_COMMAND_TIMEOUT", "CLI_INVALID_RESPONSE",
                                      "cli.invalid_service_response"}

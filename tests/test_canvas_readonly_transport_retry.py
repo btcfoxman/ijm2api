@@ -167,3 +167,40 @@ def test_retryable_transport_without_reason_can_recover_exact_read(clock):
     assert CanvasClient(runner, ACCOUNT)._call(['node', 'quote', '--node-id', 'original-node'],
         read_only=True, deadline=120) == {'synthetic_response': True}
     assert len(runner.calls) == 2 and clock['sleeps'] == [0.25]
+
+
+def observed_retryable_failure(**overrides):
+    # Actual post-release resource-get envelope: exit 21, no reason/serviceCode.
+    error={'code':'cli.transport_failed','class':'retryable_failure','retryable':True,'requiredAction':'retry'}
+    error.update(overrides)
+    return CanvasCLIError('cli.transport_failed',
+        'The service could not be reached. Check network and proxy access, then retry safely.',
+        details={'error':error},exit_code=21,outcome_unknown=False)
+
+
+def test_observed_resource_get_retryable_failure_recovers_original_resource(clock):
+    runner=Runner([observed_retryable_failure()])
+    args=['resource','get','original-resource','--project-id','original-project']
+    assert CanvasClient(runner,ACCOUNT)._call(args,read_only=True,deadline=120)=={'synthetic_response':True}
+    assert len(runner.calls)==2 and clock['sleeps']==[0.25]
+    assert all(call[1]==args and call[2]['deadline']==120 for call in runner.calls)
+
+
+@pytest.mark.parametrize('metadata', [
+    {'retryable':False}, {'requiredAction':'human_intervention'}, {'requiredAction':'resume'},
+    {'requiredAction':'login'}, {'serviceCode':20114}, {'reason':'identity_mismatch'},
+    {'code':'cli.authentication_required'},
+])
+def test_observed_failure_class_does_not_override_metadata_vetoes(clock,metadata):
+    runner=Runner([observed_retryable_failure(**metadata)])
+    with pytest.raises(CanvasCLIError):
+        CanvasClient(runner,ACCOUNT)._call(['resource','get','original-resource'],read_only=True,deadline=120)
+    assert len(runner.calls)==1 and not clock['sleeps']
+
+
+def test_observed_failure_class_never_enables_paid_write_replay(clock):
+    failure=observed_retryable_failure();failure.outcome_unknown=True
+    runner=Runner([failure])
+    with pytest.raises(CanvasCLIError) as caught:
+        CanvasClient(runner,ACCOUNT)._call(['node','run','--submit-id','original-submit'],read_only=True,deadline=120)
+    assert caught.value.outcome_unknown is True and len(runner.calls)==1 and not clock['sleeps']

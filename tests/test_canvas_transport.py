@@ -51,6 +51,7 @@ class FakeRunner:
         self.media_type = "video"
         self.resource_error_code = 0
         self.diagnostic_failure = False
+        self.uploaded_types = {}
 
     def account_directory(self, account):
         return self.path
@@ -71,13 +72,14 @@ class FakeRunner:
             assert self.persisted, "IDs must be stored before the first remote write"
             data = {"project": {"projectId": args[-1]}}
         elif action == ["resource", "upload"]:
+            self.uploaded_types[args[-1]] = args[args.index('--type') + 1]
             if self.upload_timeout:
                 raise CanvasCLIError("CLI_COMMAND_TIMEOUT", "upload timed out")
             data = {"resourceId": args[-1]}
         elif action == ["resource", "get"]:
             if self.diagnostic_failure:
                 raise CanvasCLIError("CLI_COMMAND_TIMEOUT", "diagnostic unavailable")
-            data = {"resourceId": args[2], "status": "success", "type": self.media_type, "creditsAmount": 20,
+            data = {"resourceId": args[2], "status": "success", "type": self.uploaded_types.get(args[2], self.media_type), "creditsAmount": 20,
                     "errorCode": self.resource_error_code}
         elif action == ["node", "create"]:
             assert "--run" not in args
