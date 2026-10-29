@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from .canvas_cli import CanvasCLI, CanvasCLIError, account_profile, sanitize
+from .canvas_cli import CanvasCLI, CanvasCLIError, account_profile, admission_verdict, sanitize
 from .catalog import ALIASES, media_alias_kind
 from .errors import public_error, upstream_review_error
 
@@ -782,12 +782,12 @@ class CanvasClient:
                 item = items[0]
                 if item.get("nodeId") != context["node_id"] or item.get("submitId") != context["submit_id"]:
                     raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas acceptance identities do not match", outcome_unknown=True)
-                state = str(item.get("state") or "").lower()
-                if item.get("error") or state in {"failed", "rejected", "canceled", "cancelled"}:
-                    error = item.get("error") or {}
+                verdict = admission_verdict(item.get("state"))
+                if item.get("error") or verdict == "rejected":
+                    error = item.get("error") if isinstance(item.get("error"), dict) else {}
                     raise CanvasCLIError("UPSTREAM_REJECTED", str(error.get("message") or "Canvas rejected the generation"), details={"error": error},
-                                         outcome_unknown=bool(item.get("resources")) or state in {"accepted", "running", "in_progress", "processing", "completed", "succeeded", "success"})
-                if state not in {"accepted", "running", "in_progress", "processing", "completed", "succeeded", "success"}:
+                                         outcome_unknown=bool(item.get("resources")) or verdict != "rejected")
+                if verdict != "accepted":
                     raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas returned an uncertain submission state", outcome_unknown=True)
                 context["resource_ids"] = [str(x["resourceId"]) for x in item.get("resources", []) if isinstance(x, dict) and x.get("resourceId")]
                 context["phase"] = "accepted"
@@ -940,12 +940,14 @@ class CanvasClient:
         result: dict[str, Any] = {"status": "running", "progress": 45, "result_urls": [],
                                   "result_paths": [], "result_files": [], "credit_facts": [],
                                   "error_code": "", "error_message": ""}
-        if state in {"absent", "unknown"} or submission.get("state") in {"absent", "unknown"}:
+        submission_verdict = admission_verdict(submission.get("state")) if submission else None
+        if state in {"absent", "unknown"} or submission_verdict == "unknown":
             result.update(status="unknown", error_code="UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
                           error_message="Canvas submission could not be resolved; automatic resubmission is disabled")
             return result
         failed = [x for x in resources if str(x.get("state") or "").lower() in {"failed", "rejected", "error", "canceled", "cancelled"}]
-        if state in {"failed", "partial_failed", "rejected", "error", "canceled", "cancelled"} or failed or data.get("submissionError"):
+        if (state in {"failed", "partial_failed", "rejected", "error", "canceled", "cancelled"}
+                or submission_verdict == "rejected" or failed or data.get("submissionError")):
             result.update(self._failure_details(context, data, resources, failed, deadline=deadline))
             return result
         terminal = state in {"completed", "success", "succeeded"}

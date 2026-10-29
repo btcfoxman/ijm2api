@@ -95,17 +95,30 @@ def sanitize(value: Any) -> Any:
     return value[:3000]
 
 
+def admission_verdict(state: Any) -> str:
+    """Official run admission verdict; generation/resource states are separate."""
+    if not isinstance(state, str):
+        return "unknown"
+    value = state.strip().upper().removeprefix("RUN_")
+    return value.lower() if value in {"ACCEPTED", "REJECTED"} else "unknown"
+
+
 def _has_accepted(envelope: dict[str, Any]) -> bool:
     # Preserve any partial acceptance. A query/recovery error mentioning a
     # balance must not turn a paid/uncertain submission into an account retry.
     for body in (envelope.get("data"), envelope.get("partialData")):
         if not isinstance(body, dict):
             continue
-        for item in body.get("items", []):
-            if not isinstance(item, dict):
-                continue
-            if item.get("resources") or str(item.get("state", "")).lower() in {
-                    "accepted", "running", "in_progress", "completed", "success", "unknown"}:
+        items = body.get("items")
+        if not isinstance(items, list):
+            if "items" in body:
+                return True
+            continue
+        for item in items:
+            # A partial/ambiguous receipt is not positive evidence of a safe
+            # pre-submit credit rejection. Never turn it into a paid retry.
+            if (not isinstance(item, dict) or item.get("resources")
+                    or admission_verdict(item.get("state")) != "rejected"):
                 return True
     return False
 

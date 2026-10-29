@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import mimetypes
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -140,6 +141,24 @@ class CanvasServiceMixin:
         original = original if isinstance(original, dict) else {}
         return str(original.get('message') or fallback)[:600]
 
+    @staticmethod
+    def _canvas_closed_diagnostic(context: dict) -> dict:
+        """Public-safe enums only; never copy prose, request IDs or raw bodies."""
+        source = context.get('submit_error')
+        source = source if isinstance(source, dict) else {}
+        diagnostic = {}
+        for key in ('code', 'phase', 'class', 'reason', 'requiredAction'):
+            value = source.get(key)
+            if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', value):
+                diagnostic[key] = value
+        exit_code = source.get('exit_code')
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool) and -255 <= exit_code <= 255:
+            diagnostic['exit_code'] = exit_code
+        for key in ('dispatch_started', 'outcome_unknown', 'retryable'):
+            if isinstance(source.get(key), bool):
+                diagnostic[key] = source[key]
+        return diagnostic
+
     def _park_canvas_task(self, task_id: str, reason: str, message: str | None = None) -> dict:
         task = self.store.task(task_id) or {}
         if self._canvas_task_terminated(task):
@@ -158,13 +177,22 @@ class CanvasServiceMixin:
         task = self.store.task(task_id) or {}
         if self._canvas_task_terminated(task):
             return task
+        original = self._canvas_closed_diagnostic(task.get('upstream_context') or {})
+        message = 'Canvas submission could not be confirmed within the bounded lookup window; task failed without resubmission'
+        if original:
+            labels = [('code', 'code'), ('phase', 'phase'), ('exit_code', 'exit'),
+                      ('class', 'class'), ('reason', 'reason'), ('requiredAction', 'action')]
+            summary = '; '.join(f'{label}={original[key]}' for key, label in labels if key in original)
+            if summary:
+                message += f' (original CLI: {summary})'
         context = self._canvas_context(task_id, {'reconciliation_closed': True,
             'reconciliation_close_reason': reason, 'reconciliation_closed_at': time.time(),
-            'reconciliation_paused': False, 'financial_outcome': 'unconfirmed'},
+            'reconciliation_paused': False, 'financial_outcome': 'unconfirmed',
+            'closed_submission_diagnostic': original},
             remove=('reconciliation_pause_reason', 'reconciliation_paused_at'))
         return self._update_canvas_task(task_id, {'status': 'failed', 'progress': 100,
             'completed_at': time.time(), 'error_code': 'CLI_SUBMISSION_UNCONFIRMED',
-            'error_message': 'Canvas submission could not be confirmed within the bounded lookup window; task failed without resubmission',
+            'error_message': message[:600],
             'upstream_context': context})
 
     def _refresh_canvas_result_urls(self, task: dict) -> dict:
