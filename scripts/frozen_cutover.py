@@ -14,6 +14,11 @@ import uuid
 def execute(args, *, input=None, timeout=30):
     result = subprocess.run(args, input=input, capture_output=True, text=True, timeout=timeout)
     if result.returncode:
+        if args[:3] == ["docker", "exec", "-i"] and input is not None:
+            # Only the trusted read-only guard runs through this stdin path.
+            # deploy_pre.sh redirects this exception to its private 0600 log.
+            raise RuntimeError("DockerCutoverOperationFailed phase=guard_exec exit="
+                + str(result.returncode) + " " + result.stderr[-4000:].strip())
         raise RuntimeError("DockerCutoverOperationFailed")
     return result.stdout.strip()
 
@@ -22,18 +27,41 @@ def companion_program(query_ids, startup_sha, *, backup=False):
     here = Path(__file__).resolve().parent
     query = (here / "query_resume_guard.py").read_text(encoding="utf-8")
     idle = (here.parent / "app/deploy_guard.py").read_text(encoding="utf-8")
-    program = "import hashlib,json,os,pathlib,sqlite3\n"
+    program = "import hashlib,json,os,pathlib,sqlite3,tempfile\n"
     program += "query={\"__name__\":\"frozen_query_guard\"};idle={\"__name__\":\"frozen_idle_guard\"}\n"
     program += "exec(compile(" + repr(query) + ",'query_guard','exec'),query)\n"
     program += "exec(compile(" + repr(idle) + ",'idle_guard','exec'),idle)\n"
     program += "root=pathlib.Path(os.environ.get('IJM_DATA_DIR','/app/data'));expected=" + repr(query_ids) + "\n"
-    program += "if expected:\n value=query['check'](root/'ijm2api.db',query['parse_expected'](expected),root,pathlib.Path('/app/app/service.py')," + repr(startup_sha) + ")\n"
-    program += "else:\n count=idle['active_work'](root/'ijm2api.db');value={'passed':count==0,'mode':'idle','active_count':count,'binding_sha256':None}\n"
-    program += "if value.get('passed') is not True:raise RuntimeError('FrozenGuardRejected')\n"
+    # A WAL-mode source may have no sidecars when its last writer closed.
+    # Never ask SQLite to initialize them on the original read-only mount.
+    program += """with tempfile.TemporaryDirectory(prefix='ijm-frozen-clone-',dir='/tmp') as temporary:
+ clone_root=pathlib.Path(temporary);source_manifest={}
+ for name in ('ijm2api.db','ijm2api.db-wal'):
+  original=root/name
+  if original.is_symlink():raise RuntimeError('FrozenSourceSymlinkRejected')
+  if not original.exists():
+   if name=='ijm2api.db':raise RuntimeError('FrozenSourceDatabaseMissing')
+   source_manifest[name]=None;continue
+  if not original.is_file():raise RuntimeError('FrozenSourceNotRegularFile')
+  checksum=hashlib.sha256()
+  with original.open('rb') as reader,(clone_root/name).open('xb') as writer:
+   before=os.fstat(reader.fileno())
+   for chunk in iter(lambda:reader.read(1024*1024),b''):
+    writer.write(chunk);checksum.update(chunk)
+   after=os.fstat(reader.fileno())
+  if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns):raise RuntimeError('FrozenSourceChangedDuringRead')
+  (clone_root/name).chmod(0o600)
+  source_manifest[name]={'sha256':checksum.hexdigest(),'size_bytes':after.st_size}
+ database=clone_root/'ijm2api.db'
+"""
+    program += " if expected:\n  value=query['check'](database,query['parse_expected'](expected),root,pathlib.Path('/app/app/service.py')," + repr(startup_sha) + ")\n"
+    program += " else:\n  count=idle['active_work'](database);value={'passed':count==0,'mode':'idle','active_count':count,'binding_sha256':None}\n"
+    program += " if value.get('passed') is not True:raise RuntimeError('FrozenGuardRejected')\n"
+    program += " value['source_manifest']=source_manifest\n"
     if backup:
-        program += "source=sqlite3.connect((root/'ijm2api.db').as_uri()+'?mode=ro',uri=True,timeout=5);source.execute('PRAGMA query_only=ON')\n"
-        program += "target=pathlib.Path('/tmp/frozen.ijm2api.db');dest=sqlite3.connect(str(target));source.backup(dest);dest.close();source.close();target.chmod(0o600)\n"
-        program += "value['frozen_backup_sha256']=hashlib.sha256(target.read_bytes()).hexdigest()\n"
+        program += " source=sqlite3.connect(database.as_uri()+'?mode=ro',uri=True,timeout=5);source.execute('PRAGMA query_only=ON')\n"
+        program += " target=pathlib.Path('/tmp/frozen.ijm2api.db');dest=sqlite3.connect(str(target));source.backup(dest);dest.close();source.close();target.chmod(0o600)\n"
+        program += " with target.open('rb') as reader:value['frozen_backup_sha256']=hashlib.file_digest(reader,'sha256').hexdigest()\n"
     program += "print(json.dumps(value))\n"
     return program
 
@@ -89,6 +117,8 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
         run(["docker", "pause", old_id], timeout=15)
         first = json.loads(run(["docker", "exec", "-i", companion_id, "python", "-B", "-"],
             input=companion_program(query_ids, startup_sha, backup=True), timeout=30))
+        if not isinstance(first.get("source_manifest"), dict):
+            raise RuntimeError("FrozenSourceManifestMissing")
         baseline_path = release / "query-resume-baseline.safe.json"
         baseline = json.loads(baseline_path.read_text()) if baseline_path.is_file() else None
         if (query_ids and first.get("mode") != "idle"
@@ -107,6 +137,8 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
                 or final.get("binding_sha256") != first.get("binding_sha256")
                 or final.get("active_count") != first.get("active_count")):
             raise RuntimeError("FrozenStateChangedDuringBackup")
+        if final.get("source_manifest") != first["source_manifest"]:
+            raise RuntimeError("FrozenSourceChangedDuringBackup")
         current = json.loads(run(["docker", "inspect", service], timeout=10))[0]
         if current["Id"] != old_id or not current["State"]["Running"] or not current["State"].get("Paused"):
             raise RuntimeError("OriginalAppDidNotRemainFrozen")

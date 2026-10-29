@@ -35,6 +35,11 @@ class FakeDocker:
         self.first_failure = False
         self.first_binding = BINDING
         self.final_binding = BINDING
+        self.first_source_manifest = {
+            "ijm2api.db": {"sha256": "d" * 64, "size_bytes": 123},
+            "ijm2api.db-wal": None,
+        }
+        self.final_source_manifest = json.loads(json.dumps(self.first_source_manifest))
         self.final_failure = False
         self.bad_backup = False
         self.changed_before_pause = False
@@ -92,7 +97,8 @@ class FakeDocker:
             if self.guard_count == 2 and self.final_failure:
                 raise RuntimeError("FrozenGuardRejected: active work arrived")
             value = {"passed": True, "mode": "query_only", "active_count": 4,
-                     "binding_sha256": self.first_binding if self.guard_count == 1 else self.final_binding}
+                     "binding_sha256": self.first_binding if self.guard_count == 1 else self.final_binding,
+                     "source_manifest": self.first_source_manifest if self.guard_count == 1 else self.final_source_manifest}
             if self.guard_count == 1:
                 assert "source.backup(dest)" in input
                 value["frozen_backup_sha256"] = hashlib.sha256(self.backup).hexdigest()
@@ -194,6 +200,26 @@ class FrozenCutoverTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     self.invoke()
                 self.assert_aborted_safely()
+
+    def test_source_database_or_optional_wal_fingerprint_drift_aborts(self):
+        for change in ["database-content", "database-size", "wal-created", "wal-removed"]:
+            with self.subTest(change=change):
+                self.docker = FakeDocker()
+                (self.release / "frozen.ijm2api.db").unlink(missing_ok=True)
+                final = self.docker.final_source_manifest
+                if change == "database-content":
+                    final["ijm2api.db"]["sha256"] = "e" * 64
+                elif change == "database-size":
+                    final["ijm2api.db"]["size_bytes"] += 1
+                elif change == "wal-created":
+                    final["ijm2api.db-wal"] = {"sha256": "e" * 64, "size_bytes": 99}
+                else:
+                    self.docker.first_source_manifest["ijm2api.db-wal"] = {"sha256": "e" * 64, "size_bytes": 99}
+                with self.assertRaises(RuntimeError):
+                    self.invoke()
+                self.assert_aborted_safely()
+                self.assertEqual(self.docker.guard_count, 2)
+                self.assertEqual(sum(args[0] == "binary_export" for args in self.docker.calls), 1)
 
     def test_concurrent_container_replacement_is_not_paused_or_removed(self):
         self.docker.changed_before_pause = True

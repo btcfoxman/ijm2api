@@ -1,8 +1,8 @@
 """Hosted-only Docker smoke of the real cutover controller, with synthetic data.
 
 No provider, service API, credentials, CLI executable, or application is started.
-The fixtures use a private temporary bind mount and a Python PID 1 holding a
-SQLite WAL open.  Run only in a GitHub-hosted Linux job with Docker available.
+The fixtures cover both an open SQLite WAL and an idle WAL-mode database with
+no sidecars. Run only in a GitHub-hosted Linux job with Docker available.
 """
 from __future__ import annotations
 
@@ -104,12 +104,16 @@ db.execute('PRAGMA journal_mode=WAL');db.execute('PRAGMA wal_autocheckpoint=0')
 db.execute('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?)',(%r,%r,1,'canvas_cli',%r,'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN','{}','{}','',''))
 db.commit();db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
 db.execute("INSERT INTO snapshot_probe VALUES('uncheckpointed-synthetic-WAL-row')");db.commit()
+if not %r:
+ db.close()
+ assert (root/'ijm2api.db').read_bytes()[18:20]==bytes([2,2])
+ assert not (root/'ijm2api.db-wal').exists() and not (root/'ijm2api.db-shm').exists()
 heartbeat=%r
 subprocess.Popen([sys.executable,'-B','-c',"name='child';"+heartbeat])
 while not (root/'child.ready').is_file():time.sleep(0.01)
 (root/'ready').write_text('ready')
 exec(heartbeat,{'name':'parent'})
-""" % (TASK, "submitted" if active else "succeeded", json.dumps(context), HEARTBEAT)
+""" % (TASK, "submitted" if active else "succeeded", json.dumps(context), active, HEARTBEAT)
 
 
 class Trace:
@@ -187,8 +191,18 @@ def query_fixture(image, data, sql, parameters=(), *, service=None):
     if service:
         args = ['exec', service, 'python', '-B', '-c', program]
     else:
+        # The original remains read-only even when missing WAL sidecars. A
+        # private clone lets SQLite initialize its own disposable WAL index.
+        program = ("import json,pathlib,shutil,sqlite3,tempfile\n"
+            "with tempfile.TemporaryDirectory(dir='/tmp') as temporary:\n"
+            " root=pathlib.Path('/app/data');clone=pathlib.Path(temporary)\n"
+            " for name in ('ijm2api.db','ijm2api.db-wal'):\n"
+            "  if (root/name).is_file():shutil.copyfile(root/name,clone/name)\n"
+            " db=sqlite3.connect((clone/'ijm2api.db').as_uri()+'?mode=ro',uri=True)\n"
+            " db.execute('PRAGMA query_only=ON')\n print(json.dumps(db.execute(" + repr(sql) + "," + repr(parameters) + ").fetchall()))")
         args = ['run', '--rm', '--pull', 'never', '--network', 'none', '--read-only', '--user', '0:0',
             '--cap-drop', 'ALL', '--cap-add', 'DAC_READ_SEARCH', '--security-opt', 'no-new-privileges',
+            '--tmpfs', '/tmp:rw,noexec,nosuid,size=128m,mode=0700',
             '--mount', 'type=bind,source=' + str(data) + ',target=/app/data,readonly',
             '--entrypoint', 'python', image, '-B', '-c', program]
     return json.loads(docker(args))
@@ -221,7 +235,10 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                         "synthetic_container_logs": (docker(["logs", "--tail", "40", service], optional=True) or "")[-3000:]})
                     raise RuntimeError("SyntheticFixtureDidNotStart")
                 time.sleep(0.1)
-            assert (data / "ijm2api.db-wal").stat().st_size > 32
+            if active:
+                assert (data / "ijm2api.db-wal").stat().st_size > 32
+            else:
+                assert not (data / "ijm2api.db-wal").exists() and not (data / "ijm2api.db-shm").exists()
             if query:
                 baseline = json.loads(docker(['exec', '-i', service, 'python', '-B', '-'],
                     input=controller.companion_program(json.dumps([TASK]), SOURCE_SHA)))
@@ -268,6 +285,8 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                     assert db.execute("SELECT value FROM snapshot_probe").fetchall() == [("uncheckpointed-synthetic-WAL-row",)]
                     assert db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
                 assert query_fixture(image, data, "SELECT COUNT(*) FROM tasks") == [[1]]
+                if not active:
+                    assert not (data / "ijm2api.db-wal").exists() and not (data / "ijm2api.db-shm").exists()
             # PID 1 death can auto-remove its namespace companion asynchronously.
             cleanup_deadline = time.monotonic() + 5
             while trace.companion and docker(["inspect", trace.companion], optional=True) is not None:
@@ -275,7 +294,8 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                     raise RuntimeError("SyntheticCompanionWasNotCleaned")
                 time.sleep(0.1)
             return {"name": name, "passed": True, "rejected": rejected,
-                "events": trace.events, "synthetic_only": True, "provider_calls": 0}
+                "events": trace.events, "synthetic_only": True, "provider_calls": 0,
+                "source_layout": "uncheckpointed_WAL" if active else "WAL_mode_without_sidecars"}
         finally:
             if trace and trace.companion:
                 docker(["rm", "--force", trace.companion], optional=True)
