@@ -59,11 +59,14 @@ jobs:
           node-version: '22'
       - name: Verify application
         env:
+          NO_PROXY: localhost,127.0.0.1,::1,192.168.3.5,pypi.org,files.pythonhosted.org
+          PIP_DISABLE_PIP_VERSION_CHECK: '1'
           IJM_API_KEY: ci-only-api-key
           IJM_ADMIN_TOKEN: ci-only-admin-token
           IJM_DATA_DIR: /tmp/ijm2api-ci
         run: |
-          python -m pip install -r requirements-dev.txt
+          export no_proxy="$NO_PROXY"
+          python -m pip install --index-url https://pypi.org/simple --timeout 30 --retries 2 -r requirements-dev.txt
           python -m pytest -q
           node --test tests/*.js
           python -m compileall -q app
