@@ -24,77 +24,31 @@ env:
 
 jobs:
   build:
-    runs-on: [self-hosted, Linux, X64, ijm2api-ci-pre35]
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
       image_tag: ${{ github.sha }}
     steps:
-      - name: Verify isolated build capacity
-        id: build_capacity
-        shell: bash
-        run: |
-          set -euo pipefail
-          for path in "$RUNNER_TEMP" "$GITHUB_WORKSPACE"; do
-            available_bytes="$(df -PB1 "$path" | awk 'NR==2 {print $4}')"
-            [[ "$available_bytes" =~ ^[0-9]+$ ]]
-            if (( available_bytes < 15 * 1024 * 1024 * 1024 )); then
-              echo "Isolated build runner requires at least 15 GiB free disk."
-              exit 1
-            fi
-          done
-          printf 'builder=ijm2api-%s-%s\n' "${GITHUB_SHA:0:12}" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
-      - name: Prepare private Python 3.12 validation environment
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.4'
+      - name: Verify validation runtimes
         shell: bash
         run: |
           set -euo pipefail
-          umask 077
-          /usr/bin/python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
-          validation_venv="$RUNNER_TEMP/ijm-validation-python"
-          /usr/bin/python3 -m venv --copies "$validation_venv"
-          "$validation_venv/bin/python" -c 'import sys; assert sys.prefix != sys.base_prefix'
-          printf '%s/bin\n' "$validation_venv" >> "$GITHUB_PATH"
-      - name: Prepare verified private Node 22 runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-          node_archive="$RUNNER_TEMP/node-v22.23.4-linux-x64.tar.xz"
-          node_runtime="$RUNNER_TEMP/ijm-validation-node22"
-          node_archive_checksum=1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce
-          node_cache_dir="$RUNNER_TOOL_CACHE/ijm2api-node-sdk"
-          node_cached_archive="$node_cache_dir/node-v22.23.4-linux-x64.tar.xz"
-          verify_node_archive() {
-            printf '%s  %s\n' "$node_archive_checksum" "$1" | sha256sum --check --status
-          }
-          if [[ -f "$node_cached_archive" ]] && verify_node_archive "$node_cached_archive"; then
-            cp -- "$node_cached_archive" "$node_archive"
-          else
-            if ! (curl -fsSL --proxy http://192.168.3.5:10809 --noproxy '' --retry 0 --connect-timeout 5 --max-time 180 \
-                https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz --output "$node_archive" \
-                && verify_node_archive "$node_archive"); then
-              curl -fsSL --noproxy nodejs.org --retry 0 --connect-timeout 5 --max-time 45 \
-                https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz --output "$node_archive"
-            fi
-            verify_node_archive "$node_archive"
-            mkdir -p "$node_cache_dir"
-            cp -- "$node_archive" "$node_cached_archive"
-            chmod 600 "$node_cached_archive"
-          fi
-          verify_node_archive "$node_archive"
-          mkdir -p "$node_runtime"
-          tar -xJf "$node_archive" --directory "$node_runtime" --strip-components=1 --no-same-owner
-          "$node_runtime/bin/node" -e 'if (process.version !== "v22.23.4") process.exit(1)'
-          printf '%s/bin\n' "$node_runtime" >> "$GITHUB_PATH"
+          python -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
+          node -e 'if (process.version !== "v22.23.4") process.exit(1)'
       - name: Verify application
         env:
-          NO_PROXY: localhost,127.0.0.1,::1,192.168.3.5,pypi.org,files.pythonhosted.org
           PIP_DISABLE_PIP_VERSION_CHECK: '1'
           IJM_API_KEY: ci-only-api-key
           IJM_ADMIN_TOKEN: ci-only-admin-token
           IJM_DATA_DIR: /tmp/ijm2api-ci
         run: |
-          export no_proxy="$NO_PROXY"
           python -m pip install --index-url https://pypi.org/simple --timeout 30 --retries 2 -r requirements-dev.txt
           python -m pytest -q
           node --test tests/*.js
@@ -106,16 +60,6 @@ jobs:
           "$RUNNER_TEMP/canvas-proxy/graftcp" --version
           "$RUNNER_TEMP/canvas-proxy/graftcp" --config /dev/null --select_proxy_mode only_http_proxy --http_proxy 127.0.0.1:9 -- /bin/true
       - uses: docker/setup-buildx-action@v3
-        with:
-          name: ${{ steps.build_capacity.outputs.builder }}
-          driver: docker-container
-          driver-opts: |
-            memory=2g
-            memory-swap=2g
-            cpu-period=100000
-            cpu-quota=200000
-            env.HTTP_PROXY=http://192.168.3.5:10809
-            env.HTTPS_PROXY=http://192.168.3.5:10809
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -128,13 +72,6 @@ jobs:
           file: ./Dockerfile
           push: true
           platforms: linux/amd64
-          build-args: |
-            HTTP_PROXY=http://192.168.3.5:10809
-            HTTPS_PROXY=http://192.168.3.5:10809
-            http_proxy=http://192.168.3.5:10809
-            https_proxy=http://192.168.3.5:10809
-            NO_PROXY=localhost,127.0.0.1,::1,192.168.3.5
-            no_proxy=localhost,127.0.0.1,::1,192.168.3.5
           tags: |
             ghcr.io/btcfoxman/ijm2api:${{ github.sha }}
             ghcr.io/btcfoxman/ijm2api:pre
