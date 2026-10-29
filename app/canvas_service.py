@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .canvas_cli import CanvasCLIError, sanitize
+from .canvas_cli import TRANSPORT_DIAGNOSTIC_COMMANDS, CanvasCLIError, sanitize
 from .canvas_client import CanvasClient, identity_network_error
 from .account_policy import credit_rejected
 from .cost_adapter import input_evidence, number
@@ -78,6 +78,24 @@ class CanvasServiceMixin:
         diagnostic = {key: sanitize(value)[:600] if isinstance(value, str) else value
             for key, value in values.items() if isinstance(value, (str, int, float, bool)) or value is None}
         diagnostic['at'] = time.time()
+        transport = details.get('transport_diagnostic')
+        if isinstance(transport, dict):
+            safe_transport = {}
+            pair = transport.get('command_pair')
+            if (isinstance(pair, (list, tuple)) and len(pair) == 2
+                    and all(isinstance(value, str) for value in pair)
+                    and tuple(pair) in TRANSPORT_DIAGNOSTIC_COMMANDS):
+                safe_transport['command_pair'] = list(pair)
+            for name in ('stdout', 'stderr'):
+                length = transport.get(name + '_bytes')
+                digest = transport.get(name + '_sha256')
+                if isinstance(length, int) and not isinstance(length, bool) and length >= 0:
+                    safe_transport[name + '_bytes'] = length
+                if (isinstance(digest, str) and len(digest) == 64
+                        and all(char in '0123456789abcdef' for char in digest)):
+                    safe_transport[name + '_sha256'] = digest
+            if safe_transport:
+                diagnostic['transport_diagnostic'] = safe_transport
         return diagnostic
 
     def _canvas_observation_deadline(self, task_id: str) -> float:
@@ -427,6 +445,10 @@ class CanvasServiceMixin:
                         "Canvas submission receipt unavailable; querying original operation")})
                 self._poll_canvas(task_id, client, deadline)
             else:
+                if not submission_started:
+                    phase = str((current_task.get('upstream_context') or {}).get('phase')
+                        or ('identity' if identity_pending else 'model_selection' if model_pending else 'preparing'))
+                    self._canvas_context(task_id, {'preparation_error': self._canvas_diagnostic(exc, phase)})
                 expired_preparation = not submission_started and time.monotonic() >= deadline
                 self._fail_canvas_task(task_id, 'CLI_PREPARATION_TIMEOUT' if expired_preparation else exc.code,
                     'Task deadline passed during Canvas preparation; no generation was submitted'

@@ -25,6 +25,11 @@ from urllib.parse import unquote, urlsplit
 PINNED_VERSION = "1.2.0"
 PINNED_PROXY_VERSION = "0.8.3"
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+TRANSPORT_DIAGNOSTIC_COMMANDS = frozenset({('auth', 'account'), ('auth', 'status'),
+    ('auth', 'login'), ('auth', 'wait'), ('auth', 'refresh'), ('auth', 'logout'),
+    ('model', 'list'), ('canvas', 'ls'), ('canvas', 'create'), ('node', 'create'),
+    ('node', 'show'), ('node', 'quote'), ('node', 'confirm'), ('node', 'run'),
+    ('resource', 'upload'), ('resource', 'get'), ('resource', 'download'), ('operation', 'status')})
 _SECRET_KEY = re.compile(r"token|password|secret|authorization|cookie|devicecode|privatekey", re.I)
 _PROFILE = re.compile(r"[A-Za-z0-9_.-]{1,80}\Z")
 
@@ -426,12 +431,18 @@ class CanvasCLI:
             if proxy_config:
                 proxy_config.unlink(missing_ok=True)
         paid_submit = args[:2] == ["node", "run"]
+        transport_diagnostic = {f'{name}_bytes': len(data) for name, data in zip(('stdout', 'stderr'), buffers)}
+        transport_diagnostic.update({f'{name}_sha256': hashlib.sha256(data).hexdigest()
+                                     for name, data in zip(('stdout', 'stderr'), buffers)})
+        if tuple(args[:2]) in TRANSPORT_DIAGNOSTIC_COMMANDS:
+            transport_diagnostic['command_pair'] = list(args[:2])
+        error_details = {'transport_diagnostic': transport_diagnostic}
         if overflow.is_set():
             raise CanvasCLIError("CLI_OUTPUT_LIMIT", "Canvas CLI output exceeded its limit",
-                                 outcome_unknown=paid_submit)
+                                 details=error_details, outcome_unknown=paid_submit)
         if timed_out:
             raise CanvasCLIError("CLI_COMMAND_TIMEOUT", "Canvas CLI command timed out",
-                                 outcome_unknown=paid_submit)
+                                 details=error_details, outcome_unknown=paid_submit)
         envelope: dict[str, Any] | None = None
         for raw in buffers:
             try:
@@ -443,7 +454,7 @@ class CanvasCLI:
                 pass
         if envelope is None:
             raise CanvasCLIError("CLI_INVALID_RESPONSE", "Canvas CLI returned no valid JSON result",
-                                 exit_code=process.returncode, outcome_unknown=paid_submit)
+                                 details=error_details, exit_code=process.returncode, outcome_unknown=paid_submit)
         if process.returncode != 0 or not envelope.get("ok"):
             error = envelope.get("error") if isinstance(envelope.get("error"), dict) else {}
             # A structured service/transport error still may arrive after the
@@ -460,8 +471,8 @@ class CanvasCLI:
                 local_rejection or auth_rejection or unconfirmed or before_submit or credit_rejection))
             raise CanvasCLIError(str(error.get("code") or "CLI_COMMAND_FAILED"),
                                  str(error.get("message") or "Canvas CLI command failed"),
-                                 details=envelope, exit_code=process.returncode, outcome_unknown=unknown)
+                                 details={**envelope, **error_details}, exit_code=process.returncode, outcome_unknown=unknown)
         if not isinstance(envelope.get("data"), dict):
             raise CanvasCLIError("CLI_INVALID_RESPONSE", "Canvas CLI data is not an object",
-                                 outcome_unknown=paid_submit)
+                                 details=error_details, outcome_unknown=paid_submit)
         return envelope
