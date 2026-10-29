@@ -8,12 +8,13 @@ import mimetypes
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .canvas_cli import CanvasCLIError, sanitize
 from .canvas_client import CanvasClient, identity_network_error
 from .account_policy import credit_rejected
 from .cost_adapter import input_evidence, number
-from .media import MediaError, _download, media_error_diagnostic
+from .media import MediaError, _DIRECT_FIRST_MEDIA_HOSTS, _download, media_error_diagnostic
 from .upload import _probe_media
 from .result_transfer import ResultTransferError, store_original
 
@@ -189,6 +190,16 @@ class CanvasServiceMixin:
                 "cli_auth_status": "expired" if auth_error else account.get("cli_auth_status", "pending"),
                 "cli_auth_error": str(exc)[:300], "last_error": str(exc)[:300]})
 
+    @staticmethod
+    def _canvas_direct_media_allowed(source: str) -> bool:
+        """Reuse only the browser's existing fixed public-material policy."""
+        try:
+            parsed = urlsplit(source)
+            return (parsed.scheme == "https" and parsed.hostname in _DIRECT_FIRST_MEDIA_HOSTS
+                    and parsed.username is None and parsed.password is None and parsed.port in {None, 443})
+        except (TypeError, ValueError, AttributeError):
+            return False
+
     def _canvas_local_assets(self, normalized: dict, account: dict, directory: Path, *,
                              deadline: float | None = None) -> dict:
         assets = {kind: [] for kind in ("images", "videos", "audios")}
@@ -199,7 +210,8 @@ class CanvasServiceMixin:
                         raise MediaError("Canvas reference requires a media URL; browser asset IDs cannot be reused",
                                          category="invalid_source", attempt_count=0)
                     contents, mime, filename = _download(str(source), kind,
-                        str(account["proxy_url"]), allow_direct_fallback=False, deadline=deadline)
+                        str(account["proxy_url"]),
+                        allow_direct_fallback=self._canvas_direct_media_allowed(str(source)), deadline=deadline)
                 except MediaError as exc:
                     exc.diagnostic.update(media_kind=kind, media_index=index + 1)
                     raise
