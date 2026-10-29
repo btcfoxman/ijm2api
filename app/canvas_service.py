@@ -11,7 +11,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .canvas_cli import TRANSPORT_DIAGNOSTIC_COMMANDS, CanvasCLIError, sanitize
-from .canvas_client import CanvasClient, identity_network_error
+from .canvas_client import CanvasClient, identity_network_error, public_image_source_url
+from .canvas_timing import PreparationTiming
 from .account_policy import credit_rejected
 from .cost_adapter import input_evidence, number
 from .media import MediaError, _DIRECT_FIRST_MEDIA_HOSTS, _download, media_error_diagnostic
@@ -223,6 +224,11 @@ class CanvasServiceMixin:
         assets = {kind: [] for kind in ("images", "videos", "audios")}
         for kind in assets:
             for index, source in enumerate(normalized.get(kind) or []):
+                if kind == 'images' and str(source).startswith(('https://', 'http://')):
+                    # The pinned CLI imports public image URLs server-side. Its
+                    # request still uses the selected account proxy transport.
+                    assets[kind].append({'source_url': public_image_source_url(source)})
+                    continue
                 try:
                     if not str(source).startswith(("https://", "http://", "data:")):
                         raise MediaError("Canvas reference requires a media URL; browser asset IDs cannot be reused",
@@ -288,9 +294,29 @@ class CanvasServiceMixin:
         if preflight_deadlines:
             deadline = min(deadline, time.monotonic() + max(0, min(preflight_deadlines) - time.time()))
 
+        def timing_changed(snapshot):
+            # Admission failures remain inside their existing audit entries.
+            # Never put a new top-level key on a task requeued to another account.
+            current = self.store.task(task_id) or {}
+            if (context.get('backend') == 'canvas_cli' and current.get('account_id') == account_id
+                    and current.get('status') in {'preparing', 'submitted', 'running'}
+                    and (current.get('upstream_context') or {}).get('backend') == 'canvas_cli'
+                    and not self._canvas_task_terminated(current)):
+                self._canvas_context(task_id, {'preparation_timing': snapshot})
+
+        timing = PreparationTiming(task_id, queued_at=task.get('created_at'), on_change=timing_changed)
+        if isinstance(client, CanvasClient):
+            client.preparation_timing = timing
+
+        def fail_preparation(code, message):
+            timing.finish()
+            self._canvas_context(task_id, {'preparation_timing': timing.snapshot()})
+            return self._fail_canvas_task(task_id, code, message)
+
         def persist(value):
             nonlocal context
             context = {**context, **value}
+            context['preparation_timing'] = timing.snapshot()
             old_error = ((self.store.task(task_id) or {}).get('upstream_context') or {}).get('submit_error')
             if old_error:
                 context['submit_error'] = old_error
@@ -302,21 +328,22 @@ class CanvasServiceMixin:
 
         try:
             if time.monotonic() >= deadline:
-                self._fail_canvas_task(task_id, 'CLI_PREPARATION_TIMEOUT', 'Task deadline passed before Canvas preparation; no generation was submitted')
+                fail_preparation('CLI_PREPARATION_TIMEOUT', 'Task deadline passed before Canvas preparation; no generation was submitted')
                 return True
             self._update_canvas_task(task_id, {"execution_backend": "canvas_cli"})
-            state = client.identity(deadline=deadline)
+            with timing.phase('identity'):
+                state = client.identity(deadline=deadline)
             identity_pending = False
             identity = str(state.get("user_id") or "")
             if not identity or identity != str(account.get("login_user_id") or account.get("cli_user_id") or ""):
                 self.store.update_account(account_id, {"cli_auth_status": "error",
                     "cli_auth_error": "CLI identity does not match the signed-in account", "status": "cli_auth_required"})
-                self._fail_canvas_task(task_id, "ACCOUNT_VERIFICATION_FAILED", "CLI identity does not match the signed-in account")
+                fail_preparation("ACCOUNT_VERIFICATION_FAILED", "CLI identity does not match the signed-in account")
                 return True
             fresh_before = number(state.get("available_balance"))
             budget_balance = fresh_before if fresh_before is not None else number(account.get('balance'))
             if budget_balance is None:
-                self._fail_canvas_task(task_id, "ACCOUNT_VERIFICATION_FAILED", "CLI account has neither a fresh nor a cached available balance for its budget")
+                fail_preparation("ACCOUNT_VERIFICATION_FAILED", "CLI account has neither a fresh nor a cached available balance for its budget")
                 return True
             if fresh_before is not None:
                 self.store.update_account(account_id, {"balance": fresh_before})
@@ -327,35 +354,38 @@ class CanvasServiceMixin:
             if task['model'] == 'sd-2-5-480p-x':
                 normalized['resolution'] = '720p'
             model_pending = True
-            client.preflight_model(normalized, deadline=deadline)
+            with timing.phase('model_preflight'):
+                client.preflight_model(normalized, deadline=deadline)
             model_pending = False
             with tempfile.TemporaryDirectory(prefix=f"ijm-canvas-{task_id}-") as directory:
-                assets = self._canvas_local_assets(normalized, account, Path(directory), deadline=deadline)
+                with timing.phase('material_prepare'):
+                    assets = self._canvas_local_assets(normalized, account, Path(directory), deadline=deadline)
                 self._update_canvas_task(task_id, {"cost_evidence": input_evidence(assets), "progress": 15})
                 prepared = client.prepare(normalized, task_id, assets, persist=persist, deadline=deadline)
                 persist(prepared)
             if time.monotonic() >= deadline:
-                self._fail_canvas_task(task_id, 'CLI_PREPARATION_TIMEOUT', 'Task deadline passed during Canvas preparation; no generation was submitted')
+                fail_preparation('CLI_PREPARATION_TIMEOUT', 'Task deadline passed during Canvas preparation; no generation was submitted')
                 return True
             quote = number(context.get("quoted_credits"))
             if quote is None:
-                self._fail_canvas_task(task_id, "CLI_QUOTE_UNAVAILABLE", "Canvas could not establish the complete task quote")
+                fail_preparation("CLI_QUOTE_UNAVAILABLE", "Canvas could not establish the complete task quote")
                 return True
             ceiling = number(normalized.get('_canvas_credit_ceiling'))
             if ceiling is not None and quote > ceiling:
-                self._fail_canvas_task(task_id, 'CLI_CREDIT_CEILING_EXCEEDED', 'Canvas quote exceeds the explicitly authorized recovery credit ceiling')
+                fail_preparation('CLI_CREDIT_CEILING_EXCEEDED', 'Canvas quote exceeds the explicitly authorized recovery credit ceiling')
                 return True
             with self._lock:
                 self._update_canvas_task(task_id, {"estimated_cost": quote,
                     "cost_evidence": {"canvas_quote": {"amount": quote, "source": "node.quote"},
                                       "execution_backend": "canvas_cli"}})
                 self._credit_reservations[task_id] = (account_id, quote)
+            credit_wait = timing.begin_phase('credit_wait')
             while not self._stop.is_set():
                 if self._canvas_task_terminated(self.store.task(task_id)):
                     return True
                 deadline = self._admission_deadline(task_id, deadline)
                 if time.monotonic() >= deadline:
-                    self._fail_canvas_task(task_id, 'CLI_PREPARATION_TIMEOUT',
+                    fail_preparation('CLI_PREPARATION_TIMEOUT',
                         'Task deadline passed while waiting for Canvas credits; no generation was submitted')
                     return True
                 with self._lock:
@@ -403,18 +433,23 @@ class CanvasServiceMixin:
                 self._stop.wait(min(1, max(0, deadline - time.monotonic())))
             else:
                 return True
+            timing.end_phase(credit_wait)
             submission_started = True
-            submitted = client.submit(context, int(math.ceil(quote)), persist=persist, deadline=deadline)
+            with timing.phase('confirmation_submit'), timing.defer_notifications():
+                submitted = client.submit(context, int(math.ceil(quote)), persist=persist, deadline=deadline)
+            timing.finish()
             persist({**submitted, "submission_phase": "submitted"})
             self._update_canvas_task(task_id, {"status": "submitted", "progress": 40})
             self._poll_canvas(task_id, client, deadline)
             return True
         except CanvasCLIError as exc:
+            timing.finish()
             current_task = self.store.task(task_id)
             if self._canvas_task_terminated(current_task):
                 return True
             if model_pending and self._canvas_model_ineligible(current_task, exc, deadline):
                 diagnostic = self._canvas_diagnostic(exc, 'model_selection')
+                diagnostic['preparation_timing'] = timing.snapshot()
                 diagnostic.update(dispatch_started=False, requested_model=task['model'],
                     kind='image' if task['normalized'].get('kind') == 'image' else 'video',
                     task_deadline=time.time() + max(0, deadline - time.monotonic()))
@@ -422,6 +457,7 @@ class CanvasServiceMixin:
                 return 'skip_model' if skipped else True
             if identity_pending and self._canvas_identity_network_retry(current_task, exc, deadline):
                 diagnostic = self._canvas_diagnostic(exc, 'identity')
+                diagnostic['preparation_timing'] = timing.snapshot()
                 diagnostic.update(dispatch_started=False,
                     task_deadline=time.time() + max(0, deadline - time.monotonic()))
                 retry = self._handle_admission_rejection(task_id, account_id, exc.code,
@@ -449,13 +485,15 @@ class CanvasServiceMixin:
                 if not submission_started:
                     phase = str((current_task.get('upstream_context') or {}).get('phase')
                         or ('identity' if identity_pending else 'model_selection' if model_pending else 'preparing'))
-                    self._canvas_context(task_id, {'preparation_error': self._canvas_diagnostic(exc, phase)})
+                    self._canvas_context(task_id, {'preparation_error': {**self._canvas_diagnostic(exc, phase),
+                        'preparation_timing': timing.snapshot()}, 'preparation_timing': timing.snapshot()})
                 expired_preparation = not submission_started and time.monotonic() >= deadline
                 self._fail_canvas_task(task_id, 'CLI_PREPARATION_TIMEOUT' if expired_preparation else exc.code,
                     'Task deadline passed during Canvas preparation; no generation was submitted'
                     if expired_preparation else str(exc))
             return True
         except Exception as exc:
+            timing.finish()
             if self._canvas_task_terminated(self.store.task(task_id)):
                 return True
             code = "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN" if submission_started else (
@@ -473,10 +511,12 @@ class CanvasServiceMixin:
                     self._canvas_context(task_id, {"media_download_error": diagnostic})
                     logger.warning("Canvas media download failed task=%s account=%s diagnostic=%s",
                                    task_id, account_id, diagnostic)
-                self._fail_canvas_task(task_id, code, f"{type(exc).__name__}: Canvas preparation failed")
+                fail_preparation(code, f"{type(exc).__name__}: Canvas preparation failed")
             logger.warning("Canvas task %s failed in %s (%s)", task_id,
                            "submission" if submission_started else "preparation", type(exc).__name__)
             return True
+        finally:
+            timing.finish()
 
     def _canvas_settlement(self, task: dict, client, *, deadline: float | None = None) -> dict:
         values = {}

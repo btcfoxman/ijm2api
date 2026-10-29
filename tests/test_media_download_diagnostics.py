@@ -203,17 +203,18 @@ def test_third_reference_failure_is_durable_safe_and_never_reaches_canvas_prepar
     account = owner(store)
     store.update_account(account["id"], {"proxy_url": PROXY})
     account = store.account(account["id"], private=True)
-    row = task(store, image_urls=[SOURCE + f"&index={index}" for index in range(3)])
+    row = task(store, audio_urls=[SOURCE.replace("reference.png", "reference.mp3") + f"&index={index}" for index in range(3)])
     client = fake_client(store, service, account)
     session = Mock()
     session.get.side_effect = lambda *args, **kwargs: response(503)
     monkeypatch.setattr("app.media.requests.Session", lambda: session)
     monkeypatch.setattr("app.media.time.sleep", lambda _: None)
+    monkeypatch.setattr("app.canvas_service._probe_media", lambda body, suffix: {"duration": 1.0})
     seen = []
     def download(source, kind, proxy_url, **kwargs):
         seen.append((kind, proxy_url, kwargs))
         if len(seen) < 3:
-            return b"fixture image", "image/png", "fixture.png"
+            return b"fixture audio", "audio/mpeg", "fixture.mp3"
         return _download(source, kind, proxy_url, **kwargs)
     with patch.object(service, "canvas_client", return_value=client), patch("app.canvas_service._download", download):
         service._run(row["id"])
@@ -222,7 +223,7 @@ def test_third_reference_failure_is_durable_safe_and_never_reaches_canvas_prepar
     assert result["status"] == "failed" and result["error_code"] == "MEDIA_DOWNLOAD_FAILED"
     assert result["error_message"] == "MediaError: Canvas preparation failed"
     assert diagnostic == {"category": "http", "http_status": 503, "attempt_count": 2, "retry_count": 1,
-        "route": "account_proxy", "media_kind": "images", "media_index": 3,
+        "route": "account_proxy", "media_kind": "audios", "media_index": 3,
         "exception_types": ["MediaError", "HTTPError"]}
     assert len(seen) == 3 and all(item[1] == PROXY and item[2]["allow_direct_fallback"] is False for item in seen)
     assert result["actual_cost"] is None and not result["attempted_account_ids"]

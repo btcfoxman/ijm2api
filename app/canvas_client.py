@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import ipaddress
 import math
 import re
 import time
 import uuid
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from .canvas_cli import CanvasCLI, CanvasCLIError, account_profile, sanitize
 from .catalog import ALIASES, media_alias_kind
@@ -139,6 +142,34 @@ def _key(value: Any) -> str:
 
 def _stable(*parts: Any) -> str:
     return str(uuid.uuid5(_NAMESPACE, ":".join(map(str, parts))))
+
+
+def public_image_source_url(value: Any) -> str:
+    """Keep remote-image imports on public HTTP(S) locators, without fetching."""
+    try:
+        if (not isinstance(value, str) or not value or len(value) > 16384
+                or '\\' in value or any(ord(char) <= 32 or ord(char) == 127 for char in value)):
+            raise ValueError
+        parsed = urlsplit(value)
+        host = (parsed.hostname or '').rstrip('.').lower()
+        if (parsed.scheme not in {'http', 'https'} or not host or parsed.username is not None
+                or parsed.password is not None or '%' in host
+                or parsed.port is not None and not 1 <= parsed.port <= 65535
+                or host in {'localhost', 'metadata', 'instance-data'}
+                or host.endswith(('.localhost', '.local', '.internal', '.lan', '.home'))):
+            raise ValueError
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            if '.' not in host or re.fullmatch(r'(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+)){0,3}', host):
+                raise ValueError
+        else:
+            mapped = getattr(address, 'ipv4_mapped', None)
+            if not address.is_global or mapped is not None and not mapped.is_global:
+                raise ValueError
+    except (TypeError, ValueError):
+        raise CanvasCLIError('MEDIA_DOWNLOAD_FAILED', 'Canvas reference image requires a public HTTP(S) URL') from None
+    return value
 
 
 def _file_mime(path: Path, media_type: str) -> str:
@@ -328,6 +359,10 @@ class CanvasClient:
         self.runner = runner
         self.account = dict(account)
         self._capabilities = capabilities or {}
+        self.preparation_timing = None
+
+    def _phase(self, name, **metadata):
+        return self.preparation_timing.phase(name, **metadata) if self.preparation_timing is not None else nullcontext()
 
     @staticmethod
     def _remaining(deadline: float | None, timeout: float | None = None) -> float | None:
@@ -352,7 +387,9 @@ class CanvasClient:
                 kwargs = {'timeout': budget}
                 if deadline is not None:
                     kwargs['deadline'] = deadline
-                result = _data(self.runner.run(self.account, args, **kwargs))
+                invoke = lambda: _data(self.runner.run(self.account, args, **kwargs))
+                result = (self.preparation_timing.command(self.runner, self.account, args, kwargs, attempt + 1, invoke)
+                          if self.preparation_timing is not None else invoke())
                 # A paid receipt must remain accepted even if processing it
                 # reaches the clock boundary. submit() owns that safety edge.
                 if args[:2] not in (["node", "confirm"], ["node", "run"]):
@@ -488,13 +525,21 @@ class CanvasClient:
                 raise CanvasCLIError("MEDIA_UPLOAD_PENDING", "Canvas reference upload is not ready; retained original resource ID") from exc
             raise
 
-    def _upload_resource(self, path: Path, media_type: str, resource_id: str, project_id: str, *,
-                         deadline: float | None = None) -> None:
+    def _upload_resource(self, path: Path | None, media_type: str, resource_id: str, project_id: str, *,
+                         deadline: float | None = None, source_url: str | None = None) -> None:
         """Retries keep the same documented registration idempotency key."""
+        if source_url is not None:
+            if media_type != 'image' or path is not None:
+                raise CanvasCLIError('MEDIA_INPUT_MISSING', 'Canvas source-url imports require an image and no local file')
+            source = ['--source-url', public_image_source_url(source_url)]
+        elif isinstance(path, Path):
+            source = ['--file', str(path.resolve())]
+        else:
+            raise CanvasCLIError('MEDIA_INPUT_MISSING', 'Canvas reference file is missing')
         for attempt in range(3):
             upload_acknowledged = False
             try:
-                self._call(["resource", "upload", "--file", str(path.resolve()),
+                self._call(["resource", "upload", *source,
                             "--type", media_type, "--project-id", project_id,
                             "--resource-id", resource_id], timeout=180, deadline=deadline)
                 upload_acknowledged = True
@@ -592,15 +637,24 @@ class CanvasClient:
             if persist:
                 persist(copy.deepcopy(context))
         save("preparing")
-        self._ensure_project(context, deadline=deadline)
+        with self._phase('project'):
+            self._ensure_project(context, deadline=deadline)
         for group, media_type in (("images", "image"), ("videos", "video"), ("audios", "audio")):
             for index, asset in enumerate(assets.get(group, [])):
                 resource_id = context["resources"][group][index]
                 if resource_id not in context["uploaded_resources"]:
+                    source_url = asset.get('source_url') if isinstance(asset, dict) else None
                     path = asset.get("path") if isinstance(asset, dict) else asset
-                    if not isinstance(path, (str, Path)) or not Path(path).is_file():
-                        raise CanvasCLIError("MEDIA_INPUT_MISSING", "Canvas reference file is missing")
-                    self._upload_resource(Path(path), media_type, resource_id, context["project_id"], deadline=deadline)
+                    with self._phase('reference_upload', index=index + 1, media_type=media_type):
+                        if source_url is not None:
+                            if media_type != 'image' or path is not None:
+                                raise CanvasCLIError('MEDIA_INPUT_MISSING', 'Canvas remote references require an image URL only')
+                            self._upload_resource(None, media_type, resource_id, context['project_id'],
+                                                  deadline=deadline, source_url=source_url)
+                        else:
+                            if not isinstance(path, (str, Path)) or not Path(path).is_file():
+                                raise CanvasCLIError("MEDIA_INPUT_MISSING", "Canvas reference file is missing")
+                            self._upload_resource(Path(path), media_type, resource_id, context["project_id"], deadline=deadline)
                     context["uploaded_resources"].append(resource_id)
                     save("uploading")
         args = ["node", "create", kind, "--project-id", context["project_id"],
@@ -612,10 +666,12 @@ class CanvasClient:
             for resource_id in context["resources"][group]:
                 args.extend(["--ref", "res:" + resource_id])
         save("saving")
-        self._call(args, deadline=deadline)
+        with self._phase('draft_save'):
+            self._call(args, deadline=deadline)
         save("quoting")
-        quote = self._call(["node", "quote", "--project-id", context["project_id"],
-                            "--node-id", context["node_id"]], read_only=True, deadline=deadline)
+        with self._phase('quote'):
+            quote = self._call(["node", "quote", "--project-id", context["project_id"],
+                                "--node-id", context["node_id"]], read_only=True, deadline=deadline)
         items = quote.get("items")
         if (not isinstance(items, list) or len(items) != 1 or items[0].get("nodeId") != context["node_id"]
                 or items[0].get("error") or items[0].get("generationDiff") or not quote.get("confirmable", False)):

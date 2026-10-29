@@ -1,4 +1,4 @@
-"""Only existing fixed public-media hosts reuse the browser preparation route."""
+"""Local video/audio downloads retain existing public-host and proxy policy."""
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,10 +14,10 @@ from test_canvas_execution import context, owner, task
 from test_canvas_transport import FakeRunner
 
 
-SOURCE = "https://media.juxingdonghua.com/fixture.png?signature=caller-signature"
+SOURCE = "https://media.juxingdonghua.com/fixture.mp4?signature=caller-signature"
 PROXY = "socks5://fixture-user:fixture-password@proxy.test:20019"
 ACCOUNT = {"id": 19, "proxy_url": PROXY}
-IMAGE = b"\x89PNG\r\n\x1a\nfixture-image"
+VIDEO = b"fixture-video-content"
 
 
 @pytest.mark.parametrize("source", [SOURCE, SOURCE.replace("media.juxingdonghua.com", "MEDIA.JUXINGDONGHUA.COM"),
@@ -49,12 +49,12 @@ def response():
     value = Mock()
     value.__enter__ = Mock(return_value=value)
     value.__exit__ = Mock(return_value=False)
-    value.headers = {"Content-Type": "image/png"}
+    value.headers = {"Content-Type": "video/mp4"}
     value.status_code = 200
     raw = SimpleNamespace(closed=False, _connection=SimpleNamespace(sock=Mock()))
     def read1(*args, **kwargs):
         raw.closed = True
-        return IMAGE
+        return VIDEO
     raw.read1 = Mock(side_effect=read1)
     value.raw = raw
     return value
@@ -79,6 +79,7 @@ def sessions(monkeypatch):
     monkeypatch.setattr("app.media.requests.Session", create)
     monkeypatch.setattr("app.media.time.sleep", lambda _: None)
     monkeypatch.setattr("app.media._DIRECT_MEDIA_UNTIL", {})
+    monkeypatch.setattr("app.canvas_service._probe_media", lambda body, suffix: {"duration": 1.0})
     return actions, opened
 
 
@@ -91,7 +92,7 @@ def assert_original_proxy(value):
 def test_real_download_uses_direct_first_then_original_account_proxy(tmp_path, sessions):
     actions, opened = sessions
     actions.extend([requests.ReadTimeout("fixture interruption"), response()])
-    assets = CanvasServiceMixin()._canvas_local_assets({"images": [SOURCE]}, ACCOUNT, tmp_path, deadline=10**12)
+    assets = CanvasServiceMixin()._canvas_local_assets({"videos": [SOURCE]}, ACCOUNT, tmp_path, deadline=10**12)
     assert len(opened) == 2
     assert opened[0].get.call_args.kwargs["proxies"] == {}
     assert opened[0].get.call_args.kwargs["allow_redirects"] is False
@@ -103,7 +104,8 @@ def test_real_download_uses_direct_first_then_original_account_proxy(tmp_path, s
         kwargs = value.get.call_args.kwargs
         assert kwargs["headers"] == {"User-Agent": "Mozilla/5.0", "Accept-Encoding": "identity"}
         assert "cookies" not in kwargs and "auth" not in kwargs
-    assert Path(assets["images"][0]["path"]).read_bytes() == IMAGE
+    assert Path(assets["videos"][0]["path"]).read_bytes() == VIDEO
+    assert assets["videos"][0]["duration"] == 1.0
     assert ACCOUNT == {"id": 19, "proxy_url": PROXY}
 
 
@@ -113,7 +115,7 @@ def test_other_public_and_official_hosts_remain_proxy_only(tmp_path, sessions, m
     actions.extend([requests.ReadTimeout("fixture interruption"), requests.ReadTimeout("fixture interruption")])
     monkeypatch.setattr("app.media._DIRECT_MEDIA_UNTIL", {"caller.example": 10**15})
     with pytest.raises(MediaError) as found:
-        CanvasServiceMixin()._canvas_local_assets({"images": [source]}, ACCOUNT, tmp_path, deadline=10**12)
+        CanvasServiceMixin()._canvas_local_assets({"videos": [source]}, ACCOUNT, tmp_path, deadline=10**12)
     assert len(opened) == 2
     for value in opened:
         assert_original_proxy(value)
@@ -130,7 +132,7 @@ def test_direct_retry_consumes_original_shared_download_deadline(tmp_path, sessi
     actions.extend([interrupted, response()])
     monkeypatch.setattr("app.media.time", SimpleNamespace(monotonic=lambda: clock["now"],
         sleep=lambda delay: clock.update(now=clock["now"] + delay)))
-    CanvasServiceMixin()._canvas_local_assets({"images": [SOURCE]}, ACCOUNT, tmp_path, deadline=10)
+    CanvasServiceMixin()._canvas_local_assets({"videos": [SOURCE]}, ACCOUNT, tmp_path, deadline=10)
     assert [value.get.call_args.kwargs["timeout"].total for value in opened] == [10, 5.5]
     assert clock["now"] == 4.5
     assert_original_proxy(opened[1])
@@ -145,7 +147,7 @@ def test_direct_failure_at_original_deadline_never_opens_proxy_attempt(tmp_path,
     actions.append(interrupted)
     monkeypatch.setattr("app.media.time", SimpleNamespace(monotonic=lambda: clock["now"], sleep=Mock()))
     with pytest.raises(MediaError) as found:
-        CanvasServiceMixin()._canvas_local_assets({"images": [SOURCE]}, ACCOUNT, tmp_path, deadline=3)
+        CanvasServiceMixin()._canvas_local_assets({"videos": [SOURCE]}, ACCOUNT, tmp_path, deadline=3)
     assert len(opened) == 1 and clock["now"] == 3
     assert media_error_diagnostic(found.value)["category"] == "deadline"
     assert media_error_diagnostic(found.value)["route"] == "direct_media"
@@ -157,7 +159,8 @@ def test_public_material_route_does_not_change_account_for_any_cli_rpc(context, 
     account = owner(store)
     store.update_account(account["id"], {"proxy_url": PROXY, "login_user_id": "42", "cli_user_id": "42"})
     account = store.account(account["id"], private=True)
-    row = task(store, image_urls=[SOURCE])
+    image_source = SOURCE.replace("fixture.mp4", "fixture.png")
+    row = task(store, image_urls=[image_source])
     actions, opened = sessions
     actions.append(response())
     class AccountRunner(FakeRunner):
@@ -181,5 +184,8 @@ def test_public_material_route_does_not_change_account_for_any_cli_rpc(context, 
     assert runner.accounts and all(selected == account for selected in runner.accounts)
     assert sum(args[:2] == ["node", "run"] for args in runner.calls) == 1
     assert store.account(account["id"], private=True)["proxy_url"] == PROXY
-    assert opened[0].get.call_args.kwargs["proxies"] == {}
+    assert opened == []
+    uploads = [args for args in runner.calls if args[:2] == ["resource", "upload"]]
+    assert len(uploads) == 1 and "--file" not in uploads[0]
+    assert uploads[0][uploads[0].index("--source-url") + 1] == image_source
     service.browser_runtime.acquire.assert_not_called()
