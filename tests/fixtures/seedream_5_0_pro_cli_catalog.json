@@ -1,0 +1,117 @@
+{
+  "source": {
+    "cli_version": "1.2.0",
+    "command": [
+      "model",
+      "list",
+      "--type",
+      "image"
+    ],
+    "capture": "Read-only existing-account CLI model catalog; no quote, confirmation or generation",
+    "evidence_sha256": "e66e3d20463caf3d8c367ffc463c4e9e85d36a064f64d18539f437793c175652"
+  },
+  "items": [
+    {
+      "type": "image",
+      "model": "seedream_5.0_pro",
+      "displayName": "Seedream 5.0 Pro",
+      "aliases": [
+        "5.0pro"
+      ],
+      "modes": [
+        {
+          "name": "i2i",
+          "flags": [
+            {
+              "flag": "--prompt",
+              "required": false
+            },
+            {
+              "flag": "--ratio",
+              "required": false,
+              "values": [
+                "21:9",
+                "16:9",
+                "3:2",
+                "4:3",
+                "1:1",
+                "3:4",
+                "2:3",
+                "9:16"
+              ]
+            },
+            {
+              "flag": "--resolution",
+              "required": true,
+              "values": [
+                "1.5K",
+                "2K",
+                "4K"
+              ]
+            },
+            {
+              "flag": "--count",
+              "required": false,
+              "min": 1,
+              "max": 4
+            }
+          ],
+          "references": {
+            "min": 1,
+            "max": 10,
+            "types": [
+              {
+                "mediaType": "image",
+                "min": 1,
+                "max": 10
+              }
+            ]
+          }
+        },
+        {
+          "name": "t2i",
+          "flags": [
+            {
+              "flag": "--prompt",
+              "required": true
+            },
+            {
+              "flag": "--ratio",
+              "required": false,
+              "values": [
+                "21:9",
+                "16:9",
+                "3:2",
+                "4:3",
+                "1:1",
+                "3:4",
+                "2:3",
+                "9:16"
+              ]
+            },
+            {
+              "flag": "--resolution",
+              "required": true,
+              "values": [
+                "1.5K",
+                "2K",
+                "4K"
+              ]
+            },
+            {
+              "flag": "--count",
+              "required": false,
+              "min": 1,
+              "max": 4
+            }
+          ],
+          "references": {
+            "min": 0,
+            "max": 0,
+            "types": []
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -25,7 +25,7 @@ from .auto_login import AutoLoginManager
 from .canvas_auth import CanvasAuthManager
 from .canvas_cli import CanvasCLIError
 from .catalog import public_models
-from .image_client import IMAGE_MODELS
+from .image_client import IMAGE_MODELS, image_model_requires_cli
 from .service import Service
 from .store import ACCOUNT_SECRET_FIELDS, ACCOUNT_SETUP_FIELDS, Store
 
@@ -472,7 +472,9 @@ def admin_models() -> list[dict[str, Any]]:
 @app.get("/v1/models", dependencies=[Depends(api_auth)])
 def models() -> dict[str, Any]:
     image_models = [{"id": model + suffix, "object": "model", "owned_by": "ijmapi"}
-                    for model in IMAGE_MODELS for suffix in ("", "-2k", "-4k")]
+                    for model, upstream in IMAGE_MODELS.items()
+                    for suffix in (("", "-1.5k", "-2k", "-4k") if image_model_requires_cli(upstream)
+                                   else ("", "-2k", "-4k"))]
     return {"object": "list", "data": admin_models() + image_models}
 
 

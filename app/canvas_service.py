@@ -373,7 +373,8 @@ class CanvasServiceMixin:
                             pending = self._pending_credits(self.store.scheduling_rows(), task_id)
                             current_available, _ = self._available_credits({**account, 'balance': budget_balance}, pending)
                             candidates = self._funded_accounts(quote, set(task.get('attempted_account_ids') or [])
-                                | self._model_excluded_accounts(task), pending)
+                                | self._model_excluded_accounts(task), pending,
+                                self._required_execution_backend(task) or None)
                             candidates = [a for a in candidates if int(a['id']) != account_id
                                 and int(a['priority']) == int(account['priority'])
                                 and a.get('_available_credits') is not None

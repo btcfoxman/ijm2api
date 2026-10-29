@@ -14,7 +14,9 @@ from .browser import CDPBrowser
 IMAGE_MODELS = {
     "gpt-image-2.5-flare": "dreamina_gpt_image_2_5_flare",
     "gpt-image-2.5-sunburst": "dreamina_gpt_image_2_5_sunburst",
+    "seedream-5.0-pro": "seedream_5.0_pro",
 }
+CLI_ONLY_IMAGE_MODELS = frozenset({"seedream_5.0_pro"})
 IMAGE_RATIOS = {
     "1:1": (1, 1024, 1024),
     "3:4": (2, 768, 1024),
@@ -31,13 +33,26 @@ IMAGE_DRAFT_VERSION = "3.3.30"
 
 def resolve_image_model(model: str) -> str:
     name = model.strip().lower()
-    for tier in ("-1k", "-2k", "-4k"):
+    selected_tier = ""
+    for tier in ("-1.5k", "-1k", "-2k", "-4k"):
         if name.endswith(tier):
             name = name[:-len(tier)]
+            selected_tier = tier[1:]
             break
     if name not in IMAGE_MODELS:
         raise ValueError(f"unsupported IJM image model: {model}")
-    return IMAGE_MODELS[name]
+    upstream_model = IMAGE_MODELS[name]
+    if selected_tier and selected_tier not in image_model_resolutions(upstream_model):
+        raise ValueError(f"unsupported IJM image model resolution: {model}")
+    return upstream_model
+
+
+def image_model_requires_cli(upstream_model: str) -> bool:
+    return upstream_model in CLI_ONLY_IMAGE_MODELS
+
+
+def image_model_resolutions(upstream_model: str) -> tuple[str, ...]:
+    return ("1.5k", "2k", "4k") if image_model_requires_cli(upstream_model) else ("1k", "2k", "4k")
 
 
 def _uuid() -> str:
@@ -65,6 +80,8 @@ def _core(normalized: dict[str, Any]) -> dict[str, Any]:
 def build_image_submit_body(normalized: dict[str, Any], assets: list[dict[str, Any]],
                             workspace_id: int = 0) -> tuple[dict[str, Any], str]:
     """Build the observed 3.0.2 image draft; edit resources keep input order."""
+    if image_model_requires_cli(normalized["upstream_model"]):
+        raise ValueError("this image model requires Canvas CLI execution")
     submit_id = _uuid()
     component_id = _uuid()
     is_edit = bool(assets)
@@ -146,6 +163,8 @@ class DreaminaImageClient:
         return workspace_id
 
     def submit(self, normalized: dict[str, Any], assets: list[dict[str, Any]]) -> dict[str, str]:
+        if image_model_requires_cli(normalized["upstream_model"]):
+            raise ValueError("this image model requires Canvas CLI execution")
         if assets:
             uris = [str(item["image_uri"]) for item in assets]
             self.browser.post("/mweb/v1/imagex/submit_audit_job", {"uri_list": uris},

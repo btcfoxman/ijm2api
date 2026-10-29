@@ -25,7 +25,7 @@ from .canvas_service import ADMISSION_AUDIT_FIELDS, CanvasServiceMixin, executio
 from .account_policy import credit_rejected as _credit_rejected
 from .catalog import MODELS, normalize_request
 from .client import DreaminaClient, DreaminaError, InputAudioDurationError, SubmissionPreflightError
-from .image_client import DreaminaImageClient, resolve_image_model
+from .image_client import DreaminaImageClient, resolve_image_model, image_model_requires_cli
 from .image_request import normalize_image_request
 from .errors import public_error, upstream_review_error
 from .media import MediaError
@@ -388,7 +388,8 @@ class Service(CanvasServiceMixin):
         if self.store.active_count() >= int(settings["task_workers"]) + int(settings["task_queue_capacity"]):
             raise RuntimeError("IJMAPI queue is full")
         task_id = "ijm_img_" + uuid.uuid4().hex[:16]
-        task = self.store.create_task(task_id, request, normalized)
+        task = self.store.create_task(task_id, request, normalized,
+            execution_backend="canvas_cli" if image_model_requires_cli(normalized["upstream_model"]) else "")
         self._pool.submit(self._run_image, task_id)
         return self.image_response(task)
 
@@ -524,6 +525,12 @@ class Service(CanvasServiceMixin):
             accounts.append({**item, '_available_credits': available})
         return accounts
 
+    @staticmethod
+    def _required_execution_backend(task: dict) -> str:
+        normalized = task.get('normalized') or {}
+        return ('canvas_cli' if normalized.get('kind') == 'image'
+                and image_model_requires_cli(normalized.get('upstream_model')) else '')
+
     def _reserve_account(self, estimated_cost: float = 0, *,
                          exclude_ids: set[int] | None = None,
                          prefer_balance: bool = False, task_id: str | None = None) -> dict[str, Any] | None:
@@ -533,7 +540,7 @@ class Service(CanvasServiceMixin):
                 return None
             pending = self._pending_credits(self.store.scheduling_rows(), task_id)
             task = (self.store.task(task_id) or {}) if task_id else {}
-            backend = task.get('execution_backend')
+            backend = self._required_execution_backend(task) or task.get('execution_backend')
             excluded = excluded | self._model_excluded_accounts(task)
             accounts = self._funded_accounts(estimated_cost, excluded, pending, backend)
             # Unknown cost is not a free task: probe a larger balance until a
@@ -556,7 +563,7 @@ class Service(CanvasServiceMixin):
             pending = self._pending_credits(self.store.scheduling_rows(), task_id)
             task = (self.store.task(task_id) or {}) if task_id else {}
             return bool(self._funded_accounts(estimated_cost, excluded | self._model_excluded_accounts(task),
-                pending, task.get('execution_backend'), include_aux_busy=True))
+                pending, self._required_execution_backend(task) or task.get('execution_backend'), include_aux_busy=True))
 
     def _release_account(self, account_id: int, task_id: str | None = None) -> None:
         with self._lock:
@@ -598,12 +605,13 @@ class Service(CanvasServiceMixin):
                 return False
             audit = {key: value for key, value in (task.get('upstream_context') or {}).items()
                      if key in ADMISSION_AUDIT_FIELDS}
+            required_backend = self._required_execution_backend(task)
             saved = self.store.update_task(task_id, {'status': 'queued', 'progress': 0,
-                'account_id': None, 'balance_before': None, 'execution_backend': '',
+                'account_id': None, 'balance_before': None, 'execution_backend': required_backend,
                 'upstream_context': audit,
-                'cost_evidence': {'execution_backend': '', 'canvas_quote': None},
+                'cost_evidence': {'execution_backend': required_backend, 'canvas_quote': None},
                 **changes}, preserve_terminal=True)
-            return saved.get('status') == 'queued' and saved.get('execution_backend') == ''
+            return saved.get('status') == 'queued' and saved.get('execution_backend') == required_backend
 
     @staticmethod
     def _admission_history(task: dict) -> list:
@@ -698,7 +706,8 @@ class Service(CanvasServiceMixin):
             return any(int(account['id']) in self._aux_account_owners
                        or any(owner == int(account['id']) for owner, _ in pending.values())
                        for account in self._funded_accounts(estimated_cost,
-                           excluded | self._model_excluded_accounts(task), {}, task.get('execution_backend'),
+                           excluded | self._model_excluded_accounts(task), {},
+                           self._required_execution_backend(task) or task.get('execution_backend'),
                            include_aux_busy=True))
 
     def check_account(self, account_id: int, *, start_browser: bool = False) -> dict[str, Any]:
