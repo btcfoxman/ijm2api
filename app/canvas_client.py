@@ -26,6 +26,28 @@ _MODEL_NAMES = {
 }
 _TRANSIENT = {"network_timeout", "dns_resolution_failed", "network_error",
               "service_unavailable", "rate_limited", "transport_error"}
+_TRANSPORT_RETRY_READS = frozenset({('auth', 'account'), ('model', 'list'), ('canvas', 'ls'),
+    ('node', 'quote'), ('node', 'show'), ('resource', 'get'), ('operation', 'status')})
+
+
+def _read_only_transport_retry(args: list[str], exc: CanvasCLIError) -> bool:
+    """An exact read may reconnect after a typed transport failure."""
+    if exc.code != 'cli.transport_failed' or tuple(args[:2]) not in _TRANSPORT_RETRY_READS:
+        return False
+    error = exc.details.get('error') or {}
+    if not isinstance(error, dict) or error.get('retryable') is False:
+        return False
+    if error.get('serviceCode') not in (None, ''):
+        return False
+    if str(error.get('requiredAction') or '').lower() not in {'', 'retry'}:
+        return False
+    if str(error.get('code') or '') not in {'', 'cli.transport_failed'}:
+        return False
+    if str(error.get('class') or '').lower() not in {
+            '', 'transport_error', 'transport_failure', 'network_error', 'network_failure', 'internal_failure'}:
+        return False
+    reason = str(error.get('reason') or '').lower()
+    return not reason or reason in _TRANSIENT
 
 
 def identity_network_error(exc: CanvasCLIError) -> bool:
@@ -315,7 +337,8 @@ class CanvasClient:
             except CanvasCLIError as exc:
                 error = exc.details.get("error", {})
                 transient = (exc.code in {"CLI_COMMAND_TIMEOUT", "CLI_INVALID_RESPONSE", "cli.invalid_service_response"}
-                             or bool(error.get("retryable")) and error.get("reason") in _TRANSIENT)
+                             or bool(error.get("retryable")) and error.get("reason") in _TRANSIENT
+                             or read_only and _read_only_transport_retry(args, exc))
                 if not read_only or attempt == 2 or not transient:
                     raise
                 self._sleep(0.25 * 2 ** attempt, deadline)
