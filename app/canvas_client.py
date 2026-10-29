@@ -855,7 +855,8 @@ class CanvasClient:
                 "upstream_error_code": str(code or ""), "credit_facts": facts}
 
     def poll(self, context: dict[str, Any], *, deadline: float | None = None) -> dict[str, Any]:
-        self._check_context(context)
+        with self.runner.account_guard(self.account, deadline=deadline):
+            self._check_context(context)
         data = self._call(["operation", "status", context["submit_id"],
                            "--project-id", context["project_id"]], read_only=True, deadline=deadline)
         reference = data.get("operationRef")

@@ -282,8 +282,10 @@ def test_result_download_shares_query_deadline_without_restarting_180_second_bud
             raise CanvasCLIError('CLI_COMMAND_TIMEOUT', 'synthetic result download timed out')
         return original(account, args, timeout=timeout)
     runner.run = interrupted
-    monkeypatch.setattr('app.canvas_client.time', SimpleNamespace(monotonic=lambda: clock['now'],
-        sleep=lambda delay: clock.update(now=clock['now'] + delay)))
+    fake_time = SimpleNamespace(monotonic=lambda: clock['now'],
+        sleep=lambda delay: clock.update(now=clock['now'] + delay))
+    monkeypatch.setattr('app.canvas_client.time', fake_time)
+    monkeypatch.setattr('app.canvas_cli.time', fake_time)
     with pytest.raises(CanvasCLIError):
         client.poll(context, deadline=5)
     assert clock['now'] == 5
@@ -881,6 +883,84 @@ def test_old_magic_valid_half_video_is_not_reused(tmp_path):
     assert Path(result["path"]).read_bytes().endswith(b"original-bytes")
     assert sum(args[:2] == ["resource", "download"] for args in runner.calls) == 1
     assert not list(base.glob("*.part"))
+
+
+def test_poll_context_lock_respects_original_deadline_before_any_command(tmp_path, monkeypatch):
+    runner = CanvasCLI(tmp_path, allow_unwrapped_for_tests=True)
+    account = {"id": 19}
+    context = {"account_id": 19, "profile": runner.profile(account),
+               "project_id": "original-project", "submit_id": "original-submit"}
+    client = CanvasClient(runner, account)
+    execute = Mock(side_effect=AssertionError("Expired poll cannot start a command"))
+    monkeypatch.setattr(runner, "_execute", execute)
+    locked, release = threading.Event(), threading.Event()
+
+    def hold_account():
+        with runner._lock(19):
+            locked.set()
+            release.wait(1)
+
+    holder = threading.Thread(target=hold_account)
+    holder.start()
+    assert locked.wait(1)
+    safety_release = threading.Timer(0.25, release.set)
+    safety_release.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(CanvasCLIError) as found:
+            client.poll(context, deadline=started + 0.02)
+        elapsed = time.monotonic() - started
+        assert found.value.code == "CLI_TASK_DEADLINE_EXCEEDED"
+        assert elapsed < 0.15, "Profile validation waited beyond the original poll deadline"
+        execute.assert_not_called()
+    finally:
+        release.set()
+        safety_release.cancel()
+        holder.join(1)
+        runner.close()
+    assert not holder.is_alive()
+
+
+def test_expired_poll_never_reads_credential_profile(tmp_path, monkeypatch):
+    runner = CanvasCLI(tmp_path, allow_unwrapped_for_tests=True)
+    client = CanvasClient(runner, {"id": 19})
+    monkeypatch.setattr(runner, "profile", Mock(side_effect=AssertionError("Expired poll read its profile")))
+    try:
+        with pytest.raises(CanvasCLIError) as found:
+            client.poll({"account_id": 19, "profile": "original"}, deadline=time.monotonic() - 1)
+        assert found.value.code == "CLI_TASK_DEADLINE_EXCEEDED"
+        runner.profile.assert_not_called()
+    finally:
+        runner.close()
+
+
+def test_poll_profile_guard_ends_before_operation_observation(tmp_path, monkeypatch):
+    runner = CanvasCLI(tmp_path, allow_unwrapped_for_tests=True)
+    account = {"id": 19}
+    context = {"account_id": 19, "profile": runner.profile(account),
+               "project_id": "original-project", "submit_id": "original-submit"}
+    client = CanvasClient(runner, account)
+    threads, acquired = [], threading.Event()
+
+    def inspect_command(args, **kwargs):
+        assert args == ["operation", "status", "original-submit", "--project-id", "original-project"]
+        def other_sequence():
+            with runner.account_guard(account, deadline=time.monotonic() + 0.5):
+                acquired.set()
+        contender = threading.Thread(target=other_sequence)
+        threads.append(contender)
+        contender.start()
+        assert acquired.wait(0.3), "Profile validation held its outer lock during observation"
+        return {"operationRef": "original-submit", "state": "running", "resources": []}
+
+    monkeypatch.setattr(client, "_call", inspect_command)
+    try:
+        assert client.poll(context, deadline=time.monotonic() + 1)["status"] == "running"
+    finally:
+        for thread in threads:
+            thread.join(1)
+        runner.close()
+    assert all(not thread.is_alive() for thread in threads)
 
 
 def test_timed_out_partial_download_is_removed_before_same_resource_retry(tmp_path, monkeypatch):
