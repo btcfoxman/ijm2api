@@ -160,6 +160,10 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
         data, app, release, proc = (root / value for value in ("data", "app", "release", "proc"))
         for folder in (data, app, release, proc):
             folder.mkdir(mode=0o700)
+        # Hosted uid owns these synthetic mounts; cap-drop ALL container root
+        # cannot bypass 0700.  No credentials exist here; production is untouched.
+        data.chmod(0o777)
+        app.chmod(0o755)
         (app / "service.py").write_bytes(SERVICE_SOURCE)
         try:
             old_id = docker(["run", "--detach", "--name", service, "--pull", "never",
