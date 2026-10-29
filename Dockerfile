@@ -10,8 +10,15 @@ WORKDIR /app
 COPY requirements.txt .
 COPY tools/install_canvas_cli.py /tmp/install_canvas_cli.py
 COPY tools/install_canvas_proxy.py /tmp/install_canvas_proxy.py
-RUN apt-get -o Acquire::Retries=2 update \
-    && apt-get -o Acquire::Retries=2 install -y --no-install-recommends ca-certificates chromium xauth xvfb x11vnc fluxbox novnc fonts-liberation fonts-noto-cjk ffmpeg \
+RUN set -eu; \
+    set -- ca-certificates chromium xauth xvfb x11vnc fluxbox novnc fonts-liberation fonts-noto-cjk ffmpeg; \
+    (apt-get -o Acquire::Retries=2 -o APT::Update::Error-Mode=any update \
+        || apt-get -o Acquire::Retries=2 -o APT::Update::Error-Mode=any \
+            -o Acquire::http::Proxy=DIRECT -o Acquire::https::Proxy=DIRECT update) \
+    && (apt-get -o Acquire::Retries=2 --download-only install -y --no-install-recommends "$@" \
+        || apt-get -o Acquire::Retries=2 -o Acquire::http::Proxy=DIRECT \
+            -o Acquire::https::Proxy=DIRECT --download-only install -y --no-install-recommends "$@") \
+    && apt-get -o APT::Get::Fix-Missing=false --no-download install -y --no-install-recommends "$@" \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir -r requirements.txt \
     && python /tmp/install_canvas_cli.py \
