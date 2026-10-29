@@ -22,6 +22,8 @@ from .account_automation import AccountAutomation, AutomationError
 from .browser_runtime import BrowserRuntime
 from .canvas_cli import CanvasCLI, CanvasCLIError
 from .canvas_service import ADMISSION_AUDIT_FIELDS, CanvasServiceMixin, execution_mode
+from .canvas_quote_hints import matching_hint
+from .canvas_timing import INITIAL_ADMISSION_UNSET
 from .account_policy import credit_rejected as _credit_rejected
 from .catalog import MODELS, normalize_request
 from .client import DreaminaClient, DreaminaError, InputAudioDurationError, SubmissionPreflightError
@@ -530,8 +532,14 @@ class Service(CanvasServiceMixin):
         return (None if balance is None else balance - sum(amounts), uncertain)
 
     def _funded_accounts(self, estimated_cost: float, excluded: set[int], pending: dict,
-                         backend: str | None = None, *, include_aux_busy: bool = False) -> list[dict]:
-        accounts = []
+                         backend: str | None = None, *, include_aux_busy: bool = False,
+                         task: dict | None = None) -> list[dict]:
+        accounts, legacy, all_quotes = [], [], []
+        if task and (task.get('normalized') or {}).get('kind') != 'image':
+            try:
+                all_quotes = self.store.canvas_quote_hints()
+            except Exception as exc:
+                logger.warning('Canvas scheduling quote cache unavailable (%s)', type(exc).__name__)
         for item in self.store.accounts(private=True):
             if (int(item['id']) in excluded or not item['enabled'] or item['status'] != 'active'
                     or not item['proxy_url'] or not _credential_setup_ready(item)):
@@ -546,9 +554,30 @@ class Service(CanvasServiceMixin):
             if backend and execution_mode(item) != backend:
                 continue
             available, unknown_hold = self._available_credits(item, pending)
-            if unknown_hold or available is not None and (available < estimated_cost or available <= 0):
+            if unknown_hold or available is not None and available <= 0:
                 continue
-            accounts.append({**item, '_available_credits': available})
+            candidate = {**item, '_available_credits': available}
+            if available is None or available >= estimated_cost:
+                legacy.append(candidate)
+            hint = next((row for row in all_quotes if row['account_id'] == int(item['id'])
+                and matching_hint(row, item, self.canvas_cli.data_dir, task['normalized'])), None)
+            required = hint['amount'] if hint is not None else estimated_cost
+            if available is None or available >= required:
+                accounts.append({**candidate, '_scheduling_quote_amount': hint['amount']} if hint else candidate)
+        # Predictions never turn an otherwise usable pool into an endless wait,
+        # nor bypass a higher-priority account without checking a current quote.
+        if not accounts:
+            return legacy
+        def has_slot(item):
+            account_id = int(item['id'])
+            return max(self._active.get(account_id, 0), sum(owner == account_id
+                for owner, _ in pending.values())) < int(item['max_concurrency'])
+        if not any(has_slot(item) for item in accounts) and any(has_slot(item) for item in legacy):
+            return legacy
+        if legacy:
+            highest = max(int(item['priority']) for item in legacy)
+            if not any(int(item['priority']) >= highest for item in accounts):
+                accounts.extend(item for item in legacy if int(item['priority']) == highest)
         return accounts
 
     @staticmethod
@@ -568,11 +597,13 @@ class Service(CanvasServiceMixin):
             task = (self.store.task(task_id) or {}) if task_id else {}
             backend = self._required_execution_backend(task) or task.get('execution_backend')
             excluded = excluded | self._model_excluded_accounts(task)
-            accounts = self._funded_accounts(estimated_cost, excluded, pending, backend)
+            accounts = self._funded_accounts(estimated_cost, excluded, pending, backend, task=task)
+            hinted_priorities = {int(item['priority']) for item in accounts if '_scheduling_quote_amount' in item}
             # Unknown cost is not a free task: probe a larger balance until a
             # measured budget exists. Explicit priority always remains first.
             accounts.sort(key=lambda item: (-int(item['priority']), item['_available_credits'] is None,
-                (item['_available_credits'] or 0) * (1 if estimated_cost > 0 else -1), item['id']))
+                (item['_available_credits'] or 0) * (1 if estimated_cost > 0
+                    or int(item['priority']) in hinted_priorities else -1), item['id']))
             for account in accounts:
                 account_id = int(account["id"])
                 active = self._active.get(account_id, 0)
@@ -580,7 +611,8 @@ class Service(CanvasServiceMixin):
                 if max(active, held) >= int(account["max_concurrency"]):
                     continue
                 self._active[account_id] = active + 1
-                self._credit_reservations[task_id or 'slot-' + uuid.uuid4().hex] = (account_id, estimated_cost)
+                self._credit_reservations[task_id or 'slot-' + uuid.uuid4().hex] = (
+                    account_id, account.get('_scheduling_quote_amount', estimated_cost))
                 return account
         return None
 
@@ -589,7 +621,7 @@ class Service(CanvasServiceMixin):
             pending = self._pending_credits(self.store.scheduling_rows(), task_id)
             task = (self.store.task(task_id) or {}) if task_id else {}
             return bool(self._funded_accounts(estimated_cost, excluded | self._model_excluded_accounts(task),
-                pending, self._required_execution_backend(task) or task.get('execution_backend'), include_aux_busy=True))
+                pending, self._required_execution_backend(task) or task.get('execution_backend'), include_aux_busy=True, task=task))
 
     def _release_account(self, account_id: int, task_id: str | None = None) -> None:
         with self._lock:
@@ -734,7 +766,7 @@ class Service(CanvasServiceMixin):
                        for account in self._funded_accounts(estimated_cost,
                            excluded | self._model_excluded_accounts(task), {},
                            self._required_execution_backend(task) or task.get('execution_backend'),
-                           include_aux_busy=True))
+                           include_aux_busy=True, task=task))
 
     def check_account(self, account_id: int, *, start_browser: bool = False) -> dict[str, Any]:
         account = self.store.account(account_id, private=True)
@@ -815,6 +847,7 @@ class Service(CanvasServiceMixin):
         deadline = self._admission_deadline(task_id,
             time.monotonic() + int(self.settings()['task_timeout_seconds']))
         estimated_cost = float(task.get("estimated_cost") or 0)
+        initial_admission_at = self._initial_preparation_admission(task)
         attempted = list(task["attempted_account_ids"])
         funding_excluded: set[int] = set()
         credit_reason = task.get("error_message") or "Dreamina account has insufficient credits"
@@ -855,8 +888,11 @@ class Service(CanvasServiceMixin):
                         "status": "preparing", "progress": 5, "balance_before": None,
                         "execution_backend": backend, "cost_evidence": {'execution_backend': backend},
                         "error_code": "", "error_message": ""})
+                    if initial_admission_at is INITIAL_ADMISSION_UNSET:
+                        initial_admission_at = time.time()
+                    self._remember_preparation_admission(task_id, initial_admission_at)
                     if backend == 'canvas_cli':
-                        result = self._execute_canvas(task_id, account, deadline)
+                        result = self._execute_canvas(task_id, account, deadline, initial_admission_at=initial_admission_at)
                         if result is True:
                             return
                         if result in {'retry', 'retry_preflight', 'skip_model'}:
@@ -977,6 +1013,7 @@ class Service(CanvasServiceMixin):
         attempted: list[int] = list(task["attempted_account_ids"])
         funding_excluded: set[int] = set()
         estimated_cost = 0.0
+        initial_admission_at = self._initial_preparation_admission(task)
         preflight_failure = ((task.get('error_code'), task.get('error_message'))
             if self._admission_history(task) and task.get('error_code') else None)
         try:
@@ -1001,8 +1038,11 @@ class Service(CanvasServiceMixin):
                     self.store.update_task(task_id, {"account_id": account_id,
                         "status": "preparing", "progress": 5, "error_code": "", "error_message": "",
                         "execution_backend": backend, 'cost_evidence': {'execution_backend': backend}})
+                    if initial_admission_at is INITIAL_ADMISSION_UNSET:
+                        initial_admission_at = time.time()
+                    self._remember_preparation_admission(task_id, initial_admission_at)
                     if backend == 'canvas_cli':
-                        result = self._execute_canvas(task_id, account, deadline)
+                        result = self._execute_canvas(task_id, account, deadline, initial_admission_at=initial_admission_at)
                         if result is True:
                             return
                         if result in {'retry', 'retry_preflight', 'skip_model'}:

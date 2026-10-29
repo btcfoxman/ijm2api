@@ -119,6 +119,12 @@ class Store:
                     PRIMARY KEY (account_id, kind, digest)
                 );
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS canvas_quote_hints (
+                    account_id INTEGER NOT NULL, identity_epoch TEXT NOT NULL,
+                    dimension_key TEXT NOT NULL, model TEXT NOT NULL, mode TEXT NOT NULL,
+                    amount REAL NOT NULL, observed_at REAL NOT NULL, source TEXT NOT NULL,
+                    PRIMARY KEY(account_id,identity_epoch,dimension_key,model,mode)
+                );
             """)
             if "managed_profile" not in {row[1] for row in db.execute("PRAGMA table_info(accounts)")}:
                 db.execute("ALTER TABLE accounts ADD COLUMN managed_profile INTEGER NOT NULL DEFAULT 0")
@@ -386,6 +392,24 @@ class Store:
                  OR (status IN ('failed','expired') AND error_code='UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'))
                 ORDER BY created_at,id""").fetchall()
         return {"history": [dict(row) for row in history], "inflight": [dict(row) for row in inflight]}
+
+    def save_canvas_quote_hint(self, hint: dict) -> None:
+        """Cache a validated node quote independently of task costs/status."""
+        from .canvas_quote_hints import MAX_HINTS, TTL_SECONDS
+        with self._lock, self._connect() as db:
+            db.execute('''INSERT OR REPLACE INTO canvas_quote_hints
+                (account_id,identity_epoch,dimension_key,model,mode,amount,observed_at,source)
+                VALUES(:account_id,:identity_epoch,:dimension_key,:model,:mode,:amount,:observed_at,:source)''', hint)
+            db.execute('DELETE FROM canvas_quote_hints WHERE observed_at<?', (time.time()-TTL_SECONDS,))
+            db.execute('''DELETE FROM canvas_quote_hints WHERE rowid NOT IN
+                (SELECT rowid FROM canvas_quote_hints ORDER BY observed_at DESC,rowid DESC LIMIT ?)''', (MAX_HINTS,))
+
+    def canvas_quote_hints(self) -> list[dict]:
+        from .canvas_quote_hints import MAX_HINTS, TTL_SECONDS
+        with self._connect() as db:
+            return [dict(row) for row in db.execute('''SELECT * FROM canvas_quote_hints
+                WHERE observed_at BETWEEN ? AND ? ORDER BY observed_at DESC,rowid DESC LIMIT ?''',
+                (time.time()-TTL_SECONDS, time.time(), MAX_HINTS))]
 
     def update_account(self, account_id: int, values: dict[str, Any]) -> dict[str, Any]:
         allowed = {"name", "cdp_port", "proxy_url", "project_id", "max_concurrency", "priority", "managed_profile",

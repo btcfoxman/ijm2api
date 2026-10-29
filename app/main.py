@@ -620,7 +620,7 @@ def _with_cost_observations(task: dict[str, Any]) -> dict[str, Any]:
             'observation_deadline', 'reconciliation_paused', 'reconciliation_pause_reason',
             'reconciliation_paused_at', 'consecutive_submission_absent', 'reconciliation_closed',
             'reconciliation_closed_at', 'reconciliation_close_reason', 'financial_outcome', 'preflight_failures',
-            'preparation_timing')
+            'preparation_timing', 'preparation_attempts', 'preparation_attempt_count', 'preparation_admission_at')
         task['execution_diagnostics'] = sanitize({key: context[key] for key in diagnostic_keys if key in context})
     return {**task, "cost_observations": [{key: value for key, value in row.items() if not key.startswith("_")}
                                         for row in build_observations(full_task or task)]}

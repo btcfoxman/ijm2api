@@ -170,7 +170,9 @@ def test_insufficient_quote_never_invokes_paid_run(context):
     result = store.task("task")
     assert result["status"] == "failed"
     assert result["error_code"] in {"INSUFFICIENT_CREDITS", "ACCOUNT_POOL_UNAVAILABLE"}
-    assert result["upstream_context"] == {}
+    assert set(result['upstream_context']) == {
+        'preparation_admission_at', 'preparation_attempts', 'preparation_attempt_count'}
+    assert result['upstream_context']['preparation_attempts'][0]['reason'] == 'insufficient_credits'
     assert result["attempted_account_ids"] == []
     client.submit.assert_not_called()
     client.poll.assert_not_called()

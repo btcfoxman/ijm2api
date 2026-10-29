@@ -12,7 +12,8 @@ from urllib.parse import urlsplit
 
 from .canvas_cli import TRANSPORT_DIAGNOSTIC_COMMANDS, CanvasCLIError, sanitize
 from .canvas_client import CanvasClient, identity_network_error, public_image_source_url
-from .canvas_timing import PreparationTiming
+from .canvas_timing import PreparationTiming, archived_attempts, INITIAL_ADMISSION_UNSET
+from .canvas_quote_hints import new_hint
 from .account_policy import credit_rejected
 from .cost_adapter import input_evidence, number
 from .media import MediaError, _DIRECT_FIRST_MEDIA_HOSTS, _download, media_error_diagnostic
@@ -21,7 +22,8 @@ from .result_transfer import ResultTransferError, store_original
 
 logger = logging.getLogger(__name__)
 ADMISSION_AUDIT_FIELDS = frozenset({'previous_submissions', 'recovery_resolution',
-    'preflight_failures', 'model_eligibility_exclusions'})
+    'preflight_failures', 'model_eligibility_exclusions', 'preparation_admission_at',
+    'preparation_attempts', 'preparation_attempt_count'})
 
 
 def execution_mode(account: dict) -> str:
@@ -29,6 +31,23 @@ def execution_mode(account: dict) -> str:
 
 
 class CanvasServiceMixin:
+    def _initial_preparation_admission(self, task):
+        context = task.get('upstream_context') or {}
+        if 'preparation_admission_at' in context:
+            return number(context['preparation_admission_at'])
+        if task.get('attempted_account_ids') or self._admission_history(task) or context.get('previous_submissions'):
+            return None  # A legacy/recovered attempt has no reliable first binding timestamp.
+        return INITIAL_ADMISSION_UNSET
+
+    def _remember_preparation_admission(self, task_id, admitted_at):
+        """Optional audit shared by browser and CLI; no intent/receipt writes."""
+        try:
+            current = self.store.task(task_id) or {}
+            if 'preparation_admission_at' not in (current.get('upstream_context') or {}):
+                self._canvas_context(task_id, {'preparation_admission_at': admitted_at})
+        except Exception as exc:
+            logger.warning('Canvas preparation audit unavailable (%s)', type(exc).__name__)
+
     @staticmethod
     def _canvas_task_terminated(task: dict | None) -> bool:
         if not task:
@@ -272,7 +291,8 @@ class CanvasServiceMixin:
             and error.get('requested_model') == task.get('model')
             and error.get('kind') == ('image' if task['normalized'].get('kind') == 'image' else 'video'))
 
-    def _execute_canvas(self, task_id: str, account: dict, deadline: float) -> bool | str:
+    def _execute_canvas(self, task_id: str, account: dict, deadline: float, *,
+                        initial_admission_at=INITIAL_ADMISSION_UNSET) -> bool | str:
         """Return False only for a verified pre-run funding rejection."""
         task = self.store.task(task_id)
         if self._canvas_task_terminated(task):
@@ -304,18 +324,53 @@ class CanvasServiceMixin:
                     and not self._canvas_task_terminated(current)):
                 self._canvas_context(task_id, {'preparation_timing': snapshot})
 
-        timing = PreparationTiming(task_id, queued_at=task.get('created_at'), on_change=timing_changed)
+        if initial_admission_at is INITIAL_ADMISSION_UNSET:
+            initial_admission_at = self._initial_preparation_admission(task)
+        timing = PreparationTiming(task_id, queued_at=task.get('created_at'),
+            first_admission_at=context.get('preparation_admission_at', initial_admission_at), on_change=timing_changed)
+        context.setdefault('preparation_admission_at', timing.first_admission_at)
+
+        def persist_timing_audit(value):
+            try:
+                self._canvas_context(task_id, value)
+            except Exception as exc:
+                logger.warning('Canvas preparation audit unavailable (%s)', type(exc).__name__)
+
+        persist_timing_audit({'preparation_admission_at': context['preparation_admission_at']})
+        attempt_archived = False
+
+        def finish_attempt(reason):
+            nonlocal attempt_archived
+            timing.finish()
+            if not attempt_archived:
+                try:
+                    current = self.store.task(task_id) or {}
+                    if not self._canvas_task_terminated(current):
+                        audit = archived_attempts(current.get('upstream_context') or {}, timing.snapshot(), account_id, reason)
+                        context.update(audit)
+                        persist_timing_audit(audit)
+                except Exception as exc:
+                    logger.warning('Canvas preparation audit unavailable (%s)', type(exc).__name__)
+                finally:
+                    attempt_archived = True
+
         if isinstance(client, CanvasClient):
             client.preparation_timing = timing
 
         def fail_preparation(code, message):
-            timing.finish()
+            finish_attempt('preparation_failed')
             self._canvas_context(task_id, {'preparation_timing': timing.snapshot()})
             return self._fail_canvas_task(task_id, code, message)
 
         def persist(value):
             nonlocal context
             context = {**context, **value}
+            # A submit receipt may contain an older context copy from before
+            # finish_attempt archived the current attempt. Keep the durable audit.
+            durable = (self.store.task(task_id) or {}).get('upstream_context') or {}
+            for key in ('preparation_admission_at', 'preparation_attempts', 'preparation_attempt_count'):
+                if key in durable:
+                    context[key] = durable[key]
             context['preparation_timing'] = timing.snapshot()
             old_error = ((self.store.task(task_id) or {}).get('upstream_context') or {}).get('submit_error')
             if old_error:
@@ -370,6 +425,13 @@ class CanvasServiceMixin:
             if quote is None:
                 fail_preparation("CLI_QUOTE_UNAVAILABLE", "Canvas could not establish the complete task quote")
                 return True
+            try:
+                hint = new_hint(account, self.canvas_cli.data_dir,
+                    (self.store.task(task_id) or task)['normalized'], context, identity)
+                if hint is not None:
+                    self.store.save_canvas_quote_hint(hint)
+            except Exception as exc:
+                logger.warning('Canvas scheduling quote cache unavailable (%s)', type(exc).__name__)
             ceiling = number(normalized.get('_canvas_credit_ceiling'))
             if ceiling is not None and quote > ceiling:
                 fail_preparation('CLI_CREDIT_CEILING_EXCEEDED', 'Canvas quote exceeds the explicitly authorized recovery credit ceiling')
@@ -395,6 +457,7 @@ class CanvasServiceMixin:
                                     if (value := number(raw)) is not None]
                     raw_funded = bool(raw_balances) and min(raw_balances) >= quote
                     if not funded and (not temporary_hold or quote <= 0 or not raw_funded):
+                        finish_attempt('insufficient_credits')
                         return False if self._requeue_unaccepted_task(task_id,
                             error_code='INSUFFICIENT_CREDITS',
                             error_message='Canvas quote exceeds available unreserved credits') else True
@@ -404,7 +467,7 @@ class CanvasServiceMixin:
                             current_available, _ = self._available_credits({**account, 'balance': budget_balance}, pending)
                             candidates = self._funded_accounts(quote, set(task.get('attempted_account_ids') or [])
                                 | self._model_excluded_accounts(task), pending,
-                                self._required_execution_backend(task) or None)
+                                self._required_execution_backend(task) or None, task=self.store.task(task_id))
                             candidates = [a for a in candidates if int(a['id']) != account_id
                                 and int(a['priority']) == int(account['priority'])
                                 and a.get('_available_credits') is not None
@@ -413,6 +476,7 @@ class CanvasServiceMixin:
                                     sum(owner == int(a['id']) for owner, _ in pending.values())) < int(a['max_concurrency'])]
                             self._update_canvas_task(task_id, {'cost_evidence': {'canvas_budget_checked': True}})
                             if candidates:
+                                finish_attempt('best_fit_reselect')
                                 return 'reselect' if self._requeue_unaccepted_task(task_id) else True
                         attempts = list(task.get("attempted_account_ids") or [])
                         if account_id not in attempts:
@@ -437,13 +501,13 @@ class CanvasServiceMixin:
             submission_started = True
             with timing.phase('confirmation_submit'), timing.defer_notifications():
                 submitted = client.submit(context, int(math.ceil(quote)), persist=persist, deadline=deadline)
-            timing.finish()
+            finish_attempt('accepted')
             persist({**submitted, "submission_phase": "submitted"})
             self._update_canvas_task(task_id, {"status": "submitted", "progress": 40})
             self._poll_canvas(task_id, client, deadline)
             return True
         except CanvasCLIError as exc:
-            timing.finish()
+            finish_attempt('command_failed')
             current_task = self.store.task(task_id)
             if self._canvas_task_terminated(current_task):
                 return True
@@ -493,7 +557,7 @@ class CanvasServiceMixin:
                     if expired_preparation else str(exc))
             return True
         except Exception as exc:
-            timing.finish()
+            finish_attempt('preparation_failed')
             if self._canvas_task_terminated(self.store.task(task_id)):
                 return True
             code = "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN" if submission_started else (
@@ -516,7 +580,7 @@ class CanvasServiceMixin:
                            "submission" if submission_started else "preparation", type(exc).__name__)
             return True
         finally:
-            timing.finish()
+            finish_attempt('stopped')
 
     def _canvas_settlement(self, task: dict, client, *, deadline: float | None = None) -> dict:
         values = {}

@@ -34,6 +34,49 @@ TRANSPORT_DIAGNOSTIC_COMMANDS = frozenset({('auth', 'account'), ('auth', 'status
     ('version',), ('schema',)})
 _SECRET_KEY = re.compile(r"token|password|secret|authorization|cookie|devicecode|privatekey", re.I)
 _PROFILE = re.compile(r"[A-Za-z0-9_.-]{1,80}\Z")
+_STDERR_SYMPTOMS = {
+    'ptrace_diagnostic': (b'ptrace',),
+    'permission_denied': (b'operation not permitted', b'permission denied'),
+    'proxy_auth': (b'proxy authentication', b'407 proxy'),
+    'connection_refused': (b'connection refused',),
+    'connection_reset': (b'connection reset', b'broken pipe'),
+    'dns_failure': (b'no such host', b'lookup failed', b'temporary failure in name resolution'),
+    'tls_failure': (b'tls handshake', b'certificate verify', b'x509:'),
+    'unexpected_eof': (b'unexpected eof',),
+    'process_panic': (b'panic:', b'segmentation fault'),
+}
+
+
+def command_failure_facts(error) -> dict:
+    """Fixed scalar facts only: no exception prose, stdout, stderr or locators."""
+    result = {}
+    exit_code = getattr(error, 'exit_code', None)
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        result['exit_code'] = exit_code
+    details = getattr(error, 'details', {})
+    details = details if isinstance(details, dict) else {}
+    source = details.get('error') or {}
+    if isinstance(source, dict):
+        for key in ('class', 'reason', 'serviceCode', 'requiredAction', 'retryable'):
+            value = source.get(key)
+            if (isinstance(value, (bool, int)) or isinstance(value, str)
+                    and re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', value)):
+                result[key] = value
+    transport = details.get('transport_diagnostic') or {}
+    if isinstance(transport, dict):
+        safe = {}
+        for kind in ('stdout', 'stderr'):
+            size, digest = transport.get(kind + '_bytes'), transport.get(kind + '_sha256')
+            if isinstance(size, int) and not isinstance(size, bool) and 0 <= size <= MAX_OUTPUT_BYTES:
+                safe[kind + '_bytes'] = size
+            if isinstance(digest, str) and re.fullmatch(r'[a-f0-9]{64}', digest):
+                safe[kind + '_sha256'] = digest
+        symptoms = transport.get('stderr_symptoms')
+        if isinstance(symptoms, list):
+            safe['stderr_symptoms'] = [name for name in _STDERR_SYMPTOMS if name in symptoms]
+        if safe:
+            result['transport'] = safe
+    return result
 
 
 def sanitize(value: Any) -> Any:
@@ -455,15 +498,20 @@ class CanvasCLI:
         transport_diagnostic = {f'{name}_bytes': len(data) for name, data in zip(('stdout', 'stderr'), buffers)}
         transport_diagnostic.update({f'{name}_sha256': hashlib.sha256(data).hexdigest()
                                      for name, data in zip(('stdout', 'stderr'), buffers)})
+        stderr_lower = bytes(buffers[1]).lower()
+        symptoms = [name for name, needles in _STDERR_SYMPTOMS.items()
+                    if any(needle in stderr_lower for needle in needles)]
+        if symptoms:
+            transport_diagnostic['stderr_symptoms'] = symptoms
         if tuple(args[:2]) in TRANSPORT_DIAGNOSTIC_COMMANDS:
             transport_diagnostic['command_pair'] = list(args[:2])
         error_details = {'transport_diagnostic': transport_diagnostic}
         if overflow.is_set():
             raise CanvasCLIError("CLI_OUTPUT_LIMIT", "Canvas CLI output exceeded its limit",
-                                 details=error_details, outcome_unknown=paid_submit)
+                                 details=error_details, exit_code=process.returncode, outcome_unknown=paid_submit)
         if timed_out:
             raise CanvasCLIError("CLI_COMMAND_TIMEOUT", "Canvas CLI command timed out",
-                                 details=error_details, outcome_unknown=paid_submit)
+                                 details=error_details, exit_code=process.returncode, outcome_unknown=paid_submit)
         envelope: dict[str, Any] | None = None
         for raw in buffers:
             try:

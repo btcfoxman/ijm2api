@@ -24,11 +24,25 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, ijm2api-ci-pre35]
     timeout-minutes: 35
     outputs:
       image_tag: ${{ github.sha }}
     steps:
+      - name: Verify isolated build capacity
+        id: build_capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+          for path in "$RUNNER_TEMP" "$GITHUB_WORKSPACE"; do
+            available_bytes="$(df -PB1 "$path" | awk 'NR==2 {print $4}')"
+            [[ "$available_bytes" =~ ^[0-9]+$ ]]
+            if (( available_bytes < 15 * 1024 * 1024 * 1024 )); then
+              echo "Isolated build runner requires at least 15 GiB free disk."
+              exit 1
+            fi
+          done
+          printf 'builder=ijm2api-%s-%s\n' "${GITHUB_SHA:0:12}" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -57,6 +71,14 @@ jobs:
           "$RUNNER_TEMP/canvas-proxy/graftcp" --version
           "$RUNNER_TEMP/canvas-proxy/graftcp" --config /dev/null --select_proxy_mode only_http_proxy --http_proxy 127.0.0.1:9 -- /bin/true
       - uses: docker/setup-buildx-action@v3
+        with:
+          name: ${{ steps.build_capacity.outputs.builder }}
+          driver: docker-container
+          driver-opts: |
+            memory=2g
+            memory-swap=2g
+            cpu-period=100000
+            cpu-quota=200000
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io

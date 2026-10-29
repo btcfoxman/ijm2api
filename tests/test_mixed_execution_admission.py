@@ -93,7 +93,9 @@ def test_proven_credit_rejection_selects_other_configured_mode_by_priority_and_b
     mixed.clients[lower['id']].submit.assert_not_called()
     mixed.browser[lower['id']].submit.assert_not_called()
     if other_mode == 'browser':
-        assert result['upstream_context'] == {}
+        assert set(result['upstream_context']) == {
+            'preparation_admission_at', 'preparation_attempts', 'preparation_attempt_count'}
+        assert result['upstream_context']['preparation_attempt_count'] == 1
         assert not result['normalized']['_cost_evidence'].get('canvas_quote')
     else:
         assert result['upstream_context']['account_id'] == fitting['id']
@@ -146,7 +148,10 @@ def test_cross_mode_credit_rejections_share_two_attempt_limit_and_preserve_audit
     result = mixed.store.task(identifier)
     assert result['status'] == 'failed' and result['error_code'] == 'INSUFFICIENT_CREDITS'
     assert result['attempted_account_ids'] == [first['id'], second['id']]
-    assert result['upstream_context'] == audit
+    assert {key:result['upstream_context'][key] for key in audit} == audit
+    assert set(result['upstream_context']) == set(audit) | {
+        'preparation_admission_at', 'preparation_attempts', 'preparation_attempt_count'}
+    assert result['upstream_context']['preparation_attempt_count'] == 1
     mixed.clients[third['id']].identity.assert_not_called()
     mixed.browser[third['id']].submit.assert_not_called()
 

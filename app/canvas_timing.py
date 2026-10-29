@@ -8,12 +8,22 @@ import time
 from collections import deque
 from contextlib import contextmanager, nullcontext
 
-from .canvas_cli import CanvasCLI, TRANSPORT_DIAGNOSTIC_COMMANDS
+from .canvas_cli import CanvasCLI, TRANSPORT_DIAGNOSTIC_COMMANDS, command_failure_facts
 
 
 _PHASES = frozenset({'identity', 'model_preflight', 'material_prepare', 'project',
     'reference_upload', 'draft_save', 'quote', 'credit_wait', 'confirmation_submit'})
 _SAFE_CODE = re.compile(r'[A-Za-z0-9_.-]{1,80}\Z')
+INITIAL_ADMISSION_UNSET = object()
+
+
+def archived_attempts(context, timing, account_id, reason):
+    """Bounded safe audit, separate from paid attempts and account exclusions."""
+    previous = list(context.get('preparation_attempts') or [])
+    ordinal = int(context.get('preparation_attempt_count') or 0) + 1
+    previous.append({'ordinal': ordinal, 'account_id': int(account_id),
+        'reason': reason, 'timing': timing})
+    return {'preparation_attempts': previous[-8:], 'preparation_attempt_count': ordinal}
 
 
 class PreparationTiming:
@@ -23,13 +33,15 @@ class PreparationTiming:
     must not be added to infer total preparation time; elapsed_ms is the total.
     """
 
-    def __init__(self, task_id, *, queued_at=None, on_change=None, monotonic=None, wall_time=None):
+    def __init__(self, task_id, *, queued_at=None, first_admission_at=INITIAL_ADMISSION_UNSET,
+                 on_change=None, monotonic=None, wall_time=None):
         self._mono = monotonic or time.monotonic
         self._wall = wall_time or time.time
         self.task_id = task_id if isinstance(task_id, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,120}', task_id) else 'unknown-task'
         self.started_at = self._wall()
         self._started = self._mono()
         self.queued_at = queued_at
+        self.first_admission_at = self.started_at if first_admission_at is INITIAL_ADMISSION_UNSET else first_admission_at
         self._ended = None
         self._listener = on_change
         self._deferred = 0
@@ -47,10 +59,14 @@ class PreparationTiming:
     def snapshot(self):
         total = self._ms(self._started) if self._ended is None else self._ended
         queued = self.queued_at
+        initial = self.first_admission_at
+        valid_queue = isinstance(queued, (int, float)) and not isinstance(queued, bool) and math.isfinite(queued)
+        valid_initial = isinstance(initial, (int, float)) and not isinstance(initial, bool) and math.isfinite(initial)
+        queue_wait = round(max(0, initial - queued) * 1000, 3) if valid_queue and valid_initial else None
         return copy.deepcopy({'task_id': self.task_id, 'started_at': self.started_at,
             'finished': self._ended is not None, 'elapsed_ms': total,
-            'queue_wait_ms': round(max(0, self.started_at - queued) * 1000, 3)
-                if isinstance(queued, (int, float)) and not isinstance(queued, bool) and math.isfinite(queued) else None,
+            'queue_wait_ms': queue_wait, 'first_admission_queue_ms': queue_wait,
+            'elapsed_before_attempt_ms': round(max(0, self.started_at - queued) * 1000, 3) if valid_queue else None,
             'phases': self._phases, 'commands': self._commands,
             'current_phase': self._active[-1] if self._active else None,
             'current_command': self._command, 'command_count': self._count,
@@ -144,6 +160,7 @@ class PreparationTiming:
             entry['outcome'] = 'failed'
             code = str(getattr(error, 'code', type(error).__name__))
             entry['error_code'] = code if _SAFE_CODE.fullmatch(code) else 'Error'
+            entry['failure'] = command_failure_facts(error)
             raise
         finally:
             if execution_started is not None:
