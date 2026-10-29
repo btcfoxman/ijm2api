@@ -77,7 +77,7 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
         # cgroup stays runnable after pause. It never starts the application.
         companion_id = run(["docker", "run", "--detach", "--rm", "--name", name,
             "--pull", "never", "--network", "none", "--read-only", "--user", "0:0",
-            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--memory", "256m", "--cpus", "0.5", "--pids-limit", "64",
+            "--cap-drop", "ALL", "--cap-add", "DAC_READ_SEARCH", "--security-opt", "no-new-privileges", "--memory", "256m", "--cpus", "0.5", "--pids-limit", "64",
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=128m,mode=0700", "--volumes-from", old_id + ":ro",
             "--pid", "container:" + old_id, "--entrypoint", "python", image,
             "-B", "-c", "import time; time.sleep(600)"], timeout=20)

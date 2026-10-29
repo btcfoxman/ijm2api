@@ -63,6 +63,15 @@ class FakeDocker:
         if args[:2] == ["docker", "run"]:
             for flag in ["--rm", "--read-only", "--cap-drop", "--pids-limit", "--tmpfs"]:
                 assert flag in args
+            # Read an existing private host-owned data directory without
+            # granting file writes, tracing, host namespaces or admin powers.
+            assert args.count("--cap-drop") == 1
+            assert args[args.index("--cap-drop") + 1] == "ALL"
+            assert args.count("--cap-add") == 1
+            assert args[args.index("--cap-add") + 1] == "DAC_READ_SEARCH"
+            assert "--privileged" not in args
+            assert not any(cap in args for cap in ["DAC_OVERRIDE", "SYS_ADMIN", "SYS_PTRACE"])
+            assert args[args.index("--security-opt") + 1] == "no-new-privileges"
             assert args[args.index("--network") + 1] == "none"
             assert args[args.index("--pull") + 1] == "never"
             assert args[args.index("--volumes-from") + 1] == self.old_id + ":ro"

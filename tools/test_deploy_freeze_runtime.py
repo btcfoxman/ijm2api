@@ -93,6 +93,7 @@ marker.parent.mkdir(parents=True,exist_ok=True)
 marker.parent.parent.chmod(0o777);marker.parent.chmod(0o777)
 marker.write_text('synthetic-profile')
 db=sqlite3.connect(str(root/'ijm2api.db'))
+(root/'ijm2api.db').chmod(0o600)
 db.executescript('''CREATE TABLE accounts(id INTEGER,enabled INTEGER,status TEXT,execution_mode TEXT,
 cli_auth_status TEXT,login_user_id TEXT,cli_user_id TEXT,proxy_url TEXT);
 CREATE TABLE tasks(id TEXT,status TEXT,account_id INTEGER,execution_backend TEXT,
@@ -135,6 +136,10 @@ class Trace:
         command = args[1:]
         if command[0] == "run":
             assert not self.paused and "--read-only" in command
+            assert command.count('--cap-drop') == command.count('--cap-add') == 1
+            assert command[command.index('--cap-drop') + 1] == 'ALL'
+            assert command[command.index('--cap-add') + 1] == 'DAC_READ_SEARCH'
+            assert not {'--privileged', 'DAC_OVERRIDE', 'SYS_ADMIN', 'SYS_PTRACE'}.intersection(command)
             assert command[command.index("--network") + 1] == "none"
             assert command[command.index("--volumes-from") + 1] == self.service + ":ro"
             assert command[command.index("--pid") + 1] == "container:" + self.service
@@ -175,6 +180,20 @@ class Trace:
         return docker(command, input=input, timeout=timeout)
 
 
+def query_fixture(image, data, sql, parameters=(), *, service=None):
+    """Read the root-owned 0600 fixture without relaxing its real permissions."""
+    program = ("import json,sqlite3\ndb=sqlite3.connect('file:/app/data/ijm2api.db?mode=ro',uri=True)\n"
+        "db.execute('PRAGMA query_only=ON')\nprint(json.dumps(db.execute(" + repr(sql) + "," + repr(parameters) + ").fetchall()))")
+    if service:
+        args = ['exec', service, 'python', '-B', '-c', program]
+    else:
+        args = ['run', '--rm', '--pull', 'never', '--network', 'none', '--read-only', '--user', '0:0',
+            '--cap-drop', 'ALL', '--cap-add', 'DAC_READ_SEARCH', '--security-opt', 'no-new-privileges',
+            '--mount', 'type=bind,source=' + str(data) + ',target=/app/data,readonly',
+            '--entrypoint', 'python', image, '-B', '-c', program]
+    return json.loads(docker(args))
+
+
 def run_case(controller, guard, image, name, *, active, query, race=False, pause_timeout=False):
     service = "ijm-freeze-smoke-" + uuid.uuid4().hex[:16]
     trace = None
@@ -183,14 +202,14 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
         data, app, release, proc = (root / value for value in ("data", "app", "release", "proc"))
         for folder in (data, app, release, proc):
             folder.mkdir(mode=0o700)
-        # Hosted uid owns these synthetic mounts; cap-drop ALL container root
-        # cannot bypass 0700.  No credentials exist here; production is untouched.
-        data.chmod(0o777)
+        # Reproduce the live cross-uid boundary: owner-only data, root-owned
+        # 0600 database. Only the original dummy may bypass write permissions.
+        data.chmod(0o700)
         app.chmod(0o755)
         (app / "service.py").write_bytes(SERVICE_SOURCE)
         try:
             old_id = docker(["run", "--detach", "--name", service, "--pull", "never",
-                "--network", "none", "--read-only", "--cap-drop", "ALL",
+                "--network", "none", "--read-only", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "DAC_OVERRIDE",
                 "--security-opt", "no-new-privileges", "--memory", "128m", "--pids-limit", "32",
                 "--mount", "type=bind,source=" + str(data) + ",target=/app/data",
                 "--mount", "type=bind,source=" + str(app) + ",target=/app/app,readonly",
@@ -204,8 +223,8 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                 time.sleep(0.1)
             assert (data / "ijm2api.db-wal").stat().st_size > 32
             if query:
-                baseline = guard.check(data / "ijm2api.db", {TASK}, data,
-                    app / "service.py", SOURCE_SHA, proc)
+                baseline = json.loads(docker(['exec', '-i', service, 'python', '-B', '-'],
+                    input=controller.companion_program(json.dumps([TASK]), SOURCE_SHA)))
                 assert baseline["mode"] == "accepted_queries_only"
                 (release / "query-resume-baseline.safe.json").write_text(json.dumps(baseline))
             should_reject = race or pause_timeout or (active and not query)
@@ -232,10 +251,9 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                 assert receipt["original_unpaused_after_abort"] is True
                 assert not receipt["original_removed_while_frozen"]
                 assert "old_removed_while_frozen" not in trace.events
-                with closing(sqlite3.connect((data / "ijm2api.db").as_uri() + "?mode=ro", uri=True)) as db:
-                    assert db.execute("SELECT status FROM tasks WHERE id=?", (TASK,)).fetchone()[0] == "submitted"
-                    if race:
-                        assert db.execute("SELECT status FROM tasks WHERE id=?", (RACE_TASK,)).fetchone()[0] == "preparing"
+                assert query_fixture(image, data, "SELECT status FROM tasks WHERE id=?", (TASK,), service=service) == [["submitted"]]
+                if race:
+                    assert query_fixture(image, data, "SELECT status FROM tasks WHERE id=?", (RACE_TASK,), service=service) == [["preparing"]]
             else:
                 assert receipt["passed"] and receipt["original_removed_while_frozen"]
                 assert docker(["inspect", service], optional=True) is None
@@ -249,8 +267,7 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                 with closing(sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True)) as db:
                     assert db.execute("SELECT value FROM snapshot_probe").fetchall() == [("uncheckpointed-synthetic-WAL-row",)]
                     assert db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
-                with closing(sqlite3.connect((data / "ijm2api.db").as_uri() + "?mode=ro", uri=True)) as db:
-                    assert db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+                assert query_fixture(image, data, "SELECT COUNT(*) FROM tasks") == [[1]]
             # PID 1 death can auto-remove its namespace companion asynchronously.
             cleanup_deadline = time.monotonic() + 5
             while trace.companion and docker(["inspect", trace.companion], optional=True) is not None:
