@@ -54,9 +54,20 @@ jobs:
           /usr/bin/python3 -m venv --copies "$validation_venv"
           "$validation_venv/bin/python" -c 'import sys; assert sys.prefix != sys.base_prefix'
           printf '%s/bin\n' "$validation_venv" >> "$GITHUB_PATH"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
+      - name: Prepare verified private Node 22 runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          node_archive="$RUNNER_TEMP/node-v22.23.4-linux-x64.tar.xz"
+          node_runtime="$RUNNER_TEMP/ijm-validation-node22"
+          curl -fsSL --noproxy nodejs.org --retry 2 --connect-timeout 5 --max-time 180 \
+            https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz --output "$node_archive"
+          printf '1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce  %s\n' "$node_archive" | sha256sum --check
+          mkdir -p "$node_runtime"
+          tar -xJf "$node_archive" --directory "$node_runtime" --strip-components=1 --no-same-owner
+          "$node_runtime/bin/node" -e 'if (process.version !== "v22.23.4") process.exit(1)'
+          printf '%s/bin\n' "$node_runtime" >> "$GITHUB_PATH"
       - name: Verify application
         env:
           NO_PROXY: localhost,127.0.0.1,::1,192.168.3.5,pypi.org,files.pythonhosted.org
