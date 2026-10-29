@@ -61,9 +61,27 @@ jobs:
           umask 077
           node_archive="$RUNNER_TEMP/node-v22.23.4-linux-x64.tar.xz"
           node_runtime="$RUNNER_TEMP/ijm-validation-node22"
-          curl -fsSL --noproxy nodejs.org --retry 2 --connect-timeout 5 --max-time 180 \
-            https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz --output "$node_archive"
-          printf '1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce  %s\n' "$node_archive" | sha256sum --check
+          node_archive_checksum=1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce
+          node_cache_dir="$RUNNER_TOOL_CACHE/ijm2api-node-sdk"
+          node_cached_archive="$node_cache_dir/node-v22.23.4-linux-x64.tar.xz"
+          verify_node_archive() {
+            printf '%s  %s\n' "$node_archive_checksum" "$1" | sha256sum --check --status
+          }
+          if [[ -f "$node_cached_archive" ]] && verify_node_archive "$node_cached_archive"; then
+            cp -- "$node_cached_archive" "$node_archive"
+          else
+            if ! (curl -fsSL --proxy http://192.168.3.5:10809 --noproxy '' --retry 0 --connect-timeout 5 --max-time 180 \
+                https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz --output "$node_archive" \
+                && verify_node_archive "$node_archive"); then
+              curl -fsSL --noproxy nodejs.org --retry 0 --connect-timeout 5 --max-time 45 \
+                https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz --output "$node_archive"
+            fi
+            verify_node_archive "$node_archive"
+            mkdir -p "$node_cache_dir"
+            cp -- "$node_archive" "$node_cached_archive"
+            chmod 600 "$node_cached_archive"
+          fi
+          verify_node_archive "$node_archive"
           mkdir -p "$node_runtime"
           tar -xJf "$node_archive" --directory "$node_runtime" --strip-components=1 --no-same-owner
           "$node_runtime/bin/node" -e 'if (process.version !== "v22.23.4") process.exit(1)'
