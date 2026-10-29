@@ -28,7 +28,8 @@ def assert_original_ids_and_no_replay(runner):
 
 @pytest.mark.parametrize('ack', [False,True])
 @pytest.mark.parametrize('service_code', [6,'6'])
-@pytest.mark.parametrize('metadata', [{},{'requiredAction':'fix_input','retryable':False}])
+@pytest.mark.parametrize('metadata', [{},{'requiredAction':'fix_input','retryable':False},
+                                      {'requiredAction':'none','retryable':False}])
 def test_ack_and_unknown_uploads_observe_missing_original_resource_until_ready(clock,ack,service_code,metadata):
     runner=UploadRunner(clock,[not_found(service_code,**metadata),not_found(service_code,**metadata),ready()],upload_succeeds=ack)
     upload(CanvasClient(runner,ACCOUNT))
@@ -92,6 +93,33 @@ def test_exact_missing_is_not_a_global_call_retry_rule(clock):
         CanvasClient(runner,ACCOUNT)._call(['resource','get','original-resource','--project-id','original-project'],
                                          read_only=True,deadline=150)
     assert caught.value.code=='service.6' and len(runner.calls)==1 and clock['now']==0
+
+
+def test_actual_none_action_is_not_misclassified_as_human_intervention():
+    from app.canvas_client import _planned_resource_not_found, _resource_read_intervention
+    error=not_found(requiredAction='none',retryable=False)
+    assert not _resource_read_intervention(error)
+    assert _planned_resource_not_found(error,'original-resource')
+
+
+def test_not_found_diagnostic_keeps_the_sdk_action_and_retryable_marker():
+    from app.canvas_client import safe_cli_diagnostic
+    diagnostic=safe_cli_diagnostic(not_found(requiredAction='none',retryable=False))
+    assert diagnostic['requiredAction']=='none'
+    assert diagnostic['retryable'] is False
+
+
+def test_actual_preparation_diagnostic_keeps_action_markers_without_envelope_secrets():
+    from app.canvas_service import CanvasServiceMixin
+    error=not_found(requiredAction='none',retryable=False)
+    error.details['error'].update(token='private-token',prompt='private-prompt',nested={'secret':'private-secret'})
+    diagnostic=CanvasServiceMixin._canvas_diagnostic(error,'uploading')
+    assert diagnostic['phase']=='uploading'
+    assert diagnostic['code']=='service.6' and diagnostic['serviceCode']==6
+    assert diagnostic['requiredAction']=='none' and diagnostic['retryable'] is False
+    assert diagnostic['exit_code']==2 and diagnostic['outcome_unknown'] is False
+    assert not {'token','prompt','nested'} & diagnostic.keys()
+    assert all(value not in repr(diagnostic) for value in ('private-token','private-prompt','private-secret'))
 
 
 @pytest.mark.parametrize('ack', [False,True])

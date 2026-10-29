@@ -72,7 +72,7 @@ def _resource_read_intervention(exc: CanvasCLIError) -> bool:
     action = str(error.get('requiredAction') or '').lower()
     classification = ' '.join([str(exc.code).lower(),
         *(str(error.get(key) or '').lower() for key in ('class', 'reason'))])
-    return (action not in {'', 'retry', 'fix_input'}
+    return (action not in {'', 'none', 'retry', 'fix_input'}
         or any(word in classification for word in ('human_intervention', 'auth', 'identity', 'mismatch', 'permission')))
 
 
@@ -93,7 +93,7 @@ def safe_cli_diagnostic(exc: CanvasCLIError, *, secrets: tuple[str, ...] = ()) -
     source = exc.details.get("error", exc.details)
     source = source if isinstance(source, dict) else {}
     result = {}
-    for key in ("code", "class", "reason", "serviceCode", "traceId", "message"):
+    for key in ("code", "class", "reason", "serviceCode", "traceId", "message", "requiredAction", "retryable"):
         value = source.get(key)
         if isinstance(value, (str, int, float, bool)):
             result[key] = sanitize(value)

@@ -65,7 +65,7 @@ class CanvasServiceMixin:
         source = details.get('error')
         source = source if isinstance(source, dict) else {}
         values = {key: source[key] for key in ('code', 'message', 'class', 'reason', 'serviceCode',
-            'traceId', 'exit_code', 'dispatch_started', 'outcome_unknown') if key in source}
+            'traceId', 'exit_code', 'dispatch_started', 'outcome_unknown', 'requiredAction', 'retryable') if key in source}
         values.update(code=getattr(error, 'code', type(error).__name__), message=str(error), phase=phase)
         exit_code = getattr(error, 'exit_code', None)
         if exit_code is not None:
