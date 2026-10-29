@@ -10,8 +10,8 @@ WORKDIR /app
 COPY requirements.txt .
 COPY tools/install_canvas_cli.py /tmp/install_canvas_cli.py
 COPY tools/install_canvas_proxy.py /tmp/install_canvas_proxy.py
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates chromium xauth xvfb x11vnc fluxbox novnc fonts-liberation fonts-noto-cjk ffmpeg \
+RUN apt-get -o Acquire::Retries=2 update \
+    && apt-get -o Acquire::Retries=2 install -y --no-install-recommends ca-certificates chromium xauth xvfb x11vnc fluxbox novnc fonts-liberation fonts-noto-cjk ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir -r requirements.txt \
     && python /tmp/install_canvas_cli.py \
