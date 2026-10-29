@@ -8,6 +8,7 @@ import math
 import re
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -632,7 +633,8 @@ class CanvasClient:
     def submit(self, context: dict[str, Any], ceiling: int, *,
                persist: Callable[[dict[str, Any]], Any] | None = None,
                deadline: float | None = None) -> dict[str, Any]:
-        self._check_context(context)
+        if context.get("account_id") != int(self.account["id"]):
+            raise CanvasCLIError("CLI_ACCOUNT_MISMATCH", "Canvas command account does not match its durable task")
         if (context.get("phase") in {"accepted", "unknown"}
                 or context.get("submission_phase") in {"run_dispatching", "submitted", "accepted", "unknown"}):
             raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "An existing Canvas submission must only be queried", outcome_unknown=True)
@@ -662,50 +664,80 @@ class CanvasClient:
                                          outcome_unknown=dispatched) from cause
 
         try:
-            save("confirming")
-            # Confirmation only mints a spending-ceiling token. Retrying it
-            # never starts generation; node run below is attempted once only.
-            for attempt in range(3):
+            # Each CLI command uses this same reentrant lock. Keep confirmation
+            # and its single paid dispatch together, never generation polling.
+            with self.runner.account_guard(self.account, deadline=deadline):
+                remaining()
+                self._check_context(context)
+                save("confirming")
+                # Confirmation only mints a spending-ceiling token. Retrying it
+                # never starts generation; node run below is attempted once only.
+                for attempt in range(3):
+                    try:
+                        confirmed = self._call(["node", "confirm", "--project-id", context["project_id"],
+                                                "--node-id", context["node_id"], "--credit-ceiling", str(ceiling)],
+                                               timeout=remaining(), deadline=deadline)
+                        break
+                    except CanvasCLIError as exc:
+                        if exc.code != "cli.invalid_service_response" or attempt == 2:
+                            raise
+                        # Keep confirmation's established pre-dispatch deadline error.
+                        time.sleep(min(0.25 * 2 ** attempt, remaining()) if deadline is not None
+                                   else 0.25 * 2 ** attempt)
+                        remaining()
+                token = confirmed.get("creditConfirmationToken")
+                if not isinstance(token, str) or not token:
+                    raise CanvasCLIError("CLI_CONFIRMATION_INVALID", "Canvas did not issue a credit confirmation token")
+                received_at, received_mono = time.time(), time.monotonic()
+                raw_expiry = confirmed.get("expiresAt")
                 try:
-                    confirmed = self._call(["node", "confirm", "--project-id", context["project_id"],
-                                            "--node-id", context["node_id"], "--credit-ceiling", str(ceiling)],
-                                           timeout=remaining(), deadline=deadline)
-                    break
-                except CanvasCLIError as exc:
-                    if exc.code != "cli.invalid_service_response" or attempt == 2:
-                        raise
-                    # Keep confirmation's established pre-dispatch deadline error.
-                    time.sleep(min(0.25 * 2 ** attempt, remaining()) if deadline is not None
-                               else 0.25 * 2 ** attempt)
+                    if not isinstance(raw_expiry, str):
+                        raise ValueError("Missing confirmation expiry")
+                    expires = datetime.fromisoformat(raw_expiry.replace("Z", "+00:00"))
+                    if expires.utcoffset() is None:
+                        raise ValueError("Confirmation expiry has no timezone")
+                    expires_at = expires.timestamp()
+                    if not math.isfinite(expires_at):
+                        raise ValueError("Invalid confirmation expiry")
+                except (ValueError, OverflowError, OSError):
+                    raise CanvasCLIError("CLI_CONFIRMATION_INVALID", "Canvas credit confirmation expiry is invalid") from None
+                context["confirmation_received_at"] = received_at
+                context["confirmation_expires_at"] = expires_at
+                token_deadline = received_mono + max(0, expires_at - received_at)
+
+                def valid_confirmation() -> None:
                     remaining()
-            token = confirmed.get("creditConfirmationToken")
-            if not isinstance(token, str) or not token:
-                raise CanvasCLIError("CLI_CONFIRMATION_INVALID", "Canvas did not issue a credit confirmation token")
-            remaining()
-            save("run_dispatching")
-            budget = remaining()  # Persistence itself may consume the budget.
-            dispatched = True
-            result = self._call(["node", "run", "--project-id", context["project_id"],
-                                 "--node-id", context["node_id"], "--submit-id", context["submit_id"],
-                                 "--credit-token", token], timeout=budget, deadline=deadline)
-            items = result.get("items")
-            if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
-                raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas acceptance result is incomplete", outcome_unknown=True)
-            item = items[0]
-            if item.get("nodeId") != context["node_id"] or item.get("submitId") != context["submit_id"]:
-                raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas acceptance identities do not match", outcome_unknown=True)
-            state = str(item.get("state") or "").lower()
-            if item.get("error") or state in {"failed", "rejected", "canceled", "cancelled"}:
-                error = item.get("error") or {}
-                raise CanvasCLIError("UPSTREAM_REJECTED", str(error.get("message") or "Canvas rejected the generation"), details={"error": error},
-                                     outcome_unknown=bool(item.get("resources")) or state in {"accepted", "running", "in_progress", "processing", "completed", "succeeded", "success"})
-            if state not in {"accepted", "running", "in_progress", "processing", "completed", "succeeded", "success"}:
-                raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas returned an uncertain submission state", outcome_unknown=True)
-            context["resource_ids"] = [str(x["resourceId"]) for x in item.get("resources", []) if isinstance(x, dict) and x.get("resourceId")]
-            context["phase"] = "accepted"
-            context.pop("submit_error", None)
-            save("accepted")
-            return copy.deepcopy(context)
+                    if time.time() >= expires_at or time.monotonic() >= token_deadline:
+                        raise CanvasCLIError("CLI_CONFIRMATION_EXPIRED", "Canvas credit confirmation expired before generation was dispatched")
+
+                valid_confirmation()
+                context["dispatch_prepared_at"] = time.time()
+                save("run_dispatching")
+                valid_confirmation()  # Persistence must not outlive the token.
+                budget = remaining()
+                context["dispatch_started_at"] = time.time()
+                dispatched = True
+                result = self._call(["node", "run", "--project-id", context["project_id"],
+                                     "--node-id", context["node_id"], "--submit-id", context["submit_id"],
+                                     "--credit-token", token], timeout=budget, deadline=deadline)
+                items = result.get("items")
+                if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+                    raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas acceptance result is incomplete", outcome_unknown=True)
+                item = items[0]
+                if item.get("nodeId") != context["node_id"] or item.get("submitId") != context["submit_id"]:
+                    raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas acceptance identities do not match", outcome_unknown=True)
+                state = str(item.get("state") or "").lower()
+                if item.get("error") or state in {"failed", "rejected", "canceled", "cancelled"}:
+                    error = item.get("error") or {}
+                    raise CanvasCLIError("UPSTREAM_REJECTED", str(error.get("message") or "Canvas rejected the generation"), details={"error": error},
+                                         outcome_unknown=bool(item.get("resources")) or state in {"accepted", "running", "in_progress", "processing", "completed", "succeeded", "success"})
+                if state not in {"accepted", "running", "in_progress", "processing", "completed", "succeeded", "success"}:
+                    raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas returned an uncertain submission state", outcome_unknown=True)
+                context["resource_ids"] = [str(x["resourceId"]) for x in item.get("resources", []) if isinstance(x, dict) and x.get("resourceId")]
+                context["phase"] = "accepted"
+                context.pop("submit_error", None)
+                save("accepted")
+                return copy.deepcopy(context)
         except Exception as caught:
             exc = caught if isinstance(caught, CanvasCLIError) else CanvasCLIError(
                 "CLI_SUBMISSION_INTERRUPTED", "Canvas submission was interrupted", outcome_unknown=dispatched)

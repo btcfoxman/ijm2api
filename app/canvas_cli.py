@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -293,6 +294,25 @@ class CanvasCLI:
     def _lock(self, account_id: int) -> threading.RLock:
         with self._guard:
             return self._locks.setdefault(account_id, threading.RLock())
+
+    @contextmanager
+    def account_guard(self, account: dict[str, Any], *, deadline: float | None = None):
+        """Keep a bounded sequence on the same account's command lock."""
+        lock = self._lock(_account_id(account))
+        remaining = deadline - time.monotonic() if deadline is not None else None
+        if remaining is not None and remaining <= 0:
+            raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas task deadline expired before acquiring its account')
+        acquired = lock.acquire() if remaining is None else lock.acquire(timeout=remaining)
+        if not acquired:
+            raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas task deadline expired while waiting for its account')
+        try:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas task deadline expired before starting its account sequence')
+            if self._closed.is_set():
+                raise CanvasCLIError('CLI_STOPPING', 'Canvas CLI transport is stopping')
+            yield
+        finally:
+            lock.release()
 
     @staticmethod
     def _terminate(process: subprocess.Popen[bytes]) -> None:

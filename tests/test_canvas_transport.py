@@ -41,7 +41,13 @@ def request():
 
 
 class FakeRunner:
+    _lock = CanvasCLI._lock
+    account_guard = CanvasCLI.account_guard
+
     def __init__(self, tmp_path):
+        self._guard = threading.Lock()
+        self._locks = {}
+        self._closed = threading.Event()
         self.path = tmp_path
         self.calls = []
         self.persisted = []
@@ -92,7 +98,8 @@ class FakeRunner:
                 raise CanvasCLIError("CLI_COMMAND_TIMEOUT", "diagnostic unavailable")
             data = {"nodes": []}
         elif action == ["node", "confirm"]:
-            data = {"creditConfirmationToken": "never-save-this-token", "creditCeiling": 20}
+            data = {"creditConfirmationToken": "never-save-this-token", "creditCeiling": 20,
+                    "expiresAt": "2099-01-01T00:00:00Z"}
         elif action == ["node", "run"]:
             if self.run_failure:
                 raise self.run_failure
