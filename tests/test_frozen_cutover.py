@@ -40,6 +40,16 @@ class FakeDocker:
         self.changed_before_pause = False
         self.removal_timeout_after_effect = False
         self.pause_timeout_after_effect = False
+        self.export_failure = False
+
+    def export_backup(self, companion_id, destination):
+        assert companion_id == self.companion_id and self.paused and self.guard_count == 1
+        self.calls.append(["binary_export", companion_id, str(destination)])
+        self.inputs.append(None)
+        if self.export_failure:
+            Path(destination).write_bytes(b"incomplete stream")
+            raise RuntimeError("SyntheticStreamExportFailed")
+        Path(destination).write_bytes(b"corrupted backup" if self.bad_backup else self.backup)
 
     def __call__(self, args, *, input=None, timeout=30):
         self.calls.append(list(args))
@@ -80,11 +90,6 @@ class FakeDocker:
             else:
                 assert "source.backup(dest)" not in input
             return json.dumps(value)
-        if args[:2] == ["docker", "cp"]:
-            assert self.paused and self.guard_count == 1
-            assert args[2] == self.companion_id + ":/tmp/frozen.ijm2api.db"
-            Path(args[-1]).write_bytes(b"corrupted backup" if self.bad_backup else self.backup)
-            return ""
         if args[:2] == ["docker", "unpause"]:
             assert args[-1] == self.old_id and self.paused and not self.old_removed
             self.paused = False
@@ -115,7 +120,7 @@ class FrozenCutoverTests(unittest.TestCase):
 
     def invoke(self):
         return cutover.freeze_remove("ijm2api", "ghcr.io/test/ijm2api:immutable", self.release,
-                                     QUERY_IDS, "b" * 64, run=self.docker)
+                                     QUERY_IDS, "b" * 64, run=self.docker, exporter=self.docker.export_backup)
 
     def receipt(self):
         return json.loads((self.release / "frozen-cutover.safe.json").read_text())
@@ -134,9 +139,11 @@ class FrozenCutoverTests(unittest.TestCase):
         receipt = self.invoke()
         self.assertTrue(receipt["passed"] and receipt["original_removed_while_frozen"])
         self.assertFalse(receipt["original_unpaused_after_abort"])
-        actions = [args[1] for args in self.docker.calls]
+        actions = [args[1] if args[0] == 'docker' else args[0] for args in self.docker.calls]
         self.assertLess(actions.index("pause"), actions.index("exec"))
-        self.assertLess(actions.index("cp"), len(actions) - 3)
+        self.assertLess(actions.index("exec"), actions.index("binary_export"))
+        self.assertLess(actions.index("binary_export"), len(actions) - 3)
+        self.assertFalse(any(args[:2] == ["docker", "cp"] for args in self.docker.calls))
         self.assertEqual(self.docker.guard_count, 2)
         self.assertTrue(self.docker.old_removed)
         self.assertNotIn("unpause", actions)
@@ -150,14 +157,14 @@ class FrozenCutoverTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "FrozenGuardRejected"):
             self.invoke()
         self.assert_aborted_safely()
-        self.assertFalse(any(args[1] == "cp" for args in self.docker.calls))
+        self.assertFalse(any(args[0] == "binary_export" for args in self.docker.calls))
 
     def test_original_query_binding_drift_aborts_before_copy_or_removal(self):
         self.docker.first_binding = "c" * 64
         with self.assertRaisesRegex(RuntimeError, "FrozenOriginalBindingChanged"):
             self.invoke()
         self.assert_aborted_safely()
-        self.assertFalse(any(args[1] == "cp" for args in self.docker.calls))
+        self.assertFalse(any(args[0] == "binary_export" for args in self.docker.calls))
 
     def test_bad_backup_digest_aborts_without_second_guard_or_removal(self):
         self.docker.bad_backup = True
@@ -184,7 +191,7 @@ class FrozenCutoverTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "OriginalAppChangedBeforeFreeze"):
             self.invoke()
         self.assertFalse(self.docker.paused or self.docker.old_removed)
-        self.assertFalse(any(args[1] in ["pause", "unpause", "cp"] for args in self.docker.calls))
+        self.assertFalse(any(args[0] == "binary_export" or args[1] in ["pause", "unpause", "cp"] for args in self.docker.calls))
         self.assertIn(["docker", "rm", "--force", self.docker.companion_id], self.docker.calls)
 
     def test_removal_timeout_is_reconciled_as_gone_without_unpausing(self):
@@ -212,6 +219,15 @@ class FrozenCutoverTests(unittest.TestCase):
             self.invoke()
         self.assert_aborted_safely()
         self.assertEqual(self.docker.guard_count, 0)
+
+    def test_binary_stream_export_failure_unpauses_without_removal_or_paid_action(self):
+        self.docker.export_failure = True
+        with self.assertRaisesRegex(RuntimeError, "SyntheticStreamExportFailed"):
+            self.invoke()
+        self.assert_aborted_safely()
+        self.assertEqual(self.docker.guard_count, 1)
+        self.assertEqual(sum(args[0] == "binary_export" for args in self.docker.calls), 1)
+        self.assertFalse(any(args[:2] == ["docker", "cp"] for args in self.docker.calls))
 
 
 if __name__ == "__main__":

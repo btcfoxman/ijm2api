@@ -112,16 +112,23 @@ exec(heartbeat,{'name':'parent'})
 
 
 class Trace:
-    def __init__(self, service, data, *, inject_race=False, expect_success=False, pause_timeout=False):
+    def __init__(self, service, data, *, inject_race=False, expect_success=False, pause_timeout=False,
+                 exporter=None):
         self.service = service
         self.data = data
         self.inject_race = inject_race
         self.expect_success = expect_success
         self.pause_timeout = pause_timeout
+        self.exporter = exporter
         self.paused = False
         self.companion = None
         self.events = []
         self.frozen_heartbeats = None
+
+    def export_backup(self, companion_id, destination):
+        assert self.paused and companion_id == self.companion
+        self.events.append("frozen_binary_backup_export")
+        self.exporter(companion_id, destination)
 
     def __call__(self, args, *, input=None, timeout=30):
         assert args[0] == "docker"
@@ -202,11 +209,12 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                 assert baseline["mode"] == "accepted_queries_only"
                 (release / "query-resume-baseline.safe.json").write_text(json.dumps(baseline))
             should_reject = race or pause_timeout or (active and not query)
-            trace = Trace(old_id, data, inject_race=race, expect_success=not should_reject, pause_timeout=pause_timeout)
+            trace = Trace(old_id, data, inject_race=race, expect_success=not should_reject,
+                pause_timeout=pause_timeout, exporter=controller.export_frozen_backup)
             rejected = False
             try:
                 receipt = controller.freeze_remove(service, image, release,
-                    json.dumps([TASK]) if query else "", SOURCE_SHA, run=trace)
+                    json.dumps([TASK]) if query else "", SOURCE_SHA, run=trace, exporter=trace.export_backup)
             except RuntimeError as error:
                 rejected = True
                 receipt_file = release / "frozen-cutover.safe.json"

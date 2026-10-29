@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import uuid
 
 
@@ -37,7 +38,26 @@ def companion_program(query_ids, startup_sha, *, backup=False):
     return program
 
 
-def freeze_remove(service, image, release, query_ids, startup_sha, run=execute):
+def export_frozen_backup(companion_id, destination, timeout=30):
+    """Stream the existing tmpfs backup; Docker's archive API cannot copy it."""
+    command = ["docker", "exec", companion_id, "python", "-B", "-c",
+        "import pathlib,shutil,sys\nwith pathlib.Path('/tmp/frozen.ijm2api.db').open('rb') as source:"
+        "shutil.copyfileobj(source,sys.stdout.buffer,1024*1024)"]
+    with Path(destination).open("xb") as output, tempfile.TemporaryFile() as errors:
+        os.fchmod(output.fileno(), 0o600)
+        try:
+            result = subprocess.run(command, stdout=output, stderr=errors, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("FrozenBackupExportTimedOut") from None
+        if result.returncode:
+            errors.seek(0, os.SEEK_END)
+            errors.seek(max(0, errors.tell() - 2000))
+            detail = errors.read().decode("utf-8", errors="replace").strip()
+            raise RuntimeError("FrozenBackupExportFailed:" + detail)
+
+
+def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
+                  exporter=export_frozen_backup):
     release = Path(release)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", service) or not release.is_dir():
         raise RuntimeError("CutoverArgumentsInvalid")
@@ -77,7 +97,7 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute):
         destination = release / "frozen.ijm2api.db"
         if destination.exists():
             raise RuntimeError("FrozenBackupAlreadyExists")
-        run(["docker", "cp", companion_id + ":/tmp/frozen.ijm2api.db", str(destination)], timeout=20)
+        exporter(companion_id, destination)
         destination.chmod(0o600)
         if hashlib.sha256(destination.read_bytes()).hexdigest() != first.get("frozen_backup_sha256"):
             raise RuntimeError("FrozenBackupChecksumMismatch")
