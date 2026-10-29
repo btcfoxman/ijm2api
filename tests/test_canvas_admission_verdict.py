@@ -101,7 +101,7 @@ def test_partial_error_envelope_cannot_become_safe_balance_retry(tmp_path, monke
 
 
 @pytest.mark.parametrize('submission,expected', [
-    (' RUN_ACCEPTED ', 'running'), ('RUN_UNKNOWN', 'unknown'), ('processing', 'unknown'),
+    (' RUN_ACCEPTED ', 'running'), ('RUN_UNKNOWN', 'unknown'), ('processing', 'running'),
 ])
 def test_original_operation_keeps_generation_and_admission_contracts_separate(boundary, submission, expected):
     runner, client, context, calls, _ = boundary

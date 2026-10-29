@@ -540,4 +540,8 @@ textarea { resize: vertical; }
 #onlineAccountMessage { flex:none; margin:0; padding:8px 10px; color:var(--muted); background:#18252a; border:1px solid var(--line); border-radius:5px; }
 #onlineAccountFrame { display:block; flex:1; min-width:0; min-height:0; width:100%; border:1px solid var(--line); border-radius:5px; background:#101826; }
 .online-account-layout footer { flex:none; }
+.upstream-identifiers { display:flex; flex-direction:column; gap:3px; margin-top:6px; }
+.upstream-id-line { display:flex; gap:6px; align-items:baseline; color:var(--muted); font-size:11px; }
+.upstream-id-line > span { flex:none; }
+.upstream-id-line > button { display:block; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px; }
 @media(max-width:650px) { .online-account-fields .form-grid { grid-template-columns:1fr; } .online-account-fields .form-grid .wide { grid-column:auto; } .online-account-layout header .caption { display:none; } }

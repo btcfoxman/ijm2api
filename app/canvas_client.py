@@ -936,23 +936,37 @@ class CanvasClient:
                     or not isinstance(resource.get("resourceId"), str) or not resource["resourceId"].strip()
                     or not isinstance(resource.get("state"), str) or resource["state"].strip().lower() not in resource_states):
                 raise CanvasCLIError("CLI_INVALID_RESPONSE", "Canvas operation response contains an invalid resource", outcome_unknown=True)
+        resource_ids = [resource["resourceId"] for resource in resources]
+        if len(set(resource_ids)) != len(resource_ids):
+            raise CanvasCLIError("CLI_INVALID_RESPONSE", "Canvas operation response contains duplicate resources", outcome_unknown=True)
+        expected = context.get("resource_ids") or []
+        if (not isinstance(expected, list) or any(not isinstance(value, str) or not value.strip() for value in expected)
+                or len(set(expected)) != len(expected)
+                or expected and not set(resource_ids).issubset(expected)):
+            raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas operation resources do not match the original receipt", outcome_unknown=True)
         submission = data.get("submission") if isinstance(data.get("submission"), dict) else {}
         result: dict[str, Any] = {"status": "running", "progress": 45, "result_urls": [],
                                   "result_paths": [], "result_files": [], "credit_facts": [],
                                   "error_code": "", "error_message": ""}
-        submission_verdict = admission_verdict(submission.get("state")) if submission else None
-        if state in {"absent", "unknown"} or submission_verdict == "unknown":
+        if state in {"absent", "unknown"}:
             result.update(status="unknown", error_code="UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
                           error_message="Canvas submission could not be resolved; automatic resubmission is disabled")
             return result
         failed = [x for x in resources if str(x.get("state") or "").lower() in {"failed", "rejected", "error", "canceled", "cancelled"}]
         if (state in {"failed", "partial_failed", "rejected", "error", "canceled", "cancelled"}
-                or submission_verdict == "rejected" or failed or data.get("submissionError")):
+                or failed or data.get("submissionError")):
             result.update(self._failure_details(context, data, resources, failed, deadline=deadline))
             return result
         terminal = state in {"completed", "success", "succeeded"}
         successful = [x for x in resources if str(x.get("state") or "").lower() in {"success", "succeeded", "completed"}]
         if not terminal or not resources or len(successful) != len(resources):
+            # operation.submission summarizes the lifecycle (e.g. completed),
+            # unlike node.run's ACCEPTED/REJECTED admission receipt. Concrete
+            # original-operation resources/terminal states outrank that summary.
+            summary = str(submission.get("state") or "").strip().lower().removeprefix("run_")
+            if not resources and summary in {"absent", "unknown"}:
+                result.update(status="unknown", error_code="UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
+                              error_message="Canvas submission could not be resolved; automatic resubmission is disabled")
             return result
         if len(resources) != int(context.get("output_count") or 1):
             result.update(status="failed", progress=100, error_code="CLI_RESULT_INCOMPLETE",

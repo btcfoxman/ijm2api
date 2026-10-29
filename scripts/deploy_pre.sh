@@ -34,6 +34,7 @@ for number,path in enumerate([str(env),*configs]):
  shutil.copyfile(source,backup);backup.chmod(0o600)
 context={'directory':str(root),'project':project,'service':service,'configs':configs,
  'checksums':checksums,'previous_image':value['Config']['Image'],'previous_image_id':value['Image'],
+ 'previous_container_id':value['Id'],
  'was_running':bool(value['State']['Running']),
  'data_mounts':[{'source':mount['Source'],'target':mount['Destination']} for mount in value.get('Mounts',[]) if mount['Destination']=='/app/data']}
 if not context['data_mounts']:raise SystemExit('Existing persistent /app/data mount is required')
@@ -52,6 +53,12 @@ PY
 )
 compose=("${compose_base[@]}" -f "$release/image.compose.json")
 rollback=("${compose_base[@]}" -f "$release/rollback.compose.json")
+query_ids="${IJM_DEPLOY_QUERY_ONLY_TASK_IDS:-}"
+startup_sha=""
+if [ -n "$query_ids" ]; then
+  test "${GITHUB_EVENT_NAME:-}" = workflow_dispatch || { echo "Query-only maintenance requires explicit manual dispatch"; exit 1; }
+  startup_sha="$(sha256sum "$(dirname "${BASH_SOURCE[0]}")/../app/service.py" | cut -d ' ' -f 1)"
+fi
 
 pulled=0
 for attempt in 1 2 3; do
@@ -72,6 +79,28 @@ if any(mounts.get(item['target'])!=item['source'] for item in context['data_moun
 PY
 
 active_commands() {
+  if [ -n "$query_ids" ]; then
+    # This read-only gate never parks tasks, changes account flags, or sends CLI commands.
+    docker exec -i -e "IJM_DEPLOY_QUERY_ONLY_TASK_IDS=$query_ids" -e "IJM_DEPLOY_STARTUP_SHA256=$startup_sha" \
+      "$DEPLOY_SERVICE" python -B - < "$(dirname "${BASH_SOURCE[0]}")/query_resume_guard.py" >"$release/query-resume-current.safe.json"
+    python3 - "$release" <<'PY'
+import json,pathlib,sys
+out=pathlib.Path(sys.argv[1]);current=json.loads((out/'query-resume-current.safe.json').read_text())
+if current.get('passed') is not True:
+ print(1);raise SystemExit(0)
+baseline=out/'query-resume-baseline.safe.json'
+if current.get('mode')!='idle':
+ if baseline.exists():
+  previous=json.loads(baseline.read_text())
+  if current.get('binding_sha256')!=previous.get('binding_sha256'):
+   print(1);raise SystemExit(0)
+ else:
+  with baseline.open('x') as handle:json.dump(current,handle,indent=2)
+  baseline.chmod(0o600)
+print(0)
+PY
+    return
+  fi
   # Stream the checked-out read-only guard into the old image as well.
   docker exec -i "$DEPLOY_SERVICE" python -B - < "$(dirname "${BASH_SOURCE[0]}")/../app/deploy_guard.py"
 }
@@ -124,6 +153,34 @@ healthy() {
 
 check_preserved_config
 test "$(active_commands)" -eq 0 || { echo "New work arrived; service was not restarted. Retry deployment after it completes"; exit 1; }
+# Close the final check-to-restart race. The verified image is used only as an
+# offline read-only companion; no app server, CLI business call or build starts.
+if ! IJM_DEPLOY_QUERY_ONLY_TASK_IDS="$query_ids" IJM_DEPLOY_STARTUP_SHA256="$startup_sha" \
+    python3 "$(dirname "${BASH_SOURCE[0]}")/frozen_cutover.py" --service "$DEPLOY_SERVICE" --image "$image" --release "$release" \
+    >"$release/frozen-cutover.private.log" 2>&1; then
+  echo "Frozen cutover did not complete; verifying whether the old service needs recovery"
+  recovery="$(python3 - "$release/context.private.json" <<'PY'
+import json,subprocess,sys,time
+context=json.load(open(sys.argv[1]));time.sleep(1)
+result=subprocess.run(['docker','ps','--all','--no-trunc','--format','{{json .}}'],capture_output=True,text=True,timeout=10)
+if result.returncode:raise SystemExit('Cannot inspect Docker; refusing speculative recovery')
+rows=[json.loads(line) for line in result.stdout.splitlines() if line]
+named=[row for row in rows if row.get('Names')==context['service']]
+if not named:print('restore')
+elif len(named)==1 and named[0].get('ID')==context['previous_container_id'] and named[0].get('State') in {'exited','dead','created'}:print('restore')
+else:print('preserve')
+PY
+)"
+  if [ "$recovery" = restore ]; then
+    check_preserved_config
+    "${rollback[@]}" up -d --no-deps --no-build --pull never "$DEPLOY_SERVICE" >"$release/freeze-abort-recovery.private.log" 2>&1
+    healthy || { echo "Previous image recovery requires operator inspection"; exit 1; }
+    echo "Previous published image recovered with unchanged data; candidate cutover failed"
+  else
+    echo "Existing service retained; no additional restart was attempted"
+  fi
+  exit 1
+fi
 if "${compose[@]}" up -d --no-deps --no-build --pull never "$DEPLOY_SERVICE" >"$release/restart.private.log" 2>&1 && healthy; then
   actual_image="$(docker inspect -f '{{.Config.Image}}' "$DEPLOY_SERVICE")"
   if [ "$actual_image" = "$image" ] && check_preserved_config; then

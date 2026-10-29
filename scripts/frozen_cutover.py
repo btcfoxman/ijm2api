@@ -1,0 +1,151 @@
+"""Freeze, verify, and remove only the original app; never build or submit."""
+from __future__ import annotations
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import uuid
+
+
+def execute(args, *, input=None, timeout=30):
+    result = subprocess.run(args, input=input, capture_output=True, text=True, timeout=timeout)
+    if result.returncode:
+        raise RuntimeError("DockerCutoverOperationFailed")
+    return result.stdout.strip()
+
+
+def companion_program(query_ids, startup_sha, *, backup=False):
+    here = Path(__file__).resolve().parent
+    query = (here / "query_resume_guard.py").read_text(encoding="utf-8")
+    idle = (here.parent / "app/deploy_guard.py").read_text(encoding="utf-8")
+    program = "import hashlib,json,os,pathlib,sqlite3\n"
+    program += "query={\"__name__\":\"frozen_query_guard\"};idle={\"__name__\":\"frozen_idle_guard\"}\n"
+    program += "exec(compile(" + repr(query) + ",'query_guard','exec'),query)\n"
+    program += "exec(compile(" + repr(idle) + ",'idle_guard','exec'),idle)\n"
+    program += "root=pathlib.Path(os.environ.get('IJM_DATA_DIR','/app/data'));expected=" + repr(query_ids) + "\n"
+    program += "if expected:\n value=query['check'](root/'ijm2api.db',query['parse_expected'](expected),root,pathlib.Path('/app/app/service.py')," + repr(startup_sha) + ")\n"
+    program += "else:\n count=idle['active_work'](root/'ijm2api.db');value={'passed':count==0,'mode':'idle','active_count':count,'binding_sha256':None}\n"
+    program += "if value.get('passed') is not True:raise RuntimeError('FrozenGuardRejected')\n"
+    if backup:
+        program += "source=sqlite3.connect((root/'ijm2api.db').as_uri()+'?mode=ro',uri=True,timeout=5);source.execute('PRAGMA query_only=ON')\n"
+        program += "target=pathlib.Path('/tmp/frozen.ijm2api.db');dest=sqlite3.connect(str(target));source.backup(dest);dest.close();source.close();target.chmod(0o600)\n"
+        program += "value['frozen_backup_sha256']=hashlib.sha256(target.read_bytes()).hexdigest()\n"
+    program += "print(json.dumps(value))\n"
+    return program
+
+
+def freeze_remove(service, image, release, query_ids, startup_sha, run=execute):
+    release = Path(release)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", service) or not release.is_dir():
+        raise RuntimeError("CutoverArgumentsInvalid")
+    original = json.loads(run(["docker", "inspect", service], timeout=10))[0]
+    old_id = original["Id"]
+    if not original["State"]["Running"] or original["State"].get("Paused"):
+        raise RuntimeError("OriginalAppNotRunningUnpaused")
+    name = "ijm-frozen-guard-" + uuid.uuid4().hex[:16]
+    companion_id = None
+    paused = False
+    removed = False
+    receipt = {"passed": False, "old_container_sha256": hashlib.sha256(old_id.encode()).hexdigest(),
+        "server_builds": 0, "new_generations": 0, "database_writes": 0,
+        "original_unpaused_after_abort": False, "original_removed_while_frozen": False}
+    try:
+        # The companion joins while the original is running; only its separate
+        # cgroup stays runnable after pause. It never starts the application.
+        companion_id = run(["docker", "run", "--detach", "--rm", "--name", name,
+            "--pull", "never", "--network", "none", "--read-only", "--user", "0:0",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--memory", "256m", "--cpus", "0.5", "--pids-limit", "64",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=128m,mode=0700", "--volumes-from", old_id + ":ro",
+            "--pid", "container:" + old_id, "--entrypoint", "python", image,
+            "-B", "-c", "import time; time.sleep(600)"], timeout=20)
+        current = json.loads(run(["docker", "inspect", service], timeout=10))[0]
+        if current["Id"] != old_id or not current["State"]["Running"] or current["State"].get("Paused"):
+            raise RuntimeError("OriginalAppChangedBeforeFreeze")
+        # A client timeout does not prove the daemon failed to pause it.
+        paused = True
+        run(["docker", "pause", old_id], timeout=15)
+        first = json.loads(run(["docker", "exec", "-i", companion_id, "python", "-B", "-"],
+            input=companion_program(query_ids, startup_sha, backup=True), timeout=30))
+        baseline_path = release / "query-resume-baseline.safe.json"
+        baseline = json.loads(baseline_path.read_text()) if baseline_path.is_file() else None
+        if (query_ids and first.get("mode") != "idle"
+                and (not baseline or first.get("binding_sha256") != baseline.get("binding_sha256"))):
+            raise RuntimeError("FrozenOriginalBindingChanged")
+        destination = release / "frozen.ijm2api.db"
+        if destination.exists():
+            raise RuntimeError("FrozenBackupAlreadyExists")
+        run(["docker", "cp", companion_id + ":/tmp/frozen.ijm2api.db", str(destination)], timeout=20)
+        destination.chmod(0o600)
+        if hashlib.sha256(destination.read_bytes()).hexdigest() != first.get("frozen_backup_sha256"):
+            raise RuntimeError("FrozenBackupChecksumMismatch")
+        final = json.loads(run(["docker", "exec", "-i", companion_id, "python", "-B", "-"],
+            input=companion_program(query_ids, startup_sha), timeout=20))
+        if (final.get("passed") is not True or final.get("mode") != first.get("mode")
+                or final.get("binding_sha256") != first.get("binding_sha256")
+                or final.get("active_count") != first.get("active_count")):
+            raise RuntimeError("FrozenStateChangedDuringBackup")
+        current = json.loads(run(["docker", "inspect", service], timeout=10))[0]
+        if current["Id"] != old_id or not current["State"]["Running"] or not current["State"].get("Paused"):
+            raise RuntimeError("OriginalAppDidNotRemainFrozen")
+        receipt.update(frozen_guard=final, frozen_backup_sha256=first["frozen_backup_sha256"])
+        # Never unpause an approved old listener: a newly queued request must
+        # not cross the final check. Hosted Docker smoke verifies this path.
+        try:
+            run(["docker", "rm", "--force", old_id], timeout=30)
+            removed = True
+            receipt["original_removed_while_frozen"] = True
+        except Exception:
+            # A timeout is not evidence that removal failed. Query the daemon
+            # before deciding whether to recreate or preserve the old service.
+            rows = [json.loads(line) for line in run(["docker", "ps", "--all", "--no-trunc", "--format", "{{json .}}"], timeout=10).splitlines() if line]
+            old = [row for row in rows if row.get("ID") == old_id]
+            named = [row for row in rows if row.get("Names") == service]
+            if not old and not named:
+                removed = True
+                receipt.update(original_removed_while_frozen=True, removal_timeout_resolved="original_absent")
+            elif len(old) == len(named) == 1 and old[0].get("ID") == named[0].get("ID") and old[0].get("State") in {"exited", "dead", "created"}:
+                removed = True  # No old app process exists; compose will replace the stopped container.
+                receipt.update(original_stopped_while_frozen=True, removal_timeout_resolved="original_stopped")
+            else:
+                raise RuntimeError("RemovalOutcomeNotSafeForRecreate") from None
+        receipt.update(passed=True)
+        return receipt
+    finally:
+        if paused and not removed:
+            try:
+                current = json.loads(run(["docker", "inspect", old_id], timeout=10))[0]
+                if current["Id"] == old_id and current["State"]["Running"] and current["State"].get("Paused"):
+                    run(["docker", "unpause", old_id], timeout=15)
+                    receipt["original_unpaused_after_abort"] = True
+            except Exception:
+                receipt["unpause_requires_operator_review"] = True
+        if companion_id:
+            try:
+                run(["docker", "rm", "--force", companion_id], timeout=15)
+            except Exception:
+                # Killing PID-namespace init may already have removed the --rm companion.
+                receipt["companion_already_exited_or_cleanup_failed"] = True
+        try:
+            (release / "frozen-cutover.safe.json").write_text(json.dumps(receipt, indent=2))
+        except OSError:
+            # Audit IO must never mask the successful removal return and keep
+            # deploy_pre.sh from immediately starting the already-built image.
+            print("Frozen cutover receipt could not be written; continue service recovery", file=__import__('sys').stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--service", required=True)
+    parser.add_argument("--image", required=True)
+    parser.add_argument("--release", type=Path, required=True)
+    args = parser.parse_args()
+    value = freeze_remove(args.service, args.image, args.release, os.environ.get("IJM_DEPLOY_QUERY_ONLY_TASK_IDS", ""),
+        os.environ.get("IJM_DEPLOY_STARTUP_SHA256", ""))
+    print(json.dumps(value))
+
+
+if __name__ == "__main__":
+    main()

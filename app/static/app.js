@@ -119,12 +119,38 @@ function costObservationCell(task) {
   return globalThis.TaskCost?.cell(task.id, task.task_cost) || '<span class="cell-sub">未知</span>';
 }
 
+function upstreamIdentifierCell(task) {
+  const ids = task.upstream_identifiers || {};
+  const line = (label, value, hint = '') => `<span class="upstream-id-line"><span>${label}</span><button type="button" class="link-button mono" data-copy-upstream-id="${escapeHtml(value)}" title="${escapeHtml(hint || value)}">${escapeHtml(value)}</button></span>`;
+  const rows = [];
+  if (ids.task_id) rows.push(line('上游任务ID', ids.task_id));
+  for (const value of ids.resource_ids || []) rows.push(line('上游资源ID', value));
+  if (!rows.length) rows.push('<span class="cell-sub">上游任务ID：尚未取得</span>');
+  if (ids.submission_id) rows.push(line('提交ID', ids.submission_id, `本地预分配的 Canvas 提交标识，用于查询原提交；不是上游生成任务ID。${ids.submission_id}`));
+  return `<span class="upstream-identifiers">${rows.join('')}</span>`;
+}
+
+async function copyUpstreamIdentifier(value) {
+  if (navigator.clipboard?.writeText) {
+    try { await navigator.clipboard.writeText(value); return; } catch (_) { /* LAN HTTP fallback below. */ }
+  }
+  const previous = document.activeElement;
+  const input = document.createElement('textarea');
+  input.value = value; input.readOnly = true;
+  input.style.cssText = 'position:fixed;left:-9999px;top:0';
+  document.body.append(input);
+  try {
+    input.select(); input.setSelectionRange(0, input.value.length);
+    if (!document.execCommand('copy')) throw new Error('复制失败，请选中上游标识复制');
+  } finally { input.remove(); previous?.focus(); }
+}
+
 function renderTasks() {
   const items = state.tasks.slice(0, 20); $("#tasksBody").innerHTML = items.map((task) => {
     const unknown = globalThis.CanvasTaskState.unknown(task);
     const media = mediaFromTask(task); const inputs = media.filter((item) => !item.result); const results = media.filter((item) => item.result);
     const result = unknown ? `<span class="error-upstream" title="${escapeHtml(task.error_message)}">待核实：${escapeHtml(task.error_message || "原提交回执未确认")}</span>` : task.status === "failed" || task.status === "expired" ? `<span class="error-stack"><span class="error-public">响应：${escapeHtml(failureMessage(task))}</span><span class="error-upstream" title="${escapeHtml(task.error_message)}">上游：${escapeHtml(task.error_message || "未知错误")}</span></span>` : `<span class="result-links">${results.map((item) => `<a href="${escapeHtml(item.url)}" target="_blank">视${results.length > 1 ? results.indexOf(item) + 1 : ""}</a>`).join("")}</span>`;
-    return `<tr><td><button class="cell-title link-button mono" data-action="detail" data-id="${escapeHtml(task.id)}">${escapeHtml(task.id.slice(0, 20))}</button><span class="cell-sub mono">${escapeHtml((task.channel || "待分配").toUpperCase())} · ${executionLabel(task.execution_backend)}${task.account_id ? ` · #${task.account_id} · ${escapeHtml(task.account_name || "")}` : ""}</span></td>
+    return `<tr><td><button class="cell-title link-button mono" data-action="detail" data-id="${escapeHtml(task.id)}">${escapeHtml(task.id.slice(0, 20))}</button><span class="cell-sub mono">${escapeHtml((task.channel || "待分配").toUpperCase())} · ${executionLabel(task.execution_backend)}${task.account_id ? ` · #${task.account_id} · ${escapeHtml(task.account_name || "")}` : ""}</span>${upstreamIdentifierCell(task)}</td>
       <td class="prompt-cell"><span class="cell-title" title="${escapeHtml(task.prompt)}">${escapeHtml(task.prompt || "-")}</span><span class="task-meta-line"><span class="task-spec">${escapeHtml(taskSpec(task))}</span>${inputs.length ? `<span class="media-text">${inputs.map((item, index) => `<button data-action="media" data-id="${escapeHtml(task.id)}" data-media-index="${index}">${{ image: "图", video: "视", audio: "音" }[item.kind]}${item.label}</button>`).join(" ")}</span>` : ""}</span></td><td class="task-cost-column">${costObservationCell(task)}</td>
       <td>${unknown ? `<span class="badge submitted">${globalThis.CanvasTaskState.label(task)}</span>` : badge(task.status)}</td><td><div class="progress-stack"><span class="progress-value"><b class="mono">${globalThis.CanvasTaskState.progress(task)}</b>${unknown ? '' : `<span class="progress-track"><i style="width:${Math.min(Number(task.progress || 0), 100)}%"></i></span>`}</span><span class="elapsed">${terminal.has(task.status) ? "耗时" : "已用"} ${elapsed(task)}</span></div></td>
       <td><span class="time-stack"><span>创建 ${fmtTime(task.created_at)}</span><span>更新 ${fmtTime(task.updated_at)}</span></span></td><td>${result}</td></tr>`;
@@ -233,6 +259,12 @@ document.addEventListener("click", async (event) => {
     try { showDetail(await api(`/api/tasks/${state.detail.id}/reconcile`, { method: 'POST' })); toast('已查询原提交，未重新生成'); }
     catch (error) { toast(error.message, true); }
     finally { reconcile.disabled = false; await refresh(); }
+    return;
+  }
+  const upstreamId = event.target.closest('[data-copy-upstream-id]');
+  if (upstreamId) {
+    try { await copyUpstreamIdentifier(upstreamId.dataset.copyUpstreamId); toast('上游标识已复制'); }
+    catch (error) { toast(error.message || '复制失败', true); }
     return;
   }
   const detail = event.target.closest("[data-action='detail']"); if (detail) try { showDetail(await api(`/api/tasks/${detail.dataset.id}`)); } catch (error) { toast(error.message, true); }

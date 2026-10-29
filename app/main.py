@@ -611,8 +611,11 @@ def get_generic(task_id: str) -> dict[str, Any]:
 
 
 def _with_cost_observations(task: dict[str, Any]) -> dict[str, Any]:
+    from .task_identifiers import upstream_identifiers
+
     full_task = task
     task = {key: value for key, value in task.items() if key != 'upstream_context'}
+    task['upstream_identifiers'] = upstream_identifiers(full_task)
     if task.get('execution_backend') == 'canvas_cli':
         from .canvas_cli import sanitize
         context = full_task.get('upstream_context') or {}

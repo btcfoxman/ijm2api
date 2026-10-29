@@ -4,6 +4,12 @@ on:
   push:
     branches: [pre]
   workflow_dispatch:
+    inputs:
+      query_only_task_ids:
+        description: 'Explicit JSON array of already accepted Canvas local task IDs; empty keeps strict idle deployment'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -52,6 +58,7 @@ jobs:
           python -m pip install --index-url https://pypi.org/simple --timeout 30 --retries 2 -r requirements-dev.txt
           python -m pytest -q
           node --test tests/*.js
+          node --check app/static/app.js
           python -m compileall -q app
           bash -n scripts/deploy_pre.sh
       - name: Verify pinned Canvas account proxy tracer
@@ -77,6 +84,13 @@ jobs:
             ghcr.io/btcfoxman/ijm2api:pre
           provenance: false
           sbom: false
+      - name: Verify frozen cutover with real Docker on hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$IMAGE_REGISTRY/$IMAGE_NAMESPACE/$IMAGE_NAME:$GITHUB_SHA"
+          docker pull "$image"
+          python tools/test_deploy_freeze_runtime.py --image "$image"
 
   deploy:
     needs: build
@@ -85,6 +99,7 @@ jobs:
     env:
       IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
       DEPLOY_WAIT_SECONDS: ${{ vars.DEPLOY_WAIT_SECONDS || '7200' }}
+      IJM_DEPLOY_QUERY_ONLY_TASK_IDS: ${{ github.event_name == 'workflow_dispatch' && inputs.query_only_task_ids || '' }}
     steps:
       - uses: actions/checkout@v4
       - name: Isolate registry credentials
