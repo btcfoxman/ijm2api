@@ -195,11 +195,11 @@ async function scenario(initial,lateAssets,includeSdk,origin='https://dreamina.c
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is required for page-context execution")
 class CreditRegionContextTests(unittest.TestCase):
-    def expression(self, path="/commerce/v1/benefits/user_credit", **kwargs):
+    def expression(self, path="/commerce/v1/benefits/user_credit", *, body=None, **kwargs):
         browser = CDPBrowser(19301)
         with patch.object(browser, "evaluate", return_value=json.dumps(
                 {"http": 200, "body": {"ret": "0", "data": {}}})) as evaluate:
-            browser.post(path, {}, **kwargs)
+            browser.post(path, {} if body is None else body, **kwargs)
         return evaluate.call_args.args[0]
 
     def execute_contexts(self, expressions, contexts):
@@ -309,11 +309,12 @@ process.stdin.on('end', async () => {
                      {"sdk": {"code": "SG", "domain": {"commerce_domain": 'https://commerce.us.capcut.com'}}},
                      {"hostname": "attacker.test", "sdk": {"code": "US", "domain": {
                          "commerce_domain": 'https://commerce.us.capcut.com'}}}]
-        for path in ["/commerce/v1/benefits/user_credit", "/commerce/v1/benefits/credit_receive"]:
+        for path in ["/commerce/v1/benefits/user_credit", "/commerce/v1/benefits/credit_receive", "/mweb/v1/get_settings"]:
             result = self.execute_contexts([self.expression(path)], contexts)
             self.assertEqual(len(result['calls']), len(contexts))
             for call in result['calls']:
-                self.assertEqual(call['url'], 'https://commerce-api-sg.capcut.com' + path)
+                origin = 'https://mweb-api-sg.capcut.com' if path.startswith('/mweb/') else 'https://commerce-api-sg.capcut.com'
+                self.assertEqual(call['url'], origin + path)
                 self.assertEqual(call['options']['headers'], {'content-type': 'application/json'})
 
     def test_us_origin_getter_and_proxy_are_read_once_and_cannot_change_dispatch_origin(self):
@@ -343,13 +344,48 @@ process.stdin.on('end', async () => {
             'https://commerce.us.capcut.com/commerce/v1/benefits/user_credit'])
         self.assertEqual(json.loads(result['values'][-1]), {'transport_error': 'fetch'})
 
-    def test_new_commerce_domain_does_not_guess_a_new_mweb_origin(self):
+    def test_new_commerce_domain_uses_original_verified_us_mweb_origin(self):
         context = {'sdk': {'code': 'US', 'domain': {'commerce_domain': 'https://commerce.us.capcut.com',
                                                   'web_domain': 'https://web-edit.us.capcut.com'}}}
         expression = self.expression('/mweb/v1/get_settings', query={'aid': '513695', 'region': 'SG'})
         call = self.execute_contexts([expression], [context])['calls'][0]
-        self.assertEqual(call['url'], 'https://mweb-api-sg.capcut.com/mweb/v1/get_settings?aid=513695&region=SG')
-        self.assertEqual(call['options']['headers'], {'content-type': 'application/json'})
+        self.assertEqual(call['url'], 'https://dreamina-api-us-ttp2.us.capcut.com/mweb/v1/get_settings?aid=513641&region=US')
+        self.assertEqual(call['options']['headers'], {'content-type': 'application/json', 'appid': '513641'})
+
+    def test_both_evidenced_us_contexts_keep_original_mweb_route_body_and_query_rules(self):
+        body = {'synthetic_marker': ['unchanged', 1], 'nested': {'enabled': True}}
+        contexts = [{'sdk': {'code': 'US', 'domain': {'commerce_domain': origin}}}
+                    for origin in ['https://commerce-us-ttp2.us.capcut.com', 'https://commerce.us.capcut.com']]
+        for path in ['/mweb/v1/get_settings', '/mweb/v1/get_upload_token', '/mweb/v1/get_history_by_ids']:
+            with self.subTest(path=path):
+                expression = self.expression(path, body=body, query={'aid': '513695', 'region': 'SG', 'keep': 'caller'})
+                result = self.execute_contexts([expression], contexts)
+                self.assertEqual(len(result['calls']), 2)
+                for call in result['calls']:
+                    url = urllib.parse.urlsplit(call['url'])
+                    self.assertEqual(url.hostname, 'dreamina-api-us-ttp2.us.capcut.com')
+                    self.assertEqual(url.path, path)
+                    self.assertEqual(dict(urllib.parse.parse_qsl(url.query)), {'aid': '513641', 'region': 'US', 'keep': 'caller'})
+                    self.assertEqual(call['options']['headers'], {'content-type': 'application/json', 'appid': '513641'})
+                    self.assertEqual(json.loads(call['options']['body']), body)
+                    self.assertEqual(call['options']['credentials'], 'include')
+        call = self.execute_contexts([self.expression('/mweb/v1/get_settings', query={'keep': 'caller'})], [contexts[1]])['calls'][0]
+        self.assertEqual(dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(call['url']).query)), {'keep': 'caller', 'aid': '513641'})
+
+    def test_mweb_getter_and_proxy_use_one_verified_origin_snapshot(self):
+        old, new, attacker = ('https://commerce-us-ttp2.us.capcut.com', 'https://commerce.us.capcut.com', 'https://arbitrary.test')
+        contexts = [{'sdk': {'code': 'US'}, 'originAccess': access, 'originSequence': sequence}
+                    for access, sequence in [('getter', [new, attacker]), ('proxy', [old, attacker]),
+                                             ('getter', [attacker, new]), ('proxy', [attacker, old])]]
+        expression = self.expression('/mweb/v1/get_settings', query={'aid': 'caller', 'region': 'SG', 'keep': 'unchanged'})
+        result = self.execute_contexts([expression], contexts)
+        self.assertEqual(result['reads'], [{'domain': 1, 'origin': 1}] * 4)
+        for i, call in enumerate(result['calls']):
+            url = urllib.parse.urlsplit(call['url'])
+            self.assertEqual(url.hostname, 'dreamina-api-us-ttp2.us.capcut.com' if i < 2 else 'mweb-api-sg.capcut.com')
+            self.assertEqual(dict(urllib.parse.parse_qsl(url.query)), {
+                'aid': '513641' if i < 2 else 'caller', 'region': 'US' if i < 2 else 'SG', 'keep': 'unchanged'})
+            self.assertNotIn('arbitrary.test', call['url'])
 
     def test_context_is_read_again_per_call_without_cross_account_cache(self):
         us = {"sdk": {"code": "US", "domain": {
@@ -402,10 +438,11 @@ process.stdin.on('end', async () => {
         us = {"sdk": {"code": "US", "domain": {
             "commerce_domain": "https://commerce-us-ttp2.us.capcut.com"}}}
         expression = self.expression("/mweb/v1/aigc_draft/generate")
-        result = self.execute_contexts([expression], [us, {}, {**us, "throwFetch": True}])
-        self.assertEqual(len(result["calls"]), 3)
+        new_us = {'sdk': {'code': 'US', 'domain': {'commerce_domain': 'https://commerce.us.capcut.com'}}}
+        result = self.execute_contexts([expression], [us, new_us, {}, {**new_us, "throwFetch": True}])
+        self.assertEqual(len(result["calls"]), 4)
         self.assertEqual([urllib.parse.urlsplit(c["url"]).hostname for c in result["calls"]],
-                         ["dreamina-api-us-ttp2.us.capcut.com", "mweb-api-sg.capcut.com",
+                         ["dreamina-api-us-ttp2.us.capcut.com", "dreamina-api-us-ttp2.us.capcut.com", "mweb-api-sg.capcut.com",
                           "dreamina-api-us-ttp2.us.capcut.com"])
         self.assertEqual(json.loads(result["values"][-1]), {"transport_error": "fetch"})
 

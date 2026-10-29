@@ -488,9 +488,9 @@ class CDPBrowser:
             # Use the current page's verified regional SDK configuration for
             # credit and MWEB calls. Never cache context across accounts or
             # retry a request in another region. Native SDK calls are separate.
+            commerce_origin_setup = "const commerceOrigin=info?.domain?.commerce_domain;"
+            us_commerce_context = json.dumps(COMMERCE_US_ORIGINS, separators=(",", ":")) + ".includes(commerceOrigin)"
             if path.startswith("/mweb/"):
-                commerce_origin_setup = ""
-                us_commerce_context = "info?.domain?.commerce_domain===" + json.dumps(COMMERCE_US_API)
                 us_url = MWEB_US_API + url[len(MWEB_API):]
                 regional_url = (
                     "const requestUrl=new URL(" + json.dumps(us_url) + ");"
@@ -499,8 +499,6 @@ class CDPBrowser:
                     "requestUrl.searchParams.set('region','US');url=requestUrl.href;"
                 )
             else:
-                commerce_origin_setup = "const commerceOrigin=info?.domain?.commerce_domain;"
-                us_commerce_context = json.dumps(COMMERCE_US_ORIGINS, separators=(",", ":")) + ".includes(commerceOrigin)"
                 regional_url = "url=commerceOrigin+" + json.dumps(url[len(COMMERCE_API):]) + ";"
             expression = (
                 "(async()=>{let r;let url=" + json.dumps(url) + ";"
