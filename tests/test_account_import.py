@@ -297,16 +297,13 @@ class AccountImportTests(unittest.TestCase):
         with sqlite3.connect(self.store.path) as db:
             db.executemany("INSERT INTO tasks(id,account_id,model,status,normalized_json,request_json,estimated_cost,"
                            "actual_cost,created_at,updated_at,completed_at,error_code) VALUES(?,?,'synthetic-model',?,?,?,?,?,?,1,?,?)", rows)
-        connection = self.store._connect()
         queries = []
-        connection.set_trace_callback(queries.append)
-        try:
+        with self.store._connect() as connection:
+            connection.set_trace_callback(queries.append)
             with patch.object(self.store, "_connect", return_value=connection), patch.object(
                     self.store, "_task", side_effect=AssertionError("scheduler must avoid public task projection")):
                 value = self.store.scheduling_rows()
             self.assertEqual(connection.total_changes, 0)
-        finally:
-            connection.close()
         self.assertTrue(all(query.lstrip().upper().startswith("SELECT ") for query in queries))
         self.assertEqual(len(value["history"]), 1000)
         self.assertEqual(value["history"][0]["id"], "success-1000")
