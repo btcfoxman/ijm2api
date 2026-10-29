@@ -51,9 +51,22 @@ def docker(args, *, input=None, timeout=30, optional=False):
     result = subprocess.run(["docker", *args], input=input, capture_output=True,
                             text=True, timeout=timeout)
     if result.returncode and not optional:
-        # Docker output can contain host paths.  Keep the CI assertion bounded.
-        raise RuntimeError("SyntheticDockerOperationFailed:" + args[0])
-    return result.stdout.strip() if result.returncode == 0 else None
+        # Every command here targets synthetic containers only. Preserve the
+        # bounded cause so a rejected gate cannot hide its actual failure.
+        raise RuntimeError("SyntheticDockerOperationFailed:" + args[0] + ":" + result.stderr[-3000:].strip())
+    if result.returncode:
+        return None
+    return (result.stdout + (result.stderr if args[0] == "logs" else "")).strip()
+
+
+def save_diagnostic(value):
+    directory = Path(os.environ["RUNNER_TEMP"]) / "ijm-freeze-smoke-evidence"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    destination = directory / ("diagnostic-" + uuid.uuid4().hex + ".json")
+    with destination.open("x", encoding="utf-8") as handle:
+        json.dump(value, handle, sort_keys=True)
+    destination.chmod(0o600)
+    print("SYNTHETIC_FREEZE_DIAGNOSTIC " + json.dumps(value, sort_keys=True), flush=True)
 
 
 def require_hosted():
@@ -178,6 +191,8 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
             deadline = time.monotonic() + 20
             while not (data / "ready").is_file():
                 if time.monotonic() >= deadline:
+                    save_diagnostic({"case": name, "phase": "fixture_start",
+                        "synthetic_container_logs": (docker(["logs", "--tail", "40", service], optional=True) or "")[-3000:]})
                     raise RuntimeError("SyntheticFixtureDidNotStart")
                 time.sleep(0.1)
             assert (data / "ijm2api.db-wal").stat().st_size > 32
@@ -192,9 +207,13 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
             try:
                 receipt = controller.freeze_remove(service, image, release,
                     json.dumps([TASK]) if query else "", SOURCE_SHA, run=trace)
-            except RuntimeError:
+            except RuntimeError as error:
                 rejected = True
-                receipt = json.loads((release / "frozen-cutover.safe.json").read_text())
+                receipt_file = release / "frozen-cutover.safe.json"
+                receipt = json.loads(receipt_file.read_text()) if receipt_file.is_file() else {}
+                save_diagnostic({"case": name, "phase": "freeze_remove", "error_type": type(error).__name__,
+                    "error_message": str(error)[-4000:], "receipt": receipt, "events": trace.events,
+                    "expected_rejection": should_reject, "synthetic_only": True})
             assert rejected == should_reject, "UnexpectedCutoverDecision"
             assert trace.events[0] == "companion_joined_before_pause"
             if not pause_timeout:

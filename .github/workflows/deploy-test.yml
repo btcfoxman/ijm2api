@@ -10,6 +10,11 @@ on:
         required: false
         default: ''
         type: string
+      smoke_only_image_tag:
+        description: 'Diagnostic only: run hosted synthetic Docker smoke against an existing same-repository 40-hex image tag; never deploy'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -36,19 +41,32 @@ jobs:
       image_tag: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
+      - name: Validate diagnostic image selection
+        shell: bash
+        env:
+          SMOKE_ONLY_IMAGE_TAG: ${{ inputs.smoke_only_image_tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SMOKE_ONLY_IMAGE_TAG" ]; then
+            test "$GITHUB_EVENT_NAME" = workflow_dispatch
+            [[ "$SMOKE_ONLY_IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - uses: actions/setup-node@v4
+        if: ${{ inputs.smoke_only_image_tag == '' }}
         with:
           node-version: '22.23.4'
       - name: Verify validation runtimes
+        if: ${{ inputs.smoke_only_image_tag == '' }}
         shell: bash
         run: |
           set -euo pipefail
           python -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
           node -e 'if (process.version !== "v22.23.4") process.exit(1)'
       - name: Verify application
+        if: ${{ inputs.smoke_only_image_tag == '' }}
         env:
           PIP_DISABLE_PIP_VERSION_CHECK: '1'
           IJM_API_KEY: ci-only-api-key
@@ -62,17 +80,20 @@ jobs:
           python -m compileall -q app
           bash -n scripts/deploy_pre.sh
       - name: Verify pinned Canvas account proxy tracer
+        if: ${{ inputs.smoke_only_image_tag == '' }}
         run: |
           python tools/install_canvas_proxy.py --destination "$RUNNER_TEMP/canvas-proxy/graftcp" --license-directory "$RUNNER_TEMP/canvas-proxy/licenses"
           "$RUNNER_TEMP/canvas-proxy/graftcp" --version
           "$RUNNER_TEMP/canvas-proxy/graftcp" --config /dev/null --select_proxy_mode only_http_proxy --http_proxy 127.0.0.1:9 -- /bin/true
       - uses: docker/setup-buildx-action@v3
+        if: ${{ inputs.smoke_only_image_tag == '' }}
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ secrets.GHCR_USERNAME || github.actor }}
           password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
       - name: Build and push verified image
+        if: ${{ inputs.smoke_only_image_tag == '' }}
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -86,14 +107,19 @@ jobs:
           sbom: false
       - name: Verify frozen cutover with real Docker on hosted runner
         shell: bash
+        env:
+          SMOKE_ONLY_IMAGE_TAG: ${{ inputs.smoke_only_image_tag }}
         run: |
           set -euo pipefail
-          image="$IMAGE_REGISTRY/$IMAGE_NAMESPACE/$IMAGE_NAME:$GITHUB_SHA"
+          tag="${SMOKE_ONLY_IMAGE_TAG:-$GITHUB_SHA}"
+          [[ "$tag" =~ ^[0-9a-f]{40}$ ]]
+          image="$IMAGE_REGISTRY/$IMAGE_NAMESPACE/$IMAGE_NAME:$tag"
           docker pull "$image"
           python tools/test_deploy_freeze_runtime.py --image "$image"
 
   deploy:
     needs: build
+    if: ${{ needs.build.result == 'success' && inputs.smoke_only_image_tag == '' }}
     runs-on: [self-hosted, linux, x64, ijm2api-pre]
     timeout-minutes: 150
     env:
