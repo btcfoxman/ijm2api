@@ -113,8 +113,6 @@ jobs:
           tags: |
             ghcr.io/btcfoxman/ijm2api:${{ github.sha }}
             ghcr.io/btcfoxman/ijm2api:pre
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
           provenance: false
           sbom: false
 
