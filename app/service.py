@@ -21,7 +21,7 @@ from .browser import BrowserError, BrowserRejected, CDPBrowser, browser_alive
 from .account_automation import AccountAutomation, AutomationError
 from .browser_runtime import BrowserRuntime
 from .canvas_cli import CanvasCLI, CanvasCLIError
-from .canvas_service import CanvasServiceMixin, execution_mode
+from .canvas_service import ADMISSION_AUDIT_FIELDS, CanvasServiceMixin, execution_mode
 from .account_policy import credit_rejected as _credit_rejected
 from .catalog import MODELS, normalize_request
 from .client import DreaminaClient, DreaminaError, InputAudioDurationError, SubmissionPreflightError
@@ -532,7 +532,9 @@ class Service(CanvasServiceMixin):
             if sum(self._active.values()) >= int(self.settings()["task_workers"]):
                 return None
             pending = self._pending_credits(self.store.scheduling_rows(), task_id)
-            backend = (self.store.task(task_id) or {}).get('execution_backend') if task_id else None
+            task = (self.store.task(task_id) or {}) if task_id else {}
+            backend = task.get('execution_backend')
+            excluded = excluded | self._model_excluded_accounts(task)
             accounts = self._funded_accounts(estimated_cost, excluded, pending, backend)
             # Unknown cost is not a free task: probe a larger balance until a
             # measured budget exists. Explicit priority always remains first.
@@ -552,8 +554,9 @@ class Service(CanvasServiceMixin):
     def _has_eligible_account(self, estimated_cost: float, excluded: set[int], task_id: str | None = None) -> bool:
         with self._lock:
             pending = self._pending_credits(self.store.scheduling_rows(), task_id)
-            backend = (self.store.task(task_id) or {}).get('execution_backend') if task_id else None
-            return bool(self._funded_accounts(estimated_cost, excluded, pending, backend, include_aux_busy=True))
+            task = (self.store.task(task_id) or {}) if task_id else {}
+            return bool(self._funded_accounts(estimated_cost, excluded | self._model_excluded_accounts(task),
+                pending, task.get('execution_backend'), include_aux_busy=True))
 
     def _release_account(self, account_id: int, task_id: str | None = None) -> None:
         with self._lock:
@@ -566,10 +569,94 @@ class Service(CanvasServiceMixin):
         """One admission-rejection policy for browser, Canvas, image and video."""
         return self._handle_admission_rejection(task_id, account_id, 'INSUFFICIENT_CREDITS', reason)
 
+    @staticmethod
+    def _unaccepted_admission(task: dict, *, rejected: bool = False) -> bool:
+        """A typed rejection may clear a dispatched request, never an acceptance."""
+        context = task.get('upstream_context') or {}
+        if (CanvasServiceMixin._canvas_task_terminated(task)
+                or task.get('status') in {'submitted', 'running', 'submission_unknown'}
+                or task.get('error_code') == 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'
+                or task.get('run_id') or task.get('thread_id')
+                or task.get('result_urls') or task.get('upstream_result_urls')
+                or (task.get('normalized') or {}).get('_execution')
+                or context.get('phase') in {'accepted', 'unknown'}
+                or context.get('submission_phase') in {'accepted', 'submitted', 'unknown'}
+                or context.get('resource_ids')
+                or context.get('financial_outcome') in {'unknown', 'unconfirmed'}
+                or context.get('reconciliation_paused') or context.get('reconciliation_closed')
+                or context.get('automatic_resubmission_blocked')
+                or (context.get('submit_error') or {}).get('outcome_unknown') is True):
+            return False
+        return rejected or context.get('submission_phase') not in {'submitting', 'run_dispatching'}
+
+    def _requeue_unaccepted_task(self, task_id: str, *, rejected: bool = False,
+                                 **changes) -> bool:
+        """Release only a proven-unaccepted binding; keep its admission audit."""
+        with self._lock:
+            task = self.store.task(task_id) or {}
+            if not self._unaccepted_admission(task, rejected=rejected):
+                return False
+            audit = {key: value for key, value in (task.get('upstream_context') or {}).items()
+                     if key in ADMISSION_AUDIT_FIELDS}
+            saved = self.store.update_task(task_id, {'status': 'queued', 'progress': 0,
+                'account_id': None, 'balance_before': None, 'execution_backend': '',
+                'upstream_context': audit,
+                'cost_evidence': {'execution_backend': '', 'canvas_quote': None},
+                **changes}, preserve_terminal=True)
+            return saved.get('status') == 'queued' and saved.get('execution_backend') == ''
+
+    @staticmethod
+    def _admission_history(task: dict) -> list:
+        context = task.get('upstream_context') or {}
+        return list(context.get('preflight_failures') or []) + list(context.get('model_eligibility_exclusions') or [])
+
+    @staticmethod
+    def _model_excluded_accounts(task: dict) -> set[int]:
+        kind = 'image' if (task.get('normalized') or {}).get('kind') == 'image' else 'video'
+        return {entry['account_id'] for entry in (task.get('upstream_context') or {}).get('model_eligibility_exclusions') or []
+            if isinstance(entry, dict) and isinstance(entry.get('account_id'), int)
+            and not isinstance(entry['account_id'], bool)
+            and entry.get('requested_model') == task.get('model') and entry.get('kind') == kind}
+
+    def _exclude_model_account(self, task_id: str, account_id: int, diagnostic: dict) -> bool:
+        """A request-local eligibility skip never consumes a credit attempt."""
+        with self._lock:
+            task = self.store.task(task_id) or {}
+            if (not self._unaccepted_admission(task)
+                    or any(key not in ADMISSION_AUDIT_FIELDS for key in task.get('upstream_context') or {})):
+                return False
+            context = dict(task.get('upstream_context') or {})
+            history = list(context.get('model_eligibility_exclusions') or [])
+            history.append({'account_id': account_id, **diagnostic})
+            context['model_eligibility_exclusions'] = history
+            self.store.update_task(task_id, {'upstream_context': context}, preserve_terminal=True)
+            return self._requeue_unaccepted_task(task_id, error_code=diagnostic['code'],
+                error_message=diagnostic['message'])
+
+    def _admission_deadline(self, task_id: str, deadline: float) -> float:
+        """Read-only account preflights retain their original wall budget across modes."""
+        task = self.store.task(task_id) or {}
+        previous = [value for entry in self._admission_history(task)
+                    if isinstance(entry, dict) and (value := number(entry.get('task_deadline'))) is not None]
+        if previous:
+            return min(deadline, time.monotonic() + max(0, min(previous) - time.time()))
+        return deadline
+
+    def _admission_expired(self, task_id: str, deadline: float) -> bool:
+        if time.monotonic() < self._admission_deadline(task_id, deadline):
+            return False
+        if not self._admission_history(self.store.task(task_id) or {}):
+            return False
+        self._fail(task_id, 'CLI_PREPARATION_TIMEOUT',
+                   'Original task admission deadline passed; no generation was submitted')
+        return True
+
     def _handle_admission_rejection(self, task_id: str, account_id: int, code: str,
                                     reason: str, *, preflight_error: dict | None = None) -> bool:
         """A proven rejection before paid work shares one two-account budget."""
         task = self.store.task(task_id) or {}
+        if not self._unaccepted_admission(task, rejected=True):
+            return False
         attempted = list(task.get('attempted_account_ids') or [])
         if account_id not in attempted:
             attempted.append(account_id)
@@ -587,13 +674,8 @@ class Service(CanvasServiceMixin):
         if len(attempted) >= MAX_CREDIT_ACCOUNT_ATTEMPTS:
             self._fail(task_id, code, reason)
             return False
-        audit = {key: value for key, value in (task.get('upstream_context') or {}).items()
-                 if task.get('execution_backend') == 'canvas_cli'
-                 and key in {'previous_submissions', 'recovery_resolution', 'preflight_failures'}}
-        task = self.store.update_task(task_id, {'status': 'queued', 'progress': 0,
-            'account_id': None, 'balance_before': None, 'upstream_context': audit,
-            'error_code': code, 'error_message': reason}, preserve_terminal=True)
-        return task.get('status') == 'queued'
+        return self._requeue_unaccepted_task(task_id, rejected=True,
+            error_code=code, error_message=reason)
 
     def _submission_funded(self, account: dict, task_id: str, estimated_cost: float, balance: Any) -> bool:
         with self._lock:
@@ -612,10 +694,11 @@ class Service(CanvasServiceMixin):
     def _has_waiting_credit_account(self, estimated_cost: float, excluded: set[int], task_id: str) -> bool:
         with self._lock:
             pending = self._pending_credits(self.store.scheduling_rows(), task_id)
+            task = self.store.task(task_id) or {}
             return any(int(account['id']) in self._aux_account_owners
                        or any(owner == int(account['id']) for owner, _ in pending.values())
-                       for account in self._funded_accounts(estimated_cost, excluded, {},
-                           (self.store.task(task_id) or {}).get('execution_backend') if task_id else None,
+                       for account in self._funded_accounts(estimated_cost,
+                           excluded | self._model_excluded_accounts(task), {}, task.get('execution_backend'),
                            include_aux_busy=True))
 
     def check_account(self, account_id: int, *, start_browser: bool = False) -> dict[str, Any]:
@@ -680,7 +763,11 @@ class Service(CanvasServiceMixin):
             return
         # The executor is only a waiter/dispatcher.  The configurable limit
         # applies to actual upstream work, not to the number of Python threads.
+        deadline = self._admission_deadline(task_id,
+            time.monotonic() + int(self.settings()['task_timeout_seconds']))
         while not self._stop.is_set():
+            if self._admission_expired(task_id, deadline):
+                return
             if not self._worker_slots.acquire(timeout=1):
                 continue
             with self._lock:
@@ -690,12 +777,13 @@ class Service(CanvasServiceMixin):
             time.sleep(1)
         else:
             return
-        deadline = time.monotonic() + int(self.settings()["task_timeout_seconds"])
+        deadline = self._admission_deadline(task_id,
+            time.monotonic() + int(self.settings()['task_timeout_seconds']))
         estimated_cost = float(task.get("estimated_cost") or 0)
         attempted = list(task["attempted_account_ids"])
         funding_excluded: set[int] = set()
         credit_reason = task.get("error_message") or "Dreamina account has insufficient credits"
-        admission_code = (task.get('error_code') if (task.get('upstream_context') or {}).get('preflight_failures')
+        admission_code = (task.get('error_code') if self._admission_history(task)
                           else None) or 'INSUFFICIENT_CREDITS'
         try:
             task = self._update_cost_estimate(self.store.task(task_id) or task)
@@ -709,19 +797,24 @@ class Service(CanvasServiceMixin):
                     excluded = set(attempted) | funding_excluded
                     account = self._reserve_account(estimated_cost, exclude_ids=excluded,
                                                     prefer_balance=bool(attempted), task_id=task_id)
-                    if account or ((attempted or funding_excluded) and not self._has_eligible_account(
+                    if account or ((attempted or funding_excluded or self._model_excluded_accounts(self.store.task(task_id) or {}))
+                            and not self._has_eligible_account(
                             estimated_cost, excluded, task_id) and not self._has_waiting_credit_account(
                                 estimated_cost, excluded, task_id)):
                         break
                     self._stop.wait(1)
                 if not account:
-                    code = admission_code if attempted else "ACCOUNT_POOL_UNAVAILABLE"
-                    message = credit_reason if attempted else "no available Dreamina account before timeout"
+                    rejected = attempted or self._model_excluded_accounts(self.store.task(task_id) or {})
+                    code = admission_code if rejected else "ACCOUNT_POOL_UNAVAILABLE"
+                    message = credit_reason if rejected else "no available Dreamina account before timeout"
                     self._fail(task_id, code, message)
                     return
                 account_id = int(account["id"])
                 owned = False
                 try:
+                    deadline = self._admission_deadline(task_id, deadline)
+                    if self._admission_expired(task_id, deadline):
+                        return
                     backend = execution_mode(account)
                     self.store.update_task(task_id, {"account_id": account_id,
                         "status": "preparing", "progress": 5, "balance_before": None,
@@ -731,13 +824,14 @@ class Service(CanvasServiceMixin):
                         result = self._execute_canvas(task_id, account, deadline)
                         if result is True:
                             return
-                        if result in {'retry', 'retry_preflight'}:
+                        if result in {'retry', 'retry_preflight', 'skip_model'}:
                             retry = self.store.task(task_id) or {}
                             attempted = list(retry.get('attempted_account_ids') or [])
                             credit_reason = retry.get('error_message') or credit_reason
                             admission_code = retry.get('error_code') or 'INSUFFICIENT_CREDITS'
                             if result == 'retry':
-                                deadline = time.monotonic() + int(self.settings()['task_timeout_seconds'])
+                                deadline = self._admission_deadline(task_id,
+                                    time.monotonic() + int(self.settings()['task_timeout_seconds']))
                         elif result != 'reselect':
                             funding_excluded.add(account_id)
                         estimated_cost = float((self.store.task(task_id) or {}).get('estimated_cost') or 0)
@@ -758,7 +852,8 @@ class Service(CanvasServiceMixin):
                     if not funded:
                         if not temporary_hold:
                             funding_excluded.add(account_id)
-                        self.store.update_task(task_id, {'status': 'queued', 'account_id': None, 'progress': 0})
+                        if not self._requeue_unaccepted_task(task_id):
+                            return
                         continue
                     self.store.update_task(task_id, {"balance_before": before, "progress": 12})
                     assets = client.upload_inputs(task["normalized"])
@@ -770,9 +865,11 @@ class Service(CanvasServiceMixin):
                     if not funded:
                         if not temporary_hold:
                             funding_excluded.add(account_id)
-                        self.store.update_task(task_id, {'status': 'queued', 'account_id': None,
-                                                       'progress': 0, 'balance_before': None})
+                        if not self._requeue_unaccepted_task(task_id):
+                            return
                         continue
+                    if self._admission_expired(task_id, deadline):
+                        return
                     self.store.update_task(task_id, {"progress": 30})
                     attempted.append(account_id)
                     self.store.update_task(task_id, {"attempted_account_ids": attempted})
@@ -791,7 +888,8 @@ class Service(CanvasServiceMixin):
                         credit_reason = str(exc)
                         if not self._handle_credit_rejection(task_id, account_id, credit_reason):
                             return
-                        deadline = time.monotonic() + int(self.settings()["task_timeout_seconds"])
+                        deadline = self._admission_deadline(task_id,
+                            time.monotonic() + int(self.settings()['task_timeout_seconds']))
                         continue
                     except BrowserError as exc:
                         self._fail(task_id, "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
@@ -812,8 +910,9 @@ class Service(CanvasServiceMixin):
                     self.browser_runtime.release(account, owned)
                     self._release_account(account_id, task_id)
             if not self._stop.is_set():
-                self._fail(task_id, admission_code if attempted else "ACCOUNT_POOL_UNAVAILABLE",
-                           credit_reason if attempted else "no available Dreamina account before timeout")
+                rejected = attempted or self._model_excluded_accounts(self.store.task(task_id) or {})
+                self._fail(task_id, admission_code if rejected else "ACCOUNT_POOL_UNAVAILABLE",
+                           credit_reason if rejected else "no available Dreamina account before timeout")
         except Exception as exc:
             self._fail(task_id, 'INTERNAL_ERROR', f'{type(exc).__name__}: task scheduling could not complete')
         finally:
@@ -826,8 +925,11 @@ class Service(CanvasServiceMixin):
         if self._cli_authorization_missing():
             self._fail(task_id, 'ACCOUNT_POOL_UNAVAILABLE', 'CLI authorization is required for the enabled accounts')
             return
-        deadline = time.monotonic() + int(self.settings()["task_timeout_seconds"])
+        deadline = self._admission_deadline(task_id,
+            time.monotonic() + int(self.settings()['task_timeout_seconds']))
         while not self._stop.is_set():
+            if self._admission_expired(task_id, deadline):
+                return
             if not self._worker_slots.acquire(timeout=1):
                 continue
             with self._lock:
@@ -841,7 +943,7 @@ class Service(CanvasServiceMixin):
         funding_excluded: set[int] = set()
         estimated_cost = 0.0
         preflight_failure = ((task.get('error_code'), task.get('error_message'))
-            if (task.get('upstream_context') or {}).get('preflight_failures') and task.get('error_code') else None)
+            if self._admission_history(task) and task.get('error_code') else None)
         try:
             while not self._stop.is_set() and time.monotonic() < deadline:
                 excluded = set(attempted) | funding_excluded
@@ -857,6 +959,9 @@ class Service(CanvasServiceMixin):
                 account_id = int(account["id"])
                 owned = False
                 try:
+                    deadline = self._admission_deadline(task_id, deadline)
+                    if self._admission_expired(task_id, deadline):
+                        return
                     backend = execution_mode(account)
                     self.store.update_task(task_id, {"account_id": account_id,
                         "status": "preparing", "progress": 5, "error_code": "", "error_message": "",
@@ -865,11 +970,11 @@ class Service(CanvasServiceMixin):
                         result = self._execute_canvas(task_id, account, deadline)
                         if result is True:
                             return
-                        if result in {'retry', 'retry_preflight'}:
+                        if result in {'retry', 'retry_preflight', 'skip_model'}:
                             retry = self.store.task(task_id) or {}
                             attempted = list(retry.get('attempted_account_ids') or [])
                             preflight_failure = ((retry.get('error_code'), retry.get('error_message'))
-                                if result == 'retry_preflight' else None)
+                                if result in {'retry_preflight', 'skip_model'} else None)
                         elif result != 'reselect':
                             funding_excluded.add(account_id)
                         estimated_cost = float((self.store.task(task_id) or {}).get('estimated_cost') or 0)
@@ -883,11 +988,14 @@ class Service(CanvasServiceMixin):
                         pass
                     if balance is not None:
                         self.store.update_account(account_id, {'balance': balance})
-                    if not self._submission_funded(account, task_id, 0, balance if balance is not None else account.get('balance')):
+                    if not self._submission_funded(account, task_id, estimated_cost, balance if balance is not None else account.get('balance')):
                         funding_excluded.add(account_id)
-                        self.store.update_task(task_id, {'status': 'queued', 'account_id': None, 'progress': 0})
+                        if not self._requeue_unaccepted_task(task_id):
+                            return
                         continue
                     assets = video_client.upload_inputs(task["normalized"])["images"]
+                    if self._admission_expired(task_id, deadline):
+                        return
                     self.store.update_task(task_id, {"progress": 30})
                     attempted.append(account_id)
                     self.store.update_task(task_id, {"attempted_account_ids": attempted})

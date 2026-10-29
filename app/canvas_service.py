@@ -18,6 +18,8 @@ from .upload import _probe_media
 from .result_transfer import ResultTransferError, store_original
 
 logger = logging.getLogger(__name__)
+ADMISSION_AUDIT_FIELDS = frozenset({'previous_submissions', 'recovery_resolution',
+    'preflight_failures', 'model_eligibility_exclusions'})
 
 
 def execution_mode(account: dict) -> str:
@@ -213,9 +215,21 @@ class CanvasServiceMixin:
         if (task.get('normalized') or {}).get('_execution'):
             return False
         context = task.get('upstream_context') or {}
-        if any(key not in {'previous_submissions', 'recovery_resolution', 'preflight_failures'} for key in context):
+        if any(key not in ADMISSION_AUDIT_FIELDS for key in context):
             return False
         return identity_network_error(exc)
+
+    def _canvas_model_ineligible(self, task: dict, exc: CanvasCLIError, deadline: float) -> bool:
+        """Only a valid account catalog with no requested model is ineligible."""
+        if (time.monotonic() >= deadline or exc.outcome_unknown
+                or exc.code != 'CLI_CAPABILITY_UNAVAILABLE'
+                or not self._unaccepted_admission(task)
+                or any(key not in ADMISSION_AUDIT_FIELDS for key in task.get('upstream_context') or {})):
+            return False
+        error = (getattr(exc, 'details', None) or {}).get('error') or {}
+        return (isinstance(error, dict) and error.get('scope') == 'account' and error.get('reason') == 'model_not_in_catalog'
+            and error.get('requested_model') == task.get('model')
+            and error.get('kind') == ('image' if task['normalized'].get('kind') == 'image' else 'video'))
 
     def _execute_canvas(self, task_id: str, account: dict, deadline: float) -> bool | str:
         """Return False only for a verified pre-run funding rejection."""
@@ -226,14 +240,15 @@ class CanvasServiceMixin:
         client = self.canvas_client(account)
         submission_started = False
         identity_pending = True
+        model_pending = False
         context = {key: value for key, value in (task.get('upstream_context') or {}).items()
-                   if key in {'previous_submissions', 'recovery_resolution', 'preflight_failures'}}
+                   if key in ADMISSION_AUDIT_FIELDS}
         resolution = context.get('recovery_resolution') or {}
         attempt_started = number(resolution.get('attempt_started_at')) if isinstance(resolution, dict) else None
         if attempt_started is not None:
             deadline = min(deadline, time.monotonic() + max(0,
                 attempt_started + int(self.settings()['task_timeout_seconds']) - time.time()))
-        preflight_deadlines = [value for entry in context.get('preflight_failures') or []
+        preflight_deadlines = [value for entry in self._admission_history(task)
             if isinstance(entry, dict) and (value := number(entry.get('task_deadline'))) is not None]
         if preflight_deadlines:
             deadline = min(deadline, time.monotonic() + max(0, min(preflight_deadlines) - time.time()))
@@ -276,6 +291,9 @@ class CanvasServiceMixin:
             normalized["_execution_backend"] = "canvas_cli"
             if task['model'] == 'sd-2-5-480p-x':
                 normalized['resolution'] = '720p'
+            model_pending = True
+            client.preflight_model(normalized, deadline=deadline)
+            model_pending = False
             with tempfile.TemporaryDirectory(prefix=f"ijm-canvas-{task_id}-") as directory:
                 assets = self._canvas_local_assets(normalized, account, Path(directory), deadline=deadline)
                 self._update_canvas_task(task_id, {"cost_evidence": input_evidence(assets), "progress": 15})
@@ -297,45 +315,58 @@ class CanvasServiceMixin:
                     "cost_evidence": {"canvas_quote": {"amount": quote, "source": "node.quote"},
                                       "execution_backend": "canvas_cli"}})
                 self._credit_reservations[task_id] = (account_id, quote)
-                funded, _ = self._submission_budget_status(account, task_id, quote, budget_balance)
-                if not funded:
-                    self._update_canvas_task(task_id, {"status": "queued", "account_id": None,
-                        "progress": 0, "balance_before": None, "upstream_context": {
-                            key: value for key, value in context.items()
-                            if key in {'previous_submissions', 'recovery_resolution', 'preflight_failures'}},
-                        "execution_backend": "canvas_cli", "error_code": "INSUFFICIENT_CREDITS",
-                        "error_message": "Canvas quote exceeds available unreserved credits"})
-                    return False
-                if not (task['normalized'].get('_cost_evidence') or {}).get('canvas_budget_checked'):
-                    pending = self._pending_credits(self.store.scheduling_rows(), task_id)
-                    current_available, _ = self._available_credits({**account, 'balance': budget_balance}, pending)
-                    candidates = self._funded_accounts(quote, set(task.get('attempted_account_ids') or []), pending, 'canvas_cli')
-                    candidates = [a for a in candidates if int(a['id']) != account_id
-                        and int(a['priority']) == int(account['priority'])
-                        and a.get('_available_credits') is not None
-                        and current_available is not None and a['_available_credits'] < current_available
-                        and max(self._active.get(int(a['id']), 0),
-                            sum(owner == int(a['id']) for owner, _ in pending.values())) < int(a['max_concurrency'])]
-                    self._update_canvas_task(task_id, {'cost_evidence': {'canvas_budget_checked': True}})
-                    if candidates:
-                        self._update_canvas_task(task_id, {'status': 'queued', 'account_id': None,
-                            'progress': 0, 'balance_before': None, 'upstream_context': {
-                                key: value for key, value in context.items()
-                                if key in {'previous_submissions', 'recovery_resolution', 'preflight_failures'}},
-                            'execution_backend': 'canvas_cli'})
-                        return 'reselect'
-                attempts = list(task.get("attempted_account_ids") or [])
-                if account_id not in attempts:
-                    attempts.append(account_id)
-                # The durable record is committed before any paid run request.
-                began_at = time.time() if attempt_started is None else attempt_started
-                observation_deadline = began_at + int(self.settings()['task_timeout_seconds'])
-                if preflight_deadlines:
-                    observation_deadline = min(observation_deadline, min(preflight_deadlines))
-                persist({"submission_phase": "confirming", "expected_user_id": identity,
-                    'observation_started_at': began_at,
-                    'observation_deadline': observation_deadline})
-                self._update_canvas_task(task_id, {"attempted_account_ids": attempts, "progress": 30})
+            while not self._stop.is_set():
+                if self._canvas_task_terminated(self.store.task(task_id)):
+                    return True
+                deadline = self._admission_deadline(task_id, deadline)
+                if time.monotonic() >= deadline:
+                    self._fail_canvas_task(task_id, 'CLI_PREPARATION_TIMEOUT',
+                        'Task deadline passed while waiting for Canvas credits; no generation was submitted')
+                    return True
+                with self._lock:
+                    funded, temporary_hold = self._submission_budget_status(account, task_id, quote, budget_balance)
+                    current_balance = (self.store.account(account_id, private=True) or {}).get('balance')
+                    raw_balances = [value for raw in (budget_balance, current_balance)
+                                    if (value := number(raw)) is not None]
+                    raw_funded = bool(raw_balances) and min(raw_balances) >= quote
+                    if not funded and (not temporary_hold or quote <= 0 or not raw_funded):
+                        return False if self._requeue_unaccepted_task(task_id,
+                            error_code='INSUFFICIENT_CREDITS',
+                            error_message='Canvas quote exceeds available unreserved credits') else True
+                    if funded:
+                        if not (task['normalized'].get('_cost_evidence') or {}).get('canvas_budget_checked'):
+                            pending = self._pending_credits(self.store.scheduling_rows(), task_id)
+                            current_available, _ = self._available_credits({**account, 'balance': budget_balance}, pending)
+                            candidates = self._funded_accounts(quote, set(task.get('attempted_account_ids') or [])
+                                | self._model_excluded_accounts(task), pending)
+                            candidates = [a for a in candidates if int(a['id']) != account_id
+                                and int(a['priority']) == int(account['priority'])
+                                and a.get('_available_credits') is not None
+                                and current_available is not None and a['_available_credits'] < current_available
+                                and max(self._active.get(int(a['id']), 0),
+                                    sum(owner == int(a['id']) for owner, _ in pending.values())) < int(a['max_concurrency'])]
+                            self._update_canvas_task(task_id, {'cost_evidence': {'canvas_budget_checked': True}})
+                            if candidates:
+                                return 'reselect' if self._requeue_unaccepted_task(task_id) else True
+                        attempts = list(task.get("attempted_account_ids") or [])
+                        if account_id not in attempts:
+                            attempts.append(account_id)
+                        # The durable record is committed before any paid run request.
+                        began_at = time.time() if attempt_started is None else attempt_started
+                        observation_deadline = began_at + int(self.settings()['task_timeout_seconds'])
+                        if preflight_deadlines:
+                            observation_deadline = min(observation_deadline, min(preflight_deadlines))
+                        persist({"submission_phase": "confirming", "expected_user_id": identity,
+                            'observation_started_at': began_at,
+                            'observation_deadline': observation_deadline})
+                        self._update_canvas_task(task_id, {"attempted_account_ids": attempts, "progress": 30})
+                        break
+                # Our own positive quote is durable. Another admitted task may
+                # still have an unknown hold; let it quote/finish without this
+                # task losing its uploads or holding the scheduler lock.
+                self._stop.wait(min(1, max(0, deadline - time.monotonic())))
+            else:
+                return True
             submission_started = True
             submitted = client.submit(context, int(math.ceil(quote)), persist=persist, deadline=deadline)
             persist({**submitted, "submission_phase": "submitted"})
@@ -346,6 +377,13 @@ class CanvasServiceMixin:
             current_task = self.store.task(task_id)
             if self._canvas_task_terminated(current_task):
                 return True
+            if model_pending and self._canvas_model_ineligible(current_task, exc, deadline):
+                diagnostic = self._canvas_diagnostic(exc, 'model_selection')
+                diagnostic.update(dispatch_started=False, requested_model=task['model'],
+                    kind='image' if task['normalized'].get('kind') == 'image' else 'video',
+                    task_deadline=time.time() + max(0, deadline - time.monotonic()))
+                skipped = self._exclude_model_account(task_id, account_id, diagnostic)
+                return 'skip_model' if skipped else True
             if identity_pending and self._canvas_identity_network_retry(current_task, exc, deadline):
                 diagnostic = self._canvas_diagnostic(exc, 'identity')
                 diagnostic.update(dispatch_started=False,

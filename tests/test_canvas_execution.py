@@ -48,6 +48,7 @@ def task(store, identifier="task", *, backend="", **request):
 
 def fake_client(store, service, account, *, quote=10, actual=None, kind="video"):
     client = Mock(account=account)
+    client.preflight_model.return_value = {'model': 'synthetic-supported-model'}
     client.identity.side_effect = lambda **kwargs: {"user_id": account["login_user_id"],
         "available_balance": account["balance"] - (actual if actual is not None else quote) if client.submit.call_count else account["balance"]}
 

@@ -131,8 +131,9 @@ def _data(envelope: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
-def _unsupported(message: str) -> CanvasCLIError:
-    return CanvasCLIError("CLI_CAPABILITY_UNAVAILABLE", message + "; select browser submission mode manually")
+def _unsupported(message: str, *, details: dict[str, Any] | None = None) -> CanvasCLIError:
+    return CanvasCLIError("CLI_CAPABILITY_UNAVAILABLE", message + "; select browser submission mode manually",
+                          details=details)
 
 
 def _failure_code(code: Any, message: str) -> str:
@@ -158,6 +159,9 @@ def _model_candidates(normalized: dict[str, Any]) -> list[str]:
 
 
 def select_model(items: list[dict[str, Any]], normalized: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(items, list) or any(not isinstance(item, dict)
+            or not isinstance(item.get("model"), str) or not item["model"].strip() for item in items):
+        raise CanvasCLIError("CLI_CAPABILITIES_INVALID", "Canvas returned an invalid model catalog")
     candidates = [_key(x) for x in _model_candidates(normalized) if x]
     for candidate in candidates:
         matches = [item for item in items if candidate in {
@@ -167,7 +171,10 @@ def select_model(items: list[dict[str, Any]], normalized: dict[str, Any]) -> dic
             return matches[0]
         if len(matches) > 1:
             raise _unsupported("Canvas model discovery returned an ambiguous model mapping")
-    raise _unsupported(f"Canvas does not expose the requested model {normalized.get('model', '')}")
+    requested = str(normalized.get("model") or "")
+    raise _unsupported(f"Canvas does not expose the requested model {requested}", details={"error": {
+        "scope": "account", "reason": "model_not_in_catalog", "requested_model": requested,
+        "kind": "image" if normalized.get("kind") == "image" else "video"}})
 
 
 def select_mode(model: dict[str, Any], normalized: dict[str, Any], counts: dict[str, int]) -> dict[str, Any]:
@@ -367,10 +374,20 @@ class CanvasClient:
         if kind not in self._capabilities:
             data = self._call(["model", "list", "--type", kind], read_only=True, deadline=deadline)
             items = data.get("items")
-            if not isinstance(items, list):
+            if not isinstance(items, list) or any(not isinstance(item, dict)
+                    or not isinstance(item.get("model"), str) or not item["model"].strip() for item in items):
                 raise CanvasCLIError("CLI_CAPABILITIES_INVALID", "Canvas returned an invalid model catalog")
-            self._capabilities[kind] = [x for x in items if isinstance(x, dict) and x.get("model")]
+            self._capabilities[kind] = items
         return self._capabilities[kind]
+
+    def preflight_model(self, normalized: dict[str, Any], *,
+                        deadline: float | None = None) -> dict[str, Any]:
+        """Resolve this account's advertised model before material or canvas writes."""
+        self._remaining(deadline)
+        kind = "image" if normalized.get("kind") == "image" else "video"
+        selected = select_model(self.capabilities(kind, deadline=deadline), normalized)
+        self._remaining(deadline)
+        return selected
 
     def _ensure_project(self, context: dict[str, Any], *, deadline: float | None = None) -> None:
         wanted = context["project_id"]
@@ -422,6 +439,19 @@ class CanvasClient:
                 self._resource_ready(resource_id, project_id, deadline=deadline)
                 return
             except CanvasCLIError as exc:
+                if exc.code == "MEDIA_UPLOAD_FAILED":
+                    raise
+                if exc.code == "cli.upload_state_unknown":
+                    # The CLI explicitly forbids replaying an unknown upload.
+                    # Only observe its original registration ID; this is not a
+                    # node.run recovery and must never allocate another ID.
+                    try:
+                        self._observe_unknown_upload(resource_id, project_id, deadline=deadline)
+                    except CanvasCLIError as observed:
+                        if observed.code == "MEDIA_UPLOAD_PENDING":
+                            raise exc from observed
+                        raise
+                    return
                 # A lost response can follow successful storage/registration.
                 # Observe the persisted ID before another same-ID upload.
                 try:
@@ -437,13 +467,38 @@ class CanvasClient:
                     raise
                 self._sleep(0.5 * 2 ** attempt, deadline)
 
+    def _observe_unknown_upload(self, resource_id: str, project_id: str, *,
+                                deadline: float | None = None) -> None:
+        observation_deadline = time.monotonic() + 120
+        if deadline is not None:
+            observation_deadline = min(observation_deadline, deadline)
+        try:
+            while True:
+                try:
+                    data = self._resource_ready(resource_id, project_id, deadline=observation_deadline)
+                    if data.get("resourceId") != resource_id:
+                        raise CanvasCLIError("CLI_RESOURCE_MISMATCH", "Canvas returned another reference resource")
+                    return
+                except CanvasCLIError as exc:
+                    retryable_read = (not exc.outcome_unknown and (
+                        exc.code in {"cli.resource_unavailable", "CLI_COMMAND_TIMEOUT", "CLI_INVALID_RESPONSE",
+                                     "cli.invalid_service_response"}
+                        or identity_network_error(exc)))
+                    if not retryable_read:
+                        raise
+                    self._sleep(1, observation_deadline)
+        except CanvasCLIError as exc:
+            if exc.code == "CLI_TASK_DEADLINE_EXCEEDED" and (deadline is None or time.monotonic() < deadline):
+                raise CanvasCLIError("MEDIA_UPLOAD_PENDING", "Canvas reference upload remains unconfirmed") from exc
+            raise
+
     def prepare(self, normalized: dict[str, Any], task_id: str,
                 assets: dict[str, list[Any]], *,
                 persist: Callable[[dict[str, Any]], Any] | None = None,
                 deadline: float | None = None) -> dict[str, Any]:
         kind = "image" if normalized.get("kind") == "image" else "video"
         counts = {x: len(assets.get(x, [])) for x in ("images", "videos", "audios")}
-        model = select_model(self.capabilities(kind, deadline=deadline), normalized)
+        model = self.preflight_model(normalized, deadline=deadline)
         mode = select_mode(model, normalized, counts)
         flags = generation_flags(mode, normalized)
         old = normalized.get("_execution")
