@@ -44,13 +44,16 @@ jobs:
           done
           printf 'builder=ijm2api-%s-%s\n' "${GITHUB_SHA:0:12}" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
+      - name: Prepare private Python 3.12 validation environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          /usr/bin/python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
+          validation_venv="$RUNNER_TEMP/ijm-validation-python"
+          /usr/bin/python3 -m venv --copies "$validation_venv"
+          "$validation_venv/bin/python" -c 'import sys; assert sys.prefix != sys.base_prefix'
+          printf '%s/bin\n' "$validation_venv" >> "$GITHUB_PATH"
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
