@@ -98,8 +98,6 @@ jobs:
             cpu-quota=200000
             env.HTTP_PROXY=http://192.168.3.5:10809
             env.HTTPS_PROXY=http://192.168.3.5:10809
-            env.NO_PROXY=production.cloudfront.docker.com
-            env.no_proxy=production.cloudfront.docker.com
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
