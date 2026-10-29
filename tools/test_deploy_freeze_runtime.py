@@ -224,6 +224,7 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
         try:
             old_id = docker(["run", "--detach", "--name", service, "--pull", "never",
                 "--network", "none", "--read-only", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "DAC_OVERRIDE",
+                "--tmpfs", "/tmp:rw,noexec,nosuid,size=128m,mode=0700",
                 "--security-opt", "no-new-privileges", "--memory", "128m", "--pids-limit", "32",
                 "--mount", "type=bind,source=" + str(data) + ",target=/app/data",
                 "--mount", "type=bind,source=" + str(app) + ",target=/app/app,readonly",
