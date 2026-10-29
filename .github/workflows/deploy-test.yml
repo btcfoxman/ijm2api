@@ -85,6 +85,8 @@ jobs:
             memory-swap=2g
             cpu-period=100000
             cpu-quota=200000
+            env.HTTP_PROXY=http://192.168.3.5:20001
+            env.HTTPS_PROXY=http://192.168.3.5:20001
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
