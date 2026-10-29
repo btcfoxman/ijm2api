@@ -23,6 +23,7 @@ MWEB_API = "https://mweb-api-sg.capcut.com"
 MWEB_US_API = "https://dreamina-api-us-ttp2.us.capcut.com"
 COMMERCE_API = "https://commerce-api-sg.capcut.com"
 COMMERCE_US_API = "https://commerce-us-ttp2.us.capcut.com"
+COMMERCE_US_ORIGINS = (COMMERCE_US_API, "https://commerce.us.capcut.com")
 _PROCESS_LOCK = threading.RLock()
 _PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 _UPLOAD_LOCKS: dict[int, threading.RLock] = {}
@@ -488,6 +489,8 @@ class CDPBrowser:
             # credit and MWEB calls. Never cache context across accounts or
             # retry a request in another region. Native SDK calls are separate.
             if path.startswith("/mweb/"):
+                commerce_origin_setup = ""
+                us_commerce_context = "info?.domain?.commerce_domain===" + json.dumps(COMMERCE_US_API)
                 us_url = MWEB_US_API + url[len(MWEB_API):]
                 regional_url = (
                     "const requestUrl=new URL(" + json.dumps(us_url) + ");"
@@ -496,15 +499,15 @@ class CDPBrowser:
                     "requestUrl.searchParams.set('region','US');url=requestUrl.href;"
                 )
             else:
-                us_url = COMMERCE_US_API + url[len(COMMERCE_API):]
-                regional_url = "url=" + json.dumps(us_url) + ";"
+                commerce_origin_setup = "const commerceOrigin=info?.domain?.commerce_domain;"
+                us_commerce_context = json.dumps(COMMERCE_US_ORIGINS, separators=(",", ":")) + ".includes(commerceOrigin)"
+                regional_url = "url=commerceOrigin+" + json.dumps(url[len(COMMERCE_API):]) + ";"
             expression = (
                 "(async()=>{let r;let url=" + json.dumps(url) + ";"
                 "const headers={'content-type':'application/json'};"
-                "try{const info=globalThis.__locationInfo;"
+                "try{const info=globalThis.__locationInfo;" + commerce_origin_setup +
                 "if(globalThis.location?.hostname==='dreamina.capcut.com'&&"
-                "info?.code==='US'&&info?.domain?.commerce_domain==="
-                + json.dumps(COMMERCE_US_API) + "){"
+                "info?.code==='US'&&" + us_commerce_context + "){"
                 + regional_url + "headers.appid='513641'}}catch(_){}"
                 "try{r=await fetch(url,{method:'POST',credentials:'include',headers,"
                 "body:JSON.stringify(" + payload + ")})}"

@@ -209,7 +209,7 @@ let input = '';
 process.stdin.on('data', (part) => { input += part; });
 process.stdin.on('end', async () => {
   const {expressions, contexts} = JSON.parse(input);
-  const calls = [], values = [];
+  const calls = [], values = [], reads = [];
   const sandbox = {URL, location: {hostname: 'dreamina.capcut.com'}};
   sandbox.fetch = async (url, options) => {
     calls.push({url, options});
@@ -221,11 +221,20 @@ process.stdin.on('end', async () => {
     const item = contexts[i];
     if (item.sdk === undefined) delete sandbox.__locationInfo;
     else sandbox.__locationInfo = item.sdk;
+    let domainReads = 0, originReads = 0;
+    if (item.originSequence) {
+      const readOrigin = () => item.originSequence[Math.min(originReads++, item.originSequence.length - 1)];
+      const domain = item.originAccess === 'proxy'
+        ? new Proxy({}, {get: (_, key) => key === 'commerce_domain' ? readOrigin() : undefined})
+        : Object.defineProperty({}, 'commerce_domain', {get: readOrigin});
+      Object.defineProperty(sandbox.__locationInfo, 'domain', {get: () => {domainReads++; return domain;}});
+    }
     sandbox.location.hostname = item.hostname || 'dreamina.capcut.com';
     sandbox.throwFetch = !!item.throwFetch;
     values.push(await vm.runInContext(expressions[i % expressions.length], sandbox));
+    reads.push({domain: domainReads, origin: originReads});
   }
-  process.stdout.write(JSON.stringify({calls, values}));
+  process.stdout.write(JSON.stringify({calls, values, reads}));
 });
 """
         result = subprocess.run([shutil.which("node"), "-e", script],
@@ -274,6 +283,73 @@ process.stdin.on('end', async () => {
             self.assertEqual(call["url"],
                              "https://commerce-api-sg.capcut.com/commerce/v1/benefits/user_credit")
             self.assertEqual(call["options"]["headers"], {"content-type": "application/json"})
+
+    def test_both_evidenced_us_commerce_origins_preserve_query_body_and_existing_headers(self):
+        origins = ["https://commerce-us-ttp2.us.capcut.com", "https://commerce.us.capcut.com"]
+        contexts = [{"sdk": {"code": "US", "domain": {"commerce_domain": origin}}} for origin in origins]
+        for path in ["/commerce/v1/benefits/user_credit", "/commerce/v1/benefits/credit_receive"]:
+            with self.subTest(path=path):
+                expression = self.expression(path, query={"aid": "caller-aid", "source": "unchanged"})
+                result = self.execute_contexts([expression], contexts)
+                self.assertEqual(len(result['calls']), 2)
+                for call, origin in zip(result['calls'], origins):
+                    self.assertEqual(call['url'], origin + path + '?aid=caller-aid&source=unchanged')
+                    self.assertEqual(call['options']['headers'], {'content-type': 'application/json', 'appid': '513641'})
+                    self.assertEqual(call['options']['body'], '{}')
+                    self.assertEqual(call['options']['credentials'], 'include')
+
+    def test_new_us_origin_requires_exact_origin_us_code_and_official_page(self):
+        domains = ['https://commerce.us.capcut.com:443', 'https://commerce.us.capcut.com:8443',
+                   'https://user:private@commerce.us.capcut.com', 'https://commerce.us.capcut.com/',
+                   'https://commerce.us.capcut.com/path', 'https://commerce.us.capcut.com?token=private',
+                   'https://commerce.us.capcut.com#fragment', 'https://commerce.us.capcut.com.attacker.test',
+                   'http://commerce.us.capcut.com', None, {}, ['https://commerce.us.capcut.com']]
+        contexts = [{"sdk": {"code": "US", "domain": {"commerce_domain": value}}} for value in domains]
+        contexts += [{"sdk": {"code": "JP", "domain": {"commerce_domain": 'https://commerce.us.capcut.com'}}},
+                     {"sdk": {"code": "SG", "domain": {"commerce_domain": 'https://commerce.us.capcut.com'}}},
+                     {"hostname": "attacker.test", "sdk": {"code": "US", "domain": {
+                         "commerce_domain": 'https://commerce.us.capcut.com'}}}]
+        for path in ["/commerce/v1/benefits/user_credit", "/commerce/v1/benefits/credit_receive"]:
+            result = self.execute_contexts([self.expression(path)], contexts)
+            self.assertEqual(len(result['calls']), len(contexts))
+            for call in result['calls']:
+                self.assertEqual(call['url'], 'https://commerce-api-sg.capcut.com' + path)
+                self.assertEqual(call['options']['headers'], {'content-type': 'application/json'})
+
+    def test_us_origin_getter_and_proxy_are_read_once_and_cannot_change_dispatch_origin(self):
+        old, new, attacker = ('https://commerce-us-ttp2.us.capcut.com',
+                              'https://commerce.us.capcut.com', 'https://arbitrary.test')
+        contexts = [{'sdk': {'code': 'US'}, 'originAccess': access, 'originSequence': sequence}
+                    for access, sequence in [('getter', [new, attacker]), ('proxy', [old, attacker]),
+                                             ('getter', [attacker, new]), ('proxy', [attacker, old])]]
+        for path in ['/commerce/v1/benefits/user_credit', '/commerce/v1/benefits/credit_receive']:
+            with self.subTest(path=path):
+                result = self.execute_contexts([self.expression(path)], contexts)
+                self.assertEqual([call['url'] for call in result['calls']],
+                                 [new + path, old + path, 'https://commerce-api-sg.capcut.com' + path,
+                                  'https://commerce-api-sg.capcut.com' + path])
+                self.assertEqual(result['reads'], [{'domain': 1, 'origin': 1}] * len(contexts))
+                self.assertTrue(all('arbitrary.test' not in call['url'] for call in result['calls']))
+
+    def test_new_us_commerce_context_is_not_cached_or_retried_in_another_region(self):
+        contexts = [{"sdk": {"code": "US", "domain": {"commerce_domain": origin}}}
+                    for origin in ['https://commerce.us.capcut.com', 'https://commerce-us-ttp2.us.capcut.com']]
+        contexts += [{}, {"throwFetch": True, **contexts[0]}]
+        result = self.execute_contexts([self.expression()], contexts)
+        self.assertEqual([call['url'] for call in result['calls']], [
+            'https://commerce.us.capcut.com/commerce/v1/benefits/user_credit',
+            'https://commerce-us-ttp2.us.capcut.com/commerce/v1/benefits/user_credit',
+            'https://commerce-api-sg.capcut.com/commerce/v1/benefits/user_credit',
+            'https://commerce.us.capcut.com/commerce/v1/benefits/user_credit'])
+        self.assertEqual(json.loads(result['values'][-1]), {'transport_error': 'fetch'})
+
+    def test_new_commerce_domain_does_not_guess_a_new_mweb_origin(self):
+        context = {'sdk': {'code': 'US', 'domain': {'commerce_domain': 'https://commerce.us.capcut.com',
+                                                  'web_domain': 'https://web-edit.us.capcut.com'}}}
+        expression = self.expression('/mweb/v1/get_settings', query={'aid': '513695', 'region': 'SG'})
+        call = self.execute_contexts([expression], [context])['calls'][0]
+        self.assertEqual(call['url'], 'https://mweb-api-sg.capcut.com/mweb/v1/get_settings?aid=513695&region=SG')
+        self.assertEqual(call['options']['headers'], {'content-type': 'application/json'})
 
     def test_context_is_read_again_per_call_without_cross_account_cache(self):
         us = {"sdk": {"code": "US", "domain": {
