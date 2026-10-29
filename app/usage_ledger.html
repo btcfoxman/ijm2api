@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>消耗记录</title><link rel="icon" href="data:,">
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#e8edf5;font:14px/1.5 system-ui,sans-serif}main{max-width:1500px;margin:auto;padding:20px;color:#263243}header{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}h1{font-size:20px;margin:0}p{color:#667085}a,button{color:#263243}button,input{font:inherit;border:1px solid #cbd2dc;border-radius:5px;padding:6px 10px;background:#fff}input{width:180px}button{cursor:pointer}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.table{overflow:auto;background:#fff;border:1px solid #dbe0e8;border-radius:6px}table{border-collapse:collapse;width:100%;white-space:nowrap}th,td{text-align:left;padding:9px 12px;border-bottom:1px solid #e8ebf0;font-size:12px}th{background:#f9fafb;color:#667085}.num{font-variant-numeric:tabular-nums}.muted{color:#667085}#message{min-height:22px;margin:10px 0}.empty{text-align:center;padding:24px}
+</style>
+<main><header><div><h1>消耗记录</h1><p id="service">仅展示本服务的消耗额、单位与来源。</p></div><div class="actions"><a href="/">返回管理端</a><input id="token" type="password" autocomplete="off" aria-label="管理令牌" placeholder="管理令牌 · 登录后可留空"><button id="refresh">刷新</button></div></header>
+<div id="message" role="status"></div><div class="table"><table><thead><tr><th>任务</th><th>模型</th><th>规格</th><th>消耗额</th><th>单位</th><th>消耗类型</th><th>状态</th></tr></thead><tbody id="rows"><tr><td colspan="7" class="empty">正在读取…</td></tr></tbody></table></div></main>
+<script>
+'use strict';
+const $=id=>document.getElementById(id),esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const labels={actual:'实扣',isolated_balance:'实扣',quote:'预扣',submission_reported:'预扣',formula:'公式推',spreadsheet:'表格推',unknown:'未知'};
+async function refresh(){const token=$('token').value.trim(),headers=token?{'Authorization':'Bearer '+token,'X-Admin-Token':token}:{};const response=await fetch('/api/cost-reference/state',{credentials:'same-origin',cache:'no-store',headers});if(!response.ok)throw new Error('读取失败：HTTP '+response.status);const result=await response.json();$('service').textContent=result.service+' · 仅展示本服务的消耗额、单位与来源。';$('message').textContent='共 '+(result.observation_count||0)+' 条消耗记录';$('rows').innerHTML=(result.observations||[]).map(row=>{const known=Object.hasOwn(labels,row.source),value=!known||row.source==='unknown'?null:row.net_usage??row.quoted;return '<tr><td title="'+esc(row.task_id)+'">'+esc(row.task_id)+'</td><td>'+esc(row.model)+'</td><td>'+esc(row.resolution)+' · '+esc(row.duration??'-')+'秒 · 参考'+esc(row.reference_seconds??'-')+'秒</td><td class="num">'+esc(value??'-')+'</td><td>'+esc(row.unit||'-')+'</td><td>'+esc(labels[row.source]||'未知')+'</td><td>'+esc(row.status)+'</td></tr>'}).join('')||'<tr><td colspan="7" class="empty">暂无消耗记录</td></tr>'}
+function load(){return refresh().catch(error=>{$('message').textContent=error.message})}$('refresh').onclick=load;load();setInterval(()=>{if(!document.hidden)load()},30000);
+</script></html>

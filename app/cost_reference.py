@@ -138,6 +138,7 @@ def normalize(observation: dict[str, Any], instance: str, service: str) -> dict[
     out["billing_context"] = {k: v for k, v in context.items() if k in CONTEXT_KEYS and v is not None and isinstance(v, (str, int, float, bool))}
     # Adapter timestamps must describe evidence changes, not collection time.
     out["observed_at"] = str(out.get("observed_at") or "0")
+    out["source_label"] = SOURCE_LABELS.get(out["source"], "未知")
     if isinstance(out.get("components"), list):
         out["components"] = [normalize(item, out["source_instance_id"], service) for item in out["components"][:100]]
     return out
@@ -147,11 +148,11 @@ SOURCE_LABELS = {"actual": "实扣", "isolated_balance": "实扣", "quote": "预
                  "submission_reported": "预扣", "formula": "公式推", "spreadsheet": "表格推", "unknown": "未知"}
 PROVIDER_ALIASES = {"sdhapi": "higg2api", "sakapi": "ak2api", "magapi": "mag2api", "draapi": "dra2api",
                     "polapi": "pol2api", "fbapi": "freebeat2api", "picapi": "pic2api", "nimapi": "nim2api",
-                    "ijmapi": "ijm2api", "pipapi": "pip2api", "cliapi": "helper", "kreapi": "kre2api",
+                    "ijmapi": "ijm2api", "pipapi": "pip2api", "nadapi": "nad2api", "eleapi": "ele2api", "cliapi": "helper", "kreapi": "kre2api",
                     "jdcapi": "jdc2api", "hgapi": "hg2api", "miapi": "mi2api", "tapapi": "tap2api"}
 OWNED_UPSTREAMS = {"higg2api", "ak2api", "mag2api", "dra2api", "pol2api", "freebeat2api", "pic2api",
                    "nim2api", "ijm2api", "pip2api", "helper", "kre2api", "jdc2api", "hg2api", "mi2api",
-                   "tap2api", "art2api", "kliapi"}
+                   "tap2api", "art2api", "kliapi", "nad2api", "ele2api"}
 
 
 def display_amount(value):
@@ -258,7 +259,8 @@ def final_observation(observations):
     return indexed[-1][1]
 
 
-def project_task_cost(observations, prices=(), baselines=(), *, instance="local", service_name="", connections=None):
+def project_task_cost(observations, prices=(), baselines=(), *, instance="local", service_name="", connections=None,
+                      rules=(), money_enabled=True):
     """Privacy-safe UI projection, separate from the complete spending ledger."""
     rows = [normalize(row, instance, service_name) for row in observations]
     selected = final_observation(rows)
@@ -279,25 +281,40 @@ def project_task_cost(observations, prices=(), baselines=(), *, instance="local"
         source = selected.get("source", "unknown")
         if source in ACTUAL_SOURCES:
             usage = number(selected.get("net_usage"))
-        elif source in {"quote", "submission_reported", "formula"}:
+        elif source in {"quote", "submission_reported", "formula", "spreadsheet"}:
             usage = number(selected.get("quoted"))
             if usage is None and source == "submission_reported":
                 usage = number(selected.get("charged"))
+        inference = None
+        if usage is None and rules:
+            # Infer only this final attempt's dimensions. Other tasks and prior
+            # attempts are deliberately not passed as historical debit evidence.
+            inference = compare_candidate(candidate, [], [], list(rules), list(baselines))
+            usage = number(inference.get("usage"))
+            if usage is not None:
+                source = "spreadsheet" if inference.get("source") == "manual" else inference.get("source", "unknown")
+                candidate["unit"] = inference.get("unit") or candidate.get("unit", "credits")
         if usage is None:
             usage, source = table_estimate(candidate, baseline)
             if usage is not None:
                 candidate["unit"] = str(baseline.get("unit") or "credits")
         if usage is None:
             source = "unknown"
-        rate, pool = credit_price(candidate, prices, baseline)
-        if usage is not None and rate is not None:
-            money = usage * rate
-    return {"usage": amount(usage), "cost": amount(money), "usage_display": display_amount(usage),
-            "cost_display": display_amount(money), "currency": "CNY", "source": source,
+        if money_enabled:
+            rate, pool = credit_price(candidate, prices, baseline)
+            if usage is not None and rate is not None:
+                money = usage * rate
+    result = {"usage": amount(usage), "usage_display": display_amount(usage), "money_enabled": bool(money_enabled), "source": source,
             "source_label": SOURCE_LABELS.get(source, "未知"), "unit": candidate.get("unit", "unknown"),
             "channel": candidate.get("channel", ""), "execution_source": candidate.get("execution_source", ""),
             "selected_observation": selected,
-            "details": {"observations": rows, "baseline": baseline, "purchase": pool, "advisory_only": True}}
+            "details": {"observations": rows, "advisory_only": True}}
+    if money_enabled:
+        result.update(cost=amount(money), cost_display=display_amount(money), currency="CNY")
+        result["details"].update(baseline=baseline, purchase=pool)
+        if selected and inference:
+            result["details"]["inference_source"] = inference.get("source", "unknown")
+    return result
 
 
 class CostStore:
@@ -979,7 +996,8 @@ def compare_candidate(candidate: dict, observations: list[dict], prices: list[di
                     sample=selected if actual or quote else None, baseline=maintained, purchase=pool,
                     samples=len(evidence), history_min=None, history_max=None)
     # A consumption rule defines its output unit; unit is not a matching prerequisite.
-    rule_match = lambda r, dimensions=False: matches({k: v for k, v in r.items() if k != "unit"}, candidate, dimensions=dimensions)
+    def rule_match(rule, dimensions=False):
+        return matches({key: value for key, value in rule.items() if key != "unit"}, candidate, dimensions=dimensions)
     exact = sorted([r for r in rules if r.get("mode", "exact") == "exact" and rule_match(r, dimensions=True)], key=specificity, reverse=True)
     linear = sorted([r for r in rules if r.get("mode") == "linear" and rule_match(r)], key=specificity, reverse=True)
     usage, source = None, "unknown"
@@ -1050,12 +1068,13 @@ class CostReference:
         if observations is None:
             return self.task_costs([task_id])[str(task_id)]
         rows = [dict(row) for row in observations]
-        baselines = self.store.matrix_rows()
+        baselines = self.store.matrix_rows() if self.hub else []
         if connection:
             baselines = [r for r in baselines if not r.get("connection") or r["connection"] == connection]
-        result = project_task_cost(rows, self.store.config("prices") + self.store.config("matrix_prices"), baselines,
+        result = project_task_cost(rows, self.store.config("prices") + self.store.config("matrix_prices") if self.hub else [], baselines,
                                    instance=self.store.instance, service_name=self.service,
-                                   connections={row.get("channel"): connection for row in rows} if connection else None)
+                                   connections={row.get("channel"): connection for row in rows} if connection else None,
+                                   rules=self.store.config("rules") if self.hub else [], money_enabled=self.hub)
         return dict(result, task_id=str(task_id))
 
     def task_costs(self, task_ids, *, connections=None):
@@ -1074,7 +1093,8 @@ class CostReference:
             for raw in db.execute(f"SELECT body FROM costref_observations WHERE local=1 AND json_extract(body,'$.task_id') IN ({placeholders})", keys):
                 row = json.loads(raw[0])
                 cached.setdefault(row["task_id"], {})[row["attempt_id"]] = row
-        prices, baselines = self.store.config("prices") + self.store.config("matrix_prices"), self.store.matrix_rows()
+        prices = self.store.config("prices") + self.store.config("matrix_prices") if self.hub else []
+        baselines = self.store.matrix_rows() if self.hub else []
         result = {}
         for key in keys:
             rows = []
@@ -1100,10 +1120,13 @@ class CostReference:
             if connections is not None:
                 relevant = [r for r in baselines if not r.get("connection") or connections.get(r.get("channel")) == r["connection"]]
             result[key] = dict(project_task_cost(enriched, prices, relevant, instance=self.store.instance,
-                                                 service_name=self.service, connections=connections), task_id=key)
+                                                 service_name=self.service, connections=connections,
+                                                 rules=self.store.config("rules") if self.hub else [], money_enabled=self.hub), task_id=key)
         return result
 
     async def matrix(self):
+        if not self.hub:
+            raise ValueError("pricing management is available only in the aggregators")
         await self.collect()
         registered = {row["id"]: row for row in await self.channels()}
         rows = self.store.matrix_rows()
@@ -1118,39 +1141,16 @@ class CostReference:
         return {"service": self.service, "rows": rows, "groups": list(groups.values()), "advisory_only": True}
 
     async def push_matrix(self, channel_id, key, patch):
-        if not self.hub:
-            return {"status": "local"}
-        if provider_identity(channel_id) not in OWNED_UPSTREAMS:
-            return {"status": "not_applicable"}
-        channel = next((r for r in await self.channels() if r["id"] == channel_id), None)
-        if not channel or not channel.get("base_url") or not channel.get("token"):
-            return {"status": "pending", "reason": "尚未配置上游成本同步连接"}
-        row = next(r for r in self.store.matrix_rows() if r["id"] == key)
-        # Send only explicitly edited fields. A second hub's older snapshot must
-        # never overwrite unrelated rows or an independently edited pool.
-        edit = {"id": key, "revision": row["matrix_revision"], "channel": channel_id,
-                "model": row["model"], "resolution": row["resolution"], **patch}
-        payload = {"channel": channel_id, "source_instance_id": self.store.instance, "rows": [edit]}
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
-                response = await client.put(validate_base(channel["base_url"]) + "/internal/cost-matrix", json=payload,
-                                            headers={"Authorization": "Bearer " + channel["token"]})
-                response.raise_for_status()
-                receipt = response.json()
-                if receipt.get("skipped"):
-                    return {"status": "pending", "reason": "上游已有更新的维护值，请核对后重新保存"}
-            return {"status": "synced"}
-        except Exception as exc:
-            error = "HTTP " + str(exc.response.status_code) if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
-            return {"status": "pending", "reason": error}
+        # Procurement and manual estimates are local to each aggregator. Cost
+        # collection is one way: only usage observations flow upstream to hubs.
+        return {"status": "local", "reason": "pricing configuration stays in this aggregator"}
 
     async def collect(self):
         async with self.collect_lock:
             if not self.store.ready:
                 await asyncio.to_thread(self.store.initialize)
                 connections = {r["id"]: r["connection"] for r in await self.channels()} if self.hub else None
-                for filename, seed_method in (("cost_reference_seed.json", self.store.seed_workbook), ("purchase_prices.json", self.store.seed_purchases)):
+                for filename, seed_method in ((("cost_reference_seed.json", self.store.seed_workbook), ("purchase_prices.json", self.store.seed_purchases)) if self.hub else ()):
                     seed = Path(__file__).with_name(filename)
                     if seed.is_file():
                         snapshot = json.loads(seed.read_text(encoding="utf-8"))
@@ -1179,6 +1179,8 @@ class CostReference:
         return channels
 
     async def sync(self):
+        if not self.hub:
+            return
         import httpx
         async with self.sync_lock:
             channels = await self.channels()
@@ -1224,6 +1226,8 @@ class CostReference:
             await asyncio.to_thread(self.store.reconcile)
 
     async def compare(self, context):
+        if not self.hub:
+            raise ValueError("pricing comparison is available only in the aggregators")
         await self.collect()
         plan = await self.preview_plan(context)
         channels = {r["id"]: r for r in await self.channels()}
@@ -1371,12 +1375,15 @@ class CostReference:
 def install_cost_reference(app, *, service_name, database_path, admin_dependency, adapter, token_env,
                            hub=False, channels=None, preview=None):
     from fastapi import Body, Depends, HTTPException, Request
-    from fastapi.responses import HTMLResponse, JSONResponse, Response
+    from fastapi.responses import HTMLResponse, Response
     # FastAPI resolves postponed annotations in the module namespace.
     globals()["Request"] = Request
 
     reference = CostReference(service_name=service_name, database_path=database_path, adapter=adapter,
                               token_env=token_env, hub=hub, channels=channels, preview=preview)
+    def require_hub():
+        if not reference.hub:
+            raise HTTPException(403, "pricing management is available only in the aggregators")
     # Keep the host's startup/shutdown ordering, including hosts using lifespan rather than on_event.
     original = app.router.lifespan_context
 
@@ -1417,25 +1424,22 @@ def install_cost_reference(app, *, service_name, database_path, admin_dependency
     async def internal_preview(body: dict = Body(...)):
         await reference.collect()
         try:
-            return await reference.preview_plan(body) or {"order": [], "candidates": [], "advisory_only": True}
+            plan = await reference.preview_plan(body) or {}
+            dimensions = {"channel", "execution_source", "model", "upstream_model", "duration",
+                          "requested_duration", "reference_seconds", "requested_reference_seconds",
+                          "billable_reference_seconds", "resolution", "unit", "billing_context",
+                          "billing_instance_id", "source_instance_id"}
+            return {"order": plan.get("order", []), "candidates": [
+                {key: value for key, value in item.items() if key in dimensions}
+                for item in plan.get("candidates", []) if isinstance(item, dict)], "advisory_only": True}
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
 
     @app.put("/internal/cost-matrix", dependencies=[Depends(sync_auth)])
     async def internal_matrix(body: dict = Body(...)):
-        await reference.collect()
-        channel = str(body.get("channel") or "")
-        rows = body.get("rows")
-        if reference.hub or provider_identity(channel) != service_name or not isinstance(rows, list) or len(rows) > 500:
-            raise HTTPException(422, "invalid local cost matrix")
-        try:
-            if any(not isinstance(row, dict) or row.get("channel") != channel for row in rows):
-                raise ValueError("matrix provider mismatch")
-            receipt = await asyncio.to_thread(reference.store.import_matrix, rows, service_name=service_name,
-                                              source_instance=str(body.get("source_instance_id") or "peer")[:256])
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from None
-        return {"ok": True, "rows": len(rows), **receipt, "advisory_only": True}
+        # Old configuration stays in the database but can no longer be pushed
+        # between services. The only cross-service cost feed is observations.
+        raise HTTPException(410, "pricing configuration synchronization has been retired")
 
     @app.get("/api/cost-reference/assets/task-cost.js")
     async def task_asset():
@@ -1452,7 +1456,8 @@ def install_cost_reference(app, *, service_name, database_path, admin_dependency
             raise HTTPException(422, "task_ids must be a list of task IDs")
         try:
             connections = {r["id"]: r["connection"] for r in await reference.channels()} if reference.hub else None
-            return {"tasks": await asyncio.to_thread(reference.task_costs, ids, connections=connections), "advisory_only": True}
+            return {"tasks": await asyncio.to_thread(reference.task_costs, ids, connections=connections),
+                    "money_enabled": reference.hub, "advisory_only": True}
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
 
@@ -1463,10 +1468,12 @@ def install_cost_reference(app, *, service_name, database_path, admin_dependency
 
     @app.get("/api/cost-reference/matrix", dependencies=[Depends(admin_dependency)])
     async def matrix():
+        require_hub()
         return await reference.matrix()
 
     @app.put("/api/cost-reference/matrix/{key}", dependencies=[Depends(admin_dependency)])
     async def save_matrix(key: str, body: dict = Body(...)):
+        require_hub()
         await reference.collect()
         previous = next((r for r in reference.store.config("baselines") if r["id"] == key), {})
         channel_id = body.get("channel", previous.get("channel", ""))
@@ -1483,7 +1490,8 @@ def install_cost_reference(app, *, service_name, database_path, admin_dependency
 
     @app.get("/api/cost-reference/page", dependencies=[Depends(admin_dependency)], response_class=HTMLResponse)
     async def page():
-        return HTMLResponse(Path(__file__).with_suffix(".html").read_text(encoding="utf-8"), headers={"Cache-Control": "no-store"})
+        template = Path(__file__).with_suffix(".html") if reference.hub else Path(__file__).with_name("usage_ledger.html")
+        return HTMLResponse(template.read_text(encoding="utf-8"), headers={"Cache-Control": "no-store"})
 
     @app.get("/api/cost-reference/state", dependencies=[Depends(admin_dependency)])
     async def state():
@@ -1512,12 +1520,18 @@ def install_cost_reference(app, *, service_name, database_path, admin_dependency
         for item in observations:
             if item["source_instance_id"] == reference.store.instance:
                 spending(item)
-        return {"service": service_name, "hub": hub, "instance": reference.store.instance, "channels": channel_list,
+        result = {"service": service_name, "hub": hub, "money_enabled": reference.hub, "instance": reference.store.instance,
+                "channels": channel_list if reference.hub else [],
                 "observations": observations[:2000], "observation_count": len(observations), "totals": {k: amount(v) for k, v in totals.items()},
-                "prices": reference.store.config("prices"), "rules": reference.store.config("rules"), "baselines": reference.store.config("baselines"), "sync": reference.store.config("sync", redact=True), "failed_observations": failed_count, "advisory_only": True}
+                "failed_observations": failed_count, "advisory_only": True}
+        if reference.hub:
+            result.update(prices=reference.store.config("prices"), rules=reference.store.config("rules"),
+                          baselines=reference.store.config("baselines"), sync=reference.store.config("sync", redact=True))
+        return result
 
     @app.put("/api/cost-reference/{kind}/{key}", dependencies=[Depends(admin_dependency)])
     async def save(kind: str, key: str, body: dict = Body(...)):
+        require_hub()
         await reference.collect()
         try:
             if kind in {"prices", "rules"} and not body.get("connection"):
@@ -1533,6 +1547,7 @@ def install_cost_reference(app, *, service_name, database_path, admin_dependency
 
     @app.delete("/api/cost-reference/{kind}/{key}", dependencies=[Depends(admin_dependency)])
     async def delete(kind: str, key: str):
+        require_hub()
         await reference.collect()
         try:
             reference.store.delete_config(kind, key)
@@ -1542,6 +1557,7 @@ def install_cost_reference(app, *, service_name, database_path, admin_dependency
 
     @app.post("/api/cost-reference/compare", dependencies=[Depends(admin_dependency)])
     async def compare(body: dict = Body(...)):
+        require_hub()
         try:
             return await reference.compare(body)
         except ValueError as exc:
@@ -1549,6 +1565,7 @@ def install_cost_reference(app, *, service_name, database_path, admin_dependency
 
     @app.post("/api/cost-reference/sync", dependencies=[Depends(admin_dependency)])
     async def sync():
+        require_hub()
         await reference.collect()
         if hub:
             await reference.sync()
