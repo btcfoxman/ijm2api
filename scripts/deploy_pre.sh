@@ -113,7 +113,8 @@ PY
 healthy() {
   for attempt in $(seq 1 30); do
     if [ "$(docker inspect -f '{{.State.Health.Status}}' "$DEPLOY_SERVICE" 2>/dev/null || true)" = healthy ] \
-        && curl --noproxy '*' -fsS --connect-timeout 2 --max-time 4 "$IJM2API_ORIGIN/health" >/dev/null; then
+        && curl --noproxy '*' -fsS --connect-timeout 2 --max-time 4 "$IJM2API_ORIGIN/health" >/dev/null \
+        && docker exec -i "$DEPLOY_SERVICE" python -B - < "$(dirname "${BASH_SOURCE[0]}")/../app/deploy_runtime_guard.py"; then
       return 0
     fi
     sleep 5

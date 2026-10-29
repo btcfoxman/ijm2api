@@ -121,11 +121,37 @@ class Service(CanvasServiceMixin):
         return self.public_settings()
 
     def start(self) -> None:
-        try:
-            self.canvas_runtime = self.canvas_cli.verify_runtime()
-        except CanvasCLIError as exc:
-            self.canvas_runtime = {'available': False, 'error_code': exc.code, 'message': str(exc)}
-            logger.error('Canvas runtime unavailable (%s); browser backend remains available', exc.code)
+        last_error_code = None
+        last_diagnostic = None
+        for attempt in (1, 2):
+            try:
+                self.canvas_runtime = {**self.canvas_cli.verify_runtime(),
+                    'startup_attempts': attempt, 'last_error_code': last_error_code}
+                if last_diagnostic is not None:
+                    self.canvas_runtime['startup_last_error'] = last_diagnostic
+                break
+            except CanvasCLIError as exc:
+                last_error_code = exc.code
+                diagnostic = self._canvas_diagnostic(exc, 'runtime_check')
+                last_diagnostic = {key: diagnostic[key] for key in
+                    ('code', 'phase', 'exit_code', 'outcome_unknown', 'transport_diagnostic')
+                    if key in diagnostic}
+                transport = exc.details.get('transport_diagnostic')
+                if isinstance(transport, dict) and transport.get('command_pair') in (
+                        ['version'], ['schema'], ('version',), ('schema',)):
+                    last_diagnostic.setdefault('transport_diagnostic', {})['command_pair'] = list(
+                        transport['command_pair'])
+                self.canvas_runtime = {'available': False, 'error_code': exc.code,
+                    'message': str(exc), 'startup_attempts': attempt,
+                    'last_error_code': last_error_code, 'startup_last_error': last_diagnostic}
+                # Only the existing local, dead-loopback version/schema probe is
+                # repeated. Never extend this to authentication or task commands.
+                if exc.code == 'CLI_INVALID_RESPONSE' and attempt == 1:
+                    logger.warning('Canvas local runtime check returned invalid JSON; retrying once')
+                    time.sleep(0.25)
+                    continue
+                logger.error('Canvas runtime unavailable (%s); browser backend remains available', exc.code)
+                break
         self._started = True
         self._maintenance = threading.Thread(target=self._maintain_accounts, daemon=True,
                                              name="ijm-account-maintenance")

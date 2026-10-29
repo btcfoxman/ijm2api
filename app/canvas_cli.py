@@ -30,7 +30,8 @@ TRANSPORT_DIAGNOSTIC_COMMANDS = frozenset({('auth', 'account'), ('auth', 'status
     ('auth', 'login'), ('auth', 'wait'), ('auth', 'refresh'), ('auth', 'logout'),
     ('model', 'list'), ('canvas', 'ls'), ('canvas', 'create'), ('node', 'create'),
     ('node', 'show'), ('node', 'quote'), ('node', 'confirm'), ('node', 'run'),
-    ('resource', 'upload'), ('resource', 'get'), ('resource', 'download'), ('operation', 'status')})
+    ('resource', 'upload'), ('resource', 'get'), ('resource', 'download'), ('operation', 'status'),
+    ('version',), ('schema',)})
 _SECRET_KEY = re.compile(r"token|password|secret|authorization|cookie|devicecode|privatekey", re.I)
 _PROFILE = re.compile(r"[A-Za-z0-9_.-]{1,80}\Z")
 
