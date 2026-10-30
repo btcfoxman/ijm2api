@@ -122,6 +122,7 @@ class FakeDocker:
         self.start_error = TimeoutError("companion startup response lost")
         self.cleanup_inspect_failure = False
         self.foreign_companion_field = None
+        self.guard_cap_add = ['CAP_DAC_READ_SEARCH']
         self.empty_start_receipt = False
         self.paused = False
         self.old_removed = False
@@ -195,7 +196,7 @@ class FakeDocker:
                     "HostConfig": {"PidMode": '' if killer else "container:" + self.old_id,
                         'CgroupnsMode': 'host', 'Binds': None, 'Mounts': None,
                         "ReadonlyRootfs": True, "NetworkMode": "none", 'Privileged': False,
-                        'CapDrop': ['ALL'], 'CapAdd': None if killer else ['DAC_READ_SEARCH'], 'SecurityOpt': ['no-new-privileges']}}
+                        'CapDrop': ['ALL'], 'CapAdd': None if killer else deepcopy(self.guard_cap_add), 'SecurityOpt': ['no-new-privileges']}}
                 value['HostConfig']['VolumesFrom'] = None if killer else [self.old_id + ':ro']
                 field = self.foreign_killer_field if killer else self.foreign_companion_field
                 if killer and args[-1] == self.killer_name and self.killer_replaced_at_cleanup:
@@ -1204,6 +1205,54 @@ class FrozenCutoverTests(unittest.TestCase):
                 changed = deepcopy(candidate)
                 changed['Mounts'][0][field] = value
                 self.assertFalse(cutover.owned_helper(changed, *arguments, expected_mounts=baseline))
+
+    def test_guard_accepts_only_one_equivalent_read_search_capability_spelling(self):
+        for name in ('CAP_DAC_READ_SEARCH', 'DAC_READ_SEARCH'):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                self.release = Path(directory)
+                (self.release / 'query-resume-baseline.safe.json').write_text(json.dumps({'binding_sha256': BINDING}))
+                self.docker = FakeDocker()
+                self.docker.guard_cap_add = [name]
+                receipt = self.invoke()
+                self.assertTrue(receipt['passed'])
+                self.assertEqual(self.docker.kill_count, 1)
+
+    def test_guard_capability_extra_duplicate_unknown_missing_or_wrong_type_never_reaches_pause(self):
+        for caps in ([], None, ['CAP_SYS_ADMIN'], ['CAP_DAC_READ_SEARCH', 'CAP_SYS_ADMIN'],
+                     ['CAP_DAC_READ_SEARCH', 'CAP_DAC_READ_SEARCH'], ['DAC_READ_SEARCH', 'CAP_DAC_READ_SEARCH'],
+                     ['CAP_PRIVATE_TOKEN_DO_NOT_COPY'], 'CAP_DAC_READ_SEARCH', {'PRIVATE_TOKEN': 'secret'}):
+            with self.subTest(caps=caps):
+                self.docker = FakeDocker()
+                self.docker.guard_cap_add = caps
+                with self.assertRaisesRegex(RuntimeError, '^GuardReadOnlySpecificationRejected$'):
+                    self.invoke()
+                receipt = self.receipt()
+                diagnostic = receipt['guard_spec_diagnostic']
+                self.assertFalse(diagnostic['checks']['exact_read_only_dac_capability'])
+                self.assertIn('exact_read_only_dac_capability', diagnostic['rejected_predicates'])
+                self.assertNotIn('PRIVATE_TOKEN', json.dumps(diagnostic))
+                self.assertEqual(self.docker.kill_count, 0)
+                self.assertFalse(any(call[:2] == ['docker', 'pause'] for call in self.docker.calls))
+                self.assertTrue(receipt['original_restart_policy_restored_after_abort'])
+
+    def test_helper_rejection_diagnostic_is_readable_without_env_command_or_source_values(self):
+        self.invoke()
+        self.docker.companion_exists = True
+        candidate = json.loads(self.docker(['docker', 'inspect', self.docker.companion_id]))[0]
+        candidate['Config'].update(Env=['PRIVATE_ENV_TOKEN=secret'], Entrypoint=['PRIVATE_ENTRYPOINT'], Cmd=['PRIVATE_COMMAND', 'secret'])
+        candidate['HostConfig']['SecurityOpt'] = ['no-new-privileges:true']
+        candidate['Mounts'] = [{'Destination': '/app/data', 'Source': '/PRIVATE_SOURCE_SECRET', 'RW': False, 'Type': 'bind'}]
+        diagnostic = {}
+        self.assertFalse(cutover.owned_helper(candidate, self.docker.companion_name, self.docker.companion_image,
+            self.docker.old_id, 'guard', self.docker.cgroup.identity, diagnostic=diagnostic))
+        self.assertEqual(set(diagnostic['rejected_predicates']), {'python_entrypoint', 'no_new_privileges', 'fixed_sleep_command'})
+        self.assertEqual(diagnostic['observed']['cap_add']['values'], ['CAP_DAC_READ_SEARCH'])
+        self.assertEqual(diagnostic['observed']['security_options']['values'], ['no-new-privileges:true'])
+        self.assertEqual(diagnostic['observed']['entrypoint_length'], 1)
+        self.assertEqual(diagnostic['observed']['command_length'], 2)
+        self.assertEqual(diagnostic['observed']['destination_order'], ['/app/data'])
+        for private in ('PRIVATE_ENV_TOKEN', 'PRIVATE_ENTRYPOINT', 'PRIVATE_COMMAND', 'PRIVATE_SOURCE_SECRET', 'secret'):
+            self.assertNotIn(private, json.dumps(diagnostic))
 
 
 if __name__ == "__main__":

@@ -403,46 +403,63 @@ try:
     return program
 
 
-def owned_helper(candidate, name, image, old_id, role, identity, expected_mounts=None):
-    config, host = candidate.get("Config") or {}, candidate.get("HostConfig") or {}
+def owned_helper(candidate, name, image, old_id, role, identity, expected_mounts=None, diagnostic=None):
+    config = candidate.get("Config") if isinstance(candidate.get("Config"), dict) else {}
+    host = candidate.get("HostConfig") if isinstance(candidate.get("HostConfig"), dict) else {}
+    labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
     cid = candidate.get("Id")
-    if not (isinstance(cid, str) and re.fullmatch(r"[0-9a-f]{64}", cid) and cid != old_id
-            and candidate.get("Name") == "/" + name and config.get("Image") == image
-            and (config.get("Labels") or {}).get(COMPANION_OWNER_LABEL) == old_id
-            and (config.get("Labels") or {}).get(COMPANION_ROLE_LABEL) == role
-            and config.get("Entrypoint") == ["python"]
-            and host.get("ReadonlyRootfs") is True and host.get("NetworkMode") == "none"
-            and host.get("Privileged") is False and host.get("CapDrop") == ["ALL"]
-            and host.get("SecurityOpt") == ["no-new-privileges"]):
-        return False
+    checks = {"valid_distinct_container_id": bool(isinstance(cid, str) and re.fullmatch(r"[0-9a-f]{64}", cid) and cid != old_id),
+        "exact_name": candidate.get("Name") == "/" + name, "exact_image": config.get("Image") == image,
+        "owner_label": labels.get(COMPANION_OWNER_LABEL) == old_id, "role_label": labels.get(COMPANION_ROLE_LABEL) == role,
+        "python_entrypoint": config.get("Entrypoint") == ["python"], "readonly_rootfs": host.get("ReadonlyRootfs") is True,
+        "offline_network": host.get("NetworkMode") == "none", "not_privileged": host.get("Privileged") is False,
+        "drop_all_capabilities": host.get("CapDrop") == ["ALL"], "no_new_privileges": host.get("SecurityOpt") == ["no-new-privileges"]}
     try:
         mounts = canonical_mounts(candidate.get("Mounts"))
-        if expected_mounts is not None and mounts != canonical_mounts(expected_mounts):
-            return False
+        checks["valid_mount_destinations"] = True
+        checks["complete_mount_baseline"] = expected_mounts is None or mounts == canonical_mounts(expected_mounts)
     except RuntimeError:
-        return False
+        mounts = []
+        checks.update(valid_mount_destinations=False, complete_mount_baseline=False)
     if role == "guard":
-        return (host.get("PidMode") == "container:" + old_id and host.get("CapAdd") == ["DAC_READ_SEARCH"]
-            and host.get("CgroupnsMode") == "host"
-            and host.get("VolumesFrom") == [old_id + ":ro"]
-            and host.get("Binds") in (None, []) and host.get("Mounts") in (None, [])
-            and config.get("Cmd") == ["-B", "-c", "import time; time.sleep(600)"]
-            and isinstance(candidate.get("Mounts"), list)
-            and all(not mount.get("RW") or (mount.get("Destination") == "/tmp" and mount.get("Type") == "tmpfs") for mount in candidate["Mounts"])
-            and not any(str(mount.get("Destination", "")).startswith((CGROUP_BIND_ROOT, PROCESS_BIND_ROOT)) for mount in candidate["Mounts"]))
-    if role != "killer" or host.get("PidMode") != "" or host.get("CgroupnsMode") != "host" or host.get("Privileged") is not False:
-        return False
-    if (host.get("CapDrop") != ["ALL"] or host.get("CapAdd") not in (None, [])
-            or host.get("SecurityOpt") != ["no-new-privileges"]
-            or config.get("Cmd") != ["-I", "-S", "-B", "-c", "import time; time.sleep(600)"]
-            or host.get("VolumesFrom") not in (None, [])):
-        return False
-    expected = {CGROUP_BIND_ROOT + "/" + key: (identity["host_cgroup_path"] + "/" + key, key == "cgroup.kill")
-        for key in ("cgroup.kill", "cgroup.events", "cgroup.freeze", "cgroup.type")}
-    expected.update({PROCESS_BIND_ROOT + "/" + key: (f"/proc/{identity['pid']}/{key}", False) for key in ("stat", "cgroup")})
-    return (len(mounts) == len(expected)
-        and all(mount.get("Mode", "") == "" and mount.get("Propagation", "rprivate") == "rprivate" for mount in mounts)
-        and {mount.get("Destination"): (mount.get("Source"), mount.get("RW")) for mount in mounts if mount.get("Type") == "bind"} == expected)
+        checks.update(shared_original_pid_namespace=host.get("PidMode") == "container:" + old_id,
+            exact_read_only_dac_capability=host.get("CapAdd") in (["DAC_READ_SEARCH"], ["CAP_DAC_READ_SEARCH"]),
+            host_cgroup_namespace=host.get("CgroupnsMode") == "host", original_volumes_readonly=host.get("VolumesFrom") == [old_id + ":ro"],
+            no_extra_binds=host.get("Binds") in (None, []) and host.get("Mounts") in (None, []),
+            fixed_sleep_command=config.get("Cmd") == ["-B", "-c", "import time; time.sleep(600)"],
+            persistent_mounts_readonly=all(not mount.get("RW") or (mount.get("Destination") == "/tmp" and mount.get("Type") == "tmpfs") for mount in mounts),
+            no_cgroup_or_original_proc_mounts=not any(str(mount.get("Destination", "")).startswith((CGROUP_BIND_ROOT, PROCESS_BIND_ROOT)) for mount in mounts))
+    elif role == "killer":
+        expected = {CGROUP_BIND_ROOT + "/" + key: (identity["host_cgroup_path"] + "/" + key, key == "cgroup.kill")
+            for key in ("cgroup.kill", "cgroup.events", "cgroup.freeze", "cgroup.type")}
+        expected.update({PROCESS_BIND_ROOT + "/" + key: (f"/proc/{identity['pid']}/{key}", False) for key in ("stat", "cgroup")})
+        checks.update(private_pid_namespace=host.get("PidMode") == "", host_cgroup_namespace=host.get("CgroupnsMode") == "host",
+            no_added_capabilities=host.get("CapAdd") in (None, []), no_data_volumes=host.get("VolumesFrom") in (None, []),
+            fixed_isolated_sleep_command=config.get("Cmd") == ["-I", "-S", "-B", "-c", "import time; time.sleep(600)"],
+            exactly_six_bindings=len(mounts) == len(expected),
+            private_bind_mode=all(mount.get("Mode", "") == "" and mount.get("Propagation", "rprivate") == "rprivate" for mount in mounts),
+            exact_original_file_bindings={mount.get("Destination"): (mount.get("Source"), mount.get("RW")) for mount in mounts if mount.get("Type") == "bind"} == expected)
+    else:
+        checks["known_role"] = False
+    if isinstance(diagnostic, dict):
+        try:
+            def safe_list(value, allowed):
+                return {"count": len(value), "values": [entry if isinstance(entry, str) and entry in allowed else "other" for entry in value[:16]]} if isinstance(value, list) else {"count": None, "values": [], "list": False}
+            diagnostic["checks"] = checks
+            diagnostic["rejected_predicates"] = [key for key, passed in checks.items() if not passed]
+            diagnostic["observed"] = {"cap_add": safe_list(host.get("CapAdd"), {"DAC_READ_SEARCH", "CAP_DAC_READ_SEARCH", "CAP_SYS_ADMIN", "SYS_ADMIN", "ALL"}),
+                "cap_drop": safe_list(host.get("CapDrop"), {"ALL"}),
+                "security_options": safe_list(host.get("SecurityOpt"), {"no-new-privileges", "no-new-privileges:true"}),
+                "pid_mode": "private" if host.get("PidMode") == "" else "shared_original" if host.get("PidMode") == "container:" + old_id else "other",
+                "cgroup_namespace": host.get("CgroupnsMode") if host.get("CgroupnsMode") in {"host", "private", ""} else "other",
+                "entrypoint_length": len(config["Entrypoint"]) if isinstance(config.get("Entrypoint"), list) else None,
+                "command_length": len(config["Cmd"]) if isinstance(config.get("Cmd"), list) else None,
+                "mount_count": len(mounts), "destination_order": [mount["Destination"] for mount in mounts],
+                "writable_destinations": [mount["Destination"] for mount in mounts if mount.get("RW")],
+                "canonical_mounts_sha256": hashlib.sha256(json.dumps(mounts, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
+        except Exception as error:
+            diagnostic["observation_error"] = diagnostic_error(error)
+    return all(checks.values())
 
 
 def durable_json(path, value):
@@ -696,7 +713,13 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
         if not isinstance(companion_id, str) or not re.fullmatch(r"[0-9a-f]{64}", companion_id) or companion_id == old_id:
             raise RuntimeError("CompanionStartReceiptInvalid")
         current_guard = json.loads(run(["docker", "inspect", companion_id], timeout=10))[0]
-        if current_guard.get("Id") != companion_id or not owned_helper(current_guard, name, image, old_id, "guard", identity):
+        guard_diagnostic = {}
+        guard_owned = owned_helper(current_guard, name, image, old_id, "guard", identity, diagnostic=guard_diagnostic)
+        guard_diagnostic["checks"]["startup_cid_matches"] = current_guard.get("Id") == companion_id
+        if current_guard.get("Id") != companion_id:
+            guard_diagnostic["rejected_predicates"].append("startup_cid_matches")
+        if current_guard.get("Id") != companion_id or not guard_owned:
+            receipt["guard_spec_diagnostic"] = guard_diagnostic
             raise RuntimeError("GuardReadOnlySpecificationRejected")
         guard_mounts = canonical_mounts(current_guard["Mounts"])
         witness = json.loads(run(["docker", "exec", "-i", companion_id, "python", "-I", "-S", "-B", "-"],
@@ -713,7 +736,13 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
         if not isinstance(killer_id, str) or not re.fullmatch(r"[0-9a-f]{64}", killer_id) or killer_id in {old_id, companion_id}:
             raise RuntimeError("KillerStartReceiptInvalid")
         current_killer = json.loads(run(["docker", "inspect", killer_id], timeout=10))[0]
-        if current_killer.get("Id") != killer_id or not owned_helper(current_killer, killer_name, image, old_id, "killer", identity):
+        killer_diagnostic = {}
+        killer_owned = owned_helper(current_killer, killer_name, image, old_id, "killer", identity, diagnostic=killer_diagnostic)
+        killer_diagnostic["checks"]["startup_cid_matches"] = current_killer.get("Id") == killer_id
+        if current_killer.get("Id") != killer_id:
+            killer_diagnostic["rejected_predicates"].append("startup_cid_matches")
+        if current_killer.get("Id") != killer_id or not killer_owned:
+            receipt["killer_spec_diagnostic"] = killer_diagnostic
             raise RuntimeError("KillerPrivateSpecificationRejected")
         killer_mounts = canonical_mounts(current_killer["Mounts"])
         access = json.loads(run(["docker", "exec", "-i", killer_id, "python", "-I", "-S", "-B", "-"],
@@ -764,7 +793,13 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
             raise RuntimeError("OriginalConfigOrRestartPolicyChanged")
         cgroup.validate(frozen=True)
         current_killer = json.loads(run(["docker", "inspect", killer_id], timeout=10))[0]
-        if current_killer.get("Id") != killer_id or not owned_helper(current_killer, killer_name, image, old_id, "killer", identity, killer_mounts):
+        killer_diagnostic = {}
+        killer_owned = owned_helper(current_killer, killer_name, image, old_id, "killer", identity, killer_mounts, killer_diagnostic)
+        killer_diagnostic["checks"]["startup_cid_matches"] = current_killer.get("Id") == killer_id
+        if current_killer.get("Id") != killer_id:
+            killer_diagnostic["rejected_predicates"].append("startup_cid_matches")
+        if current_killer.get("Id") != killer_id or not killer_owned:
+            receipt["prekill_killer_spec_diagnostic"] = killer_diagnostic
             raise RuntimeError("KillerPrivateSpecificationChanged")
         killer_proof = cgroup.validate_killer(current_killer, access)
         receipt.update(frozen_guard=final, frozen_backup_sha256=first["frozen_backup_sha256"])
