@@ -130,6 +130,9 @@ class FakeDocker:
         self.pause_timeout_after_effect = False
         self.export_failure = False
         self.source_sizes = {'ijm2api.db': 69746688, 'ijm2api.db-wal': 0}
+        self.mounts = []
+        self.restart_read_mount_order_drift_once = False
+        self.restart_read_mount_field_drift_once = None
         self.snapshot_capacity_failure = False
         self.diagnostic_inspect_failure = False
         self.cgroup = FakeCgroup(self)
@@ -168,10 +171,17 @@ class FakeDocker:
                 return json.dumps([value])
             self.inspect_count += 1
             value = {"Id": self.old_id, 'Name': '/ijm2api', 'Image': 'sha256:' + 'b' * 64,
-                'Config': {'Image': 'original:immutable'}, 'Mounts': [], 'RestartCount': self.restart_count,
+                'Config': {'Image': 'original:immutable'}, 'Mounts': deepcopy(self.mounts), 'RestartCount': self.restart_count,
                 'HostConfig': {'AutoRemove': False, 'RestartPolicy': deepcopy(self.restart_policy)},
                 "State": {"Running": not self.old_stopped and not self.old_removed, "Paused": self.paused,
                           'Pid': 0 if self.old_stopped else 4321, 'Restarting': False}}
+            if self.restart_read_mount_order_drift_once and self.restart_policy['Name'] == 'no' and not self.companion_exists:
+                value['Mounts'].reverse()
+                self.restart_read_mount_order_drift_once = False
+            if self.restart_read_mount_field_drift_once and self.restart_policy['Name'] == 'no' and not self.companion_exists:
+                key, changed = self.restart_read_mount_field_drift_once
+                value['Mounts'][0][key] = changed
+                self.restart_read_mount_field_drift_once = None
             if self.changed_before_pause and self.companion_exists and not self.paused and args[-1] == 'ijm2api':
                 value["Id"] = "concurrent-replacement-id"
             return json.dumps([value])
@@ -726,6 +736,109 @@ class FrozenCutoverTests(unittest.TestCase):
                 self.invoke()
             self.assert_aborted_safely()
             self.assertIn(['docker', 'update', '--restart=on-failure:3', self.docker.old_id], self.docker.calls)
+
+    def test_mount_order_only_drift_preserves_effective_bindings_and_passes_canonical_guard(self):
+        self.docker.mounts = [
+            {'Destination': '/app/data', 'Source': '/PRIVATE_SOURCE_SECRET/data', 'Type': 'bind', 'RW': True},
+            {'Destination': '/app/profiles', 'Source': '/PRIVATE_SOURCE_SECRET/profile', 'Type': 'bind', 'RW': False}]
+        self.docker.restart_read_mount_order_drift_once = True
+        original = json.loads(self.docker(['docker', 'inspect', 'ijm2api']))[0]
+        current = deepcopy(original)
+        current['Mounts'].reverse()
+        current['HostConfig']['RestartPolicy'] = {'Name': 'no', 'MaximumRetryCount': 0}
+        value = cutover.restart_suppression_diagnostic(original, current, self.docker.cgroup.identity, self.docker.cgroup)
+        self.assertTrue(all(value['predicates'].values()))
+        self.assertTrue(all(value['stable_field_equalities'].values()))
+        self.assertFalse(value['Mounts']['order_sensitive_hashes_equal'])
+        self.assertTrue(value['Mounts']['sorted_destination_hashes_equal'])
+        self.assertEqual(value['Mounts']['original_destination_order'], ['/app/data', '/app/profiles'])
+        self.assertEqual(value['Mounts']['current_destination_order'], ['/app/profiles', '/app/data'])
+        self.assertNotIn('PRIVATE_SOURCE_SECRET', json.dumps(value))
+        before = deepcopy(self.docker.mounts)
+        receipt = self.invoke()
+        self.assertTrue(receipt['passed'] and self.docker.old_removed)
+        self.assertEqual(self.docker.kill_count, 1)
+        self.assertEqual(self.docker.mounts, before)
+
+    def test_mount_source_rw_type_and_propagation_drift_each_still_reject_before_pause(self):
+        for key, changed in (('Source', '/different'), ('RW', False), ('Type', 'volume'), ('Propagation', 'rshared')):
+            with self.subTest(field=key):
+                self.docker = FakeDocker()
+                self.docker.mounts = [{'Destination': '/app/data', 'Source': '/original', 'RW': True,
+                    'Type': 'bind', 'Propagation': 'rprivate', 'Mode': 'z', 'Driver': 'local'}]
+                self.docker.restart_read_mount_field_drift_once = (key, changed)
+                with self.assertRaisesRegex(RuntimeError, '^OriginalRestartSuppressionNotVerified$'):
+                    self.invoke()
+                value = self.receipt()['restart_suppression_diagnostic']
+                self.assertFalse(value['predicates']['stable_facts_equal'])
+                self.assertFalse(value['Mounts']['sorted_destination_hashes_equal'])
+                self.assertEqual(self.docker.kill_count, 0)
+                self.assertFalse(self.docker.paused or self.docker.old_removed)
+                self.assertTrue(self.receipt()['original_restart_policy_restored_after_abort'])
+
+    def test_duplicate_or_invalid_mount_destinations_reject_before_any_container_mutation(self):
+        bad_mounts = [None, {}, 'not-a-list', [{}], [{'Destination': '/data'}, {'Destination': '/data'}]]
+        bad_mounts += [[{'Destination': value}] for value in ('', 'relative', '/app/../data', '/app//data', '/app/\x00data', None, 7)]
+        for mounts in bad_mounts:
+            with self.subTest(mounts=mounts):
+                self.docker = FakeDocker()
+                self.docker.mounts = mounts
+                with self.assertRaisesRegex(RuntimeError, '^ContainerMount(?:ListInvalid|DestinationInvalid|DestinationDuplicate)$'):
+                    self.invoke()
+                self.assertEqual(self.docker.kill_count, 0)
+                self.assertFalse(self.docker.paused or self.docker.old_removed)
+                self.assertFalse(any(call[:2] in (['docker', 'update'], ['docker', 'run'], ['docker', 'pause']) for call in self.docker.calls))
+                self.assertNotIn(['cgroup_capture'], self.docker.calls)
+
+    def test_canonical_mounts_preserve_all_fields_and_original_input_without_filtering(self):
+        mounts = [{'Destination': '/z', 'Source': '/private-z', 'Type': 'bind', 'RW': False,
+            'Propagation': 'rslave', 'Mode': 'ro,z', 'opaque_future_field': {'a': [1, 2]}},
+            {'Destination': '/', 'Source': '/private-root', 'Type': 'volume', 'RW': True, 'Name': 'volume-name'}]
+        before = deepcopy(mounts)
+        result = cutover.canonical_mounts(mounts)
+        self.assertEqual([mount['Destination'] for mount in result], ['/', '/z'])
+        self.assertEqual(result, [before[1], before[0]])
+        self.assertEqual(mounts, before)
+        self.assertIsNot(result, mounts)
+        self.assertIs(result[1], mounts[0])
+
+    def test_suppression_diagnostic_keeps_only_config_hashes_changed_keys_and_state(self):
+        original = json.loads(self.docker(['docker', 'inspect', 'ijm2api']))[0]
+        original['Config']['Env'] = ['PRIVATE_ENV=original-secret']
+        original['HostConfig']['LogConfig'] = {'private-auth': 'original-secret'}
+        original['Mounts'] = [{'Destination': '/app/data', 'Source': '/PRIVATE_SOURCE_SECRET', 'RW': True}]
+        current = deepcopy(original)
+        current['Config']['Env'] = ['PRIVATE_ENV=current-secret']
+        current['HostConfig']['LogConfig'] = {'private-auth': 'current-secret'}
+        current['HostConfig']['RestartPolicy'] = {'Name': 'no', 'MaximumRetryCount': 0}
+        current['RestartCount'] = 1
+        current['State'].update(Pid=99, Running=False, Paused=True)
+        value = cutover.restart_suppression_diagnostic(original, current, self.docker.cgroup.identity, self.docker.cgroup)
+        self.assertEqual(value['Config']['changed_top_level_keys'], ['Env'])
+        self.assertEqual(value['HostConfig']['changed_top_level_keys'], ['LogConfig', 'RestartPolicy'])
+        self.assertNotEqual(value['Config']['original_sha256'], value['Config']['current_sha256'])
+        self.assertFalse(value['predicates']['restart_count_equal'])
+        self.assertFalse(value['predicates']['pid_matches_captured_identity'])
+        self.assertFalse(value['predicates']['running_truthy'])
+        self.assertFalse(value['predicates']['paused_falsy'])
+        self.assertTrue(value['predicates']['restart_policy_is_no'])
+        encoded = json.dumps(value)
+        for private in ('PRIVATE_ENV', 'original-secret', 'current-secret', 'PRIVATE_SOURCE_SECRET', 'private-auth'):
+            self.assertNotIn(private, encoded)
+        self.assertEqual(value['current']['state']['Pid'], 99)
+        self.assertEqual(value['current']['restart_count'], 1)
+
+    def test_suppression_observation_failure_never_changes_original_rejection_or_cleanup(self):
+        self.docker.restart_update_ignored = True
+        with patch.object(cutover, 'restart_suppression_diagnostic', side_effect=ValueError('PRIVATE_CONFIG_SECRET')):
+            with self.assertRaisesRegex(RuntimeError, '^OriginalRestartSuppressionNotVerified$'):
+                self.invoke()
+        value = self.receipt()['restart_suppression_diagnostic']
+        self.assertEqual(value, {'error_class': 'ValueError', 'errno': None})
+        self.assertNotIn('PRIVATE_CONFIG_SECRET', json.dumps(self.receipt()))
+        self.assertEqual(self.docker.kill_count, 0)
+        self.assertFalse(self.docker.paused or self.docker.old_removed)
+        self.assertTrue(self.receipt()['original_restart_policy_restored_after_abort'])
 
     def test_capture_access_or_restart_suppression_failure_never_pauses_or_kills(self):
         for failure in ('capture', 'access', 'restart'):

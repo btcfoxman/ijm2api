@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import stat
@@ -86,6 +86,53 @@ def old_container_diagnostic(current, old_id):
         "restart_policy": {"Name": policy.get("Name") if policy.get("Name") in {"no", "always", "unless-stopped", "on-failure"} else "unknown",
             "MaximumRetryCount": policy.get("MaximumRetryCount") if type(policy.get("MaximumRetryCount")) is int else None},
         "restart_count": current.get("RestartCount") if type(current.get("RestartCount")) is int else None}
+
+
+def restart_suppression_diagnostic(original, current, identity, cgroup):
+    """Compare only the already captured snapshots; never authorize a cutover."""
+    def fingerprint(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+    def changed_keys(before, after):
+        return sorted(key for key in set(before) | set(after)
+            if key not in before or key not in after or before[key] != after[key])
+    stable_original = container_stable_facts(original)
+    stable_current = container_stable_facts(current)
+    value = {"predicates": {
+        "stable_facts_equal": stable_current == stable_original,
+        "restart_policy_is_no": current["HostConfig"].get("RestartPolicy") == {"Name": "no", "MaximumRetryCount": 0},
+        "restart_count_equal": current.get("RestartCount") == original.get("RestartCount"),
+        "pid_matches_captured_identity": current["State"].get("Pid") == identity["pid"],
+        "running_truthy": bool(current["State"].get("Running")),
+        "paused_falsy": not current["State"].get("Paused")},
+        "stable_field_equalities": {key: stable_original[key] == stable_current[key] for key in stable_original},
+        "original": old_container_diagnostic(original, identity["container_id"]),
+        "current": old_container_diagnostic(current, identity["container_id"]),
+        "captured_identity_matches": {
+            "original_id": original.get("Id") == identity["container_id"],
+            "current_id": current.get("Id") == identity["container_id"],
+            "original_pid": original["State"].get("Pid") == identity["pid"],
+            "current_pid": current["State"].get("Pid") == identity["pid"]}}
+    for name in ("Config", "HostConfig"):
+        before, after = original.get(name) or {}, current.get(name) or {}
+        value[name] = {"original_sha256": fingerprint(before), "current_sha256": fingerprint(after),
+            "changed_top_level_keys": changed_keys(before, after)}
+    before, after = original.get("Mounts") or [], current.get("Mounts") or []
+    original_order, current_order = fingerprint(before), fingerprint(after)
+    original_sorted = fingerprint(sorted(before, key=lambda row: row.get("Destination", "")))
+    current_sorted = fingerprint(sorted(after, key=lambda row: row.get("Destination", "")))
+    value["Mounts"] = {"original_order_sensitive_sha256": original_order, "current_order_sensitive_sha256": current_order,
+        "order_sensitive_hashes_equal": original_order == current_order,
+        "original_sorted_destination_sha256": original_sorted, "current_sorted_destination_sha256": current_sorted,
+        "sorted_destination_hashes_equal": original_sorted == current_sorted,
+        "original_destination_order": [row.get("Destination") for row in before],
+        "current_destination_order": [row.get("Destination") for row in after]}
+    try:
+        value["live_cgroup_identity_matches"] = True
+        value["live_cgroup_events"] = cgroup.validate(frozen=False)
+    except Exception as error:
+        value["live_cgroup_identity_matches"] = False
+        value["live_cgroup_error"] = diagnostic_error(error)
+    return value
 
 
 class HostCgroup:
@@ -309,11 +356,29 @@ def durable_json(path, value):
     return hashlib.sha256(data).hexdigest()
 
 
+def canonical_mounts(mounts):
+    if not isinstance(mounts, list):
+        raise RuntimeError("ContainerMountListInvalid")
+    destinations = set()
+    for mount in mounts:
+        destination = mount.get("Destination") if isinstance(mount, dict) else None
+        if (not isinstance(destination, str) or not destination.startswith("/") or "\x00" in destination
+                or destination.startswith("//") or PurePosixPath(destination).as_posix() != destination
+                or ".." in PurePosixPath(destination).parts):
+            raise RuntimeError("ContainerMountDestinationInvalid")
+        if destination in destinations:
+            raise RuntimeError("ContainerMountDestinationDuplicate")
+        destinations.add(destination)
+    # Preserve every inspected mount field and only normalize map iteration
+    # order; any Source/RW/Type/Propagation or other field drift still differs.
+    return sorted(mounts, key=lambda mount: mount["Destination"])
+
+
 def container_stable_facts(value):
     host = dict(value.get("HostConfig") or {})
     host.pop("RestartPolicy", None)
     return {"Id": value.get("Id"), "Name": value.get("Name"), "Image": value.get("Image"),
-        "Config": value.get("Config"), "HostConfig": host, "Mounts": value.get("Mounts")}
+        "Config": value.get("Config"), "HostConfig": host, "Mounts": canonical_mounts(value.get("Mounts"))}
 
 
 def restart_argument(policy):
@@ -491,6 +556,10 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
                 or current.get("RestartCount") != original_restart_count
                 or current["State"].get("Pid") != identity["pid"]
                 or not current["State"].get("Running") or current["State"].get("Paused")):
+            try:
+                receipt["restart_suppression_diagnostic"] = restart_suppression_diagnostic(original, current, identity, cgroup)
+            except Exception as error:
+                receipt["restart_suppression_diagnostic"] = diagnostic_error(error)
             raise RuntimeError("OriginalRestartSuppressionNotVerified")
         cgroup.validate(frozen=False)
         receipt["original_restart_policy"] = policy
