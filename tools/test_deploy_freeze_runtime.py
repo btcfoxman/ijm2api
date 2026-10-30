@@ -53,7 +53,10 @@ def docker(args, *, input=None, timeout=30, optional=False):
     if result.returncode and not optional:
         # Every command here targets synthetic containers only. Preserve the
         # bounded cause so a rejected gate cannot hide its actual failure.
-        raise RuntimeError("SyntheticDockerOperationFailed:" + args[0] + ":" + result.stderr[-3000:].strip())
+        error = RuntimeError("SyntheticDockerOperationFailed:" + args[0] + ":" + result.stderr[-3000:].strip())
+        if isinstance(input, str) and input.startswith("# CGROUP_SINGLE_FILE_KILL\n"):
+            error.returncode, error.command_stderr = result.returncode, result.stderr[-4096:]
+        raise error
     if result.returncode:
         return None
     return (result.stdout + (result.stderr if args[0] == "logs" else "")).strip()

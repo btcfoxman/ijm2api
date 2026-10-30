@@ -37,6 +37,57 @@ def cgroup_events(value):
     return {key: int(pairs[key]) for key in ("populated", "frozen")}
 
 
+def diagnostic_error(error):
+    name = type(error).__name__
+    number = getattr(error, "errno", None)
+    return {"error_class": name if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", name) else "Exception",
+        "errno": number if type(number) is int else None}
+
+
+def kill_command_diagnostic(output=None, error=None):
+    value = {"returned": error is None, "returncode": 0 if error is None else None,
+        "timed_out": isinstance(error, subprocess.TimeoutExpired), "stages_observed": []}
+    if error is None:
+        try:
+            response = json.loads(output)
+            value["guest_write_returned"] = response.get("kill_write_returned") is True
+        except (TypeError, ValueError, AttributeError):
+            value["guest_write_returned"] = False
+        return value
+    value.update(diagnostic_error(error))
+    code = getattr(error, "returncode", None)
+    value["returncode"] = code if type(code) is int else None
+    tail = getattr(error, "command_stderr", getattr(error, "stderr", None))
+    if isinstance(tail, bytes):
+        tail = tail[-4096:].decode("utf-8", errors="replace")
+    elif isinstance(tail, str):
+        tail = tail[-4096:]
+    else:
+        tail = ""
+    value["stderr_captured_characters"] = len(tail)
+    value["stages_observed"] = re.findall(r"(?m)^CGROUP_KILL_STAGE=(start|prewrite_checks_passed|write_returned)$", tail)
+    value["stderr_error_classes"] = sorted(set(re.findall(r"(?m)^(RuntimeError|PermissionError|FileNotFoundError|ProcessLookupError|OSError):", tail)))
+    value["stderr_errno"] = [int(number) for number in re.findall(r"(?m)^(?:PermissionError|FileNotFoundError|ProcessLookupError|OSError): \[Errno (-?[0-9]{1,4})\]", tail)]
+    reasons = ("CompanionRootIdentityRequired", "NamespaceInitIdentityChanged", "NamespaceInitCgroupChanged",
+        "CgroupBindIdentityChanged", "CgroupDomainRequired", "CgroupWriteDescriptorChanged",
+        "CgroupNoLongerFrozen", "CgroupNotFullyFrozen", "CgroupKillShortWrite")
+    value["guest_error_reasons"] = [reason for reason in reasons if "RuntimeError: " + reason in tail]
+    return value
+
+
+def old_container_diagnostic(current, old_id):
+    if not isinstance(current, dict) or current.get("Id") != old_id:
+        return {"exact_old_id_matched": False}
+    state = current.get("State") or {}
+    policy = (current.get("HostConfig") or {}).get("RestartPolicy") or {}
+    return {"exact_old_id_matched": True,
+        "state": {key: state.get(key) for key in ("Running", "Paused", "Restarting", "Dead", "Pid", "ExitCode", "OOMKilled")
+            if type(state.get(key)) in (bool, int)},
+        "restart_policy": {"Name": policy.get("Name") if policy.get("Name") in {"no", "always", "unless-stopped", "on-failure"} else "unknown",
+            "MaximumRetryCount": policy.get("MaximumRetryCount") if type(policy.get("MaximumRetryCount")) is int else None},
+        "restart_count": current.get("RestartCount") if type(current.get("RestartCount")) is int else None}
+
+
 class HostCgroup:
     """Host metadata only; the single privileged write occurs in the companion."""
 
@@ -45,6 +96,11 @@ class HostCgroup:
         self.stop_watch = threading.Event()
         self.watcher = None
         self.empty_observation = None
+        self.last_events = None
+        self.last_events_read_bytes = None
+        self.last_events_error = None
+        self.last_watch_error = None
+        self.watch_error_count = 0
 
     def capture(self, original):
         if sys.platform != "linux" or not Path("/sys/fs/cgroup/cgroup.controllers").is_file():
@@ -117,11 +173,14 @@ class HostCgroup:
             raise RuntimeError("HeldCgroupDirectoryChanged")
         try:
             os.lseek(self.fds["events"], 0, os.SEEK_SET)
-            events = cgroup_events(os.read(self.fds["events"], 4096).decode())
+            raw = os.read(self.fds["events"], 4096)
+            self.last_events_read_bytes = len(raw)
+            events = cgroup_events(raw.decode())
+            self.last_events = events
             if events["populated"] == 0:
                 return {"empty_proof": "held_events_populated_zero", "populated": 0}
-        except (OSError, RuntimeError, ValueError):
-            pass
+        except (OSError, RuntimeError, ValueError) as error:
+            self.last_events_error = diagnostic_error(error)
         # Linux cgroup rmdir rejects populated groups. Path absence alone could
         # be a rename; require the held original directory to be unlinked too.
         link = os.readlink(f"/proc/self/fd/{self.fds['directory']}")
@@ -143,8 +202,9 @@ class HostCgroup:
                     if value:
                         self.empty_observation = value
                         return
-                except (OSError, RuntimeError, ValueError):
-                    pass
+                except (OSError, RuntimeError, ValueError) as error:
+                    self.last_watch_error = diagnostic_error(error)
+                    self.watch_error_count += 1
                 self.stop_watch.wait(0.01)
         self.watcher = threading.Thread(target=watch, name="frozen-cgroup-events", daemon=True)
         self.watcher.start()
@@ -156,6 +216,37 @@ class HostCgroup:
                 return dict(self.empty_observation, original_pid_gone=True)
             time.sleep(0.02)
         raise RuntimeError("CgroupDeathNotProven")
+
+    def diagnostic(self):
+        """Best-effort bounded observations only; never used as death proof."""
+        value = {"last_events": self.last_events, "last_events_read_bytes": self.last_events_read_bytes, "last_events_error": self.last_events_error,
+            "last_watch_error": self.last_watch_error, "watch_error_count": self.watch_error_count,
+            "empty_observation": self.empty_observation, "watcher_alive": bool(self.watcher and self.watcher.is_alive())}
+        try:
+            with Path(f"/proc/{self.pid}/stat").open("rb") as reader:
+                raw = reader.read(4096).decode("utf-8", errors="replace")
+            fields = raw[raw.rfind(")") + 2:].split()
+            ticks = int(fields[19])
+            value["original_pid"] = {"present": True, "state": fields[0] if re.fullmatch(r"[A-Za-z]", fields[0]) else "unknown",
+                "startticks": ticks, "expected_startticks": self.ticks, "original_startticks_match": ticks == self.ticks}
+        except (OSError, ValueError, IndexError) as error:
+            value["original_pid"] = dict(diagnostic_error(error), expected_startticks=self.ticks)
+            if isinstance(error, (FileNotFoundError, ProcessLookupError)):
+                value["original_pid"]["present"] = False
+        try:
+            raw = os.pread(self.fds["events"], 4096, 0)
+            value["current_held_events_read_bytes"] = len(raw)
+            value["current_held_events"] = cgroup_events(raw.decode())
+        except (OSError, RuntimeError, ValueError, AttributeError) as error:
+            value["current_held_events"] = diagnostic_error(error)
+        try:
+            value["held_directory_fd_link"] = os.readlink(f"/proc/self/fd/{self.fds['directory']}")[:1024]
+            current = os.fstat(self.fds["directory"])
+            expected = self.identities["directory"]
+            value["held_directory_identity_match"] = (current.st_dev, current.st_ino) == (expected["device"], expected["inode"])
+        except (OSError, KeyError) as error:
+            value["held_directory"] = diagnostic_error(error)
+        return value
 
     def close(self):
         self.stop_watch.set()
@@ -170,6 +261,8 @@ def cgroup_companion_program(identity, *, kill=False):
     # The kill program can itself die as namespace PID1 exits. Never depend on
     # its acknowledgement, and never run it again after the durable attempt.
     program = "# CGROUP_SINGLE_FILE_" + ("KILL" if kill else "ACCESS") + "\nimport json,os,pathlib,stat\n"
+    if kill:
+        program += "import sys\ndef observe(stage):\n try:print('CGROUP_KILL_STAGE='+stage,file=sys.stderr,flush=True)\n except Exception:pass\nobserve('start')\n"
     program += "expected=" + repr(identity) + "\nroot=pathlib.Path(" + repr(CGROUP_BIND_ROOT) + ")\n"
     program += """if os.geteuid()!=0:raise RuntimeError('CompanionRootIdentityRequired')
 value=pathlib.Path('/proc/1/stat').read_text();ticks=int(value[value.rfind(')')+2:].split()[19])
@@ -188,8 +281,11 @@ try:
         program += " if (root/'cgroup.freeze').read_text().strip()!='1':raise RuntimeError('CgroupNoLongerFrozen')\n"
         program += " events=dict(line.split() for line in (root/'cgroup.events').read_text().splitlines())\n"
         program += " if events.get('frozen')!='1' or events.get('populated')!='1':raise RuntimeError('CgroupNotFullyFrozen')\n"
+        program += " observe('prewrite_checks_passed')\n"
         program += " if os.write(fd,b'1')!=1:raise RuntimeError('CgroupKillShortWrite')\n"
-    program += "finally:os.close(fd)\nprint(json.dumps({'access_verified':True}))\n"
+        program += " observe('write_returned')\n"
+    program += "finally:os.close(fd)\n"
+    program += "print(json.dumps({'access_verified':True,'kill_write_returned':True}))\n" if kill else "print(json.dumps({'access_verified':True}))\n"
     return program
 
 
@@ -264,8 +360,11 @@ def execute(args, *, input=None, timeout=30):
         if args[:3] == ["docker", "exec", "-i"] and input is not None:
             # Only the trusted read-only guard runs through this stdin path.
             # deploy_pre.sh redirects this exception to its private 0600 log.
-            raise RuntimeError("DockerCutoverOperationFailed phase=guard_exec exit="
+            error = RuntimeError("DockerCutoverOperationFailed phase=guard_exec exit="
                 + str(result.returncode) + " " + result.stderr[-4000:].strip())
+            if input.startswith("# CGROUP_SINGLE_FILE_KILL\n"):
+                error.returncode, error.command_stderr = result.returncode, result.stderr[-4096:]
+            raise error
         raise RuntimeError("DockerCutoverOperationFailed")
     return result.stdout.strip()
 
@@ -492,15 +591,42 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
         receipt["kill_attempted"] = True
         receipt["kill_command_invocations"] = 1
         try:
-            run(["docker", "exec", "-i", companion_id, "python", "-B", "-"],
+            output = run(["docker", "exec", "-i", companion_id, "python", "-B", "-"],
                 input=cgroup_companion_program(identity, kill=True), timeout=20)
-        except Exception:
+            try:
+                receipt["kill_command_diagnostic"] = kill_command_diagnostic(output=output)
+            except Exception as error:
+                receipt["kill_command_diagnostic"] = diagnostic_error(error)
+        except Exception as error:
             receipt["kill_command_acknowledgement_missing"] = True
-        death = cgroup.wait_empty(timeout=20)
-        if death.get("original_pid_gone") is not True or death.get("empty_proof") not in {
-                "held_events_populated_zero", "held_original_cgroup_deleted"}:
-            raise RuntimeError("CgroupDeathNotProven")
+            try:
+                receipt["kill_command_diagnostic"] = kill_command_diagnostic(error=error)
+            except Exception as observation_error:
+                receipt["kill_command_diagnostic"] = diagnostic_error(observation_error)
+        try:
+            death = cgroup.wait_empty(timeout=20)
+            if death.get("original_pid_gone") is not True or death.get("empty_proof") not in {
+                    "held_events_populated_zero", "held_original_cgroup_deleted"}:
+                raise RuntimeError("CgroupDeathNotProven")
+        except Exception:
+            # Observation failures never replace the original failed death
+            # proof, authorize recovery, or cause another cgroup write.
+            try:
+                observer = getattr(cgroup, "diagnostic", None)
+                receipt["cgroup_wait_diagnostic"] = observer() if callable(observer) else {"available": False}
+            except Exception as error:
+                receipt["cgroup_wait_diagnostic"] = diagnostic_error(error)
+            try:
+                observed = json.loads(run(["docker", "inspect", old_id], timeout=5))[0]
+                receipt["old_container_wait_diagnostic"] = old_container_diagnostic(observed, old_id)
+            except Exception as error:
+                receipt["old_container_wait_diagnostic"] = diagnostic_error(error)
+            raise
         current = json.loads(run(["docker", "inspect", old_id], timeout=10))[0]
+        try:
+            receipt["old_container_death_diagnostic"] = old_container_diagnostic(current, old_id)
+        except Exception as error:
+            receipt["old_container_death_diagnostic"] = diagnostic_error(error)
         if (container_stable_facts(current) != stable_facts
                 or current["State"].get("Running") is not False or current["State"].get("Restarting")
                 or current["State"].get("Pid") != 0 or current.get("RestartCount") != original_restart_count

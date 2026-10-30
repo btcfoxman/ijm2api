@@ -8,6 +8,7 @@ from contextlib import redirect_stderr
 import io
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -70,6 +71,12 @@ class FakeCgroup:
             raise RuntimeError('CgroupDeathNotProven')
         return {'empty_proof': self.death_proof, 'populated': 0, 'original_pid_gone': True}
 
+    def diagnostic(self):
+        return {'last_events': {'populated': 1, 'frozen': 1},
+            'original_pid': {'present': True, 'state': 'Z', 'startticks': 123456,
+                'expected_startticks': 123456, 'original_startticks_match': True},
+            'last_watch_error': {'error_class': 'PermissionError', 'errno': 13}}
+
     def close(self):
         self.closed = True
 
@@ -92,6 +99,7 @@ class FakeDocker:
         self.old_stopped = False
         self.kill_count = 0
         self.kill_failure_before_effect = False
+        self.kill_error_before_effect = None
         self.kill_error_after_effect = None
         self.access_allowed = True
         self.restart_policy = {'Name': 'always', 'MaximumRetryCount': 0}
@@ -123,6 +131,7 @@ class FakeDocker:
         self.export_failure = False
         self.source_sizes = {'ijm2api.db': 69746688, 'ijm2api.db-wal': 0}
         self.snapshot_capacity_failure = False
+        self.diagnostic_inspect_failure = False
         self.cgroup = FakeCgroup(self)
 
     def export_backup(self, companion_id, destination):
@@ -138,6 +147,8 @@ class FakeDocker:
         self.calls.append(list(args))
         self.inputs.append(input)
         if args[:2] == ["docker", "inspect"]:
+            if timeout == 5 and self.diagnostic_inspect_failure:
+                raise PermissionError(13, 'private diagnostic detail must not leak')
             if args[-1] == self.companion_name:
                 if not self.companion_exists or self.cleanup_inspect_failure:
                     raise RuntimeError("CompanionInspectionUnavailable")
@@ -238,13 +249,15 @@ class FakeDocker:
                 prekill = json.loads(manifest.read_text())
                 assert prekill['frozen_backup_sha256'] == hashlib.sha256(self.backup).hexdigest()
                 self.kill_count += 1
+                if self.kill_error_before_effect:
+                    raise self.kill_error_before_effect
                 if self.kill_failure_before_effect:
                     raise TimeoutError('kill command did not give a result')
                 self.old_stopped = True
                 self.paused = False
                 if self.kill_error_after_effect:
                     raise self.kill_error_after_effect
-                return json.dumps({'access_verified': True})
+                return json.dumps({'access_verified': True, 'kill_write_returned': True})
             assert args[3] == self.companion_id and self.paused
             assert isinstance(input, str) and "FrozenGuardRejected" in input
             self.guard_count += 1
@@ -584,6 +597,118 @@ class FrozenCutoverTests(unittest.TestCase):
                 self.assertEqual(self.docker.restart_policy['Name'], 'no')
                 self.assertNotIn(['docker', 'unpause', self.docker.old_id], self.docker.calls)
                 self.assertNotIn(['docker', 'rm', self.docker.old_id], self.docker.calls)
+
+    def test_prewrite_failure_records_fixed_stages_returncode_and_zombie_without_leaking_stderr(self):
+        private = 'PRIVATE_TOKEN=must-never-appear-in-receipt https://private.invalid/credential'
+        failure = subprocess.CalledProcessError(1, ['synthetic-exec'], stderr=(
+            'CGROUP_KILL_STAGE=start\nRuntimeError: CgroupBindIdentityChanged\n' + private + '\n'))
+        self.docker.kill_error_before_effect = failure
+        with self.assertRaisesRegex(RuntimeError, 'CgroupDeathNotProven'):
+            self.invoke()
+        receipt = self.receipt()
+        diagnostic = receipt['kill_command_diagnostic']
+        self.assertFalse(diagnostic['returned'])
+        self.assertEqual(diagnostic['returncode'], 1)
+        self.assertEqual(diagnostic['stages_observed'], ['start'])
+        self.assertEqual(diagnostic['guest_error_reasons'], ['CgroupBindIdentityChanged'])
+        self.assertEqual(receipt['cgroup_wait_diagnostic']['original_pid']['state'], 'Z')
+        self.assertTrue(receipt['cgroup_wait_diagnostic']['original_pid']['original_startticks_match'])
+        docker_state = receipt['old_container_wait_diagnostic']
+        self.assertTrue(docker_state['exact_old_id_matched'])
+        self.assertEqual(docker_state['state'], {'Running': True, 'Paused': True, 'Restarting': False, 'Pid': 4321})
+        self.assertEqual(docker_state['restart_policy'], {'Name': 'no', 'MaximumRetryCount': 0})
+        encoded = json.dumps(receipt)
+        self.assertNotIn(private, encoded)
+        self.assertNotIn('PRIVATE_TOKEN', encoded)
+        self.assertEqual(self.docker.kill_count, 1)
+        self.assertTrue(receipt['postkill_outcome_requires_operator_review'])
+        self.assertNotIn(['docker', 'unpause', self.docker.old_id], self.docker.calls)
+        self.assertFalse(self.docker.old_removed)
+
+    def test_missing_ack_keeps_fixed_write_stage_but_still_requires_independent_death(self):
+        self.docker.kill_error_after_effect = subprocess.CalledProcessError(137, ['synthetic-exec'], stderr=(
+            'CGROUP_KILL_STAGE=start\nCGROUP_KILL_STAGE=prewrite_checks_passed\n'
+            'CGROUP_KILL_STAGE=write_returned\nPRIVATE_TOKEN=omit\n'))
+        receipt = self.invoke()
+        self.assertTrue(receipt['passed'] and receipt['kill_command_acknowledgement_missing'])
+        self.assertEqual(receipt['kill_command_diagnostic']['returncode'], 137)
+        self.assertEqual(receipt['kill_command_diagnostic']['stages_observed'], ['start', 'prewrite_checks_passed', 'write_returned'])
+        self.assertTrue(receipt['cgroup_death']['original_pid_gone'])
+        self.assertNotIn('PRIVATE_TOKEN', json.dumps(receipt))
+        self.assertEqual(self.docker.kill_count, 1)
+
+    def test_success_stdout_stays_one_json_and_diagnostic_does_not_store_raw_output(self):
+        program = cutover.cgroup_companion_program(self.docker.cgroup.identity, kill=True)
+        self.assertIn("file=sys.stderr,flush=True", program)
+        self.assertEqual(program.count("os.write(fd,b'1')"), 1)
+        self.assertIn("'kill_write_returned':True", program)
+        raw = json.dumps({'access_verified': True, 'kill_write_returned': True, 'raw_secret': 'PRIVATE_TOKEN=omit'})
+        self.assertEqual(cutover.kill_command_diagnostic(output=raw), {
+            'returned': True, 'returncode': 0, 'timed_out': False, 'stages_observed': [], 'guest_write_returned': True})
+        receipt = self.invoke()
+        self.assertTrue(receipt['kill_command_diagnostic']['guest_write_returned'])
+        self.assertEqual(receipt['old_container_death_diagnostic']['state']['Pid'], 0)
+        self.assertTrue(receipt['passed'])
+
+    def test_diagnostic_failures_never_replace_original_death_error_or_authorize_recovery(self):
+        self.docker.kill_failure_before_effect = True
+        self.docker.diagnostic_inspect_failure = True
+        with patch.object(self.docker.cgroup, 'diagnostic', side_effect=RuntimeError('PRIVATE_TOKEN=diagnostic-only')):
+            with self.assertRaisesRegex(RuntimeError, '^CgroupDeathNotProven$'):
+                self.invoke()
+        receipt = self.receipt()
+        self.assertEqual(receipt['cgroup_wait_diagnostic'], {'error_class': 'RuntimeError', 'errno': None})
+        self.assertEqual(receipt['old_container_wait_diagnostic'], {'error_class': 'PermissionError', 'errno': 13})
+        self.assertNotIn('PRIVATE_TOKEN', json.dumps(receipt))
+        self.assertFalse(receipt['passed'] or receipt['original_unpaused_after_abort'])
+        self.assertEqual(self.docker.kill_count, 1)
+        self.assertEqual(self.docker.restart_policy['Name'], 'no')
+
+    def test_host_diagnostic_captures_state_ticks_empty_events_and_watcher_errors_only(self):
+        group = cutover.HostCgroup()
+        group.pid, group.ticks = 4321, 123456
+        group.path = Path('/sys/fs/cgroup/synthetic-original')
+        group.fds = {'directory': 7101, 'events': 7102}
+        group.identities = {'directory': {'device': 7, 'inode': 11}}
+        group.last_events = {'populated': 1, 'frozen': 1}
+        group.last_events_read_bytes = 0
+        group.last_watch_error = {'error_class': 'PermissionError', 'errno': 13}
+        group.watch_error_count = 2
+        stat_bytes = ('4321 (synthetic comm) ' + ' '.join(['Z'] + ['0'] * 18 + ['123456', '0'])).encode()
+        with patch.object(Path, 'open', return_value=io.BytesIO(stat_bytes)), \
+                patch.object(cutover.os, 'pread', create=True, return_value=b'') as read_events, \
+                patch.object(cutover.os, 'readlink', return_value=str(group.path) + ' (deleted)'), \
+                patch.object(cutover.os, 'fstat', return_value=SimpleNamespace(st_dev=7, st_ino=11)):
+            value = group.diagnostic()
+        self.assertEqual(value['original_pid'], {'present': True, 'state': 'Z', 'startticks': 123456, 'expected_startticks': 123456, 'original_startticks_match': True})
+        self.assertEqual(value['current_held_events_read_bytes'], 0)
+        self.assertEqual(value['current_held_events']['error_class'], 'RuntimeError')
+        self.assertEqual(value['held_directory_fd_link'], str(group.path) + ' (deleted)')
+        self.assertTrue(value['held_directory_identity_match'])
+        self.assertEqual(value['last_watch_error'], {'error_class': 'PermissionError', 'errno': 13})
+        read_events.assert_called_once_with(7102, 4096, 0)
+
+    def test_real_execute_and_smoke_transport_keep_returncode_without_publishing_private_stderr(self):
+        stderr = 'CGROUP_KILL_STAGE=start\nPermissionError: [Errno 13] fixed-path\nPRIVATE_TOKEN=omit\n'
+        failed = SimpleNamespace(returncode=1, stdout='', stderr=stderr)
+        program = cutover.cgroup_companion_program(self.docker.cgroup.identity, kill=True)
+        with patch.object(cutover.subprocess, 'run', return_value=failed) as child:
+            with self.assertRaises(RuntimeError) as error:
+                cutover.execute(['docker', 'exec', '-i', 'synthetic', 'python', '-B', '-'], input=program)
+        diagnostic = cutover.kill_command_diagnostic(error=error.exception)
+        self.assertEqual(diagnostic['returncode'], 1)
+        self.assertEqual(diagnostic['stderr_errno'], [13])
+        self.assertNotIn('PRIVATE_TOKEN', json.dumps(diagnostic))
+        child.assert_called_once()
+        path = MODULE.parents[1] / 'tools/test_deploy_freeze_runtime.py'
+        spec = importlib.util.spec_from_file_location('synthetic_smoke_transport', path)
+        smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(smoke)
+        with patch.object(smoke.subprocess, 'run', return_value=failed) as child:
+            with self.assertRaises(RuntimeError) as error:
+                smoke.docker(['exec', '-i', 'synthetic', 'python', '-B', '-'], input=program)
+        self.assertEqual(cutover.kill_command_diagnostic(error=error.exception), diagnostic)
+        child.assert_called_once()
 
     def test_restart_update_result_is_read_back_and_original_retry_count_is_restored(self):
         self.docker.restart_update_timeout_after_effect = True
