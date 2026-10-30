@@ -17,7 +17,7 @@ from test_canvas_execution import context, fake_client, owner, task
 from test_canvas_transport import FakeRunner
 
 
-PUBLIC = '生成请求处理失败，请稍后查询或联系管理员~'
+PUBLIC = '生成提交失败，请稍后重试~'
 FACTS = {'generation_request_sent': False,
          'financial_outcome': 'not_charged_this_invocation', 'automatic_resubmission': False}
 
@@ -286,7 +286,7 @@ def test_historical_service_failure_is_neutral_but_does_not_gain_no_send_evidenc
     service = object.__new__(Service)
     service._refresh_canvas_result_urls = lambda value: value
     result = service.public_task(row)
-    assert result['error'] == {'code': 'SERVICE.1', 'message': PUBLIC}
+    assert result['error'] == {'code': 'SERVICE.1', 'message': '生成服务暂时不可用，请稍后重试~'}
     assert 'provider_context' not in result and row == before
     assert 'private-' not in json.dumps(result)
 

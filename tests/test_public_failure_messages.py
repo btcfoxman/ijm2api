@@ -28,8 +28,11 @@ UNKNOWN = '提交结果未确认，请核对上游任务，暂勿重复提交~'
     ('cli.authentication_required', '生成服务授权暂不可用，请稍后重试~'),
     ('CLI_COMMAND_TIMEOUT', '生成请求处理超时，请稍后查询~'),
     ('CLI_TASK_DEADLINE_EXCEEDED', '生成请求处理超时，请稍后查询~'),
-    ('CLI_INVALID_RESPONSE', '生成服务响应异常，请稍后查询或联系管理员~'),
-    ('cli.invalid_service_response', '生成服务响应异常，请稍后查询或联系管理员~'),
+    ('CLI_INVALID_RESPONSE', '生成服务响应异常，请稍后重试~'),
+    ('cli.invalid_service_response', '生成服务响应异常，请稍后重试~'),
+    ('SERVICE.1', '生成服务暂时不可用，请稍后重试~'),
+    ('CLI_PREPARATION_TRANSIENT_FAILED', '生成提交失败，请稍后重试~'),
+    ('CLI_SUBMISSION_RETRYABLE', '生成提交失败，请稍后重试~'),
     ('CLI_UNRECOGNIZED_FAILURE', '生成请求处理失败，请稍后查询或联系管理员~'),
     ('cli.unrecognized_failure', '生成请求处理失败，请稍后查询或联系管理员~'),
 ])

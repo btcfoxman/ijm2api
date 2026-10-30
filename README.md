@@ -70,6 +70,14 @@ identity-only reselection path and never switch automatically to a browser.
 Lost generation receipts retain the original account and submission UUID.
 Three explicit `operation_submission_absent` responses, or expiry of the fixed
 observation deadline, end the task as `failed` (`CLI_SUBMISSION_UNCONFIRMED`).
+For known invalid-response or retryable service failures, three explicit
+absence responses with no accepted receipt, generated resource or result
+instead return `CLI_SUBMISSION_RETRYABLE`, allowing the caller's next route.
+This includes read-only public projection of matching historical failures;
+the original stored diagnostics, request and financial facts remain unchanged.
+The provider context retains `may_have_been_accepted: true` and unconfirmed
+spend; absence is not treated as proof of no charge. Accepted tasks, partial
+receipts, identity conflicts and incomplete lookups retain their protections.
 No manual verification is required, and the operation is never automatically
 resubmitted. The worker and local
 credit reservation are released; uncertain upstream spend remains recorded
@@ -77,6 +85,11 @@ as unconfirmed, without inventing a zero charge or a refund. The original
 deadline survives restarts. Administrator task details retain the first
 submission error and latest query error. `POST /api/tasks/{id}/reconcile`
 only queries an original operation and cannot revive a closed failure.
+
+Known service and invalid-response failures before generation use bounded
+retries within the original deadline. Draft writes reuse their project, node
+and update IDs; retries do not call `node run`. Exhausted preparation failures
+return a normalized retry message so the caller can select its next route.
 
 
 CLI result downloads preserve original media bytes and are published through

@@ -6,6 +6,7 @@ import re
 
 
 CONTENT_MODERATION_MESSAGE = "检测到内容可能违规，请修改提示词或参考素材后重试~"
+RETRYABLE_SUBMISSION_MESSAGE = "生成提交失败，请稍后重试~"
 
 
 def upstream_review_error(code: str, message: str) -> str | None:
@@ -22,6 +23,10 @@ def upstream_review_error(code: str, message: str) -> str | None:
 def public_error(code: str, message: str) -> dict[str, str]:
     raw = (message or "").lower()
     kind = (code or "").upper()
+    if kind in {'CLI_PREPARATION_TRANSIENT_FAILED', 'CLI_SUBMISSION_RETRYABLE'}:
+        # Call-stage classification is authoritative. Raw diagnostics can quote
+        # arbitrary upstream prose and must not fabricate a policy/refund verdict.
+        return {'code': kind, 'message': RETRYABLE_SUBMISSION_MESSAGE}
     if (kind == 'OPERATOR_CONTENT_RESTRICTED' and message ==
             '检测到内容可能涉及版权或受限内容，请修改后重试，额度已返还~~'):
         return {'code': kind, 'message': message}
@@ -95,11 +100,10 @@ def public_error(code: str, message: str) -> dict[str, str]:
         "CLI.AUTHENTICATION_REQUIRED": "生成服务授权暂不可用，请稍后重试~",
         "CLI_COMMAND_TIMEOUT": "生成请求处理超时，请稍后查询~",
         "CLI_TASK_DEADLINE_EXCEEDED": "生成请求处理超时，请稍后查询~",
-        "CLI_INVALID_RESPONSE": "生成服务响应异常，请稍后查询或联系管理员~",
-        "CLI.INVALID_SERVICE_RESPONSE": "生成服务响应异常，请稍后查询或联系管理员~",
+        "CLI_INVALID_RESPONSE": "生成服务响应异常，请稍后重试~",
+        "CLI.INVALID_SERVICE_RESPONSE": "生成服务响应异常，请稍后重试~",
         # A historical service.1 alone proves no financial outcome or dispatch boundary.
-        "SERVICE.1": "生成请求处理失败，请稍后查询或联系管理员~",
-        "CLI_PREPARATION_TRANSIENT_FAILED": "生成请求处理失败，请稍后查询或联系管理员~",
+        "SERVICE.1": "生成服务暂时不可用，请稍后重试~",
     }
     if kind in messages:
         return {"code": kind, "message": messages[kind]}

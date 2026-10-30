@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .canvas_cli import TRANSPORT_DIAGNOSTIC_COMMANDS, CanvasCLIError, sanitize
-from .canvas_client import (CanvasClient, identity_network_error, preparation_service_unavailable,
+from .canvas_client import (CanvasClient, identity_network_error, preparation_retryable_failure,
                             public_image_source_url)
 from .canvas_timing import PreparationTiming, archived_attempts, INITIAL_ADMISSION_UNSET
 from .canvas_quote_hints import new_hint
@@ -144,6 +144,76 @@ class CanvasServiceMixin:
                                             'automatic_resubmission')}
 
     @staticmethod
+    def _canvas_retryable_submission_failure(task: dict) -> dict:
+        """Caller may fail over after bounded absence; this is not no-send proof."""
+        context = task.get('upstream_context') or {}
+        if not isinstance(context, dict):
+            return {}
+        original = context.get('submit_error') or {}
+        query = context.get('last_query_error') or {}
+        count = context.get('consecutive_submission_absent')
+        if (task.get('execution_backend') != 'canvas_cli'
+                or task.get('status') not in {'failed', 'expired'}
+                or task.get('error_code') not in {'CLI_SUBMISSION_UNCONFIRMED', 'CLI_SUBMISSION_RETRYABLE'}
+                or context.get('reconciliation_closed') is not True
+                or context.get('reconciliation_close_reason') != 'operation_submission_absent'
+                or type(count) is not int or count < 3
+                or not isinstance(query, dict) or query.get('code') != 'cli.operation_submission_absent'
+                or not isinstance(original, dict) or original.get('phase') != 'run_dispatching'
+                or original.get('dispatch_started') is not True or original.get('outcome_unknown') is not True
+                or context.get('submission_phase') != 'run_dispatching'
+                or context.get('financial_outcome') != 'unconfirmed'
+                or type(task.get('account_id')) is not int or task['account_id'] < 1
+                or context.get('account_id') != task.get('account_id')
+                or any(not isinstance(context.get(key), str) or not context[key]
+                       for key in ('profile', 'project_id', 'node_id', 'submit_id'))):
+            return {}
+        # Only the observed service/decode families are eligible. In particular,
+        # an arbitrary unknown, auth error or policy rejection is not a retry.
+        error = CanvasCLIError(str(original.get('code') or ''), '', details={'error': original})
+        if not preparation_retryable_failure(error):
+            return {}
+        normalized = task.get('normalized') or {}
+        if not isinstance(normalized, dict):
+            return {}
+        normalized_context = normalized.get('_execution') or {}
+        if not isinstance(normalized_context, dict):
+            return {}
+        for value in (context, normalized_context):
+            if (value.get('accepted') or value.get('submission_receipt_evidence')
+                    or value.get('resource_ids') or value.get('resourceIds')
+                    or isinstance(value.get('resources'), list) and bool(value['resources'])
+                    or value.get('phase') in {'accepted', 'submitted', 'running', 'succeeded', 'completed'}
+                    or value.get('submission_phase') in {'accepted', 'submitted', 'running'}
+                    or any(value.get(key) for key in ('run_data', 'run_receipt', 'submission', 'receipt',
+                        'operation_ref', 'operationRef', 'operation_id', 'last_operation', 'result_urls', 'result_files'))):
+                return {}
+        if (task.get('run_id') or task.get('thread_id') or task.get('result_urls')
+                or task.get('upstream_result_urls') or context.get('previous_submissions')
+                or context.get('manual_termination')):
+            return {}
+        if context.get('task_id') not in (None, task.get('id')):
+            return {}
+        for key in ('account_id', 'profile', 'project_id', 'node_id', 'submit_id', 'expected_user_id'):
+            if key in normalized_context and normalized_context[key] != context.get(key):
+                return {}
+        timings = [context.get('preparation_timing')]
+        for attempt in context.get('preparation_attempts') or []:
+            if not isinstance(attempt, dict) or attempt.get('reason') == 'accepted':
+                return {}
+            timings.append(attempt.get('timing'))
+        for timing in timings:
+            if isinstance(timing, dict):
+                commands = timing.get('commands') or {}
+                if not isinstance(commands, dict):
+                    return {}
+                run = commands.get('node run')
+                if run is not None and (not isinstance(run, dict) or type(run.get('count')) is not int or run['count'] > 1):
+                    return {}
+        return {'may_have_been_accepted': True, 'financial_outcome': 'unconfirmed',
+                'automatic_resubmission': False, 'fallback_allowed': True}
+
+    @staticmethod
     def _canvas_diagnostic(error, phase: str) -> dict:
         """Keep useful scalar evidence, never a raw CLI envelope or credential."""
         details = getattr(error, 'details', None) or {}
@@ -255,8 +325,11 @@ class CanvasServiceMixin:
             'reconciliation_paused': False, 'financial_outcome': 'unconfirmed',
             'closed_submission_diagnostic': original},
             remove=('reconciliation_pause_reason', 'reconciliation_paused_at'))
+        candidate = {**task, 'status': 'failed', 'error_code': 'CLI_SUBMISSION_UNCONFIRMED',
+                     'upstream_context': context}
+        retryable = self._canvas_retryable_submission_failure(candidate)
         return self._update_canvas_task(task_id, {'status': 'failed', 'progress': 100,
-            'completed_at': time.time(), 'error_code': 'CLI_SUBMISSION_UNCONFIRMED',
+            'completed_at': time.time(), 'error_code': 'CLI_SUBMISSION_RETRYABLE' if retryable else 'CLI_SUBMISSION_UNCONFIRMED',
             'error_message': message[:600],
             'upstream_context': context})
 
@@ -661,7 +734,7 @@ class CanvasServiceMixin:
                         'preparation_timing': timing.snapshot()}, 'preparation_timing': timing.snapshot()})
                 expired_preparation = not submission_started and time.monotonic() >= deadline
                 facts = (self._canvas_pre_dispatch_facts(self.store.task(task_id) or {}, exc, submission_started)
-                         if preparation_service_unavailable(exc) and not prior_dispatch_evidence else {})
+                         if preparation_retryable_failure(exc) and not prior_dispatch_evidence else {})
                 if facts:
                     self._canvas_context(task_id, {'pre_dispatch_failure': facts})
                 self._fail_canvas_task(task_id, 'CLI_PREPARATION_TRANSIENT_FAILED' if facts else

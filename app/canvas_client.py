@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from .canvas_cli import CanvasCLI, CanvasCLIError, account_profile, admission_verdict, sanitize
+from .canvas_cli import CanvasCLI, CanvasCLIError, _has_accepted, account_profile, admission_verdict, sanitize
 from .catalog import ALIASES, media_alias_kind
 from .errors import public_error, upstream_review_error
 
@@ -46,6 +46,21 @@ def preparation_service_unavailable(exc: CanvasCLIError) -> bool:
         and error.get('requiredAction') == 'retry'
         and str(error.get('reason') or '') in {'', 'service_unavailable'}
         and not any(error.get(key) for key in ('resources', 'submission', 'items', 'accepted')))
+
+
+def preparation_retryable_failure(exc: CanvasCLIError) -> bool:
+    """Known service/decoding failures of a command which cannot generate."""
+    if preparation_service_unavailable(exc):
+        return True
+    error = exc.details.get('error') or {}
+    return (not exc.outcome_unknown
+        and exc.code in {'cli.invalid_service_response', 'CLI_INVALID_RESPONSE'}
+        and isinstance(error, dict) and error.get('code') in (None, exc.code)
+        and error.get('class') in (None, '', 'internal_failure')
+        and error.get('requiredAction') in (None, '', 'retry', 'contact_support')
+        and error.get('serviceCode') in (None, '')
+        and not any(error.get(key) for key in ('resources', 'submission', 'items', 'accepted'))
+        and not exc.details.get('partialData'))
 
 
 def _read_only_transport_retry(args: list[str], exc: CanvasCLIError) -> bool:
@@ -421,6 +436,24 @@ class CanvasClient:
                 self._sleep(0.25 * 2 ** attempt, deadline)
         raise AssertionError("unreachable")
 
+    def _preparation_write(self, args: list[str], *, deadline: float | None = None) -> dict[str, Any]:
+        """At most three same-ID draft writes; never a generation command."""
+        pair = tuple(args[:2])
+        required = ('--project-id', '--node-id', '--update-id') if pair == ('node', 'create') else ('--project-id',)
+        if (pair not in {('canvas', 'create'), ('node', 'create')}
+                or any(arg.split('=', 1)[0] in {'--run', '--submit-id', '--credit-token'} for arg in args)
+                or any(args.count(flag) != 1 or args.index(flag) + 1 >= len(args) or not args[args.index(flag) + 1]
+                       for flag in required)):
+            raise CanvasCLIError('CLI_PREPARATION_WRITE_INVALID', 'Canvas preparation retry requires its original draft IDs')
+        for attempt in range(3):
+            try:
+                return self._call(args, deadline=deadline)
+            except CanvasCLIError as exc:
+                if attempt == 2 or not preparation_retryable_failure(exc):
+                    raise
+                self._sleep(0.25 * 2 ** attempt, deadline)
+        raise AssertionError('unreachable')
+
     def identity(self, *, deadline: float | None = None) -> dict[str, Any]:
         validated = None
         for attempt in range(3):
@@ -510,7 +543,7 @@ class CanvasClient:
                 break
             args = ["canvas", "ls", "--limit", "100", "--cursor", str(data["nextCursor"])]
         try:
-            self._call(["canvas", "create", f"IJM account {self.account['id']}", "--project-id", wanted], deadline=deadline)
+            self._preparation_write(["canvas", "create", f"IJM account {self.account['id']}", "--project-id", wanted], deadline=deadline)
         except CanvasCLIError:
             # Creation is idempotent by the already persisted project UUID.
             # Re-read once after a lost response; never allocate another ID.
@@ -707,7 +740,7 @@ class CanvasClient:
         with self._project_guard(context, deadline):
             save("saving")
             with self._phase('draft_save'):
-                self._call(args, deadline=deadline)
+                self._preparation_write(args, deadline=deadline)
             save("quoting")
             with self._phase('quote'):
                 quote = self._call(["node", "quote", "--project-id", context["project_id"],
@@ -775,8 +808,7 @@ class CanvasClient:
                                                timeout=remaining(), deadline=deadline)
                         break
                     except CanvasCLIError as exc:
-                        if (exc.code != "cli.invalid_service_response"
-                                and not preparation_service_unavailable(exc)) or attempt == 2:
+                        if not preparation_retryable_failure(exc) or attempt == 2:
                             raise
                         # Keep confirmation's established pre-dispatch deadline error.
                         time.sleep(min(0.25 * 2 ** attempt, remaining()) if deadline is not None
@@ -817,6 +849,8 @@ class CanvasClient:
                 result = self._call(["node", "run", "--project-id", context["project_id"],
                                      "--node-id", context["node_id"], "--submit-id", context["submit_id"],
                                      "--credit-token", token], timeout=budget, deadline=deadline)
+                if _has_accepted({'data': result}):
+                    context['submission_receipt_evidence'] = True
                 items = result.get("items")
                 if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
                     raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas acceptance result is incomplete", outcome_unknown=True)
@@ -842,6 +876,13 @@ class CanvasClient:
             # already changed the caller's in-memory phase before failing.
             if not dispatched:
                 exc.outcome_unknown = False
+            # Preserve only a veto bit before diagnostic redaction discards an
+            # ambiguous/partial receipt. No raw envelope or resource ID is added.
+            source = exc.details.get('error') or {}
+            if (_has_accepted(exc.details) or exc.details.get('partialData')
+                    or isinstance(source, dict) and any(source.get(key)
+                        for key in ('resources', 'submission', 'items', 'accepted'))):
+                context['submission_receipt_evidence'] = True
             diagnostic = safe_cli_diagnostic(exc, secrets=(token,) if isinstance(token, str) else ())
             diagnostic.update({"dispatch_started": dispatched, "phase": context.get("submission_phase", "confirming")})
             context["submit_error"] = diagnostic

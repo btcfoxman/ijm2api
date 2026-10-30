@@ -1338,6 +1338,18 @@ class Service(CanvasServiceMixin):
         self.store.update_task(task_id, {"status": "failed", "progress": 100,
             "error_code": code, "error_message": message[:600], "completed_at": time.time()}, preserve_terminal=True)
 
+    def _public_task_failure(self, task: dict[str, Any]) -> tuple[dict, dict]:
+        # Historical rows retain their original diagnostic, identity and finance.
+        # Only a bounded, empty original-submission lookup enables route retry.
+        facts = self._canvas_retryable_submission_failure(task)
+        if facts:
+            return public_error('CLI_SUBMISSION_RETRYABLE', task['error_message']), facts
+        if task['error_code'] == 'CLI_SUBMISSION_RETRYABLE':
+            # A stale retry label cannot override a later receipt or conflict.
+            return public_error('CLI_SUBMISSION_UNCONFIRMED', task['error_message']), {}
+        return (public_error(task['error_code'], task['error_message']),
+                self._canvas_public_pre_dispatch_facts(task))
+
     def image_response(self, task: dict[str, Any]) -> dict[str, Any]:
         task = self._refresh_canvas_result_urls(task)
         status = {"succeeded": "completed", "failed": "failed",
@@ -1352,7 +1364,9 @@ class Service(CanvasServiceMixin):
             "error": None,
         }
         if status == "failed":
-            result["error"] = public_error(task["error_code"], task["error_message"])
+            result['error'], facts = self._public_task_failure(task)
+            if facts:
+                result['provider_context'] = facts
         return result
 
     def public_task(self, task: dict[str, Any]) -> dict[str, Any]:
@@ -1361,9 +1375,6 @@ class Service(CanvasServiceMixin):
             result = self.image_response(task)
             result["progress"] = task["progress"]
             result["data"] = [{"url": url} for url in task["result_urls"]]
-            facts = self._canvas_public_pre_dispatch_facts(task)
-            if facts:
-                result['provider_context'] = facts
             return result
         if (task["status"] == "succeeded" and task["model"] == "sd-2-5-480p-x"
                 and task["result_urls"] and expires_soon(task.get("result_transfer") or {})):
@@ -1382,8 +1393,7 @@ class Service(CanvasServiceMixin):
                   "data": [{"url": url} for url in task["result_urls"]],
                   "account_id": task.get("account_id")}
         if task["status"] in {"failed", "expired"}:
-            result["error"] = public_error(task["error_code"], task["error_message"])
-            facts = self._canvas_public_pre_dispatch_facts(task)
+            result['error'], facts = self._public_task_failure(task)
             if facts:
                 result['provider_context'] = facts
         return result
