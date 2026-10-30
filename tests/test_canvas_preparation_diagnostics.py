@@ -1,8 +1,8 @@
 """Preparation failure facts retain only output hashes, never raw CLI text."""
 import hashlib
-import io
 import json
-from types import SimpleNamespace
+import subprocess
+import sys
 from unittest.mock import Mock, patch
 
 import pytest
@@ -14,13 +14,14 @@ from test_canvas_execution import context, fake_client, owner, task
 
 def captured_error(tmp_path, stdout, stderr=b'', *, pair=('node', 'create'), exit_code=1):
     runner = CanvasCLI(tmp_path, allow_unwrapped_for_tests=True)
-    process = SimpleNamespace(stdout=io.BytesIO(stdout), stderr=io.BytesIO(stderr),
-                              poll=lambda: exit_code, returncode=exit_code)
-    with patch.object(runner, 'environment', return_value={}), \
-            patch.object(runner, 'profile', return_value='synthetic-profile'), \
-            patch('app.canvas_cli.subprocess.Popen', return_value=process) as spawn:
+    actual = subprocess.Popen
+    program = f'import os,sys;os.write(1,{stdout!r});os.write(2,{stderr!r});sys.exit({exit_code!r})'
+    def toy_process(command, **kwargs):
+        return actual([sys.executable, '-c', program], **kwargs)
+    with patch('app.canvas_cli.subprocess.Popen', side_effect=toy_process) as spawn:
         with pytest.raises(CanvasCLIError) as caught:
-            runner.run({'id': 1}, [*pair, 'private-argument'], timeout=5)
+            runner.run({'id': 1, 'proxy_url': 'socks5://proxy.example.test:20001'},
+                       [*pair, 'private-argument'], timeout=5)
     spawn.assert_called_once()
     return caught.value
 

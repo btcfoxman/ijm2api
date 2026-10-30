@@ -1,8 +1,8 @@
 """A transient local version/schema failure cannot disable CLI until restart."""
 import hashlib
-import io
 import json
-from types import SimpleNamespace
+import subprocess
+import sys
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -129,14 +129,15 @@ def test_successful_first_probe_does_not_add_an_extra_invocation(tmp_path):
 @pytest.mark.parametrize('command', ['version', 'schema'])
 def test_local_probe_error_retains_only_exact_command_and_output_fingerprints(tmp_path, command):
     raw = b'private prompt token=private-token https://private.test/signed?secret=value'
-    process = SimpleNamespace(stdout=io.BytesIO(raw), stderr=io.BytesIO(b'noise'),
-        poll=lambda: 1, returncode=1)
     runner = CanvasCLI(tmp_path, allow_unwrapped_for_tests=True)
-    with patch.object(runner, 'environment', return_value={}), \
-            patch.object(runner, 'profile', return_value='synthetic-profile'), \
-            patch('app.canvas_cli.subprocess.Popen', return_value=process) as spawn:
+    actual = subprocess.Popen
+    program = f'import os,sys;os.write(1,{raw!r});os.write(2,b"noise");sys.exit(1)'
+    def toy_process(arguments, **kwargs):
+        return actual([sys.executable, '-c', program], **kwargs)
+    with patch('app.canvas_cli.subprocess.Popen', side_effect=toy_process) as spawn:
         with pytest.raises(CanvasCLIError) as caught:
-            runner.run({'id': 2147483647}, [command], timeout=5)
+            runner.run({'id': 2147483647, 'proxy_url': 'socks5://proxy.example.test:20001'},
+                       [command], timeout=5)
     spawn.assert_called_once()
     error = caught.value
     assert error.code == 'CLI_INVALID_RESPONSE' and error.exit_code == 1
