@@ -40,8 +40,9 @@ def boundary(tmp_path, monkeypatch):
     runner.close()
 
 
-@pytest.mark.parametrize("competing", [["node", "show"], ["node", "confirm"], ["node", "create"]])
-def test_confirmation_dispatch_is_atomic_per_account_but_other_accounts_continue(boundary, competing):
+@pytest.mark.parametrize("competing", [["node", "show"], ["node", "confirm", "--project-id", "project-original"],
+    ["node", "create", "video", "--project-id=project-original"]])
+def test_confirmation_dispatch_excludes_project_writers_but_queries_continue(boundary, competing):
     runner, client, context, calls, _ = boundary
     at_persist, release, same_done, other_done = (threading.Event() for _ in range(4))
     failures, threads = [], []
@@ -77,15 +78,21 @@ def test_confirmation_dispatch_is_atomic_per_account_but_other_accounts_continue
             threads.append(thread)
             thread.start()
         assert other_done.wait(1), "A different account must not wait for this confirmation"
-        assert not same_done.wait(0.03), "Same-account commands cannot interleave before paid dispatch"
+        if competing[:2] == ["node", "show"]:
+            assert same_done.wait(1), "Same-account read-only commands must remain concurrent"
+        else:
+            assert not same_done.wait(0.03), "Same-project writes cannot interleave before paid dispatch"
     finally:
         release.set()
         for thread in threads:
             thread.join(3)
     assert not failures
     assert not any(thread.is_alive() for thread in threads)
-    assert calls.index((19, ("node", "run"))) < max(i for i, call in enumerate(calls)
-        if call == (19, tuple(competing)))
+    if competing[:2] == ["node", "show"]:
+        assert calls.index((19, ("node", "show"))) < calls.index((19, ("node", "run")))
+    else:
+        assert calls.index((19, ("node", "run"))) < max(i for i, call in enumerate(calls)
+            if call == (19, tuple(competing[:2])))
     assert context["phase"] == "accepted"
 
 
@@ -146,7 +153,7 @@ def test_waiting_for_submission_guard_consumes_original_deadline_and_does_not_co
     held, release = threading.Event(), threading.Event()
 
     def hold():
-        with runner.account_guard({"id": 19}):
+        with runner.project_guard({"id": 19}, context['project_id']):
             held.set()
             release.wait(2)
 

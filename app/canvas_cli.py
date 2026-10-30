@@ -12,6 +12,7 @@ import hashlib
 import os
 import re
 import selectors
+import shutil
 import signal
 import subprocess
 import sys
@@ -23,9 +24,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from .canvas_account_lane import AccountLane
+
 
 PINNED_VERSION = "1.2.0"
 PINNED_PROXY_VERSION = "0.8.3"
+PINNED_GLOBAL_LINUX_SHA256 = "2bb3bd62585178017a153dcdaf40991e0ac78a80edbeefebbe611cee193ef649"
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 TRANSPORT_DIAGNOSTIC_COMMANDS = frozenset({('auth', 'account'), ('auth', 'status'),
     ('auth', 'login'), ('auth', 'wait'), ('auth', 'refresh'), ('auth', 'logout'),
@@ -195,8 +199,23 @@ class CanvasCLI:
         self.max_output_bytes = max(1024, int(max_output_bytes))
         self._guard = threading.Lock()
         self._locks: dict[int, threading.RLock] = {}
-        self._processes: dict[int, subprocess.Popen[bytes]] = {}
+        self._lanes: dict[int, AccountLane] = {}
+        self._project_locks: dict[tuple[int, str], threading.RLock] = {}
+        self._processes: dict[int, set[subprocess.Popen[bytes]]] = {}
         self._closed = threading.Event()
+        # Cache the artifact check once, never read the binary per command.
+        self._pinned_global_artifact = False
+        try:
+            path = shutil.which(self.binary)
+            if path:
+                digest = hashlib.sha256()
+                with open(path, 'rb') as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b''):
+                        digest.update(block)
+                self._pinned_global_artifact = digest.hexdigest() == PINNED_GLOBAL_LINUX_SHA256
+        except OSError:
+            pass
+        self._parallel_verified = self._allow_unwrapped_for_tests
 
     def account_directory(self, account: dict[str, Any]) -> Path:
         return self.data_dir / "canvas-cli" / f"account-{_account_id(account)}"
@@ -208,6 +227,7 @@ class CanvasCLI:
         changed binary cannot silently borrow the service's default egress.
         Service startup can catch this error and keep explicit browser mode up.
         """
+        self._parallel_verified = False
         probe = {"id": 2147483647, "proxy_url": "http://127.0.0.1:9"}
         version = self.run(probe, ["version"], timeout=10)["data"]
         if (version.get("version") != PINNED_VERSION or version.get("distribution") != "global"
@@ -243,15 +263,24 @@ class CanvasCLI:
         if (not {"format", "non-interactive", "profile"} <= globals_
                 or any(name not in commands or not flags <= commands[name] for name, flags in required.items())):
             raise CanvasCLIError("CLI_RUNTIME_INCOMPATIBLE", "Canvas CLI is missing required command contracts")
+        self._parallel_verified = self._allow_unwrapped_for_tests or self._pinned_global_artifact
         return {"available": True, "version": version["version"], "commit": version.get("commit"),
                 "distribution": version["distribution"], "schema_version": str(schema["schemaVersion"]),
                 "proxy_transport": "test_unwrapped" if self._allow_unwrapped_for_tests else "graftcp",
-                "proxy_version": None if self._allow_unwrapped_for_tests else PINNED_PROXY_VERSION}
+                "proxy_version": None if self._allow_unwrapped_for_tests else PINNED_PROXY_VERSION,
+                "parallel_account_commands": self._parallel_verified}
 
-    def profile(self, account: dict[str, Any]) -> str:
+    def profile(self, account: dict[str, Any], *, deadline: float | None = None) -> str:
         """The epoch also isolates OS keyring entries after an account reset."""
         directory = self.account_directory(account)
-        with self._lock(_account_id(account)):
+        lock = self._lock(_account_id(account))
+        remaining = deadline - time.monotonic() if deadline is not None else None
+        if remaining is not None and remaining <= 0:
+            raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas profile deadline expired')
+        acquired = lock.acquire() if remaining is None else lock.acquire(timeout=remaining)
+        if not acquired:
+            raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas profile deadline expired while waiting for metadata')
+        try:
             path = directory / "credential-profile"
             if path.is_file():
                 value = path.read_text(encoding="utf-8").strip()
@@ -265,6 +294,8 @@ class CanvasCLI:
             if os.name != "nt":
                 path.chmod(0o600)
             return value
+        finally:
+            lock.release()
 
     def invalidate(self, account_id: int) -> None:
         """Retain old recovery data and retire its credential profile permanently.
@@ -274,7 +305,7 @@ class CanvasCLI:
         ensures that it can never be reused implicitly by this local account.
         """
         account = {"id": account_id}
-        with self._lock(_account_id(account)):
+        with self.account_guard(account, exclusive=True, deadline=time.monotonic() + self.timeout), self._lock(_account_id(account)):
             with self._guard:
                 if account_id in self._processes:
                     raise CanvasCLIError("CLI_ACCOUNT_BUSY", "Canvas account has an active command")
@@ -350,24 +381,87 @@ class CanvasCLI:
         return path
 
     def _lock(self, account_id: int) -> threading.RLock:
+        """Short profile/epoch file access only; never a network command lock."""
         with self._guard:
             return self._locks.setdefault(account_id, threading.RLock())
 
+    def _lane(self, account_id: int) -> AccountLane:
+        with self._guard:
+            # A few contract-test runners deliberately borrow account_guard.
+            if not hasattr(self, '_lanes'):
+                self._lanes = {}
+            return self._lanes.setdefault(account_id, AccountLane(clock=lambda: time.monotonic()))
+
     @contextmanager
-    def account_guard(self, account: dict[str, Any], *, deadline: float | None = None):
-        """Keep a bounded sequence on the same account's command lock."""
-        lock = self._lock(_account_id(account))
-        remaining = deadline - time.monotonic() if deadline is not None else None
-        if remaining is not None and remaining <= 0:
-            raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas task deadline expired before acquiring its account')
-        acquired = lock.acquire() if remaining is None else lock.acquire(timeout=remaining)
-        if not acquired:
-            raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas task deadline expired while waiting for its account')
+    def account_guard(self, account: dict[str, Any], *, deadline: float | None = None,
+                      exclusive: bool = False):
+        """Hold task/profile identity stable while allowing independent tasks."""
+        lane = CanvasCLI._lane(self, _account_id(account))
+        exclusive = exclusive or not getattr(self, '_parallel_verified', False)
+        try:
+            lane.acquire(exclusive=exclusive, deadline=deadline, stopped=self._closed)
+        except TimeoutError:
+            raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas task deadline expired while waiting for its account') from None
+        except InterruptedError:
+            raise CanvasCLIError('CLI_STOPPING', 'Canvas CLI transport is stopping') from None
         try:
             if deadline is not None and time.monotonic() >= deadline:
                 raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas task deadline expired before starting its account sequence')
             if self._closed.is_set():
                 raise CanvasCLIError('CLI_STOPPING', 'Canvas CLI transport is stopping')
+            yield
+        finally:
+            lane.release(exclusive=exclusive)
+
+    @contextmanager
+    def command_guard(self, account: dict[str, Any], args: list[str], *,
+                      deadline: float | None = None):
+        # Unknown/future auth commands remain writers; only these proved reads
+        # may share the pinned global DevicePassport credential-file reader.
+        exclusive = bool(args) and args[0] == 'auth' and (len(args) < 2 or args[1] not in {'account', 'status'})
+        project = None
+        draft_command = len(args) > 1 and args[0] == 'node' and args[1] != 'show'
+        if draft_command:
+            values = []
+            value_flags = {'--project-id', '--node-id', '--update-id', '--title', '--mode', '--model',
+                           '--prompt', '--ratio', '--resolution', '--ref', '--duration', '--count',
+                           '--submit-id', '--credit-token', '--credit-ceiling'}
+            index = 2
+            while index < len(args):
+                flag, equals, value = args[index].partition('=')
+                if flag == '--project-id':
+                    values.append(value if equals else args[index + 1] if index + 1 < len(args) else '')
+                index += 2 if not equals and flag in value_flags else 1
+            project = values[0] if len(values) == 1 and values[0] else None
+            # An unbound/ambiguous raw mutation cannot bypass draft isolation.
+            exclusive = exclusive or project is None
+        with self.account_guard(account, deadline=deadline, exclusive=exclusive):
+            if project is None:
+                yield
+            else:
+                with self.project_guard(account, project, deadline=deadline):
+                    yield
+
+    @contextmanager
+    def project_guard(self, account: dict[str, Any], project_id: str, *, deadline: float | None = None):
+        """Only draft-save/quote and confirm/run sections exclude each other."""
+        if not isinstance(project_id, str) or not project_id or len(project_id) > 128:
+            raise CanvasCLIError('CLI_ARGUMENT_INVALID', 'Canvas project binding is invalid')
+        with self._guard:
+            lock = self._project_locks.setdefault((_account_id(account), project_id), threading.RLock())
+        while True:
+            if self._closed.is_set():
+                raise CanvasCLIError('CLI_STOPPING', 'Canvas CLI transport is stopping')
+            remaining = deadline - time.monotonic() if deadline is not None else None
+            if remaining is not None and remaining <= 0:
+                raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas draft deadline expired while waiting for its project')
+            if lock.acquire(timeout=min(.05, remaining) if remaining is not None else .05):
+                break
+        try:
+            if self._closed.is_set():
+                raise CanvasCLIError('CLI_STOPPING', 'Canvas CLI transport is stopping')
+            if deadline is not None and time.monotonic() >= deadline:
+                raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas draft deadline expired before its critical section')
             yield
         finally:
             lock.release()
@@ -608,14 +702,14 @@ class CanvasCLI:
     def cancel(self, account: dict[str, Any] | int) -> None:
         account_id = account if isinstance(account, int) else _account_id(account)
         with self._guard:
-            process = self._processes.get(account_id)
-        if process:
+            processes = tuple(self._processes.get(account_id, ()))
+        for process in processes:
             self._terminate(process)
 
     def close(self) -> None:
         self._closed.set()
         with self._guard:
-            processes = list(self._processes.values())
+            processes = [process for values in self._processes.values() for process in tuple(values)]
         for process in processes:
             self._terminate(process)
 
@@ -627,14 +721,7 @@ class CanvasCLI:
             raise CanvasCLIError("CLI_ARGUMENT_INVALID", "Canvas command arguments are invalid")
         if any(a in {"--profile", "--format", "--yes"} or a.startswith("--profile=") for a in args):
             raise CanvasCLIError("CLI_ARGUMENT_INVALID", "Canvas transport controls profile and output flags")
-        lock = self._lock(account_id)
-        remaining = deadline - time.monotonic() if deadline is not None else None
-        if remaining is not None and remaining <= 0:
-            raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas task deadline expired before acquiring its account')
-        acquired = lock.acquire() if remaining is None else lock.acquire(timeout=remaining)
-        if not acquired:
-            raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas task deadline expired while waiting for its account')
-        try:
+        with self.command_guard(account, args, deadline=deadline):
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -643,14 +730,12 @@ class CanvasCLI:
             if self._closed.is_set():
                 raise CanvasCLIError("CLI_STOPPING", "Canvas CLI transport is stopping")
             return self._execute(account, args, timeout, deadline=deadline)
-        finally:
-            lock.release()
 
     def _execute(self, account: dict[str, Any], args: list[str], timeout: float | None, *,
                  deadline: float | None = None) -> dict[str, Any]:
         account_id = _account_id(account)
         command = [self.binary, "--format", "json", "--non-interactive",
-                   "--profile", self.profile(account), *args]
+                   "--profile", self.profile(account, deadline=deadline), *args]
         env = self.environment(account)
         proxy_config = None
         if not self._allow_unwrapped_for_tests:
@@ -679,10 +764,14 @@ class CanvasCLI:
             raise CanvasCLIError(code, f"Canvas protected command could not start: {type(exc).__name__}") from None
         self._capture_process_group(process)
         with self._guard:
-            self._processes[account_id] = process
+            self._processes.setdefault(account_id, set()).add(process)
+            stopping = self._closed.is_set()
         budget = max(0.1, float(timeout if timeout is not None else self.timeout))
         deadline = min(deadline, time.monotonic() + budget) if deadline is not None else time.monotonic() + budget
         try:
+            if stopping:
+                raise CanvasCLIError('CLI_STOPPING', 'Canvas CLI stopped while starting its command',
+                                     outcome_unknown=args[:2] == ['node', 'run'])
             buffers, collection_failure = self._collect_output(process, deadline)
         finally:
             self._terminate(process)
@@ -690,7 +779,11 @@ class CanvasCLI:
                 if stream:
                     stream.close()
             with self._guard:
-                self._processes.pop(account_id, None)
+                members = self._processes.get(account_id)
+                if members is not None:
+                    members.discard(process)
+                    if not members:
+                        self._processes.pop(account_id, None)
             if proxy_config:
                 proxy_config.unlink(missing_ok=True)
         paid_submit = args[:2] == ["node", "run"]

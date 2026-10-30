@@ -172,10 +172,10 @@ class PreparationTiming:
         self._changed()
         # Custom/test runners may expose a guard without actually taking that
         # lock in run(). Their lock wait is unknown, rather than an invented 0.
-        guard = runner.account_guard if isinstance(runner, CanvasCLI) else None
+        guard = runner.command_guard if isinstance(runner, CanvasCLI) else None
         execution_started = None
         try:
-            manager = guard(account, deadline=kwargs.get('deadline')) if callable(guard) else nullcontext()
+            manager = guard(account, args, deadline=kwargs.get('deadline')) if callable(guard) else nullcontext()
             with manager:
                 if callable(guard):
                     entry['lock_wait_ms'] = self._ms(started)

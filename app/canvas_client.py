@@ -634,6 +634,18 @@ class CanvasClient:
                 assets: dict[str, list[Any]], *,
                 persist: Callable[[dict[str, Any]], Any] | None = None,
                 deadline: float | None = None) -> dict[str, Any]:
+        guard = self.runner.account_guard if isinstance(self.runner, CanvasCLI) else None
+        with guard(self.account, deadline=deadline) if callable(guard) else nullcontext():
+            return self._prepare(normalized, task_id, assets, persist=persist, deadline=deadline)
+
+    def _project_guard(self, context, deadline):
+        return (self.runner.project_guard(self.account, context['project_id'], deadline=deadline)
+                if isinstance(self.runner, CanvasCLI) else nullcontext())
+
+    def _prepare(self, normalized: dict[str, Any], task_id: str,
+                 assets: dict[str, list[Any]], *,
+                 persist: Callable[[dict[str, Any]], Any] | None = None,
+                 deadline: float | None = None) -> dict[str, Any]:
         kind = "image" if normalized.get("kind") == "image" else "video"
         counts = {x: len(assets.get(x, [])) for x in ("images", "videos", "audios")}
         model = self.preflight_model(normalized, deadline=deadline)
@@ -644,6 +656,7 @@ class CanvasClient:
             context = copy.deepcopy(old)
             if context.get("account_id") != int(self.account["id"]):
                 raise CanvasCLIError("CLI_ACCOUNT_MISMATCH", "An existing Canvas task cannot move to another account")
+            self._check_context(context, deadline=deadline)
         else:
             context = {"backend": "canvas_cli", "account_id": int(self.account["id"]),
                        "profile": self.runner.profile(self.account) if hasattr(self.runner, "profile") else account_profile(self.account),
@@ -691,13 +704,14 @@ class CanvasClient:
         for group in ("images", "videos", "audios"):
             for resource_id in context["resources"][group]:
                 args.extend(["--ref", "res:" + resource_id])
-        save("saving")
-        with self._phase('draft_save'):
-            self._call(args, deadline=deadline)
-        save("quoting")
-        with self._phase('quote'):
-            quote = self._call(["node", "quote", "--project-id", context["project_id"],
-                                "--node-id", context["node_id"]], read_only=True, deadline=deadline)
+        with self._project_guard(context, deadline):
+            save("saving")
+            with self._phase('draft_save'):
+                self._call(args, deadline=deadline)
+            save("quoting")
+            with self._phase('quote'):
+                quote = self._call(["node", "quote", "--project-id", context["project_id"],
+                                    "--node-id", context["node_id"]], read_only=True, deadline=deadline)
         items = quote.get("items")
         if (not isinstance(items, list) or len(items) != 1 or items[0].get("nodeId") != context["node_id"]
                 or items[0].get("error") or items[0].get("generationDiff") or not quote.get("confirmable", False)):
@@ -746,11 +760,11 @@ class CanvasClient:
                                          outcome_unknown=dispatched) from cause
 
         try:
-            # Each CLI command uses this same reentrant lock. Keep confirmation
-            # and its single paid dispatch together, never generation polling.
-            with self.runner.account_guard(self.account, deadline=deadline):
+            # Keep this task's credential/profile identity stable from confirm
+            # through its single run. Other tasks keep independent bindings.
+            with self.runner.account_guard(self.account, deadline=deadline), self._project_guard(context, deadline):
                 remaining()
-                self._check_context(context)
+                self._check_context(context, deadline=deadline)
                 save("confirming")
                 # Confirmation only mints a spending-ceiling token. Retrying it
                 # never starts generation; node run below is attempted once only.
@@ -939,7 +953,10 @@ class CanvasClient:
 
     def poll(self, context: dict[str, Any], *, deadline: float | None = None) -> dict[str, Any]:
         with self.runner.account_guard(self.account, deadline=deadline):
-            self._check_context(context)
+            self._check_context(context, deadline=deadline)
+            return self._poll(context, deadline=deadline)
+
+    def _poll(self, context: dict[str, Any], *, deadline: float | None = None) -> dict[str, Any]:
         data = self._call(["operation", "status", context["submit_id"],
                            "--project-id", context["project_id"]], read_only=True, deadline=deadline)
         reference = data.get("operationRef")
@@ -1018,8 +1035,11 @@ class CanvasClient:
         result.update(status="succeeded", progress=100)
         return result
 
-    def _check_context(self, context: dict[str, Any]) -> None:
+    def _check_context(self, context: dict[str, Any], *, deadline: float | None = None) -> None:
         if context.get("account_id") != int(self.account["id"]):
             raise CanvasCLIError("CLI_ACCOUNT_MISMATCH", "Canvas command account does not match its durable task")
-        if hasattr(self.runner, "profile") and context.get("profile") != self.runner.profile(self.account):
-            raise CanvasCLIError("CLI_ACCOUNT_MISMATCH", "Canvas task belongs to a retired credential profile")
+        if hasattr(self.runner, "profile"):
+            profile = (self.runner.profile(self.account, deadline=deadline)
+                       if isinstance(self.runner, CanvasCLI) else self.runner.profile(self.account))
+            if context.get("profile") != profile:
+                raise CanvasCLIError("CLI_ACCOUNT_MISMATCH", "Canvas task belongs to a retired credential profile")

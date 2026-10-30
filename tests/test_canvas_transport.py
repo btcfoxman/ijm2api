@@ -132,6 +132,19 @@ def prepare(tmp_path, *, upload_timeout=False):
     return runner, client, context
 
 
+def test_reused_retired_profile_is_rejected_before_project_or_material_writes(tmp_path):
+    runner, client, context = prepare(tmp_path)
+    context['profile'] = 'retired-profile'
+    normalized = {**request(), '_execution': context}
+    before = json.dumps(context, sort_keys=True)
+    runner.calls.clear()
+    with pytest.raises(CanvasCLIError) as mismatch:
+        client.prepare(normalized, 'ijm_test', {'images': [tmp_path / 'input.png']})
+    assert mismatch.value.code == 'CLI_ACCOUNT_MISMATCH'
+    assert runner.calls == []
+    assert json.dumps(context, sort_keys=True) == before
+
+
 def test_isolated_environments_and_invalidation(tmp_path, monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://wrong:secret@ambient:9999")
     monkeypatch.setenv("ALL_PROXY", "http://ambient:9999")
@@ -216,18 +229,17 @@ def test_account_lock_wait_consumes_task_deadline_without_spawning(tmp_path):
 def test_account_lock_recalculates_command_budget_after_acquiring(tmp_path):
     runner = CanvasCLI(tmp_path, allow_unwrapped_for_tests=True)
     clock = {'now': 0.0}
-    lock = Mock()
+    lane = Mock()
     def acquire(**kwargs):
-        assert kwargs['timeout'] == 1
+        assert kwargs['deadline'] == 1 and kwargs['exclusive'] is False
         clock['now'] += 0.8
-        return True
-    lock.acquire.side_effect = acquire
-    runner._locks[ACCOUNT['id']] = lock
+    lane.acquire.side_effect = acquire
+    runner._lanes[ACCOUNT['id']] = lane
     with patch('app.canvas_cli.time.monotonic', side_effect=lambda: clock['now']), \
             patch.object(runner, '_execute', return_value={'ok': True}) as execute:
         runner.run(ACCOUNT, ['version'], timeout=120, deadline=1)
     assert execute.call_args.args[2] == pytest.approx(0.2)
-    lock.release.assert_called_once()
+    lane.release.assert_called_once_with(exclusive=False)
 
 
 def test_read_only_retries_share_deadline_instead_of_renewing_timeout(tmp_path, monkeypatch):

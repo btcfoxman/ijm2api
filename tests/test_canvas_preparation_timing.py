@@ -67,7 +67,7 @@ def test_real_account_lock_wait_is_separate_and_keeps_original_deadline(tmp_path
     client = CanvasClient(runner, {'id':19});client.preparation_timing=timing
     locked,release=threading.Event(),threading.Event()
     def holder():
-        with runner._lock(19):
+        with runner.account_guard({'id':19}, exclusive=True):
             locked.set();release.wait(2)
     thread=threading.Thread(target=holder);thread.start();assert locked.wait(1)
     timer=threading.Timer(.12,release.set);timer.start()
@@ -89,7 +89,7 @@ def test_waiting_past_original_deadline_does_not_start_a_command(tmp_path, monke
     timing=PreparationTiming('task-expired');client=CanvasClient(runner,{'id':19});client.preparation_timing=timing
     locked,release=threading.Event(),threading.Event()
     def holder():
-        with runner._lock(19):locked.set();release.wait(1)
+        with runner.account_guard({'id':19}, exclusive=True):locked.set();release.wait(1)
     thread=threading.Thread(target=holder);thread.start();assert locked.wait(1)
     try:
         with pytest.raises(CanvasCLIError) as caught:
