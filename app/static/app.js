@@ -24,10 +24,17 @@ function api(path, options = {}) {
 }
 function apiText(path) { return fetch(path).then(async (response) => { const text = await response.text(); if (response.status === 401) location.replace("/login"); if (!response.ok) throw new Error(text || `HTTP ${response.status}`); return text; }); }
 function toast(message, error = false) { const item = $("#toast"); item.textContent = message; item.className = `toast show${error ? " error" : ""}`; clearTimeout(toast.timer); toast.timer = setTimeout(() => { item.className = "toast"; }, 3200); }
-function fmtTime(value) { return value ? new Date(Number(value) * 1000).toLocaleString() : "-"; }
+function fmtTime(value) {
+  if (!value) return "-";
+  const numeric = typeof value === "number" || /^\d+(?:\.\d+)?$/.test(String(value));
+  const date = new Date(numeric ? Number(value) * (Number(value) < 1e12 ? 1000 : 1) : value);
+  if (!Number.isFinite(date.getTime())) return "-";
+  const pad = (part) => String(part).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
 function fmtCost(value) { const number = Number(value || 0); return Number.isInteger(number) ? String(number) : number.toFixed(2).replace(/0+$/, "").replace(/\.$/, ""); }
 function elapsed(task) { const end = Number(task.completed_at || Date.now() / 1000); const total = Math.max(Math.floor(end - Number(task.created_at || end)), 0); return total < 60 ? `${total}秒` : `${Math.floor(total / 60)}分${total % 60}秒`; }
-function badge(status) { const labels = { cli_auth_required: "\u5f85 CLI \u6388\u6743", active: "可用", pending: "待检测", login_pending: "待登录", logging_in: "登录中", login_failed: "登录失败", challenge_required: "需验证", verification_required: "需安全验证", setup_required: "需设置", agreement_required: "待确认协议", profile_resetting: "重置中", queued: "排队", preparing: "准备", submitted: "已提交", running: "生成中", succeeded: "完成", failed: "失败", expired: "超时", login_required: "需登录", network_error: "网络异常", suspended: "上游封禁", disabled: "禁用", disabled_low_balance: "低额度" }; return `<span class="badge ${escapeHtml(status)}">${escapeHtml(labels[status] || status || "未知")}</span>`; }
+function badge(status, displayLabel) { const labels = { cli_auth_required: "\u5f85 CLI \u6388\u6743", active: "可用", pending: "待检测", login_pending: "待登录", logging_in: "登录中", login_failed: "登录失败", challenge_required: "需验证", verification_required: "需安全验证", setup_required: "需设置", agreement_required: "待确认协议", profile_resetting: "重置中", queued: "排队", preparing: "准备", submitted: "已提交", running: "生成中", succeeded: "完成", failed: "失败", expired: "超时", login_required: "需登录", network_error: "网络异常", suspended: "上游封禁", disabled: "禁用", disabled_low_balance: "低额度" }; return `<span class="badge ${escapeHtml(status)}">${escapeHtml(displayLabel || labels[status] || status || "未知")}</span>`; }
 function loginStageLabel(stage) { const labels = { queued: "等待自动登录", opening_browser: "准备浏览器", browser: "准备浏览器", starting: "准备浏览器", login: "模拟登录", email: "输入邮箱", password: "输入密码", settings: "设置去水印和协议", logging_in: "模拟登录", authenticating: "验证登录", watermark: "关闭水印", agreement: "确认 AI 生成协议", verifying: "核验账号设置", ready: "登录及设置完成", interrupted: "已中断，可重试", setup_required: "设置未完成", agreement_required: "协议待确认", challenge_required: "需人工验证", verification_required: "需安全验证", login_required: "需重新登录", login_failed: "登录失败", network_error: "网络异常" }; return labels[stage] || stage || ""; }
 function loginProgress(account) {
   const stage = loginStageLabel(account.login_stage);
@@ -50,7 +57,7 @@ function renderBatchResult() {
   panel.classList.toggle("error", Boolean(report.errors?.length));
   panel.textContent = lines.join("\n");
 }
-function proxyLabel(value) { try { const url = new URL(value); return `${url.hostname}:${url.port}`; } catch { return value || "直连"; } }
+function proxyLabel(value) { try { const url = new URL(value); return `${url.hostname}${url.port ? `:${url.port}` : ""}`; } catch { return value ? "代理已配置" : "直连"; } }
 function failureMessage(task) {
   if (task.public_error?.message) return task.public_error.message;
   if (task.error_code === "VIDEO_EDIT_CONSTRAINT") return "参考视频被识别为编辑任务，所选时长或画幅与原视频不兼容；请明确要求参考生成，或使用自适应画幅。";
@@ -82,8 +89,10 @@ function accountAvailability(account, settings = state.settings) {
 }
 
 function accountAvailabilityBadge(value) {
-  if (value.status === "cli_runtime_unavailable") return '<span class="badge network_error">CLI 环境不兼容</span>';
-  if (value.status === "cli_paused") return '<span class="badge disabled">接单已关闭</span>';
+  if (value.status === "cli_runtime_unavailable") return '<span class="badge network_error">环境异常</span>';
+  if (value.status === "cli_paused") return '<span class="badge disabled">已暂停</span>';
+  const compact = { cli_auth_required: "待授权", verification_required: "待验证", agreement_required: "待确认" };
+  if (compact[value.status]) return badge(value.status, compact[value.status]);
   return badge(value.status);
 }
 
@@ -93,21 +102,31 @@ function renderAccounts() {
   $("#enabledCount").textContent = enabled.length; $("#disabledCount").textContent = disabled.length;
   $("#accountsBody").innerHTML = items.map((account) => {
     const quota = account.balance_details || {};
+    const amount = (value) => value === null || value === undefined || value === "" || !Number.isFinite(Number(value))
+      ? "-" : Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
     const detail = Array.isArray(quota.details)
-      ? quota.details.map((item) => `${item.available ?? "-"}${item.expiresAt ? ` · 到期 ${item.expiresAt}` : ""}`).join(" / ") || "CLI 积分明细未提供"
-      : `VIP ${quota.vip_credit ?? 0} / Gift ${quota.gift_credit ?? 0} / Add-on ${quota.purchase_credit ?? 0}`;
+      ? quota.details.map((item) => `${amount(item.available)}${item.expiresAt ? ` · 到期 ${fmtTime(item.expiresAt)}` : ""}`).join(" / ") || "上游未提供额度明细"
+      : [["套餐", quota.vip_credit], ["赠送", quota.gift_credit], ["加购", quota.purchase_credit]]
+        .filter(([, value]) => value !== undefined && value !== null).map(([label, value]) => `${label} ${amount(value)}`).join(" · ") || "上游未提供额度明细";
+    const quotaSummary = Array.isArray(quota.details)
+      ? quota.details.length ? `${quota.details.length}项额度` : "明细未提供"
+      : [["套餐", quota.vip_credit], ["赠送", quota.gift_credit], ["加购", quota.purchase_credit]]
+        .filter(([, value]) => Number(value) > 0).map(([label]) => label).join(" / ")
+          || (["vip_credit", "gift_credit", "purchase_credit"].some((key) => quota[key] !== undefined && quota[key] !== null) ? "无可用额度" : "明细未提供");
     const progress = loginProgress(account);
     const availability = accountAvailability(account);
-    return `<tr><td><span class="cell-title"><span class="account-id mono">#${account.id}</span>${escapeHtml(account.name)}</span><span class="cell-sub">${escapeHtml(account.login_identifier || account.email || account.user_id || "")}</span></td>
-      <td>${accountAvailabilityBadge(availability)}<span class="cell-sub" title="${escapeHtml([availability.notice, progress, account.last_error].filter(Boolean).join(" · "))}">${escapeHtml(availability.notice || account.last_error || progress)}</span></td>
-      <td title="${escapeHtml(detail)}"><span class="cell-title mono">${escapeHtml(account.last_balance ?? "-")}</span><span class="cell-sub">${escapeHtml(detail)}</span></td>
+    const statusDetail = [availability.notice, progress, account.last_error].filter(Boolean).join(" · ");
+    const identity = account.login_identifier || account.email || account.user_id || "";
+    return `<tr><td><span class="cell-title"><span class="account-id mono">#${account.id}</span>${escapeHtml(account.name)}</span><span class="cell-sub" title="${escapeHtml(identity)}">${escapeHtml(identity)}</span></td>
+      <td title="${escapeHtml(statusDetail)}">${accountAvailabilityBadge(availability)}</td>
+      <td title="${escapeHtml(detail)}"><span class="cell-title mono">${escapeHtml(amount(account.last_balance))}</span><span class="cell-sub">${escapeHtml(quotaSummary)}</span></td>
       <td><input class="priority-input mono" data-account-priority="${account.id}" type="number" min="0" max="2147483647" step="1" value="${account.priority ?? 0}" title="优先级越高越先执行；相同优先级按余额和账号编号排序" aria-label="账号 #${account.id} 执行优先级"></td>
       <td><span class="slots ${account.active_tasks ? "busy" : ""}"><i></i><b class="mono">${account.active_tasks || 0} /</b><input class="concurrency-input mono" data-account-concurrency="${account.id}" type="number" min="1" value="${account.max_concurrency}" title="修改账号并发"></span></td><td class="mono">${account.total_uses || 0}</td>
-      <td><span class="cell-title mono proxy" title="${escapeHtml(account.proxy_url)}">${escapeHtml(proxyLabel(account.proxy_url))}</span></td><td><div class="execution-controls"><select class="execution-select" data-account-mode="${account.id}" aria-label="账号 #${account.id} 提交模式"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}><option value="canvas_cli"${account.execution_mode !== "browser" ? " selected" : ""}>Canvas CLI</option><option value="browser"${account.execution_mode === "browser" ? " selected" : ""}>网页提交</option></select><button class="link-button" data-action="cli-auth" data-id="${account.id}"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}>CLI 授权</button></div><span class="cell-sub" title="${escapeHtml(account.cli_auth_error || account.cli_user_id || "")}">${escapeHtml(availability.summary)}${account.execution_mode === "browser" ? ` · CDP ${account.cdp_port || "按需启动"}` : ""}</span></td><td>${fmtTime(account.updated_at)}</td>
+      <td><span class="cell-title mono proxy" title="${escapeHtml(proxyLabel(account.proxy_url))}">${escapeHtml(proxyLabel(account.proxy_url))}</span></td><td title="${escapeHtml([availability.summary, account.cli_auth_error].filter(Boolean).join(" · "))}"><div class="execution-controls"><select class="execution-select" data-account-mode="${account.id}" aria-label="账号 #${account.id} 提交模式"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}><option value="canvas_cli"${account.execution_mode !== "browser" ? " selected" : ""}>Canvas CLI</option><option value="browser"${account.execution_mode === "browser" ? " selected" : ""}>网页提交</option></select><button class="link-button" data-action="cli-auth" data-id="${account.id}"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}>CLI 授权</button></div>${account.execution_mode === "browser" ? `<span class="cell-sub">CDP ${account.cdp_port || "按需启动"}</span>` : ""}</td><td>${fmtTime(account.updated_at)}</td>
       <td><div class="row-actions">${account.password_configured ? `<button class="icon-button" data-action="auto-login" data-id="${account.id}" title="自动登录并完成去水印 / AI 协议设置"${account.status === "logging_in" ? " disabled" : ""}><i data-lucide="log-in"></i></button>` : ""}<button class="icon-button" data-action="check" data-id="${account.id}" title="检测"><i data-lucide="activity"></i></button><button class="icon-button" data-action="login" data-id="${account.id}" title="CDP 登录"><i data-lucide="monitor-up"></i></button><button class="icon-button" data-action="web-login" data-id="${account.id}" title="网页登录 / 打开账号网页"><i data-lucide="monitor"></i></button><button class="icon-button${account.status === "challenge_required" ? " needs-verification" : ""}" data-action="browser-assist" data-id="${account.id}" title="人工验证"><i data-lucide="mouse-pointer-2"></i></button><button class="icon-button" data-action="reset-profile" data-id="${account.id}" title="重置 Profile"><i data-lucide="fingerprint"></i></button><button class="icon-button" data-action="toggle" data-id="${account.id}" data-enabled="${account.enabled}" title="${account.enabled ? "禁用" : "启用"}"><i data-lucide="${account.enabled ? "pause" : "play"}"></i></button>${account.enabled ? "" : `<button class="icon-button danger" data-action="delete" data-id="${account.id}" title="删除"><i data-lucide="trash-2"></i></button>`}</div></td></tr>`;
   }).join("");
   $("#accountsEmpty").classList.toggle("show", !items.length); $("#metricAccounts").textContent = `${state.accounts.filter((item) => accountAvailability(item).available).length} / ${state.accounts.length}`;
-  $("#metricBalance").textContent = state.accounts.reduce((sum, item) => sum + Number(item.last_balance || 0), 0).toLocaleString(); icons();
+  $("#metricBalance").textContent = state.accounts.reduce((sum, item) => sum + Number(item.last_balance || 0), 0).toLocaleString(undefined, { maximumFractionDigits: 2 }); icons();
 }
 
 function mediaFromTask(task) {

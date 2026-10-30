@@ -72,7 +72,7 @@ def public_error(code: str, message: str) -> dict[str, str]:
         return {'code': 'INPUT_AUDIO_DURATION_UNSUPPORTED', 'message': '素材时长不支持，请修改后再试~'}
     if kind == "VIDEO_EDIT_CONSTRAINT" or "video editing task" in raw:
         return {"code": "VIDEO_EDIT_CONSTRAINT", "message": "素材时长不支持，请修改后再试~"}
-    if kind == "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN" or kind == "UPSTREAM_TIMEOUT":
+    if kind in {"UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "UPSTREAM_TIMEOUT", "CLI_SUBMISSION_UNCONFIRMED"}:
         return {"code": kind, "message": "提交结果未确认，请核对上游任务，暂勿重复提交~"}
     if "media download failed" in raw or kind == "MEDIA_DOWNLOAD_FAILED":
         return {"code": "MEDIA_DOWNLOAD_FAILED", "message": "素材下载失败，请检查素材链接后重试~"}
@@ -81,11 +81,27 @@ def public_error(code: str, message: str) -> dict[str, str]:
     if "wrong content type" in raw:
         return {"code": "MEDIA_FORMAT_UNSUPPORTED", "message": "素材格式不支持，请修改后再试~"}
     if "web upload failed" in raw or kind == "MEDIA_UPLOAD_FAILED":
-        return {"code": "MEDIA_UPLOAD_FAILED", "message": "上游维护中，请稍后再试~"}
-    if kind in {"ACCOUNT_POOL_UNAVAILABLE", "BROWSERERROR", "ACCOUNT_MISSING", "ACCOUNT_VERIFICATION_FAILED"}:
-        return {"code": kind, "message": "上游维护中，请稍后再试~"}
-    if kind.startswith(('CLI_', 'CLI.')) or kind in {'RESULT_TRANSFER_FAILED', 'MEDIA_UPLOAD_PENDING'}:
-        return {'code': kind, 'message': '上游维护中，请稍后再试~'}
+        return {"code": "MEDIA_UPLOAD_FAILED", "message": "素材上传失败，请检查素材后重试~"}
+    messages = {
+        "MEDIA_UPLOAD_PENDING": "素材仍在处理中，请稍后重试~",
+        "RESULT_TRANSFER_FAILED": "生成结果保存暂未完成，请稍后查询~",
+        "ACCOUNT_POOL_UNAVAILABLE": "当前可用生成资源不足，请稍后重试~",
+        "ACCOUNT_MISSING": "任务执行资源不可用，请联系管理员核查~",
+        "ACCOUNT_VERIFICATION_FAILED": "生成服务校验失败，请稍后重试~",
+        "BROWSERERROR": "生成连接异常，请稍后查询或联系管理员~",
+        "CLI_CAPABILITY_UNAVAILABLE": "所选模型不支持该参数或素材组合，请调整后重试~",
+        "CLI_AUTH_REQUIRED": "生成服务授权暂不可用，请稍后重试~",
+        "CLI_AUTH_EXPIRED": "生成服务授权暂不可用，请稍后重试~",
+        "CLI.AUTHENTICATION_REQUIRED": "生成服务授权暂不可用，请稍后重试~",
+        "CLI_COMMAND_TIMEOUT": "生成请求处理超时，请稍后查询~",
+        "CLI_TASK_DEADLINE_EXCEEDED": "生成请求处理超时，请稍后查询~",
+        "CLI_INVALID_RESPONSE": "生成服务响应异常，请稍后查询或联系管理员~",
+        "CLI.INVALID_SERVICE_RESPONSE": "生成服务响应异常，请稍后查询或联系管理员~",
+    }
+    if kind in messages:
+        return {"code": kind, "message": messages[kind]}
+    if kind.startswith(('CLI_', 'CLI.')):
+        return {'code': kind, 'message': '生成请求处理失败，请稍后查询或联系管理员~'}
     review_kind = kind if kind in {"UPSTREAM_REVIEW_FAILED", "UPSTREAM_REVIEW_SERVICE_ERROR",
                                   "UPSTREAM_IMAGE_REVIEW_FAILED"} else None
     if not review_kind and kind in {"UPSTREAM_FAILED", "2059", "1064", "2041", ""}:

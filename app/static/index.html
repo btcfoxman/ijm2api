@@ -9,7 +9,7 @@
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
   <script src="/api/cost-reference/assets/task-cost.js"></script>
 <script src="/static/canvas-task-state.js?v=20261029-reconcile" defer></script>
-<script src="/static/app.js?v=20261030-upstream-id-column" defer></script>
+<script src="/static/app.js?v=20261030-compact-accounts" defer></script>
   <script src="/static/browser-assist.js?v=ijm-canvas-20261029-1" defer></script>
   <script src="/static/account-login.js?v=20261014-2" defer></script>
 </head>
@@ -53,7 +53,7 @@
         <button class="icon-button" id="accountsRefresh" type="button" title="刷新账号"><i data-lucide="refresh-cw"></i></button>
       </div>
       <div class="table-wrap">
-        <table><thead><tr><th>账号</th><th>状态</th><th>余额 / 套餐</th><th>优先级</th><th>并发</th><th>使用</th><th>代理</th><th>Canvas CLI / Browser</th><th>最近检测</th><th class="actions-col">操作</th></tr></thead><tbody id="accountsBody"></tbody></table>
+        <table><thead><tr><th>账号</th><th>状态</th><th>额度</th><th>优先级</th><th>并发</th><th>使用</th><th>代理</th><th>提交方式</th><th>最近检测</th><th class="actions-col">操作</th></tr></thead><tbody id="accountsBody"></tbody></table>
         <div class="empty" id="accountsEmpty"><i data-lucide="users"></i><span>暂无账号</span></div>
       </div>
     </section>

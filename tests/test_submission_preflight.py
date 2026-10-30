@@ -66,7 +66,7 @@ def test_readiness_failure_never_sends_generation_or_reports_unknown(execution, 
     assert task["error_message"] == str(failure)
     assert "automatic resubmission" not in task["error_message"]
     assert public_error(task["error_code"], task["error_message"]) == {
-        "code": "ACCOUNT_VERIFICATION_FAILED", "message": "上游维护中，请稍后再试~"}
+        "code": "ACCOUNT_VERIFICATION_FAILED", "message": "生成服务校验失败，请稍后重试~"}
 
 
 @pytest.mark.parametrize("ready", [None, [], {},
@@ -141,7 +141,7 @@ def test_exact_legacy_preflight_signature_changes_only_public_projection(executi
     task = store.update_task("synthetic-preflight", {"status": "failed",
         "error_code": "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "error_message": raw})
     result = service.public_task(task)
-    assert result["error"] == {"code": "ACCOUNT_VERIFICATION_FAILED", "message": "上游维护中，请稍后再试~"}
+    assert result["error"] == {"code": "ACCOUNT_VERIFICATION_FAILED", "message": "生成服务校验失败，请稍后重试~"}
     assert store.task("synthetic-preflight") == task
     assert task["error_code"] == "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN" and task["error_message"] == raw
     client.browser.post.assert_not_called()
