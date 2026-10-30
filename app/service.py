@@ -1330,6 +1330,9 @@ class Service(CanvasServiceMixin):
             result = self.image_response(task)
             result["progress"] = task["progress"]
             result["data"] = [{"url": url} for url in task["result_urls"]]
+            facts = self._canvas_public_pre_dispatch_facts(task)
+            if facts:
+                result['provider_context'] = facts
             return result
         if (task["status"] == "succeeded" and task["model"] == "sd-2-5-480p-x"
                 and task["result_urls"] and expires_soon(task.get("result_transfer") or {})):
@@ -1349,4 +1352,7 @@ class Service(CanvasServiceMixin):
                   "account_id": task.get("account_id")}
         if task["status"] in {"failed", "expired"}:
             result["error"] = public_error(task["error_code"], task["error_message"])
+            facts = self._canvas_public_pre_dispatch_facts(task)
+            if facts:
+                result['provider_context'] = facts
         return result

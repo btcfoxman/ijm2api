@@ -12,7 +12,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .canvas_cli import TRANSPORT_DIAGNOSTIC_COMMANDS, CanvasCLIError, sanitize
-from .canvas_client import CanvasClient, identity_network_error, public_image_source_url
+from .canvas_client import (CanvasClient, identity_network_error, preparation_service_unavailable,
+                            public_image_source_url)
 from .canvas_timing import PreparationTiming, archived_attempts, INITIAL_ADMISSION_UNSET
 from .canvas_quote_hints import new_hint
 from .account_policy import credit_rejected
@@ -77,6 +78,69 @@ class CanvasServiceMixin:
                 context.pop(key, None)
             result = self._update_canvas_task(task_id, {'upstream_context': context})
             return dict(result.get('upstream_context') or {})
+
+    @staticmethod
+    def _canvas_dispatch_evidence(task: dict) -> bool:
+        """Any prior/uncertain dispatch evidence vetoes a new no-send proof."""
+        context = task.get('upstream_context') or {}
+        error = context.get('submit_error') or {}
+        if (task.get('run_id') or task.get('thread_id')
+                or task.get('result_urls') or task.get('upstream_result_urls')
+                or context.get('resource_ids') or context.get('dispatch_started_at') or context.get('accepted')
+                or context.get('dispatch_started') is True or error.get('dispatch_started') is True
+                or context.get('operation_ref') or context.get('operationRef') or context.get('operation_id')
+                or context.get('phase') in {'accepted', 'unknown', 'submission_unconfirmed'}
+                or context.get('submission_phase') not in {None, '', 'confirming'}
+                or context.get('financial_outcome') in {'unknown', 'unconfirmed'}
+                or context.get('reconciliation_closed') or context.get('reconciliation_paused')
+                or context.get('automatic_resubmission_blocked')
+                or context.get('previous_submissions')
+                or error.get('outcome_unknown') is True):
+            return True
+        timings = [context.get('preparation_timing')]
+        timings.extend(item.get('timing') for item in context.get('preparation_attempts') or []
+                       if isinstance(item, dict))
+        for timing in timings:
+            if not isinstance(timing, dict):
+                continue
+            commands = timing.get('commands') or {}
+            run = commands.get('node run')
+            if run is not None and (not isinstance(run, dict) or run.get('count') != 0):
+                return True
+            current = timing.get('current_command') or {}
+            if current.get('command_pair') == ['node', 'run']:
+                return True
+        return False
+
+    @staticmethod
+    def _canvas_pre_dispatch_facts(task: dict, exc: CanvasCLIError, submission_started: bool) -> dict:
+        """Positive call-stage evidence, not an inference from missing outputs."""
+        if (exc.outcome_unknown or task.get('status') not in {'queued', 'preparing'}
+                or CanvasServiceMixin._canvas_dispatch_evidence(task)):
+            return {}
+        if submission_started and (exc.details.get('dispatch_started') is not False
+                or exc.details.get('phase') != 'confirming'):
+            return {}
+        return {'generation_request_sent': False,
+                'financial_outcome': 'not_charged_this_invocation',
+                'automatic_resubmission': False,
+                'stage': 'confirming' if submission_started else 'preparation'}
+
+    @staticmethod
+    def _canvas_public_pre_dispatch_facts(task: dict) -> dict:
+        """Expose only the new bounded proof; preserve all stored financial data."""
+        context = task.get('upstream_context') or {}
+        facts = context.get('pre_dispatch_failure')
+        if (task.get('status') not in {'failed', 'expired'}
+                or task.get('error_code') != 'CLI_PREPARATION_TRANSIENT_FAILED'
+                or not isinstance(facts, dict) or facts.get('generation_request_sent') is not False
+                or facts.get('financial_outcome') != 'not_charged_this_invocation'
+                or facts.get('automatic_resubmission') is not False
+                or facts.get('stage') not in {'preparation', 'confirming'}
+                or CanvasServiceMixin._canvas_dispatch_evidence(task)):
+            return {}
+        return {key: facts[key] for key in ('generation_request_sent', 'financial_outcome',
+                                            'automatic_resubmission')}
 
     @staticmethod
     def _canvas_diagnostic(error, phase: str) -> dict:
@@ -325,6 +389,7 @@ class CanvasServiceMixin:
         task = self.store.task(task_id)
         if self._canvas_task_terminated(task):
             return True
+        prior_dispatch_evidence = self._canvas_dispatch_evidence(task)
         account_id = int(account["id"])
         client = self.canvas_client(account)
         submission_started = False
@@ -580,7 +645,12 @@ class CanvasServiceMixin:
                     self._canvas_context(task_id, {'preparation_error': {**self._canvas_diagnostic(exc, phase),
                         'preparation_timing': timing.snapshot()}, 'preparation_timing': timing.snapshot()})
                 expired_preparation = not submission_started and time.monotonic() >= deadline
-                self._fail_canvas_task(task_id, 'CLI_PREPARATION_TIMEOUT' if expired_preparation else exc.code,
+                facts = (self._canvas_pre_dispatch_facts(self.store.task(task_id) or {}, exc, submission_started)
+                         if preparation_service_unavailable(exc) and not prior_dispatch_evidence else {})
+                if facts:
+                    self._canvas_context(task_id, {'pre_dispatch_failure': facts})
+                self._fail_canvas_task(task_id, 'CLI_PREPARATION_TRANSIENT_FAILED' if facts else
+                    'CLI_PREPARATION_TIMEOUT' if expired_preparation else exc.code,
                     'Task deadline passed during Canvas preparation; no generation was submitted'
                     if expired_preparation else str(exc))
             return True

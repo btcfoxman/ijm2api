@@ -97,6 +97,9 @@ def public_error(code: str, message: str) -> dict[str, str]:
         "CLI_TASK_DEADLINE_EXCEEDED": "生成请求处理超时，请稍后查询~",
         "CLI_INVALID_RESPONSE": "生成服务响应异常，请稍后查询或联系管理员~",
         "CLI.INVALID_SERVICE_RESPONSE": "生成服务响应异常，请稍后查询或联系管理员~",
+        # A historical service.1 alone proves no financial outcome or dispatch boundary.
+        "SERVICE.1": "生成请求处理失败，请稍后查询或联系管理员~",
+        "CLI_PREPARATION_TRANSIENT_FAILED": "生成请求处理失败，请稍后查询或联系管理员~",
     }
     if kind in messages:
         return {"code": kind, "message": messages[kind]}

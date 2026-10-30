@@ -32,6 +32,20 @@ _TRANSIENT = {"network_timeout", "dns_resolution_failed", "network_error",
               "service_unavailable", "rate_limited", "transport_error"}
 _TRANSPORT_RETRY_READS = frozenset({('auth', 'account'), ('model', 'list'), ('canvas', 'ls'),
     ('node', 'quote'), ('node', 'show'), ('resource', 'get'), ('operation', 'status')})
+_PREPARATION_RETRY_READS = frozenset({('auth', 'account'), ('model', 'list'),
+    ('canvas', 'ls'), ('node', 'quote'), ('resource', 'get')})
+
+
+def preparation_service_unavailable(exc: CanvasCLIError) -> bool:
+    """The observed typed service.1 is retryable, never a paid-run verdict."""
+    error = exc.details.get('error')
+    return (exc.code == 'service.1' and not exc.outcome_unknown
+        and isinstance(error, dict) and error.get('code') in (None, 'service.1')
+        and type(error.get('serviceCode')) in (int, str) and error['serviceCode'] in (1, '1')
+        and error.get('class') == 'retryable_failure' and error.get('retryable') is True
+        and error.get('requiredAction') == 'retry'
+        and str(error.get('reason') or '') in {'', 'service_unavailable'}
+        and not any(error.get(key) for key in ('resources', 'submission', 'items', 'accepted')))
 
 
 def _read_only_transport_retry(args: list[str], exc: CanvasCLIError) -> bool:
@@ -399,7 +413,9 @@ class CanvasClient:
                 error = exc.details.get("error", {})
                 transient = (exc.code in {"CLI_COMMAND_TIMEOUT", "CLI_INVALID_RESPONSE", "cli.invalid_service_response"}
                              or bool(error.get("retryable")) and error.get("reason") in _TRANSIENT
-                             or read_only and _read_only_transport_retry(args, exc))
+                             or read_only and _read_only_transport_retry(args, exc)
+                             or (tuple(args[:2]) in _PREPARATION_RETRY_READS
+                                 and preparation_service_unavailable(exc)))
                 if not read_only or attempt == 2 or not transient:
                     raise
                 self._sleep(0.25 * 2 ** attempt, deadline)
@@ -735,7 +751,8 @@ class CanvasClient:
                                                timeout=remaining(), deadline=deadline)
                         break
                     except CanvasCLIError as exc:
-                        if exc.code != "cli.invalid_service_response" or attempt == 2:
+                        if (exc.code != "cli.invalid_service_response"
+                                and not preparation_service_unavailable(exc)) or attempt == 2:
                             raise
                         # Keep confirmation's established pre-dispatch deadline error.
                         time.sleep(min(0.25 * 2 ** attempt, remaining()) if deadline is not None
