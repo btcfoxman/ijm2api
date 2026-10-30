@@ -118,12 +118,13 @@ exec(heartbeat,{'name':'parent'})
 
 class Trace:
     def __init__(self, service, data, *, inject_race=False, expect_success=False, pause_timeout=False,
-                 exporter=None):
+                 exporter=None, companion_start_timeout=False):
         self.service = service
         self.data = data
         self.inject_race = inject_race
         self.expect_success = expect_success
         self.pause_timeout = pause_timeout
+        self.companion_start_timeout = companion_start_timeout
         self.exporter = exporter
         self.paused = False
         self.companion = None
@@ -140,6 +141,9 @@ class Trace:
         command = args[1:]
         if command[0] == "run":
             assert not self.paused and "--read-only" in command
+            assert timeout == 90
+            labels = [command[index + 1] for index, value in enumerate(command) if value == '--label']
+            assert labels == ['io.ijm2api.frozen-companion.owner=' + self.service]
             assert command.count('--cap-drop') == command.count('--cap-add') == 1
             assert command[command.index('--cap-drop') + 1] == 'ALL'
             assert command[command.index('--cap-add') + 1] == 'DAC_READ_SEARCH'
@@ -150,6 +154,13 @@ class Trace:
             value = docker(command, input=input, timeout=timeout)
             self.companion = value
             self.events.append("companion_joined_before_pause")
+            if self.companion_start_timeout:
+                actual = json.loads(docker(['inspect', value]))[0]
+                assert actual['State']['Running'] and not actual['State'].get('Paused')
+                assert actual['Config']['Labels']['io.ijm2api.frozen-companion.owner'] == self.service
+                self.events.append('companion_started_then_run_return_lost')
+                self.companion_start_timeout = False
+                raise subprocess.TimeoutExpired(args, timeout)
             return value
         if command[0] == "pause":
             assert self.companion and command[1] == self.service
@@ -181,6 +192,8 @@ class Trace:
         if command[:2] == ["rm", "--force"] and command[2] == self.service:
             assert self.paused
             self.events.append("old_removed_while_frozen")
+        if command[:2] == ["rm", "--force"] and command[2] == self.companion and not self.paused:
+            self.events.append('owned_startup_companion_cleanup')
         return docker(command, input=input, timeout=timeout)
 
 
@@ -208,7 +221,19 @@ def query_fixture(image, data, sql, parameters=(), *, service=None):
     return json.loads(docker(args))
 
 
-def run_case(controller, guard, image, name, *, active, query, race=False, pause_timeout=False):
+def fixture_fingerprint(service):
+    program = ("import hashlib,json,pathlib\nroot=pathlib.Path('/app/data');facts={}\n"
+        "for name in ('ijm2api.db','ijm2api.db-wal','canvas-cli/account-1/credential-profile'):\n"
+        " path=root/name\n"
+        " if path.is_file():\n"
+        "  with path.open('rb') as reader:facts[name]=hashlib.file_digest(reader,'sha256').hexdigest()\n"
+        " else:facts[name]=None\n"
+        "print(json.dumps(facts))")
+    return json.loads(docker(['exec', service, 'python', '-B', '-c', program]))
+
+
+def run_case(controller, guard, image, name, *, active, query, race=False, pause_timeout=False,
+             companion_start_timeout=False):
     service = "ijm-freeze-smoke-" + uuid.uuid4().hex[:16]
     trace = None
     with tempfile.TemporaryDirectory(prefix="ijm-freeze-smoke-") as directory:
@@ -245,15 +270,20 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                     input=controller.companion_program(json.dumps([TASK]), SOURCE_SHA)))
                 assert baseline["mode"] == "accepted_queries_only"
                 (release / "query-resume-baseline.safe.json").write_text(json.dumps(baseline))
-            should_reject = race or pause_timeout or (active and not query)
+            startup_before = fixture_fingerprint(service) if companion_start_timeout else None
+            heartbeat_before = {p.name: p.stat().st_size for p in data.glob('*.heartbeat')}
+            should_reject = race or pause_timeout or companion_start_timeout or (active and not query)
             trace = Trace(old_id, data, inject_race=race, expect_success=not should_reject,
-                pause_timeout=pause_timeout, exporter=controller.export_frozen_backup)
+                pause_timeout=pause_timeout, exporter=controller.export_frozen_backup,
+                companion_start_timeout=companion_start_timeout)
             rejected = False
+            original_error = None
             try:
                 receipt = controller.freeze_remove(service, image, release,
                     json.dumps([TASK]) if query else "", SOURCE_SHA, run=trace, exporter=trace.export_backup)
-            except RuntimeError as error:
+            except (RuntimeError, subprocess.TimeoutExpired) as error:
                 rejected = True
+                original_error = error
                 receipt_file = release / "frozen-cutover.safe.json"
                 receipt = json.loads(receipt_file.read_text()) if receipt_file.is_file() else {}
                 save_diagnostic({"case": name, "phase": "freeze_remove", "error_type": type(error).__name__,
@@ -261,17 +291,30 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                     "expected_rejection": should_reject, "synthetic_only": True})
             assert rejected == should_reject, "UnexpectedCutoverDecision"
             assert trace.events[0] == "companion_joined_before_pause"
-            if not pause_timeout:
+            if not pause_timeout and not companion_start_timeout:
                 assert "frozen_companion_read" in trace.events
             if should_reject:
                 state = json.loads(docker(["inspect", service]))[0]["State"]
                 assert state["Running"] and not state["Paused"]
-                assert receipt["original_unpaused_after_abort"] is True
                 assert not receipt["original_removed_while_frozen"]
                 assert "old_removed_while_frozen" not in trace.events
-                assert query_fixture(image, data, "SELECT status FROM tasks WHERE id=?", (TASK,), service=service) == [["submitted"]]
-                if race:
-                    assert query_fixture(image, data, "SELECT status FROM tasks WHERE id=?", (RACE_TASK,), service=service) == [["preparing"]]
+                if companion_start_timeout:
+                    assert isinstance(original_error, subprocess.TimeoutExpired)
+                    assert not trace.paused and not receipt['original_unpaused_after_abort']
+                    assert not {'old_paused', 'abort_unpaused_original', 'frozen_companion_read'}.intersection(trace.events)
+                    assert 'owned_startup_companion_cleanup' in trace.events
+                    assert len(heartbeat_before) == 2 and all(heartbeat_before.values())
+                    heartbeat_deadline = time.monotonic() + 3
+                    while not all((data / name).stat().st_size > size for name, size in heartbeat_before.items()):
+                        if time.monotonic() >= heartbeat_deadline:
+                            raise RuntimeError('OriginalHeartbeatsStoppedBeforeAnyPause')
+                        time.sleep(0.05)
+                    assert fixture_fingerprint(service) == startup_before
+                else:
+                    assert receipt["original_unpaused_after_abort"] is True
+                    assert query_fixture(image, data, "SELECT status FROM tasks WHERE id=?", (TASK,), service=service) == [["submitted"]]
+                    if race:
+                        assert query_fixture(image, data, "SELECT status FROM tasks WHERE id=?", (RACE_TASK,), service=service) == [["preparing"]]
             else:
                 assert receipt["passed"] and receipt["original_removed_while_frozen"]
                 assert docker(["inspect", service], optional=True) is None
@@ -315,6 +358,7 @@ def main():
     cases = [run_case(controller, guard, args.image, "accepted_query_WAL_success", active=True, query=True),
         run_case(controller, guard, args.image, "new_preparing_race_aborts_unpauses", active=True, query=True, race=True),
         run_case(controller, guard, args.image, "pause_timeout_after_effect_unpauses", active=True, query=True, pause_timeout=True),
+        run_case(controller, guard, args.image, "companion_start_timeout_after_effect_cleans_without_pause", active=True, query=True, companion_start_timeout=True),
         run_case(controller, guard, args.image, "default_idle_success", active=False, query=False),
         run_case(controller, guard, args.image, "default_active_stays_blocked", active=True, query=False)]
     print(json.dumps({"passed": True, "cases": cases, "count": len(cases), "provider_calls": 0}))

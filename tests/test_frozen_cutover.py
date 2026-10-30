@@ -24,7 +24,16 @@ BINDING = "a" * 64
 class FakeDocker:
     def __init__(self):
         self.old_id = "original-container-id"
-        self.companion_id = "readonly-companion-id"
+        self.companion_id = "c" * 64
+        self.companion_name = None
+        self.companion_image = None
+        self.companion_exists = False
+        self.start_timeout_after_effect = False
+        self.start_failure_before_creation = False
+        self.start_error = TimeoutError("companion startup response lost")
+        self.cleanup_inspect_failure = False
+        self.foreign_companion_field = None
+        self.empty_start_receipt = False
         self.paused = False
         self.old_removed = False
         self.inspect_count = 0
@@ -60,12 +69,34 @@ class FakeDocker:
         self.calls.append(list(args))
         self.inputs.append(input)
         if args[:2] == ["docker", "inspect"]:
+            if args[-1] == self.companion_name:
+                if not self.companion_exists or self.cleanup_inspect_failure:
+                    raise RuntimeError("CompanionInspectionUnavailable")
+                value = {"Id": self.companion_id, "Name": "/" + self.companion_name,
+                    "Config": {"Image": self.companion_image,
+                        "Labels": {cutover.COMPANION_OWNER_LABEL: self.old_id}},
+                    "HostConfig": {"PidMode": "container:" + self.old_id,
+                        "ReadonlyRootfs": True, "NetworkMode": "none"}}
+                field = self.foreign_companion_field
+                if field == "name": value["Name"] = "/foreign-container"
+                elif field == "owner": value["Config"]["Labels"][cutover.COMPANION_OWNER_LABEL] = "foreign-owner"
+                elif field == "image": value["Config"]["Image"] = "foreign-image"
+                elif field == "pid": value["HostConfig"]["PidMode"] = "host"
+                elif field == "readonly": value["HostConfig"]["ReadonlyRootfs"] = False
+                elif field == "network": value["HostConfig"]["NetworkMode"] = "host"
+                elif field == "original-id": value["Id"] = self.old_id
+                return json.dumps([value])
             self.inspect_count += 1
             value = {"Id": self.old_id, "State": {"Running": not self.old_removed, "Paused": self.paused}}
             if self.changed_before_pause and self.inspect_count == 2:
                 value["Id"] = "concurrent-replacement-id"
             return json.dumps([value])
         if args[:2] == ["docker", "run"]:
+            assert timeout == 90
+            assert args.count("--label") == 1
+            assert args[args.index("--label") + 1] == cutover.COMPANION_OWNER_LABEL + "=" + self.old_id
+            self.companion_name = args[args.index("--name") + 1]
+            self.companion_image = args[args.index("--entrypoint") + 2]
             for flag in ["--rm", "--read-only", "--cap-drop", "--pids-limit", "--tmpfs"]:
                 assert flag in args
             # Read an existing private host-owned data directory without
@@ -81,6 +112,13 @@ class FakeDocker:
             assert args[args.index("--pull") + 1] == "never"
             assert args[args.index("--volumes-from") + 1] == self.old_id + ":ro"
             assert args[args.index("--pid") + 1] == "container:" + self.old_id
+            if self.start_failure_before_creation:
+                raise self.start_error
+            self.companion_exists = True
+            if self.start_timeout_after_effect:
+                raise self.start_error
+            if self.empty_start_receipt:
+                return ""
             return self.companion_id
         if args[:2] == ["docker", "pause"]:
             assert args[-1] == self.old_id and not self.paused
@@ -117,6 +155,7 @@ class FakeDocker:
                     raise TimeoutError("remove response lost after removing original")
             else:
                 assert args[-1] == self.companion_id
+                self.companion_exists = False
             return ""
         if args[:2] == ["docker", "ps"]:
             assert args == ["docker", "ps", "--all", "--no-trunc", "--format", "{{json .}}"]
@@ -263,6 +302,54 @@ class FrozenCutoverTests(unittest.TestCase):
         self.assertEqual(self.docker.guard_count, 1)
         self.assertEqual(sum(args[0] == "binary_export" for args in self.docker.calls), 1)
         self.assertFalse(any(args[:2] == ["docker", "cp"] for args in self.docker.calls))
+
+    def assert_start_failure_preserves_original(self):
+        self.assertFalse(self.docker.paused or self.docker.old_removed)
+        self.assertEqual(self.docker.guard_count, 0)
+        self.assertEqual(sum(args[:2] == ["docker", "run"] for args in self.docker.calls), 1)
+        self.assertFalse(any(args[:2] in [["docker", "pause"], ["docker", "unpause"]] for args in self.docker.calls))
+        self.assertNotIn(["docker", "rm", "--force", self.docker.old_id], self.docker.calls)
+        self.assertFalse(self.receipt()["passed"])
+
+    def test_start_timeout_after_creation_cleans_owned_companion_without_pausing_original(self):
+        self.docker.start_timeout_after_effect = True
+        with self.assertRaises(TimeoutError) as found:
+            self.invoke()
+        self.assertIs(found.exception, self.docker.start_error)
+        self.assert_start_failure_preserves_original()
+        self.assertFalse(self.docker.companion_exists)
+        self.assertTrue(self.receipt()["owned_companion_cleanup_completed"])
+        self.assertIn(["docker", "rm", "--force", self.docker.companion_id], self.docker.calls)
+
+    def test_start_failure_without_creation_never_removes_any_container(self):
+        self.docker.start_failure_before_creation = True
+        with self.assertRaises(TimeoutError) as found:
+            self.invoke()
+        self.assertIs(found.exception, self.docker.start_error)
+        self.assert_start_failure_preserves_original()
+        self.assertFalse(any(args[:3] == ["docker", "rm", "--force"] for args in self.docker.calls))
+        self.assertTrue(self.receipt()["companion_cleanup_requires_operator_review"])
+
+    def test_uncertain_start_never_removes_foreign_or_uninspectable_companion(self):
+        for field in ["name", "owner", "image", "pid", "readonly", "network", "original-id", "inspect-failed"]:
+            with self.subTest(field=field):
+                self.docker = FakeDocker()
+                self.docker.start_timeout_after_effect = True
+                self.docker.foreign_companion_field = field
+                self.docker.cleanup_inspect_failure = field == "inspect-failed"
+                with self.assertRaises(TimeoutError) as found:
+                    self.invoke()
+                self.assertIs(found.exception, self.docker.start_error)
+                self.assert_start_failure_preserves_original()
+                self.assertFalse(any(args[:3] == ["docker", "rm", "--force"] for args in self.docker.calls))
+                self.assertTrue(self.receipt()["companion_cleanup_requires_operator_review"])
+
+    def test_empty_start_receipt_is_rejected_and_owned_companion_is_cleaned_before_pause(self):
+        self.docker.empty_start_receipt = True
+        with self.assertRaisesRegex(RuntimeError, "CompanionStartReceiptInvalid"):
+            self.invoke()
+        self.assert_start_failure_preserves_original()
+        self.assertFalse(self.docker.companion_exists)
 
 
 if __name__ == "__main__":

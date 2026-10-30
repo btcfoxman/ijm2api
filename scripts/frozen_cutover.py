@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 import uuid
 
+COMPANION_OWNER_LABEL = "io.ijm2api.frozen-companion.owner"
+
 
 def execute(args, *, input=None, timeout=30):
     result = subprocess.run(args, input=input, capture_output=True, text=True, timeout=timeout)
@@ -104,11 +106,14 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
         # The companion joins while the original is running; only its separate
         # cgroup stays runnable after pause. It never starts the application.
         companion_id = run(["docker", "run", "--detach", "--rm", "--name", name,
+            "--label", COMPANION_OWNER_LABEL + "=" + old_id,
             "--pull", "never", "--network", "none", "--read-only", "--user", "0:0",
             "--cap-drop", "ALL", "--cap-add", "DAC_READ_SEARCH", "--security-opt", "no-new-privileges", "--memory", "256m", "--cpus", "0.5", "--pids-limit", "64",
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=128m,mode=0700", "--volumes-from", old_id + ":ro",
             "--pid", "container:" + old_id, "--entrypoint", "python", image,
-            "-B", "-c", "import time; time.sleep(600)"], timeout=20)
+            "-B", "-c", "import time; time.sleep(600)"], timeout=90)
+        if not isinstance(companion_id, str) or not re.fullmatch(r"[0-9a-f]{64}", companion_id) or companion_id == old_id:
+            raise RuntimeError("CompanionStartReceiptInvalid")
         current = json.loads(run(["docker", "inspect", service], timeout=10))[0]
         if current["Id"] != old_id or not current["State"]["Running"] or current["State"].get("Paused"):
             raise RuntimeError("OriginalAppChangedBeforeFreeze")
@@ -174,12 +179,28 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
                     receipt["original_unpaused_after_abort"] = True
             except Exception:
                 receipt["unpause_requires_operator_review"] = True
-        if companion_id:
-            try:
-                run(["docker", "rm", "--force", companion_id], timeout=15)
-            except Exception:
-                # Killing PID-namespace init may already have removed the --rm companion.
-                receipt["companion_already_exited_or_cleanup_failed"] = True
+        try:
+            # A startup timeout can lose stdout after the daemon created it.
+            # Resolve only this operation's random name; never replay creation
+            # or remove an unchecked name, the original app, or a foreign ID.
+            candidates = json.loads(run(["docker", "inspect", name], timeout=10))
+            candidate = candidates[0] if isinstance(candidates, list) and len(candidates) == 1 else {}
+            config, host = candidate.get("Config") or {}, candidate.get("HostConfig") or {}
+            cleanup_id = candidate.get("Id")
+            owned = (isinstance(cleanup_id, str) and re.fullmatch(r"[0-9a-f]{64}", cleanup_id)
+                and cleanup_id != old_id and candidate.get("Name") == "/" + name
+                and (config.get("Labels") or {}).get(COMPANION_OWNER_LABEL) == old_id
+                and config.get("Image") == image and host.get("PidMode") == "container:" + old_id
+                and host.get("ReadonlyRootfs") is True and host.get("NetworkMode") == "none")
+            if owned:
+                run(["docker", "rm", "--force", cleanup_id], timeout=15)
+                receipt["owned_companion_cleanup_completed"] = True
+            else:
+                receipt["companion_cleanup_requires_operator_review"] = True
+        except Exception:
+            # The --rm companion can already be gone. Failed observation or
+            # cleanup must preserve the original outcome, never guess/remove.
+            receipt["companion_cleanup_requires_operator_review"] = True
         try:
             (release / "frozen-cutover.safe.json").write_text(json.dumps(receipt, indent=2))
         except OSError:
