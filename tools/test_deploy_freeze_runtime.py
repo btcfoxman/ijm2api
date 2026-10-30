@@ -105,8 +105,11 @@ db.execute('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?)',(%r,%r,1,'canvas_cli'
 db.commit();db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
 db.execute("INSERT INTO snapshot_probe VALUES('uncheckpointed-synthetic-WAL-row')");db.commit()
 if not %r:
+ # Exercise the real clone+backup peak above the former 128MiB tmpfs limit.
+ db.execute('CREATE TABLE snapshot_padding(payload BLOB)')
+ db.execute('INSERT INTO snapshot_padding VALUES(zeroblob(72*1024*1024))');db.commit()
  db.close()
- assert (root/'ijm2api.db').read_bytes()[18:20]==bytes([2,2])
+ with (root/'ijm2api.db').open('rb') as reader:assert reader.read(20)[18:20]==bytes([2,2])
  assert not (root/'ijm2api.db-wal').exists() and not (root/'ijm2api.db-shm').exists()
 heartbeat=%r
 subprocess.Popen([sys.executable,'-B','-c',"name='child';"+heartbeat])
@@ -184,6 +187,9 @@ class Trace:
                 self.events.append("synthetic_request_queued_while_frozen")
             return value
         if command[0] == "exec":
+            if command[2] == self.service and input and 'SnapshotSizingDatabaseMissing' in input:
+                assert not self.paused and self.companion is None and 'sqlite' not in input
+                return docker(command, input=input, timeout=timeout)
             assert self.paused and command[2] == self.companion
             self.events.append("frozen_companion_read")
         if command[0] == "unpause":
@@ -265,6 +271,7 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                 assert (data / "ijm2api.db-wal").stat().st_size > 32
             else:
                 assert not (data / "ijm2api.db-wal").exists() and not (data / "ijm2api.db-shm").exists()
+                assert (data / 'ijm2api.db').stat().st_size > 64 * 1024 * 1024
             if query:
                 baseline = json.loads(docker(['exec', '-i', service, 'python', '-B', '-'],
                     input=controller.companion_program(json.dumps([TASK]), SOURCE_SHA)))
@@ -324,13 +331,17 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                 assert (data / 'queued-after-freeze').is_file()
                 assert not (data / 'executed-after-freeze').exists(), "QueuedRequestExecutedDuringForceRemoval"
                 snapshot = release / "frozen.ijm2api.db"
-                assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == receipt["frozen_backup_sha256"]
+                with snapshot.open('rb') as reader:
+                    assert hashlib.file_digest(reader, 'sha256').hexdigest() == receipt["frozen_backup_sha256"]
                 with closing(sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True)) as db:
                     assert db.execute("SELECT value FROM snapshot_probe").fetchall() == [("uncheckpointed-synthetic-WAL-row",)]
                     assert db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
                 assert query_fixture(image, data, "SELECT COUNT(*) FROM tasks") == [[1]]
                 if not active:
                     assert not (data / "ijm2api.db-wal").exists() and not (data / "ijm2api.db-shm").exists()
+                    assert snapshot.stat().st_size > 64 * 1024 * 1024
+            capacity = receipt.get('snapshot_capacity') or {}
+            frozen = (receipt.get('frozen_guard') or {}).get('source_manifest') or {}
             # PID 1 death can auto-remove its namespace companion asynchronously.
             cleanup_deadline = time.monotonic() + 5
             while trace.companion and docker(["inspect", trace.companion], optional=True) is not None:
@@ -339,6 +350,9 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                 time.sleep(0.1)
             return {"name": name, "passed": True, "rejected": rejected,
                 "events": trace.events, "synthetic_only": True, "provider_calls": 0,
+                "frozen_source_database_bytes": (frozen.get('ijm2api.db') or {}).get('size_bytes'),
+                "frozen_backup_bytes": (release / 'frozen.ijm2api.db').stat().st_size if (release / 'frozen.ijm2api.db').is_file() else None,
+                "tmpfs_budget_bytes": capacity.get('tmpfs_bytes'), "memory_limit_bytes": capacity.get('memory_bytes'),
                 "source_layout": "uncheckpointed_WAL" if active else "WAL_mode_without_sidecars"}
         finally:
             if trace and trace.companion:

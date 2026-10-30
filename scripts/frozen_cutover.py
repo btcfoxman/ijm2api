@@ -11,6 +11,39 @@ import tempfile
 import uuid
 
 COMPANION_OWNER_LABEL = "io.ijm2api.frozen-companion.owner"
+MIB = 1024 * 1024
+SNAPSHOT_HEADROOM = 64 * MIB
+SNAPSHOT_MINIMUM = 256 * MIB
+SNAPSHOT_MAXIMUM = 1024 * MIB
+
+
+def snapshot_sizing_program():
+    """Stat only, before pause: never open the original database with SQLite."""
+    return """import json,os,pathlib
+root=pathlib.Path(os.environ.get('IJM_DATA_DIR','/app/data'));sizes={}
+for name in ('ijm2api.db','ijm2api.db-wal'):
+ path=root/name
+ if path.is_symlink():raise RuntimeError('SnapshotSizingSymlinkRejected')
+ if not path.exists():
+  if name=='ijm2api.db':raise RuntimeError('SnapshotSizingDatabaseMissing')
+  sizes[name]=0;continue
+ if not path.is_file():raise RuntimeError('SnapshotSizingNotRegularFile')
+ sizes[name]=path.stat().st_size
+print(json.dumps(sizes))
+"""
+
+
+def snapshot_budget(sizes):
+    if (not isinstance(sizes, dict) or set(sizes) != {'ijm2api.db', 'ijm2api.db-wal'}
+            or any(type(value) is not int or value < 0 for value in sizes.values())
+            or sizes['ijm2api.db'] == 0):
+        raise RuntimeError('SnapshotSizingInvalid')
+    required = 2 * sum(sizes.values()) + SNAPSHOT_HEADROOM
+    capacity = max(SNAPSHOT_MINIMUM, (required + SNAPSHOT_HEADROOM - 1) // SNAPSHOT_HEADROOM * SNAPSHOT_HEADROOM)
+    if capacity > SNAPSHOT_MAXIMUM:
+        raise RuntimeError('SnapshotCapacityLimitExceeded')
+    return {'source_db_bytes': sizes['ijm2api.db'], 'source_wal_bytes': sizes['ijm2api.db-wal'],
+            'tmpfs_bytes': capacity, 'memory_bytes': capacity + 128 * MIB}
 
 
 def execute(args, *, input=None, timeout=30):
@@ -34,6 +67,20 @@ def companion_program(query_ids, startup_sha, *, backup=False):
     program += "exec(compile(" + repr(query) + ",'query_guard','exec'),query)\n"
     program += "exec(compile(" + repr(idle) + ",'idle_guard','exec'),idle)\n"
     program += "root=pathlib.Path(os.environ.get('IJM_DATA_DIR','/app/data'));expected=" + repr(query_ids) + "\n"
+    program += """# Recheck actual frozen sizes/free space, not the pre-pause estimate.
+snapshot_bytes=0
+for name in ('ijm2api.db','ijm2api.db-wal'):
+ path=root/name
+ if path.is_symlink():raise RuntimeError('FrozenSourceSymlinkRejected')
+ if not path.exists():
+  if name=='ijm2api.db':raise RuntimeError('FrozenSourceDatabaseMissing')
+  continue
+ if not path.is_file():raise RuntimeError('FrozenSourceNotRegularFile')
+ snapshot_bytes+=path.stat().st_size
+space=os.statvfs('/tmp');available_bytes=space.f_bavail*space.f_frsize
+"""
+    program += "required_bytes=snapshot_bytes*" + ("2" if backup else "1") + "+" + str(SNAPSHOT_HEADROOM) + "\n"
+    program += "if available_bytes<required_bytes:raise RuntimeError('FrozenSnapshotCapacityInsufficient')\n"
     # A WAL-mode source may have no sidecars when its last writer closed.
     # Never ask SQLite to initialize them on the original read-only mount.
     program += """with tempfile.TemporaryDirectory(prefix='ijm-frozen-clone-',dir='/tmp') as temporary:
@@ -60,6 +107,7 @@ def companion_program(query_ids, startup_sha, *, backup=False):
     program += " else:\n  count=idle['active_work'](database);value={'passed':count==0,'mode':'idle','active_count':count,'binding_sha256':None}\n"
     program += " if value.get('passed') is not True:raise RuntimeError('FrozenGuardRejected')\n"
     program += " value['source_manifest']=source_manifest\n"
+    program += " value['snapshot_space']={'source_bytes':snapshot_bytes,'required_free_bytes':required_bytes,'available_free_bytes':available_bytes}\n"
     if backup:
         program += " source=sqlite3.connect(database.as_uri()+'?mode=ro',uri=True,timeout=5);source.execute('PRAGMA query_only=ON')\n"
         program += " target=pathlib.Path('/tmp/frozen.ijm2api.db');dest=sqlite3.connect(str(target));source.backup(dest);dest.close();source.close();target.chmod(0o600)\n"
@@ -97,19 +145,25 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
         raise RuntimeError("OriginalAppNotRunningUnpaused")
     name = "ijm-frozen-guard-" + uuid.uuid4().hex[:16]
     companion_id = None
+    companion_start_attempted = False
     paused = False
     removed = False
     receipt = {"passed": False, "old_container_sha256": hashlib.sha256(old_id.encode()).hexdigest(),
         "server_builds": 0, "new_generations": 0, "database_writes": 0,
         "original_unpaused_after_abort": False, "original_removed_while_frozen": False}
     try:
+        sizes = json.loads(run(['docker', 'exec', '-i', old_id, 'python', '-B', '-'],
+            input=snapshot_sizing_program(), timeout=10))
+        capacity = snapshot_budget(sizes)
+        receipt['snapshot_capacity'] = capacity
         # The companion joins while the original is running; only its separate
         # cgroup stays runnable after pause. It never starts the application.
+        companion_start_attempted = True
         companion_id = run(["docker", "run", "--detach", "--rm", "--name", name,
             "--label", COMPANION_OWNER_LABEL + "=" + old_id,
             "--pull", "never", "--network", "none", "--read-only", "--user", "0:0",
-            "--cap-drop", "ALL", "--cap-add", "DAC_READ_SEARCH", "--security-opt", "no-new-privileges", "--memory", "256m", "--cpus", "0.5", "--pids-limit", "64",
-            "--tmpfs", "/tmp:rw,noexec,nosuid,size=128m,mode=0700", "--volumes-from", old_id + ":ro",
+            "--cap-drop", "ALL", "--cap-add", "DAC_READ_SEARCH", "--security-opt", "no-new-privileges", "--memory", str(capacity['memory_bytes']), "--cpus", "0.5", "--pids-limit", "64",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=" + str(capacity['tmpfs_bytes']) + ",mode=0700", "--volumes-from", old_id + ":ro",
             "--pid", "container:" + old_id, "--entrypoint", "python", image,
             "-B", "-c", "import time; time.sleep(600)"], timeout=90)
         if not isinstance(companion_id, str) or not re.fullmatch(r"[0-9a-f]{64}", companion_id) or companion_id == old_id:
@@ -134,7 +188,9 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
             raise RuntimeError("FrozenBackupAlreadyExists")
         exporter(companion_id, destination)
         destination.chmod(0o600)
-        if hashlib.sha256(destination.read_bytes()).hexdigest() != first.get("frozen_backup_sha256"):
+        with destination.open('rb') as reader:
+            backup_sha256 = hashlib.file_digest(reader, 'sha256').hexdigest()
+        if backup_sha256 != first.get("frozen_backup_sha256"):
             raise RuntimeError("FrozenBackupChecksumMismatch")
         final = json.loads(run(["docker", "exec", "-i", companion_id, "python", "-B", "-"],
             input=companion_program(query_ids, startup_sha), timeout=20))
@@ -183,7 +239,7 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
             # A startup timeout can lose stdout after the daemon created it.
             # Resolve only this operation's random name; never replay creation
             # or remove an unchecked name, the original app, or a foreign ID.
-            candidates = json.loads(run(["docker", "inspect", name], timeout=10))
+            candidates = json.loads(run(["docker", "inspect", name], timeout=10)) if companion_start_attempted else []
             candidate = candidates[0] if isinstance(candidates, list) and len(candidates) == 1 else {}
             config, host = candidate.get("Config") or {}, candidate.get("HostConfig") or {}
             cleanup_id = candidate.get("Id")
@@ -195,7 +251,7 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
             if owned:
                 run(["docker", "rm", "--force", cleanup_id], timeout=15)
                 receipt["owned_companion_cleanup_completed"] = True
-            else:
+            elif companion_start_attempted:
                 receipt["companion_cleanup_requires_operator_review"] = True
         except Exception:
             # The --rm companion can already be gone. Failed observation or

@@ -8,6 +8,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -55,6 +56,8 @@ class FakeDocker:
         self.removal_timeout_after_effect = False
         self.pause_timeout_after_effect = False
         self.export_failure = False
+        self.source_sizes = {'ijm2api.db': 69746688, 'ijm2api.db-wal': 0}
+        self.snapshot_capacity_failure = False
 
     def export_backup(self, companion_id, destination):
         assert companion_id == self.companion_id and self.paused and self.guard_count == 1
@@ -112,6 +115,9 @@ class FakeDocker:
             assert args[args.index("--pull") + 1] == "never"
             assert args[args.index("--volumes-from") + 1] == self.old_id + ":ro"
             assert args[args.index("--pid") + 1] == "container:" + self.old_id
+            budget = cutover.snapshot_budget(self.source_sizes)
+            assert args[args.index('--memory') + 1] == str(budget['memory_bytes'])
+            assert args[args.index('--tmpfs') + 1] == '/tmp:rw,noexec,nosuid,size=' + str(budget['tmpfs_bytes']) + ',mode=0700'
             if self.start_failure_before_creation:
                 raise self.start_error
             self.companion_exists = True
@@ -127,9 +133,15 @@ class FakeDocker:
                 raise TimeoutError("pause response lost after freezing original")
             return ""
         if args[:2] == ["docker", "exec"]:
+            if args[3] == self.old_id:
+                assert not self.paused and self.guard_count == 0
+                assert input == cutover.snapshot_sizing_program() and 'sqlite' not in input
+                return json.dumps(self.source_sizes)
             assert args[3] == self.companion_id and self.paused
             assert isinstance(input, str) and "FrozenGuardRejected" in input
             self.guard_count += 1
+            if self.snapshot_capacity_failure:
+                raise RuntimeError('FrozenSnapshotCapacityInsufficient')
             if self.guard_count == 1 and self.first_failure:
                 raise RuntimeError("FrozenGuardRejected: new active task")
             if self.guard_count == 2 and self.final_failure:
@@ -179,6 +191,52 @@ class FrozenCutoverTests(unittest.TestCase):
     def receipt(self):
         return json.loads((self.release / "frozen-cutover.safe.json").read_text())
 
+    def test_actual_large_database_budget_covers_clone_backup_and_heap(self):
+        budget = cutover.snapshot_budget(self.docker.source_sizes)
+        self.assertEqual(budget['tmpfs_bytes'], 256 * cutover.MIB)
+        self.assertEqual(budget['memory_bytes'], 384 * cutover.MIB)
+        self.assertGreater(budget['tmpfs_bytes'], 2 * 69746688 + cutover.SNAPSHOT_HEADROOM)
+        self.assertTrue(self.invoke()['passed'])
+        self.assertEqual(self.receipt()['snapshot_capacity'], budget)
+
+    def test_wal_growth_changes_budget_and_rounding_remains_bounded(self):
+        budget = cutover.snapshot_budget({'ijm2api.db': 100 * cutover.MIB, 'ijm2api.db-wal': 100 * cutover.MIB})
+        self.assertEqual(budget['tmpfs_bytes'], 512 * cutover.MIB)
+        self.assertEqual(budget['memory_bytes'], 640 * cutover.MIB)
+        maximum = cutover.snapshot_budget({'ijm2api.db': 480 * cutover.MIB, 'ijm2api.db-wal': 0})
+        self.assertEqual(maximum['tmpfs_bytes'], cutover.SNAPSHOT_MAXIMUM)
+
+    def test_unknown_or_over_limit_size_never_starts_or_pauses_any_container(self):
+        for sizes in ({}, {'ijm2api.db': 0, 'ijm2api.db-wal': 0},
+                      {'ijm2api.db': True, 'ijm2api.db-wal': 0},
+                      {'ijm2api.db': 1, 'ijm2api.db-wal': -1},
+                      {'ijm2api.db': 481 * cutover.MIB, 'ijm2api.db-wal': 0}):
+            with self.subTest(sizes=sizes):
+                self.docker = FakeDocker()
+                self.docker.source_sizes = sizes
+                with self.assertRaisesRegex(RuntimeError, 'SnapshotSizingInvalid|SnapshotCapacityLimitExceeded'):
+                    self.invoke()
+                self.assertFalse(any(call[:2] in (['docker', 'run'], ['docker', 'pause'], ['docker', 'unpause'])
+                                     or call[:3] == ['docker', 'rm', '--force'] for call in self.docker.calls))
+                self.assertFalse(self.receipt()['original_removed_while_frozen'])
+
+    def test_frozen_capacity_failure_unpauses_without_export_or_removal(self):
+        self.docker.snapshot_capacity_failure = True
+        with self.assertRaisesRegex(RuntimeError, 'FrozenSnapshotCapacityInsufficient'):
+            self.invoke()
+        self.assertTrue(self.receipt()['original_unpaused_after_abort'])
+        self.assertFalse(self.docker.old_removed)
+        self.assertFalse(any(call[0] == 'binary_export' for call in self.docker.calls))
+
+    def test_generated_guard_checks_real_free_space_before_cloning_or_sqlite(self):
+        (self.release / 'ijm2api.db').write_bytes(b'synthetic database')
+        program = cutover.companion_program('', 'b' * 64, backup=True)
+        with patch.dict('os.environ', {'IJM_DATA_DIR': str(self.release)}), \
+                patch('os.statvfs', create=True, return_value=SimpleNamespace(f_bavail=0, f_frsize=4096)), \
+                patch('tempfile.TemporaryDirectory', side_effect=AssertionError('Clone must not start')):
+            with self.assertRaisesRegex(RuntimeError, 'FrozenSnapshotCapacityInsufficient'):
+                exec(compile(program, 'synthetic_capacity_guard', 'exec'), {})
+
     def assert_aborted_safely(self):
         self.assertFalse(self.docker.old_removed)
         self.assertFalse(self.docker.paused)
@@ -194,8 +252,11 @@ class FrozenCutoverTests(unittest.TestCase):
         self.assertTrue(receipt["passed"] and receipt["original_removed_while_frozen"])
         self.assertFalse(receipt["original_unpaused_after_abort"])
         actions = [args[1] if args[0] == 'docker' else args[0] for args in self.docker.calls]
-        self.assertLess(actions.index("pause"), actions.index("exec"))
-        self.assertLess(actions.index("exec"), actions.index("binary_export"))
+        sizing = next(i for i, args in enumerate(self.docker.calls) if args[:4] == ['docker', 'exec', '-i', self.docker.old_id])
+        guard = next(i for i, args in enumerate(self.docker.calls) if args[:4] == ['docker', 'exec', '-i', self.docker.companion_id])
+        self.assertLess(sizing, actions.index('run'))
+        self.assertLess(actions.index("pause"), guard)
+        self.assertLess(guard, actions.index("binary_export"))
         self.assertLess(actions.index("binary_export"), len(actions) - 3)
         self.assertFalse(any(args[:2] == ["docker", "cp"] for args in self.docker.calls))
         self.assertEqual(self.docker.guard_count, 2)
