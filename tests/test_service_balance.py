@@ -98,7 +98,7 @@ class ServiceBalanceTests(unittest.TestCase):
         task = self.store.task(self.task["id"])
         self.assertEqual(task["error_code"], "CONTENT_MODERATION_FAILED")
         self.assertEqual(public_error(task["error_code"], task["error_message"])["message"],
-                         "检测到内容有敏感或违规情况，请修改后重试，积分已返还～")
+                         "检测到内容可能违规，请修改提示词或参考素材后重试~")
 
     def test_short_reference_audio_is_not_submitted(self):
         self.client.submit.side_effect = InputAudioDurationError(

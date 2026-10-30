@@ -9,7 +9,7 @@
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
   <script src="/api/cost-reference/assets/task-cost.js"></script>
 <script src="/static/canvas-task-state.js?v=20261029-reconcile" defer></script>
-<script src="/static/app.js?v=20261030-upstream-ids" defer></script>
+<script src="/static/app.js?v=20261030-upstream-id-column" defer></script>
   <script src="/static/browser-assist.js?v=ijm-canvas-20261029-1" defer></script>
   <script src="/static/account-login.js?v=20261014-2" defer></script>
 </head>
@@ -64,7 +64,7 @@
         <div class="section-actions"><label class="task-limit-label" for="taskLimit">显示 <input id="taskLimit" type="number" min="1" max="1000" step="1" value="50" aria-label="最近任务显示条数"> 条</label><button class="icon-button" id="tasksRefresh" type="button" title="刷新任务"><i data-lucide="refresh-cw"></i></button><button class="icon-button danger" id="clearTasks" type="button" title="清理已结束任务"><i data-lucide="trash-2"></i></button></div>
       </div>
       <div class="table-wrap tasks-wrap">
-        <table><thead><tr><th>任务 / 账号</th><th>模型参数 / 提示词 / 素材</th><th>消耗额</th><th>状态</th><th>进度 / 耗时</th><th>创建 / 更新时间</th><th class="result-col">结果</th></tr></thead><tbody id="tasksBody"></tbody></table>
+        <table><thead><tr><th>任务 / 账号</th><th class="upstream-id-column">上游资源 / 提交ID</th><th>模型参数 / 提示词 / 素材</th><th>消耗额</th><th>状态</th><th>进度 / 耗时</th><th>创建 / 更新时间</th><th class="result-col">结果</th></tr></thead><tbody id="tasksBody"></tbody></table>
         <div class="empty" id="tasksEmpty"><i data-lucide="layers"></i><span>暂无任务</span></div>
       </div>
     </section>

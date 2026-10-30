@@ -73,7 +73,7 @@ def test_empty_or_unknown_result_is_not_published(tmp_path, payload, suffix):
 @pytest.mark.parametrize('code,message,expected', [
     ('CLI_AUTH_REQUIRED', 'expired session', '上游维护中，请稍后再试~'),
     ('CLI_CAPABILITY_UNAVAILABLE', 'model does not support duration=4', '素材时长不支持，请修改后再试~'),
-    ('12009', 'Canvas generation failed', '检测到内容有敏感或违规情况，请修改后重试，积分已返还～'),
+    ('12009', 'Canvas generation failed', '检测到内容可能违规，请修改提示词或参考素材后重试~'),
     ('UPSTREAM_SUBMIT_OUTCOME_UNKNOWN', 'connection closed', '提交结果未确认，请核对上游任务，暂勿重复提交~'),
 ])
 def test_canvas_errors_use_existing_caller_vocabulary(code, message, expected):

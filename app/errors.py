@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import re
+
+
+CONTENT_MODERATION_MESSAGE = "检测到内容可能违规，请修改提示词或参考素材后重试~"
+
 
 def upstream_review_error(code: str, message: str) -> str | None:
     """Classify observed terminal review failures without inferring refunds."""
@@ -25,6 +30,18 @@ def public_error(code: str, message: str) -> dict[str, str]:
     if (kind == "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN" and message ==
             "Dreamina identity read could not complete; automatic resubmission is disabled"):
         kind = "ACCOUNT_VERIFICATION_FAILED"
+    # Canvas's generic terminal failures use the caller's "possibly unsafe"
+    # vocabulary, including legacy rows and codes beyond the observed 20115
+    # third-party rejection. This is presentation, not a confirmed policy
+    # verdict or refund. Submission/transport uncertainty keeps its category.
+    canvas_terminal_failure = (
+        kind not in {"UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "UPSTREAM_TIMEOUT"}
+        and not kind.startswith(("CLI_", "CLI."))
+        and re.fullmatch(r"Canvas generation failed(?: \([^\r\n()]{1,80}\))?",
+                         (message or "").strip(), re.IGNORECASE)
+    )
+    if kind in {"20115", "CONTENT_MODERATION_FAILED"} or canvas_terminal_failure:
+        return {"code": "CONTENT_MODERATION_FAILED", "message": CONTENT_MODERATION_MESSAGE}
     if (kind in {"INPUT_AUDIO_DURATION_UNSUPPORTED", "INPUTAUDIODURATIONERROR"} or
             "audio clip is too long or too short" in raw):
         return {"code": "INPUT_AUDIO_DURATION_UNSUPPORTED",
@@ -41,16 +58,16 @@ def public_error(code: str, message: str) -> dict[str, str]:
             "image width or height is too large or too small" in raw):
         return {"code": "INPUT_IMAGE_SIZE_UNSUPPORTED",
                 "message": "参考图片尺寸不符合模型要求，请调整图片尺寸后重试~"}
-    if kind == "CONTENT_MODERATION_FAILED" or any(token in raw for token in (
+    if any(token in raw for token in (
         "'code': 12009", "'code': 12011", "content did not meet platform requirements",
         "output video may contain inappropriate content", "outputaudiocopyright",
     )):
         return {"code": "CONTENT_MODERATION_FAILED",
-                "message": "检测到内容有敏感或违规情况，请修改后重试，积分已返还～"}
+                "message": CONTENT_MODERATION_MESSAGE}
     if kind in {'12009', '12011', '2052'} or any(token in raw for token in (
         'this generation may violate our terms of service', 'generation has been blocked')):
         return {'code': 'CONTENT_MODERATION_FAILED',
-                'message': '检测到内容有敏感或违规情况，请修改后重试，积分已返还～'}
+                'message': CONTENT_MODERATION_MESSAGE}
     if kind == 'CLI_CAPABILITY_UNAVAILABLE' and 'does not support duration=' in raw:
         return {'code': 'INPUT_AUDIO_DURATION_UNSUPPORTED', 'message': '素材时长不支持，请修改后再试~'}
     if kind == "VIDEO_EDIT_CONSTRAINT" or "video editing task" in raw:

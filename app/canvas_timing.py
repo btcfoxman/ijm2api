@@ -15,6 +15,33 @@ _PHASES = frozenset({'identity', 'model_preflight', 'material_prepare', 'project
     'reference_upload', 'draft_save', 'quote', 'credit_wait', 'confirmation_submit'})
 _SAFE_CODE = re.compile(r'[A-Za-z0-9_.-]{1,80}\Z')
 INITIAL_ADMISSION_UNSET = object()
+_RESOURCE_STATUSES = frozenset({'pending', 'queued', 'processing', 'uploading', 'importing',
+    'preparing', 'running', 'success', 'succeeded', 'completed', 'failed', 'error',
+    'rejected', 'canceled', 'cancelled', 'unavailable'})
+_RESOURCE_ERROR_CODES = frozenset({'upload_failed', 'download_failed', 'processing_failed',
+    'invalid_media', 'unsupported_media', 'resource_not_found', 'content_policy_violation',
+    'moderation_rejected', 'policy_rejected', 'safety_rejected', 'canceled', 'cancelled'})
+
+
+def _resource_observation(args, result):
+    """Project only fixed readiness facts; never retain resource IDs or media data."""
+    if not isinstance(result, dict):
+        return None
+    def choice(value, allowed):
+        return value.lower() if isinstance(value, str) and value.lower() in allowed else None
+    facts = {'resource_id_matches': len(args) > 2 and isinstance(args[2], str) and bool(args[2])
+        and isinstance(result.get('resourceId'), str) and result['resourceId'] == args[2],
+        'status': choice(result.get('status'), _RESOURCE_STATUSES),
+        'type': choice(result.get('type'), {'image', 'video', 'audio'}),
+        'source': choice(result.get('source'), {'uploaded', 'generated'}),
+        'image_metadata_present': isinstance(result.get('image'), dict),
+        'video_metadata_present': isinstance(result.get('video'), dict)}
+    code = result.get('errorCode')
+    if isinstance(code, int) and not isinstance(code, bool) and -(2**31) <= code < 2**31:
+        facts['error_code'] = code
+    elif isinstance(code, str) and code.lower() in _RESOURCE_ERROR_CODES:
+        facts['error_code'] = code.lower()
+    return facts
 
 
 def archived_attempts(context, timing, account_id, reason):
@@ -155,6 +182,13 @@ class PreparationTiming:
                 execution_started = self._mono()
                 result = invoke()
             entry['outcome'] = 'success'
+            if pair == ('resource', 'get'):
+                try:
+                    facts = _resource_observation(args, result)
+                    if facts is not None:
+                        entry['resource_facts'] = facts
+                except Exception:
+                    pass  # Observation must not replace a successful command result.
             return result
         except BaseException as error:
             entry['outcome'] = 'failed'
