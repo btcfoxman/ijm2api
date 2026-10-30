@@ -69,6 +69,24 @@ def save_diagnostic(value):
     print("SYNTHETIC_FREEZE_DIAGNOSTIC " + json.dumps(value, sort_keys=True), flush=True)
 
 
+def assert_frozen_heartbeats(trace, data, case, receipt):
+    after = {p.name:p.stat().st_size for p in data.glob('*.heartbeat')}
+    trace.record_heartbeats('assertion')
+    before_remove = getattr(trace, 'pre_remove_heartbeats', None)
+    after_remove = getattr(trace, 'post_remove_heartbeats', None)
+    if (after != trace.frozen_heartbeats or before_remove != trace.frozen_heartbeats
+            or after_remove != trace.frozen_heartbeats):
+        save_diagnostic({'case': case, 'phase': 'frozen_heartbeat_integrity',
+            'after_pause': trace.frozen_heartbeats, 'before_remove': before_remove,
+            'after_remove': after_remove, 'final': after,
+            'queued_request_executed': (data / 'executed-after-freeze').exists(),
+            'heartbeat_stages': trace.heartbeat_stages,
+            'receipt': receipt, 'events': trace.events, 'synthetic_only': True})
+    assert before_remove == trace.frozen_heartbeats, 'OldProcessExecutedBeforeRemoval'
+    assert after_remove == trace.frozen_heartbeats, 'OldProcessExecutedDuringRemoval'
+    assert after == trace.frozen_heartbeats, 'OldProcessExecutedAfterFreeze'
+
+
 def require_hosted():
     if (os.name != "posix" or os.environ.get("GITHUB_ACTIONS") != "true"
             or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
@@ -131,6 +149,8 @@ class Trace:
         self.exporter = exporter
         self.paused = False
         self.companion = None
+        self.heartbeat_stages = {}
+        self.frozen_read_count = 0
         self.events = []
         self.frozen_heartbeats = None
 
@@ -138,6 +158,13 @@ class Trace:
         assert self.paused and companion_id == self.companion
         self.events.append("frozen_binary_backup_export")
         self.exporter(companion_id, destination)
+        self.record_heartbeats('export')
+
+    def record_heartbeats(self, stage):
+        self.heartbeat_stages[stage] = {
+            'sizes': {p.name:p.stat().st_size for p in self.data.glob('*.heartbeat')},
+            'queued_marker': (self.data / 'queued-after-freeze').exists(),
+            'executed_marker': (self.data / 'executed-after-freeze').exists()}
 
     def __call__(self, args, *, input=None, timeout=30):
         assert args[0] == "docker"
@@ -183,6 +210,7 @@ class Trace:
             if self.expect_success:
                 self.frozen_heartbeats = {p.name:p.stat().st_size for p in self.data.glob('*.heartbeat')}
                 assert len(self.frozen_heartbeats) == 2 and all(self.frozen_heartbeats.values())
+                self.record_heartbeats('after_pause')
                 (self.data / 'queued-after-freeze').touch()
                 self.events.append("synthetic_request_queued_while_frozen")
             return value
@@ -192,12 +220,22 @@ class Trace:
                 return docker(command, input=input, timeout=timeout)
             assert self.paused and command[2] == self.companion
             self.events.append("frozen_companion_read")
+            value = docker(command, input=input, timeout=timeout)
+            self.frozen_read_count += 1
+            self.record_heartbeats('first_guard' if self.frozen_read_count == 1 else 'final_guard')
+            return value
         if command[0] == "unpause":
             assert command[1] == self.service
             self.events.append("abort_unpaused_original")
         if command[:2] == ["rm", "--force"] and command[2] == self.service:
             assert self.paused
+            self.pre_remove_heartbeats = {p.name:p.stat().st_size for p in self.data.glob('*.heartbeat')}
+            self.record_heartbeats('before_remove')
             self.events.append("old_removed_while_frozen")
+            value = docker(command, input=input, timeout=timeout)
+            self.post_remove_heartbeats = {p.name:p.stat().st_size for p in self.data.glob('*.heartbeat')}
+            self.record_heartbeats('after_remove')
+            return value
         if command[:2] == ["rm", "--force"] and command[2] == self.companion and not self.paused:
             self.events.append('owned_startup_companion_cleanup')
         return docker(command, input=input, timeout=timeout)
@@ -327,7 +365,7 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                 assert docker(["inspect", service], optional=True) is None
                 assert "abort_unpaused_original" not in trace.events
                 time.sleep(0.2)
-                assert {p.name:p.stat().st_size for p in data.glob('*.heartbeat')} == trace.frozen_heartbeats, "OldProcessExecutedAfterFreeze"
+                assert_frozen_heartbeats(trace, data, name, receipt)
                 assert (data / 'queued-after-freeze').is_file()
                 assert not (data / 'executed-after-freeze').exists(), "QueuedRequestExecutedDuringForceRemoval"
                 snapshot = release / "frozen.ijm2api.db"
