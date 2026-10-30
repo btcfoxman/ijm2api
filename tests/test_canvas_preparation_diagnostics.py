@@ -68,7 +68,7 @@ def test_diagnostic_metadata_uses_exact_white_list():
     assert 'private' not in json.dumps(diagnostic) and 'secret' not in json.dumps(diagnostic)
 
 
-def test_unrecoverable_preparation_error_is_saved_after_original_context(context):
+def test_retryable_preparation_error_keeps_original_context_and_raw_diagnostic(context):
     store,service,_=context
     account=owner(store);task(store)
     client=fake_client(store,service,account)
@@ -80,10 +80,12 @@ def test_unrecoverable_preparation_error_is_saved_after_original_context(context
     client.prepare.side_effect=failed_prepare
     with patch.object(service,'canvas_client',return_value=client):service._run('task')
     row=store.task('task');saved=row['upstream_context']['preparation_error']
-    assert row['status']=='failed' and row['error_code']=='CLI_INVALID_RESPONSE'
+    assert row['status']=='failed' and row['error_code']=='CLI_PREPARATION_TRANSIENT_FAILED'
+    assert saved['code']=='CLI_INVALID_RESPONSE'
     assert saved['exit_code']==1 and saved['phase']=='saving'
     assert saved['transport_diagnostic']['command_pair']==['node','create']
     assert row['upstream_context']['submit_id']=='original-submit'
+    assert row['upstream_context']['node_id']=='original-node'
     assert row['actual_cost'] is None and not service._credit_reservations
     client.submit.assert_not_called()
 
