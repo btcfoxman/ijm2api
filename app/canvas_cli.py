@@ -11,6 +11,7 @@ import json
 import hashlib
 import os
 import re
+import selectors
 import signal
 import subprocess
 import sys
@@ -372,26 +373,237 @@ class CanvasCLI:
             lock.release()
 
     @staticmethod
-    def _terminate(process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is not None:
+    def _linux_identity(pid: int) -> tuple[int, int, int, str] | None:
+        try:
+            fields = (Path('/proc') / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()
+            return int(fields[2]), int(fields[3]), int(fields[19]), fields[0]
+        except (OSError, ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _capture_process_group(process: subprocess.Popen[bytes]) -> None:
+        """Remember identity only for the new session created by this invocation."""
+        if os.name == 'nt':
             return
+        identity = CanvasCLI._linux_identity(process.pid)
+        if identity is not None and identity[:2] == (process.pid, process.pid):
+            process._canvas_owned_group = (process.pid, identity[2])
+            process._canvas_known_members = {process.pid: identity[2]}
+            CanvasCLI._owned_group_members(process, observe=True)
+
+    @staticmethod
+    def _owned_group_members(process: subprocess.Popen[bytes], *, observe: bool = False) -> list[int]:
+        token = getattr(process, '_canvas_owned_group', None)
+        if not isinstance(token, tuple) or len(token) != 2:
+            return []
+        leader, born = token
+        if (not isinstance(leader, int) or not isinstance(born, int) or leader <= 1
+                or leader != process.pid):
+            return []
+        current = CanvasCLI._linux_identity(leader)
+        # A PID reused by another session must never become our cleanup target.
+        if current is not None and current[:3] != (leader, leader, born):
+            return []
+        known = getattr(process, '_canvas_known_members', {})
+        if current is None:
+            anchored = False
+            for pid, start in tuple(known.items()):
+                identity = CanvasCLI._linux_identity(pid)
+                if (pid != leader and identity is not None and identity[:3] == (leader, leader, start)
+                        and identity[3] != 'Z'):
+                    anchored = True
+                    break
+            if not anchored:
+                return []  # A vanished/reused session number alone proves no ownership.
+        members = []
+        for path in Path('/proc').glob('[0-9]*'):
+            identity = CanvasCLI._linux_identity(int(path.name))
+            if identity is not None and identity[:2] == (leader, leader):
+                if identity[2] < born:
+                    return []
+                if observe and current is not None:
+                    known[int(path.name)] = identity[2]
+                if identity[3] != 'Z':
+                    members.append(int(path.name))
+        return members
+
+    @staticmethod
+    def _poll_with_group_observation(process: subprocess.Popen[bytes]) -> int | None:
+        """Observe an exited child before reap; ordinary waits never scan /proc."""
+        if (getattr(process, 'returncode', None) is None
+                and getattr(process, '_canvas_owned_group', None)
+                and all(hasattr(os, name) for name in ('waitid', 'P_PID', 'WEXITED', 'WNOHANG', 'WNOWAIT'))):
+            try:
+                ended = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except (ChildProcessError, OSError):
+                pass  # No ownership inference from an unavailable observation.
+            else:
+                if ended is None:
+                    return None
+                CanvasCLI._owned_group_members(process, observe=True)
+        return process.poll()
+
+    @staticmethod
+    def _terminate(process: subprocess.Popen[bytes]) -> None:
         try:
             if os.name == "nt":
+                if process.poll() is not None:
+                    return
                 subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             else:
+                members = CanvasCLI._owned_group_members(process, observe=True)
+                if not members:
+                    # Capture may lose a very fast wrapper. Terminate only the
+                    # still-unreaped direct child represented by this Popen.
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=.25)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=.5)
+                    return
                 os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=2)
+                grace = time.monotonic() + .25
+                while time.monotonic() < grace and CanvasCLI._owned_group_members(process):
+                    process.poll()
+                    time.sleep(.025)
+                # The wrapper may have exited while a stopped descendant still
+                # owns the pipes. Recheck ownership, not just wrapper.poll().
+                if CanvasCLI._owned_group_members(process):
+                    os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=.5)
         except (OSError, subprocess.TimeoutExpired):
             try:
-                if os.name != "nt":
-                    os.killpg(process.pid, signal.SIGKILL)
-                else:
-                    process.kill()
-                process.wait(timeout=2)
+                if process.poll() is None:
+                    process.kill()  # Only this still-unreaped direct Popen child.
+                    process.wait(timeout=.5)
             except (OSError, subprocess.TimeoutExpired):
-                pass
+                pass  # Cleanup must not replace the original command failure.
+
+    @staticmethod
+    def _windows_pipe_ready(stream: Any) -> tuple[bool, int]:
+        """Peek without a background reader holding a BufferedReader lock."""
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        peek = kernel.PeekNamedPipe
+        peek.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                         ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        peek.restype = wintypes.BOOL
+        available = wintypes.DWORD()
+        handle = msvcrt.get_osfhandle(stream.fileno())
+        if not peek(handle, None, 0, None, ctypes.byref(available), None):
+            if ctypes.get_last_error() in {109, 232}:  # broken pipe / no data (closed pipe)
+                return True, 0
+            raise OSError('Canvas pipe observation failed')
+        return False, available.value
+
+    def _collect_output(self, process: subprocess.Popen[bytes], deadline: float) -> tuple[list[bytearray], str]:
+        """Collect both pipes within one deadline; never close a concurrent read."""
+        buffers = [bytearray(), bytearray()]
+        pending = {stream.fileno(): (stream, index)
+                   for index, stream in enumerate((process.stdout, process.stderr))}
+        selector = selectors.DefaultSelector() if os.name != 'nt' else None
+        exited_at = None
+        failure = ''
+        poll = lambda: self._poll_with_group_observation(process)
+
+        def known_complete_response() -> bool:
+            if poll() != 0:
+                return False
+            valid = False
+            for raw in buffers:
+                try:
+                    value = json.loads(bytes(raw).decode('utf-8-sig'))
+                except (UnicodeError, ValueError):
+                    continue
+                valid = valid or isinstance(value, dict) and isinstance(value.get('ok'), bool)
+            if not valid:
+                return False
+            # Do not mistake a valid prefix for the whole response while more
+            # bytes (including an overflow or trailing garbage) are readable.
+            try:
+                for fd, (stream, _) in pending.items():
+                    if os.name == 'nt':
+                        _, available = self._windows_pipe_ready(stream)
+                    else:
+                        import array
+                        import fcntl
+                        import termios
+                        length = array.array('i', [0])
+                        fcntl.ioctl(fd, termios.FIONREAD, length, True)
+                        available = length[0]
+                    if available:
+                        return False
+            except OSError:
+                return False
+            return True
+
+        try:
+            if selector is not None:
+                for fd in pending:
+                    os.set_blocking(fd, False)
+                    selector.register(fd, selectors.EVENT_READ)
+            while pending or poll() is None:
+                now = time.monotonic()
+                # Preserve an already observed normal receipt at the clock
+                # edge; EOF on an inherited pipe is not an admission verdict.
+                if known_complete_response():
+                    return buffers, ''
+                if now >= deadline:
+                    failure = 'timeout'
+                    break
+                if poll() is not None:
+                    exited_at = now if exited_at is None else exited_at
+                    if pending and now - exited_at >= .25:
+                        failure = 'drain_timeout'
+                        break
+                wait = min(.025, max(0, deadline - now))
+                ready = [key.fd for key, _ in selector.select(wait)] if selector is not None else []
+                if selector is None:
+                    for fd, (stream, _) in list(pending.items()):
+                        eof, available = self._windows_pipe_ready(stream)
+                        if eof or available:
+                            ready.append((fd, 0 if eof else min(65536, available)))
+                    if not ready:
+                        time.sleep(wait)
+                elif not pending:
+                    time.sleep(wait)
+                for entry in ready:
+                    fd, amount = entry if isinstance(entry, tuple) else (entry, 65536)
+                    stream, index = pending[fd]
+                    while True:
+                        try:
+                            chunk = os.read(fd, amount) if amount else b''
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            if selector is not None:
+                                selector.unregister(fd)
+                            del pending[fd]
+                            break
+                        if len(buffers[index]) + len(chunk) > self.max_output_bytes:
+                            return buffers, 'overflow'
+                        buffers[index].extend(chunk)
+                        if time.monotonic() >= deadline:
+                            return buffers, '' if known_complete_response() else 'timeout'
+                        if selector is None:
+                            eof, available = self._windows_pipe_ready(stream)
+                            if not eof and not available:
+                                break
+                            amount = 0 if eof else min(65536, available)
+                if known_complete_response():
+                    return buffers, ''
+        except (OSError, ValueError):
+            failure = 'read_failed'
+        finally:
+            if selector is not None:
+                selector.close()
+        return buffers, failure
 
     def cancel(self, account: dict[str, Any] | int) -> None:
         account_id = account if isinstance(account, int) else _account_id(account)
@@ -448,7 +660,7 @@ class CanvasCLI:
             command = [self.proxy_binary, "--config", str(proxy_config), "--", *command]
         kwargs: dict[str, Any] = {"env": env, "cwd": str(self.account_directory(account)),
                                   "stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,
-                                  "stderr": subprocess.PIPE}
+                                  "stderr": subprocess.PIPE, "bufsize": 0}
         if os.name == "nt":
             kwargs["creationflags"] = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
                                         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
@@ -465,41 +677,15 @@ class CanvasCLI:
                 proxy_config.unlink(missing_ok=True)
             code = "CLI_PROXY_WRAPPER_UNAVAILABLE" if not self._allow_unwrapped_for_tests else "CLI_UNAVAILABLE"
             raise CanvasCLIError(code, f"Canvas protected command could not start: {type(exc).__name__}") from None
+        self._capture_process_group(process)
         with self._guard:
             self._processes[account_id] = process
-        buffers = [bytearray(), bytearray()]
-        overflow = threading.Event()
-        def collect(stream: Any, index: int) -> None:
-            try:
-                while True:
-                    chunk = stream.read(65536)
-                    if not chunk:
-                        break
-                    if len(buffers[index]) + len(chunk) > self.max_output_bytes:
-                        overflow.set()
-                        break
-                    buffers[index].extend(chunk)
-            except (OSError, ValueError):
-                pass
-        readers = [threading.Thread(target=collect, args=(stream, i), daemon=True)
-                   for i, stream in enumerate((process.stdout, process.stderr))]
-        for reader in readers:
-            reader.start()
         budget = max(0.1, float(timeout if timeout is not None else self.timeout))
         deadline = min(deadline, time.monotonic() + budget) if deadline is not None else time.monotonic() + budget
-        timed_out = False
         try:
-            while process.poll() is None:
-                if overflow.is_set() or time.monotonic() >= deadline:
-                    timed_out = not overflow.is_set()
-                    self._terminate(process)
-                    break
-                time.sleep(0.025)
-            for reader in readers:
-                reader.join(timeout=2)
+            buffers, collection_failure = self._collect_output(process, deadline)
         finally:
-            if process.poll() is None:
-                self._terminate(process)
+            self._terminate(process)
             for stream in (process.stdout, process.stderr):
                 if stream:
                     stream.close()
@@ -519,11 +705,15 @@ class CanvasCLI:
         if tuple(args[:2]) in TRANSPORT_DIAGNOSTIC_COMMANDS:
             transport_diagnostic['command_pair'] = list(args[:2])
         error_details = {'transport_diagnostic': transport_diagnostic}
-        if overflow.is_set():
+        if collection_failure == 'overflow':
             raise CanvasCLIError("CLI_OUTPUT_LIMIT", "Canvas CLI output exceeded its limit",
                                  details=error_details, exit_code=process.returncode, outcome_unknown=paid_submit)
-        if timed_out:
+        if collection_failure == 'timeout':
             raise CanvasCLIError("CLI_COMMAND_TIMEOUT", "Canvas CLI command timed out",
+                                 details=error_details, exit_code=process.returncode, outcome_unknown=paid_submit)
+        if collection_failure:
+            raise CanvasCLIError('CLI_OUTPUT_DRAIN_TIMEOUT' if collection_failure == 'drain_timeout' else 'CLI_OUTPUT_READ_FAILED',
+                                 'Canvas CLI output did not close within its bounded collection window',
                                  details=error_details, exit_code=process.returncode, outcome_unknown=paid_submit)
         envelope: dict[str, Any] | None = None
         for raw in buffers:

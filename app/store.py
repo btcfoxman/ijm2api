@@ -259,10 +259,14 @@ class Store:
                           "priority": old["priority"] if priority is None else priority,
                           "enabled": int(bool(payload.get("enabled", old["enabled"]))),
                           "execution_mode": execution_mode or old["execution_mode"]}
+                if 'enabled' in payload:
+                    values['login_enable_after'] = None if payload['enabled'] else 0
                 db.execute("""UPDATE accounts SET proxy_url=:proxy_url,project_id=:project_id,
                     cdp_port=:cdp_port,max_concurrency=:max_concurrency,priority=:priority,
-                    enabled=:enabled,execution_mode=:execution_mode,updated_at=:updated_at WHERE id=:id""",
-                    {**values, "updated_at": now, "id": old["id"]})
+                    enabled=:enabled,execution_mode=:execution_mode,
+                    login_enable_after=:login_enable_after,updated_at=:updated_at WHERE id=:id""",
+                    {"login_enable_after": old['login_enable_after'], **values,
+                     "updated_at": now, "id": old["id"]})
                 account_id = int(old["id"])
             else:
                 cursor = db.execute("""INSERT INTO accounts(name,cdp_port,proxy_url,project_id,
@@ -416,6 +420,8 @@ class Store:
                    "enabled", "status", "balance", "last_error", "last_checkin_date", "login_user_id", "login_enable_after",
                    "execution_mode", "cli_auth_status", "cli_auth_error", "cli_user_id", *ACCOUNT_SETUP_FIELDS}
         data = {key: value for key, value in values.items() if key in allowed}
+        if 'enabled' in data and 'status' not in data and 'login_enable_after' not in data:
+            data['login_enable_after'] = None if data['enabled'] else 0
         if "max_concurrency" in data and not 1 <= int(data["max_concurrency"]) <= 50:
             raise ValueError("max_concurrency must be between 1 and 50")
         if "priority" in data:

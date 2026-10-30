@@ -24,7 +24,8 @@ from .canvas_cli import CanvasCLI, CanvasCLIError
 from .canvas_service import ADMISSION_AUDIT_FIELDS, CanvasServiceMixin, execution_mode
 from .canvas_quote_hints import matching_hint
 from .canvas_timing import INITIAL_ADMISSION_UNSET
-from .account_policy import credit_rejected as _credit_rejected
+from .account_policy import (account_accepts_task, low_balance_image_probe,
+                             credit_rejected as _credit_rejected)
 from .catalog import MODELS, normalize_request
 from .client import DreaminaClient, DreaminaError, InputAudioDurationError, SubmissionPreflightError
 from .image_client import DreaminaImageClient, resolve_image_model, image_model_requires_cli
@@ -535,13 +536,14 @@ class Service(CanvasServiceMixin):
                          backend: str | None = None, *, include_aux_busy: bool = False,
                          task: dict | None = None) -> list[dict]:
         accounts, legacy, all_quotes = [], [], []
+        threshold = number(self.settings().get('low_balance_disable_threshold')) or 0
         if task and (task.get('normalized') or {}).get('kind') != 'image':
             try:
                 all_quotes = self.store.canvas_quote_hints()
             except Exception as exc:
                 logger.warning('Canvas scheduling quote cache unavailable (%s)', type(exc).__name__)
         for item in self.store.accounts(private=True):
-            if (int(item['id']) in excluded or not item['enabled'] or item['status'] != 'active'
+            if (int(item['id']) in excluded or not account_accepts_task(item, task, threshold=threshold)
                     or not item['proxy_url'] or not _credential_setup_ready(item)):
                 continue
             if not include_aux_busy and int(item['id']) in self._aux_account_owners:
@@ -557,6 +559,13 @@ class Service(CanvasServiceMixin):
             if unknown_hold or available is not None and available <= 0:
                 continue
             candidate = {**item, '_available_credits': available}
+            if low_balance_image_probe(item, task, threshold):
+                # A different account's estimate is not this account's quote.
+                # Reserve its entire available budget until its own quote so
+                # another preparation cannot reuse an inherited low estimate.
+                # This is a temporary hold, never a price or actual debit.
+                accounts.append({**candidate, '_credit_reservation_amount': available})
+                continue
             if available is None or available >= estimated_cost:
                 legacy.append(candidate)
             hint = next((row for row in all_quotes if row['account_id'] == int(item['id'])
@@ -612,7 +621,8 @@ class Service(CanvasServiceMixin):
                     continue
                 self._active[account_id] = active + 1
                 self._credit_reservations[task_id or 'slot-' + uuid.uuid4().hex] = (
-                    account_id, account.get('_scheduling_quote_amount', estimated_cost))
+                    account_id, account.get('_credit_reservation_amount',
+                                            account.get('_scheduling_quote_amount', estimated_cost)))
                 return account
         return None
 
@@ -748,7 +758,11 @@ class Service(CanvasServiceMixin):
             pending = self._pending_credits(self.store.scheduling_rows(), task_id)
             current = self.store.account(int(account['id']), private=True) or {}
             snapshots = [value for raw in (balance, current.get('balance')) if (value := number(raw)) is not None]
-            available, unknown_hold = self._available_credits({**account, 'balance': min(snapshots) if snapshots else None}, pending)
+            checked = {**current, 'balance': min(snapshots) if snapshots else None}
+            threshold = number(self.settings().get('low_balance_disable_threshold')) or 0
+            if not account_accepts_task(checked, self.store.task(task_id), threshold=threshold):
+                return False
+            available, unknown_hold = self._available_credits(checked, pending)
             return not unknown_hold and available is not None and available > 0 and available >= estimated_cost
 
     def _submission_budget_status(self, account: dict, task_id: str, estimated_cost: float, balance: Any) -> tuple[bool, bool]:
@@ -993,7 +1007,7 @@ class Service(CanvasServiceMixin):
         task = self.store.task(task_id)
         if not task or task["status"] != "queued":
             return
-        if self._cli_authorization_missing():
+        if self._cli_authorization_missing() and not self._has_eligible_account(0, set(), task_id):
             self._fail(task_id, 'ACCOUNT_POOL_UNAVAILABLE', 'CLI authorization is required for the enabled accounts')
             return
         deadline = self._admission_deadline(task_id,
