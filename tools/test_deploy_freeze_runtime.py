@@ -413,6 +413,12 @@ def main():
         run_case(controller, guard, args.image, "companion_start_timeout_after_effect_cleans_without_pause", active=True, query=True, companion_start_timeout=True),
         run_case(controller, guard, args.image, "default_idle_success", active=False, query=False),
         run_case(controller, guard, args.image, "default_active_stays_blocked", active=True, query=False)]
+    # Only an explicitly selected diagnostic image enables this bounded stress.
+    # The ordinary release gate remains the original six scenarios.
+    if os.environ.get('SMOKE_ONLY_IMAGE_TAG'):
+        for attempt in range(2, 6):
+            cases.append(run_case(controller, guard, args.image,
+                'default_idle_success_stress_' + str(attempt), active=False, query=False))
     print(json.dumps({"passed": True, "cases": cases, "count": len(cases), "provider_calls": 0}))
 
 
