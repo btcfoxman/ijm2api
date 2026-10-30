@@ -15,11 +15,28 @@ import time
 import uuid
 
 COMPANION_OWNER_LABEL = "io.ijm2api.frozen-companion.owner"
+COMPANION_ROLE_LABEL = "io.ijm2api.frozen-companion.role"
 MIB = 1024 * 1024
 SNAPSHOT_HEADROOM = 64 * MIB
 SNAPSHOT_MINIMUM = 256 * MIB
 SNAPSHOT_MAXIMUM = 1024 * MIB
 CGROUP_BIND_ROOT = "/run/ijm-frozen-cgroup"
+PROCESS_BIND_ROOT = "/run/ijm-original-process"
+
+
+def pid_namespace(path):
+    value = Path(path).stat()
+    return {"device": value.st_dev, "inode": value.st_ino}
+
+
+def original_namespace_program():
+    return """# ORIGINAL_PID_NAMESPACE_WITNESS
+import json,os,pathlib
+namespace=os.stat('/proc/self/ns/pid')
+value=pathlib.Path('/proc/1/stat').read_text();ticks=int(value[value.rfind(')')+2:].split()[19])
+print(json.dumps({'pid_namespace':{'device':namespace.st_dev,'inode':namespace.st_ino},
+ 'startticks':ticks,'cgroup':pathlib.Path('/proc/1/cgroup').read_text().splitlines()}))
+"""
 
 
 def process_startticks(pid):
@@ -70,7 +87,7 @@ def kill_command_diagnostic(output=None, error=None):
     value["stderr_errno"] = [int(number) for number in re.findall(r"(?m)^(?:PermissionError|FileNotFoundError|ProcessLookupError|OSError): \[Errno (-?[0-9]{1,4})\]", tail)]
     reasons = ("CompanionRootIdentityRequired", "NamespaceInitIdentityChanged", "NamespaceInitCgroupChanged",
         "CgroupBindIdentityChanged", "CgroupDomainRequired", "CgroupWriteDescriptorChanged",
-        "CgroupNoLongerFrozen", "CgroupNotFullyFrozen", "CgroupKillShortWrite")
+        "CgroupNoLongerFrozen", "CgroupNotFullyFrozen", "CgroupKillShortWrite", "KillerPidNamespaceNotIsolated")
     value["guest_error_reasons"] = [reason for reason in reasons if "RuntimeError: " + reason in tail]
     return value
 
@@ -148,6 +165,7 @@ class HostCgroup:
         self.last_events_error = None
         self.last_watch_error = None
         self.watch_error_count = 0
+        self.killer_identity = None
 
     def capture(self, original):
         if sys.platform != "linux" or not Path("/sys/fs/cgroup/cgroup.controllers").is_file():
@@ -171,6 +189,9 @@ class HostCgroup:
         self.ticks = process_startticks(pid)
         if not self.ticks:
             raise RuntimeError("OriginalProcessIdentityMissing")
+        self.namespaces = {"original": None, "controller": pid_namespace("/proc/self/ns/pid")}
+        if original["HostConfig"].get("PidMode") != "":
+            raise RuntimeError("OriginalPrivatePidNamespaceRequired")
         self.fds["directory"] = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         self.identities = {}
         for name in ("directory", "cgroup.kill", "cgroup.events", "cgroup.freeze", "cgroup.type"):
@@ -185,22 +206,65 @@ class HostCgroup:
         if (path / "cgroup.type").read_text().strip() != "domain":
             raise RuntimeError("CgroupDomainRequired")
         self.identity = {"container_id": old_id, "pid": pid, "startticks": self.ticks,
-            "cgroup_path": relative, "host_cgroup_path": str(path), "files": self.identities}
+            "cgroup_path": relative, "host_cgroup_path": str(path), "files": self.identities,
+            "pid_namespaces": self.namespaces}
         self.validate(frozen=False)
         return self.identity
 
+    def bind_original_namespace(self, witness):
+        namespace = witness.get("pid_namespace") if isinstance(witness, dict) else None
+        if (not isinstance(namespace, dict) or set(namespace) != {"device", "inode"}
+                or any(type(value) is not int or value <= 0 for value in namespace.values())
+                or namespace == self.namespaces["controller"] or witness.get("startticks") != self.ticks
+                or witness.get("cgroup") != ["0::" + self.relative] or self.namespaces["original"] is not None):
+            raise RuntimeError("OriginalNamespaceWitnessRejected")
+        self.validate(frozen=False)
+        self.namespaces["original"] = namespace
+        return {"shared_guard_witness_verified": True, "startticks_match": True, "cgroup_match": True,
+            "original_pid_namespace": namespace, "controller_pid_namespace": self.namespaces["controller"]}
+
     def mount_args(self):
+        if self.namespaces["original"] is None:
+            raise RuntimeError("OriginalNamespaceWitnessRequired")
         arguments = ["--cgroupns", "host"]
         for name in ("cgroup.kill", "cgroup.events", "cgroup.freeze", "cgroup.type"):
             value = f"type=bind,src={self.path / name},dst={CGROUP_BIND_ROOT}/{name}"
             if name != "cgroup.kill":
                 value += ",readonly"
             arguments += ["--mount", value]
+        for name in ("stat", "cgroup"):
+            arguments += ["--mount", f"type=bind,src=/proc/{self.pid}/{name},dst={PROCESS_BIND_ROOT}/{name},readonly"]
         return arguments
+
+    def validate_killer(self, current, access):
+        if self.namespaces["original"] is None:
+            raise RuntimeError("OriginalNamespaceWitnessRequired")
+        pid, cid = (current.get("State") or {}).get("Pid"), current.get("Id")
+        if (not re.fullmatch(r"[0-9a-f]{64}", cid or "") or type(pid) is not int or pid <= 1 or pid == self.pid
+                or (current.get("HostConfig") or {}).get("PidMode") != ""
+                or not current["State"].get("Running") or current["State"].get("Paused")):
+            raise RuntimeError("KillerPrivatePidNamespaceRequired")
+        ticks = process_startticks(pid)
+        namespace = access.get("writer_pid_namespace")
+        membership = Path(f"/proc/{pid}/cgroup").read_text().splitlines()
+        if (not ticks or not isinstance(namespace, dict) or set(namespace) != {"device", "inode"}
+                or any(type(value) is not int or value <= 0 for value in namespace.values())
+                or namespace in self.namespaces.values()
+                or len(membership) != 1 or not membership[0].startswith("0::/")
+                or Path(membership[0][3:]).name not in {cid, f"docker-{cid}.scope"}
+                or process_startticks(pid) != ticks):
+            raise RuntimeError("KillerLocalNamespaceIdentityRejected")
+        proof = {"container_id": cid, "pid": pid, "startticks": ticks, "pid_namespace": namespace,
+            "private_sibling_verified": True, "local_cgroup_matches_container": True}
+        if self.killer_identity is not None and self.killer_identity != proof:
+            raise RuntimeError("KillerNamespaceIdentityChanged")
+        self.killer_identity = proof
+        return proof
 
     def validate(self, frozen=None):
         if (process_startticks(self.pid) != self.ticks
-                or Path(f"/proc/{self.pid}/cgroup").read_text().splitlines() != ["0::" + self.relative]):
+                or Path(f"/proc/{self.pid}/cgroup").read_text().splitlines() != ["0::" + self.relative]
+                or pid_namespace("/proc/self/ns/pid") != self.namespaces["controller"]):
             raise RuntimeError("OriginalProcessOrCgroupChanged")
         for name, identity in self.identities.items():
             path = self.path if name == "directory" else self.path / name
@@ -305,16 +369,19 @@ class HostCgroup:
 
 
 def cgroup_companion_program(identity, *, kill=False):
-    # The kill program can itself die as namespace PID1 exits. Never depend on
-    # its acknowledgement, and never run it again after the durable attempt.
+    # The writer is in a separate default-private sibling PID namespace. The
+    # original shared namespace companion only performs read-only guards.
     program = "# CGROUP_SINGLE_FILE_" + ("KILL" if kill else "ACCESS") + "\nimport json,os,pathlib,stat\n"
     if kill:
         program += "import sys\ndef observe(stage):\n try:print('CGROUP_KILL_STAGE='+stage,file=sys.stderr,flush=True)\n except Exception:pass\nobserve('start')\n"
-    program += "expected=" + repr(identity) + "\nroot=pathlib.Path(" + repr(CGROUP_BIND_ROOT) + ")\n"
+    program += "expected=" + repr(identity) + "\nroot=pathlib.Path(" + repr(CGROUP_BIND_ROOT) + ")\noriginal=pathlib.Path(" + repr(PROCESS_BIND_ROOT) + ")\n"
     program += """if os.geteuid()!=0:raise RuntimeError('CompanionRootIdentityRequired')
-value=pathlib.Path('/proc/1/stat').read_text();ticks=int(value[value.rfind(')')+2:].split()[19])
+namespace=os.stat('/proc/self/ns/pid');writer_namespace={'device':namespace.st_dev,'inode':namespace.st_ino}
+namespaces=expected['pid_namespaces']
+if not isinstance(namespaces['original'],dict) or namespaces['original']==namespaces['controller'] or writer_namespace in namespaces.values():raise RuntimeError('KillerPidNamespaceNotIsolated')
+value=(original/'stat').read_text();ticks=int(value[value.rfind(')')+2:].split()[19])
 if ticks!=expected['startticks']:raise RuntimeError('NamespaceInitIdentityChanged')
-if pathlib.Path('/proc/1/cgroup').read_text().splitlines()!=['0::'+expected['cgroup_path']]:raise RuntimeError('NamespaceInitCgroupChanged')
+if (original/'cgroup').read_text().splitlines()!=['0::'+expected['cgroup_path']]:raise RuntimeError('NamespaceInitCgroupChanged')
 for name in ('cgroup.kill','cgroup.events','cgroup.freeze','cgroup.type'):
  value=(root/name).lstat();wanted=expected['files'][name]
  if stat.S_ISLNK(value.st_mode) or (value.st_dev,value.st_ino)!=(wanted['device'],wanted['inode']):raise RuntimeError('CgroupBindIdentityChanged')
@@ -332,8 +399,50 @@ try:
         program += " if os.write(fd,b'1')!=1:raise RuntimeError('CgroupKillShortWrite')\n"
         program += " observe('write_returned')\n"
     program += "finally:os.close(fd)\n"
-    program += "print(json.dumps({'access_verified':True,'kill_write_returned':True}))\n" if kill else "print(json.dumps({'access_verified':True}))\n"
+    program += "print(json.dumps({'access_verified':True,'kill_write_returned':True,'writer_pid_namespace':writer_namespace}))\n" if kill else "print(json.dumps({'access_verified':True,'writer_pid_namespace':writer_namespace}))\n"
     return program
+
+
+def owned_helper(candidate, name, image, old_id, role, identity, expected_mounts=None):
+    config, host = candidate.get("Config") or {}, candidate.get("HostConfig") or {}
+    cid = candidate.get("Id")
+    if not (isinstance(cid, str) and re.fullmatch(r"[0-9a-f]{64}", cid) and cid != old_id
+            and candidate.get("Name") == "/" + name and config.get("Image") == image
+            and (config.get("Labels") or {}).get(COMPANION_OWNER_LABEL) == old_id
+            and (config.get("Labels") or {}).get(COMPANION_ROLE_LABEL) == role
+            and config.get("Entrypoint") == ["python"]
+            and host.get("ReadonlyRootfs") is True and host.get("NetworkMode") == "none"
+            and host.get("Privileged") is False and host.get("CapDrop") == ["ALL"]
+            and host.get("SecurityOpt") == ["no-new-privileges"]):
+        return False
+    try:
+        mounts = canonical_mounts(candidate.get("Mounts"))
+        if expected_mounts is not None and mounts != canonical_mounts(expected_mounts):
+            return False
+    except RuntimeError:
+        return False
+    if role == "guard":
+        return (host.get("PidMode") == "container:" + old_id and host.get("CapAdd") == ["DAC_READ_SEARCH"]
+            and host.get("CgroupnsMode") == "host"
+            and host.get("VolumesFrom") == [old_id + ":ro"]
+            and host.get("Binds") in (None, []) and host.get("Mounts") in (None, [])
+            and config.get("Cmd") == ["-B", "-c", "import time; time.sleep(600)"]
+            and isinstance(candidate.get("Mounts"), list)
+            and all(not mount.get("RW") or (mount.get("Destination") == "/tmp" and mount.get("Type") == "tmpfs") for mount in candidate["Mounts"])
+            and not any(str(mount.get("Destination", "")).startswith((CGROUP_BIND_ROOT, PROCESS_BIND_ROOT)) for mount in candidate["Mounts"]))
+    if role != "killer" or host.get("PidMode") != "" or host.get("CgroupnsMode") != "host" or host.get("Privileged") is not False:
+        return False
+    if (host.get("CapDrop") != ["ALL"] or host.get("CapAdd") not in (None, [])
+            or host.get("SecurityOpt") != ["no-new-privileges"]
+            or config.get("Cmd") != ["-I", "-S", "-B", "-c", "import time; time.sleep(600)"]
+            or host.get("VolumesFrom") not in (None, [])):
+        return False
+    expected = {CGROUP_BIND_ROOT + "/" + key: (identity["host_cgroup_path"] + "/" + key, key == "cgroup.kill")
+        for key in ("cgroup.kill", "cgroup.events", "cgroup.freeze", "cgroup.type")}
+    expected.update({PROCESS_BIND_ROOT + "/" + key: (f"/proc/{identity['pid']}/{key}", False) for key in ("stat", "cgroup")})
+    return (len(mounts) == len(expected)
+        and all(mount.get("Mode", "") == "" and mount.get("Propagation", "rprivate") == "rprivate" for mount in mounts)
+        and {mount.get("Destination"): (mount.get("Source"), mount.get("RW")) for mount in mounts if mount.get("Type") == "bind"} == expected)
 
 
 def durable_json(path, value):
@@ -531,8 +640,13 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
         raise RuntimeError("CutoverAttemptAlreadyRecorded")
     cgroup = cgroup_ops if cgroup_ops is not None else HostCgroup()
     name = "ijm-frozen-guard-" + uuid.uuid4().hex[:16]
+    killer_name = "ijm-frozen-killer-" + uuid.uuid4().hex[:16]
     companion_id = None
+    killer_id = None
     companion_start_attempted = False
+    killer_start_attempted = False
+    guard_mounts = None
+    killer_mounts = None
     paused = False
     removed = False
     restart_update_attempted = False
@@ -573,17 +687,40 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
         companion_start_attempted = True
         companion_id = run(["docker", "run", "--detach", "--rm", "--name", name,
             "--label", COMPANION_OWNER_LABEL + "=" + old_id,
+            "--label", COMPANION_ROLE_LABEL + "=guard",
             "--pull", "never", "--network", "none", "--read-only", "--user", "0:0",
             "--cap-drop", "ALL", "--cap-add", "DAC_READ_SEARCH", "--security-opt", "no-new-privileges", "--memory", str(capacity['memory_bytes']), "--cpus", "0.5", "--pids-limit", "64",
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=" + str(capacity['tmpfs_bytes']) + ",mode=0700", "--volumes-from", old_id + ":ro",
-            "--pid", "container:" + old_id, *cgroup.mount_args(), "--entrypoint", "python", image,
+            "--pid", "container:" + old_id, "--cgroupns", "host", "--entrypoint", "python", image,
             "-B", "-c", "import time; time.sleep(600)"], timeout=90)
         if not isinstance(companion_id, str) or not re.fullmatch(r"[0-9a-f]{64}", companion_id) or companion_id == old_id:
             raise RuntimeError("CompanionStartReceiptInvalid")
-        access = json.loads(run(["docker", "exec", "-i", companion_id, "python", "-B", "-"],
+        current_guard = json.loads(run(["docker", "inspect", companion_id], timeout=10))[0]
+        if current_guard.get("Id") != companion_id or not owned_helper(current_guard, name, image, old_id, "guard", identity):
+            raise RuntimeError("GuardReadOnlySpecificationRejected")
+        guard_mounts = canonical_mounts(current_guard["Mounts"])
+        witness = json.loads(run(["docker", "exec", "-i", companion_id, "python", "-I", "-S", "-B", "-"],
+            input=original_namespace_program(), timeout=10))
+        receipt["original_namespace_witness"] = cgroup.bind_original_namespace(witness)
+        killer_start_attempted = True
+        killer_id = run(["docker", "run", "--detach", "--rm", "--name", killer_name,
+            "--label", COMPANION_OWNER_LABEL + "=" + old_id,
+            "--label", COMPANION_ROLE_LABEL + "=killer",
+            "--pull", "never", "--network", "none", "--read-only", "--user", "0:0",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--memory", str(128 * MIB),
+            "--cpus", "0.5", "--pids-limit", "16", *cgroup.mount_args(), "--entrypoint", "python", image,
+            "-I", "-S", "-B", "-c", "import time; time.sleep(600)"], timeout=90)
+        if not isinstance(killer_id, str) or not re.fullmatch(r"[0-9a-f]{64}", killer_id) or killer_id in {old_id, companion_id}:
+            raise RuntimeError("KillerStartReceiptInvalid")
+        current_killer = json.loads(run(["docker", "inspect", killer_id], timeout=10))[0]
+        if current_killer.get("Id") != killer_id or not owned_helper(current_killer, killer_name, image, old_id, "killer", identity):
+            raise RuntimeError("KillerPrivateSpecificationRejected")
+        killer_mounts = canonical_mounts(current_killer["Mounts"])
+        access = json.loads(run(["docker", "exec", "-i", killer_id, "python", "-I", "-S", "-B", "-"],
             input=cgroup_companion_program(identity), timeout=10))
         if access.get("access_verified") is not True:
             raise RuntimeError("SingleFileCgroupAccessNotVerified")
+        receipt["killer_identity"] = cgroup.validate_killer(current_killer, access)
         current = json.loads(run(["docker", "inspect", service], timeout=10))[0]
         if current["Id"] != old_id or not current["State"]["Running"] or current["State"].get("Paused"):
             raise RuntimeError("OriginalAppChangedBeforeFreeze")
@@ -626,12 +763,17 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
                 or current.get("RestartCount") != original_restart_count):
             raise RuntimeError("OriginalConfigOrRestartPolicyChanged")
         cgroup.validate(frozen=True)
+        current_killer = json.loads(run(["docker", "inspect", killer_id], timeout=10))[0]
+        if current_killer.get("Id") != killer_id or not owned_helper(current_killer, killer_name, image, old_id, "killer", identity, killer_mounts):
+            raise RuntimeError("KillerPrivateSpecificationChanged")
+        killer_proof = cgroup.validate_killer(current_killer, access)
         receipt.update(frozen_guard=final, frozen_backup_sha256=first["frozen_backup_sha256"])
-        # PID1 death kills its shared-namespace companion. Export and fsync all
-        # required evidence before the only irreversible cgroup write.
+        # PID1 death kills only the shared read-only guard. The isolated killer
+        # survives, but all frozen evidence is still durable before its write.
         manifest_sha = durable_json(release / "frozen-prekill.safe.json", {
             "cgroup_identity": identity, "original_restart_policy": policy,
             "restart_count": original_restart_count, "frozen_guard": final,
+            "killer_identity": killer_proof,
             "frozen_backup_sha256": backup_sha256, "frozen_backup_bytes": destination.stat().st_size,
             "snapshot_capacity": capacity})
         receipt["durable_prekill_manifest_sha256"] = manifest_sha
@@ -660,7 +802,7 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
         receipt["kill_attempted"] = True
         receipt["kill_command_invocations"] = 1
         try:
-            output = run(["docker", "exec", "-i", companion_id, "python", "-B", "-"],
+            output = run(["docker", "exec", "-i", killer_id, "python", "-I", "-S", "-B", "-"],
                 input=cgroup_companion_program(identity, kill=True), timeout=20)
             try:
                 receipt["kill_command_diagnostic"] = kill_command_diagnostic(output=output)
@@ -759,28 +901,28 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
                 receipt["prekill_abort_recovery_requires_operator_review"] = True
         elif kill_attempted and not removed:
             receipt["postkill_outcome_requires_operator_review"] = True
-        try:
-            # A startup timeout can lose stdout after the daemon created it.
-            # Resolve only this operation's random name; never replay creation
-            # or remove an unchecked name, the original app, or a foreign ID.
-            candidates = json.loads(run(["docker", "inspect", name], timeout=10)) if companion_start_attempted else []
-            candidate = candidates[0] if isinstance(candidates, list) and len(candidates) == 1 else {}
-            config, host = candidate.get("Config") or {}, candidate.get("HostConfig") or {}
-            cleanup_id = candidate.get("Id")
-            owned = (isinstance(cleanup_id, str) and re.fullmatch(r"[0-9a-f]{64}", cleanup_id)
-                and cleanup_id != old_id and candidate.get("Name") == "/" + name
-                and (config.get("Labels") or {}).get(COMPANION_OWNER_LABEL) == old_id
-                and config.get("Image") == image and host.get("PidMode") == "container:" + old_id
-                and host.get("ReadonlyRootfs") is True and host.get("NetworkMode") == "none")
-            if owned:
-                run(["docker", "rm", "--force", cleanup_id], timeout=15)
-                receipt["owned_companion_cleanup_completed"] = True
-            elif companion_start_attempted:
+        for role, attempted, helper_name, known_id, mounts in (("killer", killer_start_attempted, killer_name, killer_id, killer_mounts), ("guard", companion_start_attempted, name, companion_id, guard_mounts)):
+            if not attempted:
+                continue
+            try:
+                # A lost startup receipt never permits another creation. Only
+                # this role's exact owned random name/spec may be cleaned.
+                candidates = json.loads(run(["docker", "inspect", helper_name], timeout=10))
+                candidate = candidates[0] if isinstance(candidates, list) and len(candidates) == 1 else {}
+                known = isinstance(known_id, str) and re.fullmatch(r"[0-9a-f]{64}", known_id) and known_id != old_id
+                if (not known or candidate.get("Id") == known_id) and owned_helper(candidate, helper_name, image, old_id, role, identity, mounts):
+                    run(["docker", "rm", "--force", candidate["Id"]], timeout=15)
+                    receipt["owned_" + role + "_cleanup_completed"] = True
+                    if role == "guard":
+                        receipt["owned_companion_cleanup_completed"] = True
+                else:
+                    receipt[role + "_cleanup_requires_operator_review"] = True
+            except Exception:
+                # A guard may already have died with old PID1; uncertainty
+                # never changes the business result or permits a blind rm.
+                receipt[role + "_cleanup_requires_operator_review"] = True
+            if role == "guard" and receipt.get("guard_cleanup_requires_operator_review"):
                 receipt["companion_cleanup_requires_operator_review"] = True
-        except Exception:
-            # The --rm companion can already be gone. Failed observation or
-            # cleanup must preserve the original outcome, never guess/remove.
-            receipt["companion_cleanup_requires_operator_review"] = True
         try:
             cgroup.close()
         except Exception:

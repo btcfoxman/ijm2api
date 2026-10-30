@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import hashlib
+import ast
 from copy import deepcopy
 import importlib.util
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 from pathlib import Path
@@ -33,7 +34,9 @@ class FakeCgroup:
         self.capture_failure = False
         self.validation_failure = False
         self.death_proof = 'held_events_populated_zero'
+        self.namespace_attested = False
         self.identity = {'pid': 4321, 'startticks': 123456, 'container_id': docker.old_id,
+            'pid_namespaces': {'original': {'device': 4, 'inode': 11}, 'controller': {'device': 4, 'inode': 22}},
             'cgroup_path': '/system.slice/docker-' + docker.old_id + '.scope',
             'host_cgroup_path': '/sys/fs/cgroup/system.slice/docker-' + docker.old_id + '.scope',
             'files': {name: {'device': 1, 'inode': number} for number, name in enumerate(
@@ -46,12 +49,30 @@ class FakeCgroup:
         assert original['Id'] == self.identity['container_id'] and original['State']['Pid'] == self.identity['pid']
         return deepcopy(self.identity)
 
+    def bind_original_namespace(self, witness):
+        assert witness == {'pid_namespace': self.identity['pid_namespaces']['original'],
+            'startticks': self.identity['startticks'], 'cgroup': ['0::' + self.identity['cgroup_path']]}
+        assert not self.namespace_attested
+        self.namespace_attested = True
+        return {'shared_guard_witness_verified': True}
+
     def mount_args(self):
+        assert self.namespace_attested
         args = ['--cgroupns', 'host']
         for name in ('cgroup.kill', 'cgroup.events', 'cgroup.freeze', 'cgroup.type'):
-            mount = 'type=bind,src=/sys/fake/' + name + ',dst=' + cutover.CGROUP_BIND_ROOT + '/' + name
+            mount = 'type=bind,src=' + self.identity['host_cgroup_path'] + '/' + name + ',dst=' + cutover.CGROUP_BIND_ROOT + '/' + name
             args += ['--mount', mount + ('' if name == 'cgroup.kill' else ',readonly')]
+        for name in ('stat', 'cgroup'):
+            args += ['--mount', f'type=bind,src=/proc/4321/{name},dst={cutover.PROCESS_BIND_ROOT}/{name},readonly']
         return args
+
+    def validate_killer(self, current, access):
+        assert self.namespace_attested
+        self.docker.calls.append(['cgroup_validate_killer'])
+        if (current['HostConfig']['PidMode'] != '' or access.get('writer_pid_namespace') != {'device': 4, 'inode': 33}):
+            raise RuntimeError('KillerLocalNamespaceIdentityRejected')
+        return {'container_id': current['Id'], 'pid': 7777, 'startticks': 654321,
+            'pid_namespace': access['writer_pid_namespace'], 'private_sibling_verified': True, 'local_cgroup_matches_container': True}
 
     def validate(self, frozen=None):
         self.docker.calls.append(['cgroup_validate', frozen])
@@ -85,6 +106,14 @@ class FakeDocker:
     def __init__(self):
         self.old_id = "a" * 64
         self.companion_id = "c" * 64
+        self.killer_id = 'e' * 64
+        self.killer_name = None
+        self.killer_image = None
+        self.killer_exists = False
+        self.killer_mounts = []
+        self.killer_start_timeout_after_effect = False
+        self.foreign_killer_field = None
+        self.killer_replaced_at_cleanup = False
         self.companion_name = None
         self.companion_image = None
         self.companion_exists = False
@@ -152,15 +181,25 @@ class FakeDocker:
         if args[:2] == ["docker", "inspect"]:
             if timeout == 5 and self.diagnostic_inspect_failure:
                 raise PermissionError(13, 'private diagnostic detail must not leak')
-            if args[-1] == self.companion_name:
-                if not self.companion_exists or self.cleanup_inspect_failure:
+            if args[-1] in (self.companion_name, self.companion_id, self.killer_name, self.killer_id):
+                killer = args[-1] in (self.killer_name, self.killer_id)
+                if not (self.killer_exists if killer else self.companion_exists) or (self.cleanup_inspect_failure and not killer):
                     raise RuntimeError("CompanionInspectionUnavailable")
-                value = {"Id": self.companion_id, "Name": "/" + self.companion_name,
-                    "Config": {"Image": self.companion_image,
-                        "Labels": {cutover.COMPANION_OWNER_LABEL: self.old_id}},
-                    "HostConfig": {"PidMode": "container:" + self.old_id,
-                        "ReadonlyRootfs": True, "NetworkMode": "none"}}
-                field = self.foreign_companion_field
+                value = {"Id": self.killer_id if killer else self.companion_id,
+                    "Name": "/" + (self.killer_name if killer else self.companion_name),
+                    "Config": {"Image": self.killer_image if killer else self.companion_image,
+                        'Entrypoint': ['python'], 'Cmd': ['-I', '-S', '-B', '-c', 'import time; time.sleep(600)'] if killer else ['-B', '-c', 'import time; time.sleep(600)'],
+                        "Labels": {cutover.COMPANION_OWNER_LABEL: self.old_id, cutover.COMPANION_ROLE_LABEL: 'killer' if killer else 'guard'}},
+                    "State": {'Pid': 7777 if killer else 8888, 'Running': True, 'Paused': False},
+                    "Mounts": deepcopy(self.killer_mounts) if killer else [],
+                    "HostConfig": {"PidMode": '' if killer else "container:" + self.old_id,
+                        'CgroupnsMode': 'host', 'Binds': None, 'Mounts': None,
+                        "ReadonlyRootfs": True, "NetworkMode": "none", 'Privileged': False,
+                        'CapDrop': ['ALL'], 'CapAdd': None if killer else ['DAC_READ_SEARCH'], 'SecurityOpt': ['no-new-privileges']}}
+                value['HostConfig']['VolumesFrom'] = None if killer else [self.old_id + ':ro']
+                field = self.foreign_killer_field if killer else self.foreign_companion_field
+                if killer and args[-1] == self.killer_name and self.killer_replaced_at_cleanup:
+                    value['Id'] = 'f' * 64
                 if field == "name": value["Name"] = "/foreign-container"
                 elif field == "owner": value["Config"]["Labels"][cutover.COMPANION_OWNER_LABEL] = "foreign-owner"
                 elif field == "image": value["Config"]["Image"] = "foreign-image"
@@ -168,11 +207,16 @@ class FakeDocker:
                 elif field == "readonly": value["HostConfig"]["ReadonlyRootfs"] = False
                 elif field == "network": value["HostConfig"]["NetworkMode"] = "host"
                 elif field == "original-id": value["Id"] = self.old_id
+                elif field == 'role': value['Config']['Labels'][cutover.COMPANION_ROLE_LABEL] = 'foreign-role'
+                elif field == 'capadd': value['HostConfig']['CapAdd'] = ['SYS_ADMIN']
+                elif field == 'mount-rw': value['Mounts'][-1]['RW'] = True
+                elif field == 'cmd': value['Config']['Cmd'] = ['app.main']
+                elif field == 'replacement-id': value['Id'] = 'f' * 64
                 return json.dumps([value])
             self.inspect_count += 1
             value = {"Id": self.old_id, 'Name': '/ijm2api', 'Image': 'sha256:' + 'b' * 64,
                 'Config': {'Image': 'original:immutable'}, 'Mounts': deepcopy(self.mounts), 'RestartCount': self.restart_count,
-                'HostConfig': {'AutoRemove': False, 'RestartPolicy': deepcopy(self.restart_policy)},
+                'HostConfig': {'AutoRemove': False, 'RestartPolicy': deepcopy(self.restart_policy), 'PidMode': ''},
                 "State": {"Running": not self.old_stopped and not self.old_removed, "Paused": self.paused,
                           'Pid': 0 if self.old_stopped else 4321, 'Restarting': False}}
             if self.restart_read_mount_order_drift_once and self.restart_policy['Name'] == 'no' and not self.companion_exists:
@@ -199,29 +243,45 @@ class FakeDocker:
             return self.old_id
         if args[:2] == ["docker", "run"]:
             assert timeout == 90
-            assert args.count("--label") == 1
-            assert args[args.index("--label") + 1] == cutover.COMPANION_OWNER_LABEL + "=" + self.old_id
-            self.companion_name = args[args.index("--name") + 1]
-            self.companion_image = args[args.index("--entrypoint") + 2]
-            for flag in ["--rm", "--read-only", "--cap-drop", "--pids-limit", "--tmpfs"]:
+            labels = [args[index + 1] for index, value in enumerate(args) if value == '--label']
+            assert len(labels) == 2 and labels[0] == cutover.COMPANION_OWNER_LABEL + '=' + self.old_id
+            killer = labels[1] == cutover.COMPANION_ROLE_LABEL + '=killer'
+            assert labels[1] == cutover.COMPANION_ROLE_LABEL + ('=killer' if killer else '=guard')
+            if killer:
+                self.killer_name = args[args.index('--name') + 1]
+                self.killer_image = args[args.index('--entrypoint') + 2]
+            else:
+                self.companion_name = args[args.index("--name") + 1]
+                self.companion_image = args[args.index("--entrypoint") + 2]
+            for flag in ["--rm", "--read-only", "--cap-drop", "--pids-limit"]:
                 assert flag in args
             # Read an existing private host-owned data directory without
             # granting file writes, tracing, host namespaces or admin powers.
             assert args.count("--cap-drop") == 1
             assert args[args.index("--cap-drop") + 1] == "ALL"
-            assert args.count("--cap-add") == 1
-            assert args[args.index("--cap-add") + 1] == "DAC_READ_SEARCH"
             assert "--privileged" not in args
             assert not any(cap in args for cap in ["DAC_OVERRIDE", "SYS_ADMIN", "SYS_PTRACE"])
             assert args[args.index("--security-opt") + 1] == "no-new-privileges"
             assert args[args.index("--network") + 1] == "none"
             assert args[args.index("--pull") + 1] == "never"
-            assert args[args.index("--volumes-from") + 1] == self.old_id + ":ro"
-            assert args[args.index("--pid") + 1] == "container:" + self.old_id
-            assert args[args.index('--cgroupns') + 1] == 'host'
             mounts = [args[i + 1] for i, value in enumerate(args) if value == '--mount']
-            assert len(mounts) == 4 and sum(not value.endswith(',readonly') for value in mounts) == 1
-            assert all(value.endswith(',readonly') or '/cgroup.kill' in value for value in mounts)
+            if killer:
+                assert '--cap-add' not in args and '--pid' not in args and '--volumes-from' not in args
+                assert args[args.index('--cgroupns') + 1] == 'host'
+                assert args[-5:-2] == ['-I', '-S', '-B']
+                assert len(mounts) == 6 and sum(not value.endswith(',readonly') for value in mounts) == 1
+                self.killer_mounts = []
+                for mount in mounts:
+                    pieces = dict(part.split('=', 1) for part in mount.split(',') if '=' in part)
+                    self.killer_mounts.append({'Type': 'bind', 'Source': pieces['src'], 'Destination': pieces['dst'], 'RW': not mount.endswith(',readonly')})
+                self.killer_exists = True
+                if self.killer_start_timeout_after_effect:
+                    raise self.start_error
+                return self.killer_id
+            assert args.count('--cap-add') == 1 and args[args.index('--cap-add') + 1] == 'DAC_READ_SEARCH'
+            assert args[args.index('--volumes-from') + 1] == self.old_id + ':ro'
+            assert args[args.index('--pid') + 1] == 'container:' + self.old_id
+            assert not mounts and args[args.index('--cgroupns') + 1] == 'host'
             budget = cutover.snapshot_budget(self.source_sizes)
             assert args[args.index('--memory') + 1] == str(budget['memory_bytes'])
             assert args[args.index('--tmpfs') + 1] == '/tmp:rw,noexec,nosuid,size=' + str(budget['tmpfs_bytes']) + ',mode=0700'
@@ -240,16 +300,22 @@ class FakeDocker:
                 raise TimeoutError("pause response lost after freezing original")
             return ""
         if args[:2] == ["docker", "exec"]:
+            if input and input.startswith('# ORIGINAL_PID_NAMESPACE_WITNESS\n'):
+                assert args[3] == self.companion_id and not self.paused and not self.killer_exists
+                assert args[-5:] == ['python', '-I', '-S', '-B', '-']
+                return json.dumps({'pid_namespace': self.cgroup.identity['pid_namespaces']['original'],
+                    'startticks': self.cgroup.identity['startticks'], 'cgroup': ['0::' + self.cgroup.identity['cgroup_path']]})
             if args[3] == self.old_id:
                 assert not self.paused and self.guard_count == 0
                 assert input == cutover.snapshot_sizing_program() and 'sqlite' not in input
                 return json.dumps(self.source_sizes)
             if 'CGROUP_SINGLE_FILE_ACCESS' in (input or ''):
-                assert args[3] == self.companion_id and not self.paused
+                assert args[3] == self.killer_id and not self.paused
                 assert "os.write(fd,b'1')" not in input
-                return json.dumps({'access_verified': self.access_allowed})
+                return json.dumps({'access_verified': self.access_allowed, 'writer_pid_namespace': {'device': 4, 'inode': 33}})
             if 'CGROUP_SINGLE_FILE_KILL' in (input or ''):
-                assert args[3] == self.companion_id and self.paused and self.guard_count == 2
+                assert args[3] == self.killer_id and self.paused and self.guard_count == 2
+                assert args[-5:] == ['python', '-I', '-S', '-B', '-']
                 assert self.restart_policy == {'Name': 'no', 'MaximumRetryCount': 0}
                 assert self.cgroup.armed and self.kill_count == 0
                 manifest = self.release / 'frozen-prekill.safe.json'
@@ -293,8 +359,9 @@ class FakeDocker:
             self.paused = False
             return ""
         if args[:3] == ["docker", "rm", "--force"]:
-            assert args[-1] == self.companion_id
-            self.companion_exists = False
+            assert args[-1] in (self.companion_id, self.killer_id)
+            if args[-1] == self.companion_id: self.companion_exists = False
+            else: self.killer_exists = False
             return ""
         if args[:2] == ['docker', 'rm']:
             assert args == ['docker', 'rm', self.old_id] and self.old_stopped and self.kill_count == 1
@@ -963,6 +1030,180 @@ class FrozenCutoverTests(unittest.TestCase):
         self.assertEqual(receipt['cgroup_death']['empty_proof'], 'held_original_cgroup_deleted')
         self.assertEqual(self.docker.kill_count, 1)
         self.assertNotIn(['docker', 'rm', '--force', self.docker.old_id], self.docker.calls)
+
+    def test_two_roles_keep_guard_read_only_and_send_single_write_only_to_private_killer(self):
+        receipt = self.invoke()
+        runs = [call for call in self.docker.calls if call[:2] == ['docker', 'run']]
+        self.assertEqual(len(runs), 2)
+        guard, killer = runs
+        self.assertIn(cutover.COMPANION_ROLE_LABEL + '=guard', guard)
+        self.assertIn(cutover.COMPANION_ROLE_LABEL + '=killer', killer)
+        self.assertIn('--pid', guard)
+        self.assertNotIn('--mount', guard)
+        self.assertNotIn('--pid', killer)
+        self.assertNotIn('--volumes-from', killer)
+        self.assertNotIn('--cap-add', killer)
+        writes = [body for body in self.docker.inputs if body and body.startswith('# CGROUP_SINGLE_FILE_KILL\n')]
+        self.assertEqual(len(writes), 1)
+        self.assertIn(['docker', 'exec', '-i', self.docker.killer_id, 'python', '-I', '-S', '-B', '-'], self.docker.calls)
+        self.assertEqual(self.docker.guard_count, 2)
+        self.assertTrue(receipt['killer_identity']['private_sibling_verified'])
+        self.assertTrue(receipt['original_namespace_witness']['shared_guard_witness_verified'])
+        self.assertFalse(self.docker.killer_exists or self.docker.companion_exists)
+
+    def test_lost_killer_start_receipt_cleans_both_exact_roles_before_pause(self):
+        self.docker.killer_start_timeout_after_effect = True
+        with self.assertRaises(TimeoutError) as error:
+            self.invoke()
+        self.assertIs(error.exception, self.docker.start_error)
+        self.assertFalse(self.docker.killer_exists or self.docker.companion_exists)
+        self.assertEqual(self.docker.kill_count, 0)
+        self.assertFalse(any(call[:2] == ['docker', 'pause'] for call in self.docker.calls))
+        self.assertEqual(self.docker.restart_policy, self.docker.original_restart_policy)
+
+    def test_killer_foreign_role_command_privilege_or_bind_is_never_removed_as_ours(self):
+        for field in ('role', 'cmd', 'capadd', 'mount-rw', 'pid', 'owner', 'image', 'network'):
+            with self.subTest(field=field):
+                self.docker = FakeDocker()
+                self.docker.foreign_killer_field = field
+                with self.assertRaisesRegex(RuntimeError, 'KillerPrivateSpecificationRejected'):
+                    self.invoke()
+                self.assertTrue(self.docker.killer_exists)
+                self.assertEqual(self.docker.kill_count, 0)
+                self.assertNotIn(['docker', 'rm', '--force', self.docker.killer_id], self.docker.calls)
+                self.assertFalse(any(call[:2] == ['docker', 'pause'] for call in self.docker.calls))
+
+    def test_known_killer_id_never_cleans_a_same_name_replacement(self):
+        self.docker.killer_replaced_at_cleanup = True
+        receipt = self.invoke()
+        self.assertTrue(receipt['passed'] and receipt['killer_cleanup_requires_operator_review'])
+        self.assertTrue(self.docker.killer_exists)
+        self.assertNotIn(['docker', 'rm', '--force', 'f' * 64], self.docker.calls)
+        self.assertNotIn(['docker', 'rm', '--force', self.docker.killer_id], self.docker.calls)
+
+    def test_namespace_witness_must_bind_original_ticks_cgroup_and_different_host_namespace(self):
+        for changed in ('valid', 'same-as-host', 'ticks', 'cgroup', 'invalid'):
+            with self.subTest(changed=changed):
+                group = cutover.HostCgroup()
+                group.pid, group.ticks, group.relative = 4321, 123456, '/synthetic-old'
+                group.path = Path('/sys/fs/cgroup/synthetic-old')
+                group.namespaces = {'original': None, 'controller': {'device': 4, 'inode': 22}}
+                witness = {'pid_namespace': {'device': 4, 'inode': 11}, 'startticks': 123456, 'cgroup': ['0::/synthetic-old']}
+                with self.assertRaisesRegex(RuntimeError, 'OriginalNamespaceWitnessRequired'):
+                    group.mount_args()
+                if changed == 'same-as-host': witness['pid_namespace'] = {'device': 4, 'inode': 22}
+                elif changed == 'ticks': witness['startticks'] = 999
+                elif changed == 'cgroup': witness['cgroup'] = ['0::/foreign']
+                elif changed == 'invalid': witness['pid_namespace']['inode'] = True
+                with patch.object(group, 'validate') as validate:
+                    if changed == 'valid':
+                        self.assertTrue(group.bind_original_namespace(witness)['shared_guard_witness_verified'])
+                        validate.assert_called_once_with(frozen=False)
+                        mounts = group.mount_args()
+                        self.assertEqual(mounts.count('--mount'), 6)
+                        self.assertEqual(sum(not value.endswith(',readonly') for value in mounts if value.startswith('type=bind')), 1)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'OriginalNamespaceWitnessRejected'):
+                            group.bind_original_namespace(witness)
+                        validate.assert_not_called()
+
+    def test_killer_namespace_requires_private_local_pid_and_never_reads_root_namespace_magiclink(self):
+        cid = self.docker.killer_id
+        for mode, namespace, membership, accepted in (
+                ('', {'device': 4, 'inode': 33}, '0::/system.slice/docker-' + cid + '.scope', True),
+                ('host', {'device': 4, 'inode': 33}, '0::/x', False),
+                ('container:' + self.docker.old_id, {'device': 4, 'inode': 33}, '0::/x', False),
+                ('', {'device': 4, 'inode': 11}, '0::/x', False),
+                ('', {'device': 4, 'inode': 22}, '0::/x', False),
+                ('', {'device': 4, 'inode': 33}, '0::/foreign', False)):
+            with self.subTest(mode=mode, namespace=namespace, membership=membership):
+                group = cutover.HostCgroup()
+                group.pid = 4321
+                group.namespaces = deepcopy(self.docker.cgroup.identity['pid_namespaces'])
+                current = {'Id': cid, 'State': {'Pid': 7777, 'Running': True, 'Paused': False}, 'HostConfig': {'PidMode': mode}}
+                with patch.object(cutover, 'process_startticks', return_value=654321), \
+                        patch.object(Path, 'read_text', return_value=membership), \
+                        patch.object(Path, 'stat', side_effect=AssertionError('Host must not follow target namespace magiclink')) as stat:
+                    if accepted:
+                        self.assertTrue(group.validate_killer(current, {'writer_pid_namespace': namespace})['private_sibling_verified'])
+                        with patch.object(cutover, 'process_startticks', return_value=654322):
+                            with self.assertRaisesRegex(RuntimeError, 'KillerNamespaceIdentityChanged'):
+                                group.validate_killer(current, {'writer_pid_namespace': namespace})
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'KillerPrivatePidNamespaceRequired|KillerLocalNamespaceIdentityRejected'):
+                            group.validate_killer(current, {'writer_pid_namespace': namespace})
+                    stat.assert_not_called()
+        module = ast.parse(MODULE.read_text())
+        calls = [node for node in ast.walk(module) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'pid_namespace']
+        self.assertTrue(calls)
+        self.assertTrue(all(isinstance(node.args[0], ast.Constant) and node.args[0].value == '/proc/self/ns/pid' for node in calls))
+
+    def test_private_guest_rejects_old_or_host_pid_namespace_before_any_write(self):
+        identity = deepcopy(self.docker.cgroup.identity)
+        program = cutover.cgroup_companion_program(identity, kill=True)
+        for inode in (11, 22):
+            with self.subTest(inode=inode), patch.object(cutover.os, 'geteuid', create=True, return_value=0), \
+                    patch.object(cutover.os, 'stat', return_value=SimpleNamespace(st_dev=4, st_ino=inode)), \
+                    patch.object(cutover.os, 'open') as opened, patch.object(cutover.os, 'write') as written, \
+                    redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, 'KillerPidNamespaceNotIsolated'):
+                    exec(compile(program, 'isolated-killer-guest', 'exec'), {})
+                opened.assert_not_called()
+                written.assert_not_called()
+
+    def test_private_guest_validates_bound_original_process_and_writes_only_once(self):
+        identity = deepcopy(self.docker.cgroup.identity)
+        process_stat = '4321 (synthetic) ' + ' '.join(['S'] + ['0'] * 18 + ['123456', '0'])
+        texts = {cutover.PROCESS_BIND_ROOT + '/stat': process_stat,
+            cutover.PROCESS_BIND_ROOT + '/cgroup': '0::' + identity['cgroup_path'],
+            cutover.CGROUP_BIND_ROOT + '/cgroup.type': 'domain',
+            cutover.CGROUP_BIND_ROOT + '/cgroup.freeze': '1',
+            cutover.CGROUP_BIND_ROOT + '/cgroup.events': 'populated 1\nfrozen 1\n'}
+        def read_text(path, *args, **kwargs):
+            return texts[str(path).replace('\\', '/')]
+        def lstat(path, *args, **kwargs):
+            expected = identity['files'][path.name]
+            return SimpleNamespace(st_dev=expected['device'], st_ino=expected['inode'], st_mode=0o100600)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(cutover.os, 'geteuid', create=True, return_value=0), \
+                patch.object(cutover.os, 'O_NOFOLLOW', create=True, new=0), \
+                patch.object(cutover.os, 'stat', return_value=SimpleNamespace(st_dev=4, st_ino=33)), \
+                patch.object(Path, 'read_text', autospec=True, side_effect=read_text), \
+                patch.object(Path, 'lstat', autospec=True, side_effect=lstat), \
+                patch.object(cutover.os, 'open', return_value=9911), \
+                patch.object(cutover.os, 'fstat', return_value=SimpleNamespace(st_dev=1, st_ino=1)), \
+                patch.object(cutover.os, 'close'), patch.object(cutover.os, 'write', return_value=1) as write, \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            exec(compile(cutover.cgroup_companion_program(identity, kill=True), 'isolated-killer-valid', 'exec'), {})
+        write.assert_called_once_with(9911, b'1')
+        self.assertEqual(len(stdout.getvalue().splitlines()), 1)
+        response = json.loads(stdout.getvalue())
+        self.assertTrue(response['kill_write_returned'])
+        self.assertEqual(response['writer_pid_namespace'], {'device': 4, 'inode': 33})
+        self.assertEqual(stderr.getvalue().splitlines(), ['CGROUP_KILL_STAGE=start', 'CGROUP_KILL_STAGE=prewrite_checks_passed', 'CGROUP_KILL_STAGE=write_returned'])
+
+    def test_missing_original_namespace_attestation_never_grants_killer_identity(self):
+        group = cutover.HostCgroup()
+        group.namespaces = {'original': None, 'controller': {'device': 4, 'inode': 22}}
+        with self.assertRaisesRegex(RuntimeError, 'OriginalNamespaceWitnessRequired'):
+            group.validate_killer({}, {'writer_pid_namespace': {'device': 4, 'inode': 33}})
+
+    def test_killer_effective_mount_reordering_passes_and_full_field_changes_reject(self):
+        self.invoke()
+        self.docker.killer_exists = True
+        candidate = json.loads(self.docker(['docker', 'inspect', self.docker.killer_id]))[0]
+        for mount in candidate['Mounts']:
+            mount.update(Mode='', Propagation='rprivate', future_field={'preserve': True})
+        baseline = deepcopy(candidate['Mounts'])
+        candidate['Mounts'].reverse()
+        arguments = (self.docker.killer_name, self.docker.killer_image, self.docker.old_id, 'killer', self.docker.cgroup.identity)
+        self.assertTrue(cutover.owned_helper(candidate, *arguments, expected_mounts=baseline))
+        for field, value in (('Source', '/foreign'), ('RW', True), ('Type', 'volume'), ('Propagation', 'rshared'),
+                             ('Mode', 'shared'), ('future_field', {'preserve': False})):
+            with self.subTest(field=field):
+                changed = deepcopy(candidate)
+                changed['Mounts'][0][field] = value
+                self.assertFalse(cutover.owned_helper(changed, *arguments, expected_mounts=baseline))
 
 
 if __name__ == "__main__":

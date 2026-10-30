@@ -153,6 +153,7 @@ class Trace:
         self.release = release
         self.paused = False
         self.companion = None
+        self.killer = None
         self.heartbeat_stages = {}
         self.frozen_read_count = 0
         self.events = []
@@ -184,28 +185,38 @@ class Trace:
             assert not self.paused and "--read-only" in command
             assert timeout == 90
             labels = [command[index + 1] for index, value in enumerate(command) if value == '--label']
-            assert labels == ['io.ijm2api.frozen-companion.owner=' + self.service]
-            assert command.count('--cap-drop') == command.count('--cap-add') == 1
+            assert len(labels) == 2 and labels[0] == 'io.ijm2api.frozen-companion.owner=' + self.service
+            role = labels[1].removeprefix('io.ijm2api.frozen-companion.role=')
+            assert role in {'guard', 'killer'}
+            assert command.count('--cap-drop') == 1
             assert command[command.index('--cap-drop') + 1] == 'ALL'
-            assert command[command.index('--cap-add') + 1] == 'DAC_READ_SEARCH'
             assert not {'--privileged', 'DAC_OVERRIDE', 'SYS_ADMIN', 'SYS_PTRACE'}.intersection(command)
             assert command[command.index("--network") + 1] == "none"
-            assert command[command.index("--volumes-from") + 1] == self.service + ":ro"
-            assert command[command.index("--pid") + 1] == "container:" + self.service
-            assert command[command.index('--cgroupns') + 1] == 'host'
             mounts = [command[index + 1] for index, value in enumerate(command) if value == '--mount']
-            assert len(mounts) == 4
-            write_mounts = [value for value in mounts if not value.endswith(',readonly')]
-            assert len(write_mounts) == 1 and write_mounts[0].endswith('/cgroup.kill')
-            assert all('/sys/fs/cgroup/' in value and ',dst=/run/ijm-frozen-cgroup/cgroup.' in value for value in mounts)
+            if role == 'guard':
+                assert command.count('--cap-add') == 1 and command[command.index('--cap-add') + 1] == 'DAC_READ_SEARCH'
+                assert command[command.index('--volumes-from') + 1] == self.service + ':ro'
+                assert command[command.index('--pid') + 1] == 'container:' + self.service
+                assert not mounts
+            else:
+                assert '--pid' not in command and '--volumes-from' not in command and '--cap-add' not in command
+                assert command[command.index('--cgroupns') + 1] == 'host'
+                assert len(mounts) == 6 and sum(not value.endswith(',readonly') for value in mounts) == 1
+                assert sum('/proc/' in value and ',dst=/run/ijm-original-process/' in value and value.endswith(',readonly') for value in mounts) == 2
+                assert command[-5:-2] == ['-I', '-S', '-B']
             value = docker(command, input=input, timeout=timeout)
-            self.companion = value
+            if role == 'guard': self.companion = value
+            else: self.killer = value
             actual = json.loads(docker(['inspect', value]))[0]
             persistent = [mount for mount in actual['Mounts'] if mount['Destination'] != '/tmp']
-            assert [mount['Destination'] for mount in persistent if mount['RW']] == ['/run/ijm-frozen-cgroup/cgroup.kill']
-            assert all(not mount['RW'] for mount in persistent if mount['Destination'].startswith('/app'))
-            self.events.append("companion_joined_before_pause")
-            if self.companion_start_timeout:
+            if role == 'guard':
+                assert all(not mount['RW'] for mount in persistent)
+                self.events.append('companion_joined_before_pause')
+            else:
+                assert len(persistent) == 6 and [mount['Destination'] for mount in persistent if mount['RW']] == ['/run/ijm-frozen-cgroup/cgroup.kill']
+                assert actual['HostConfig']['PidMode'] == '' and not actual['HostConfig']['CapAdd']
+                self.events.append('isolated_killer_joined_before_pause')
+            if self.companion_start_timeout and role == 'guard':
                 actual = json.loads(docker(['inspect', value]))[0]
                 assert actual['State']['Running'] and not actual['State'].get('Paused')
                 assert actual['Config']['Labels']['io.ijm2api.frozen-companion.owner'] == self.service
@@ -214,7 +225,7 @@ class Trace:
                 raise subprocess.TimeoutExpired(args, timeout)
             return value
         if command[0] == "pause":
-            assert self.companion and command[1] == self.service
+            assert self.companion and self.killer and command[1] == self.service
             if self.inject_race:
                 docker(["exec", self.service, "python", "-B", "-c",
                     "import sqlite3;d=sqlite3.connect('/app/data/ijm2api.db');"
@@ -236,15 +247,19 @@ class Trace:
                 self.events.append("synthetic_request_queued_while_frozen")
             return value
         if command[0] == "exec":
+            if input and input.startswith('# ORIGINAL_PID_NAMESPACE_WITNESS\n'):
+                assert command[2] == self.companion and not self.paused and self.killer is None and command[-5:] == ['python', '-I', '-S', '-B', '-']
+                return docker(command, input=input, timeout=timeout)
             if command[2] == self.service and input and 'SnapshotSizingDatabaseMissing' in input:
                 assert not self.paused and self.companion is None and 'sqlite' not in input
                 return docker(command, input=input, timeout=timeout)
             if input and 'CGROUP_SINGLE_FILE_ACCESS' in input:
-                assert not self.paused and command[2] == self.companion
+                assert not self.paused and command[2] == self.killer
                 self.events.append('single_file_access_checked_before_pause')
                 return docker(command, input=input, timeout=timeout)
             if input and 'CGROUP_SINGLE_FILE_KILL' in input:
-                assert self.paused and command[2] == self.companion and self.frozen_read_count == 2
+                assert self.paused and command[2] == self.killer and self.frozen_read_count == 2
+                assert command[-5:] == ['python', '-I', '-S', '-B', '-']
                 self.kill_commands += 1
                 assert self.kill_commands == 1
                 manifest = self.release / 'frozen-prekill.safe.json'
@@ -281,6 +296,8 @@ class Trace:
             return value
         if command[:2] == ["rm", "--force"] and command[2] == self.companion and not self.paused:
             self.events.append('owned_startup_companion_cleanup')
+        if command[:2] == ["rm", "--force"] and command[2] == self.killer:
+            self.events.append('owned_isolated_killer_cleanup')
         return docker(command, input=input, timeout=timeout)
 
 
@@ -439,7 +456,7 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
             frozen = (receipt.get('frozen_guard') or {}).get('source_manifest') or {}
             # PID 1 death can auto-remove its namespace companion asynchronously.
             cleanup_deadline = time.monotonic() + 5
-            while trace.companion and docker(["inspect", trace.companion], optional=True) is not None:
+            while any(helper and docker(["inspect", helper], optional=True) is not None for helper in (trace.companion, trace.killer)):
                 if time.monotonic() >= cleanup_deadline:
                     raise RuntimeError("SyntheticCompanionWasNotCleaned")
                 time.sleep(0.1)
@@ -449,11 +466,14 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                 "frozen_backup_bytes": (release / 'frozen.ijm2api.db').stat().st_size if (release / 'frozen.ijm2api.db').is_file() else None,
                 "tmpfs_budget_bytes": capacity.get('tmpfs_bytes'), "memory_limit_bytes": capacity.get('memory_bytes'),
                 "kill_commands": trace.kill_commands, "cgroup_death": receipt.get('cgroup_death'),
+                "isolated_killer_verified": (receipt.get('killer_identity') or {}).get('private_sibling_verified'),
                 "restart_policy_restored_after_abort": receipt.get('original_restart_policy_restored_after_abort'),
                 "source_layout": "uncheckpointed_WAL" if active else "WAL_mode_without_sidecars"}
         finally:
             if trace and trace.companion:
                 docker(["rm", "--force", trace.companion], optional=True)
+            if trace and trace.killer:
+                docker(["rm", "--force", trace.killer], optional=True)
             docker(["rm", "--force", service], optional=True)
 
 
