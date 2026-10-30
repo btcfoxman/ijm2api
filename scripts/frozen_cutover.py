@@ -7,7 +7,11 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import stat
+import sys
 import tempfile
+import threading
+import time
 import uuid
 
 COMPANION_OWNER_LABEL = "io.ijm2api.frozen-companion.owner"
@@ -15,6 +19,214 @@ MIB = 1024 * 1024
 SNAPSHOT_HEADROOM = 64 * MIB
 SNAPSHOT_MINIMUM = 256 * MIB
 SNAPSHOT_MAXIMUM = 1024 * MIB
+CGROUP_BIND_ROOT = "/run/ijm-frozen-cgroup"
+
+
+def process_startticks(pid):
+    try:
+        value = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    return int(value[value.rfind(")") + 2:].split()[19])
+
+
+def cgroup_events(value):
+    pairs = dict(line.split() for line in value.splitlines())
+    if any(pairs.get(key) not in {"0", "1"} for key in ("populated", "frozen")):
+        raise RuntimeError("CgroupEventsInvalid")
+    return {key: int(pairs[key]) for key in ("populated", "frozen")}
+
+
+class HostCgroup:
+    """Host metadata only; the single privileged write occurs in the companion."""
+
+    def __init__(self):
+        self.fds = {}
+        self.stop_watch = threading.Event()
+        self.watcher = None
+        self.empty_observation = None
+
+    def capture(self, original):
+        if sys.platform != "linux" or not Path("/sys/fs/cgroup/cgroup.controllers").is_file():
+            raise RuntimeError("CgroupV2HostRequired")
+        old_id, pid = original["Id"], original["State"].get("Pid")
+        if not re.fullmatch(r"[0-9a-f]{64}", old_id) or type(pid) is not int or pid <= 1:
+            raise RuntimeError("OriginalCgroupIdentityInvalid")
+        membership = Path(f"/proc/{pid}/cgroup").read_text().splitlines()
+        if len(membership) != 1 or not membership[0].startswith("0::/"):
+            raise RuntimeError("OriginalUnifiedCgroupRequired")
+        relative = membership[0][3:]
+        path = Path("/sys/fs/cgroup") / relative.lstrip("/")
+        if (not re.fullmatch(r"/[A-Za-z0-9_./:-]+", relative) or ".." in path.parts
+                or path.name not in {old_id, f"docker-{old_id}.scope"}
+                or path.resolve(strict=True) != path):
+            raise RuntimeError("OriginalCgroupPathRejected")
+        # Reject symlinks in every component, including ancestors.
+        if any(parent.is_symlink() for parent in (path, *path.parents)):
+            raise RuntimeError("OriginalCgroupSymlinkRejected")
+        self.pid, self.path, self.relative = pid, path, relative
+        self.ticks = process_startticks(pid)
+        if not self.ticks:
+            raise RuntimeError("OriginalProcessIdentityMissing")
+        self.fds["directory"] = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        self.identities = {}
+        for name in ("directory", "cgroup.kill", "cgroup.events", "cgroup.freeze", "cgroup.type"):
+            item = path if name == "directory" else path / name
+            value = item.lstat()
+            if value.st_uid != 0 or stat.S_ISLNK(value.st_mode):
+                raise RuntimeError("CgroupFileOwnershipInvalid")
+            if name != "directory" and not stat.S_ISREG(value.st_mode):
+                raise RuntimeError("CgroupFileTypeInvalid")
+            self.identities[name] = {"device": value.st_dev, "inode": value.st_ino}
+        self.fds["events"] = os.open(path / "cgroup.events", os.O_RDONLY | os.O_NOFOLLOW)
+        if (path / "cgroup.type").read_text().strip() != "domain":
+            raise RuntimeError("CgroupDomainRequired")
+        self.identity = {"container_id": old_id, "pid": pid, "startticks": self.ticks,
+            "cgroup_path": relative, "host_cgroup_path": str(path), "files": self.identities}
+        self.validate(frozen=False)
+        return self.identity
+
+    def mount_args(self):
+        arguments = ["--cgroupns", "host"]
+        for name in ("cgroup.kill", "cgroup.events", "cgroup.freeze", "cgroup.type"):
+            value = f"type=bind,src={self.path / name},dst={CGROUP_BIND_ROOT}/{name}"
+            if name != "cgroup.kill":
+                value += ",readonly"
+            arguments += ["--mount", value]
+        return arguments
+
+    def validate(self, frozen=None):
+        if (process_startticks(self.pid) != self.ticks
+                or Path(f"/proc/{self.pid}/cgroup").read_text().splitlines() != ["0::" + self.relative]):
+            raise RuntimeError("OriginalProcessOrCgroupChanged")
+        for name, identity in self.identities.items():
+            path = self.path if name == "directory" else self.path / name
+            value = path.lstat()
+            if stat.S_ISLNK(value.st_mode) or (value.st_dev, value.st_ino) != (identity["device"], identity["inode"]):
+                raise RuntimeError("CgroupInodeChanged")
+        os.lseek(self.fds["events"], 0, os.SEEK_SET)
+        events = cgroup_events(os.read(self.fds["events"], 4096).decode())
+        if events["populated"] != 1 or (frozen is not None and events["frozen"] != int(frozen)):
+            raise RuntimeError("OriginalCgroupFreezeStateInvalid")
+        return events
+
+    def _empty(self):
+        directory = os.fstat(self.fds["directory"])
+        identity = self.identities["directory"]
+        if (directory.st_dev, directory.st_ino) != (identity["device"], identity["inode"]):
+            raise RuntimeError("HeldCgroupDirectoryChanged")
+        try:
+            os.lseek(self.fds["events"], 0, os.SEEK_SET)
+            events = cgroup_events(os.read(self.fds["events"], 4096).decode())
+            if events["populated"] == 0:
+                return {"empty_proof": "held_events_populated_zero", "populated": 0}
+        except (OSError, RuntimeError, ValueError):
+            pass
+        # Linux cgroup rmdir rejects populated groups. Path absence alone could
+        # be a rename; require the held original directory to be unlinked too.
+        link = os.readlink(f"/proc/self/fd/{self.fds['directory']}")
+        try:
+            current = self.path.lstat()
+            path_replaced = (current.st_dev, current.st_ino) != (identity["device"], identity["inode"])
+        except FileNotFoundError:
+            path_replaced = True
+        if link == str(self.path) + " (deleted)" and path_replaced:
+            return {"empty_proof": "held_original_cgroup_deleted", "original_directory_unlinked": True}
+        return None
+
+    def arm(self):
+        self.validate(frozen=True)
+        def watch():
+            while not self.stop_watch.is_set():
+                try:
+                    value = self._empty()
+                    if value:
+                        self.empty_observation = value
+                        return
+                except (OSError, RuntimeError, ValueError):
+                    pass
+                self.stop_watch.wait(0.01)
+        self.watcher = threading.Thread(target=watch, name="frozen-cgroup-events", daemon=True)
+        self.watcher.start()
+
+    def wait_empty(self, timeout=20):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.empty_observation and process_startticks(self.pid) != self.ticks:
+                return dict(self.empty_observation, original_pid_gone=True)
+            time.sleep(0.02)
+        raise RuntimeError("CgroupDeathNotProven")
+
+    def close(self):
+        self.stop_watch.set()
+        if self.watcher:
+            self.watcher.join(timeout=1)
+        for descriptor in self.fds.values():
+            os.close(descriptor)
+        self.fds.clear()
+
+
+def cgroup_companion_program(identity, *, kill=False):
+    # The kill program can itself die as namespace PID1 exits. Never depend on
+    # its acknowledgement, and never run it again after the durable attempt.
+    program = "# CGROUP_SINGLE_FILE_" + ("KILL" if kill else "ACCESS") + "\nimport json,os,pathlib,stat\n"
+    program += "expected=" + repr(identity) + "\nroot=pathlib.Path(" + repr(CGROUP_BIND_ROOT) + ")\n"
+    program += """if os.geteuid()!=0:raise RuntimeError('CompanionRootIdentityRequired')
+value=pathlib.Path('/proc/1/stat').read_text();ticks=int(value[value.rfind(')')+2:].split()[19])
+if ticks!=expected['startticks']:raise RuntimeError('NamespaceInitIdentityChanged')
+if pathlib.Path('/proc/1/cgroup').read_text().splitlines()!=['0::'+expected['cgroup_path']]:raise RuntimeError('NamespaceInitCgroupChanged')
+for name in ('cgroup.kill','cgroup.events','cgroup.freeze','cgroup.type'):
+ value=(root/name).lstat();wanted=expected['files'][name]
+ if stat.S_ISLNK(value.st_mode) or (value.st_dev,value.st_ino)!=(wanted['device'],wanted['inode']):raise RuntimeError('CgroupBindIdentityChanged')
+if (root/'cgroup.type').read_text().strip()!='domain':raise RuntimeError('CgroupDomainRequired')
+fd=os.open(root/'cgroup.kill',os.O_WRONLY|os.O_NOFOLLOW)
+try:
+ value=os.fstat(fd);wanted=expected['files']['cgroup.kill']
+ if (value.st_dev,value.st_ino)!=(wanted['device'],wanted['inode']):raise RuntimeError('CgroupWriteDescriptorChanged')
+"""
+    if kill:
+        program += " if (root/'cgroup.freeze').read_text().strip()!='1':raise RuntimeError('CgroupNoLongerFrozen')\n"
+        program += " events=dict(line.split() for line in (root/'cgroup.events').read_text().splitlines())\n"
+        program += " if events.get('frozen')!='1' or events.get('populated')!='1':raise RuntimeError('CgroupNotFullyFrozen')\n"
+        program += " if os.write(fd,b'1')!=1:raise RuntimeError('CgroupKillShortWrite')\n"
+    program += "finally:os.close(fd)\nprint(json.dumps({'access_verified':True}))\n"
+    return program
+
+
+def durable_json(path, value):
+    data = json.dumps(value, sort_keys=True, indent=2).encode()
+    with Path(path).open("xb") as output:
+        if hasattr(os, "fchmod"):
+            os.fchmod(output.fileno(), 0o600)
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+    # Directory fsync is required on Linux; tests on Windows have no such API.
+    if sys.platform == "linux":
+        descriptor = os.open(Path(path).parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    if Path(path).read_bytes() != data:
+        raise RuntimeError("DurableCutoverManifestReadbackMismatch")
+    return hashlib.sha256(data).hexdigest()
+
+
+def container_stable_facts(value):
+    host = dict(value.get("HostConfig") or {})
+    host.pop("RestartPolicy", None)
+    return {"Id": value.get("Id"), "Name": value.get("Name"), "Image": value.get("Image"),
+        "Config": value.get("Config"), "HostConfig": host, "Mounts": value.get("Mounts")}
+
+
+def restart_argument(policy):
+    if (not isinstance(policy, dict) or set(policy) != {"Name", "MaximumRetryCount"}
+            or policy["Name"] not in {"no", "always", "unless-stopped", "on-failure"}
+            or type(policy["MaximumRetryCount"]) is not int or policy["MaximumRetryCount"] < 0
+            or (policy["Name"] != "on-failure" and policy["MaximumRetryCount"] != 0)):
+        raise RuntimeError("OriginalRestartPolicyInvalid")
+    return policy["Name"] + (":" + str(policy["MaximumRetryCount"]) if policy["Name"] == "on-failure" and policy["MaximumRetryCount"] else "")
 
 
 def snapshot_sizing_program():
@@ -135,7 +347,7 @@ def export_frozen_backup(companion_id, destination, timeout=30):
 
 
 def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
-                  exporter=export_frozen_backup):
+                  exporter=export_frozen_backup, cgroup_ops=None):
     release = Path(release)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", service) or not release.is_dir():
         raise RuntimeError("CutoverArgumentsInvalid")
@@ -143,15 +355,47 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
     old_id = original["Id"]
     if not original["State"]["Running"] or original["State"].get("Paused"):
         raise RuntimeError("OriginalAppNotRunningUnpaused")
+    if original["HostConfig"].get("AutoRemove") is not False or original["State"].get("Restarting"):
+        raise RuntimeError("OriginalAppLifecycleUnsupported")
+    policy = original["HostConfig"]["RestartPolicy"]
+    original_restart = restart_argument(policy)
+    stable_facts = container_stable_facts(original)
+    original_restart_count = original.get("RestartCount")
+    if type(original_restart_count) is not int or original_restart_count < 0:
+        raise RuntimeError("OriginalRestartCountMissing")
+    if any((release / name).exists() for name in ("frozen-kill-attempt.safe.json", "frozen-prekill.safe.json")):
+        raise RuntimeError("CutoverAttemptAlreadyRecorded")
+    cgroup = cgroup_ops if cgroup_ops is not None else HostCgroup()
     name = "ijm-frozen-guard-" + uuid.uuid4().hex[:16]
     companion_id = None
     companion_start_attempted = False
     paused = False
     removed = False
+    restart_update_attempted = False
+    kill_attempted = False
     receipt = {"passed": False, "old_container_sha256": hashlib.sha256(old_id.encode()).hexdigest(),
         "server_builds": 0, "new_generations": 0, "database_writes": 0,
+        "stop_primitive": "single_file_cgroup_kill", "kill_command_invocations": 0,
         "original_unpaused_after_abort": False, "original_removed_while_frozen": False}
     try:
+        identity = cgroup.capture(original)
+        receipt["cgroup_identity"] = identity
+        # A client timeout can occur after the daemon applied this update.
+        restart_update_attempted = True
+        try:
+            run(["docker", "update", "--restart=no", old_id], timeout=15)
+        except Exception:
+            receipt["restart_update_client_result_unknown"] = True
+        current = json.loads(run(["docker", "inspect", old_id], timeout=10))[0]
+        if (container_stable_facts(current) != stable_facts
+                or current["HostConfig"].get("RestartPolicy") != {"Name": "no", "MaximumRetryCount": 0}
+                or current.get("RestartCount") != original_restart_count
+                or current["State"].get("Pid") != identity["pid"]
+                or not current["State"].get("Running") or current["State"].get("Paused")):
+            raise RuntimeError("OriginalRestartSuppressionNotVerified")
+        cgroup.validate(frozen=False)
+        receipt["original_restart_policy"] = policy
+        receipt["restart_policy_suppressed"] = True
         sizes = json.loads(run(['docker', 'exec', '-i', old_id, 'python', '-B', '-'],
             input=snapshot_sizing_program(), timeout=10))
         capacity = snapshot_budget(sizes)
@@ -164,16 +408,21 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
             "--pull", "never", "--network", "none", "--read-only", "--user", "0:0",
             "--cap-drop", "ALL", "--cap-add", "DAC_READ_SEARCH", "--security-opt", "no-new-privileges", "--memory", str(capacity['memory_bytes']), "--cpus", "0.5", "--pids-limit", "64",
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=" + str(capacity['tmpfs_bytes']) + ",mode=0700", "--volumes-from", old_id + ":ro",
-            "--pid", "container:" + old_id, "--entrypoint", "python", image,
+            "--pid", "container:" + old_id, *cgroup.mount_args(), "--entrypoint", "python", image,
             "-B", "-c", "import time; time.sleep(600)"], timeout=90)
         if not isinstance(companion_id, str) or not re.fullmatch(r"[0-9a-f]{64}", companion_id) or companion_id == old_id:
             raise RuntimeError("CompanionStartReceiptInvalid")
+        access = json.loads(run(["docker", "exec", "-i", companion_id, "python", "-B", "-"],
+            input=cgroup_companion_program(identity), timeout=10))
+        if access.get("access_verified") is not True:
+            raise RuntimeError("SingleFileCgroupAccessNotVerified")
         current = json.loads(run(["docker", "inspect", service], timeout=10))[0]
         if current["Id"] != old_id or not current["State"]["Running"] or current["State"].get("Paused"):
             raise RuntimeError("OriginalAppChangedBeforeFreeze")
         # A client timeout does not prove the daemon failed to pause it.
         paused = True
         run(["docker", "pause", old_id], timeout=15)
+        cgroup.validate(frozen=True)
         first = json.loads(run(["docker", "exec", "-i", companion_id, "python", "-B", "-"],
             input=companion_program(query_ids, startup_sha, backup=True), timeout=30))
         if not isinstance(first.get("source_manifest"), dict):
@@ -188,8 +437,9 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
             raise RuntimeError("FrozenBackupAlreadyExists")
         exporter(companion_id, destination)
         destination.chmod(0o600)
-        with destination.open('rb') as reader:
+        with destination.open('rb+') as reader:
             backup_sha256 = hashlib.file_digest(reader, 'sha256').hexdigest()
+            os.fsync(reader.fileno())
         if backup_sha256 != first.get("frozen_backup_sha256"):
             raise RuntimeError("FrozenBackupChecksumMismatch")
         final = json.loads(run(["docker", "exec", "-i", companion_id, "python", "-B", "-"],
@@ -203,11 +453,67 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
         current = json.loads(run(["docker", "inspect", service], timeout=10))[0]
         if current["Id"] != old_id or not current["State"]["Running"] or not current["State"].get("Paused"):
             raise RuntimeError("OriginalAppDidNotRemainFrozen")
+        if (container_stable_facts(current) != stable_facts
+                or current["HostConfig"].get("RestartPolicy") != {"Name": "no", "MaximumRetryCount": 0}
+                or current.get("RestartCount") != original_restart_count):
+            raise RuntimeError("OriginalConfigOrRestartPolicyChanged")
+        cgroup.validate(frozen=True)
         receipt.update(frozen_guard=final, frozen_backup_sha256=first["frozen_backup_sha256"])
-        # Never unpause an approved old listener: a newly queued request must
-        # not cross the final check. Hosted Docker smoke verifies this path.
+        # PID1 death kills its shared-namespace companion. Export and fsync all
+        # required evidence before the only irreversible cgroup write.
+        manifest_sha = durable_json(release / "frozen-prekill.safe.json", {
+            "cgroup_identity": identity, "original_restart_policy": policy,
+            "restart_count": original_restart_count, "frozen_guard": final,
+            "frozen_backup_sha256": backup_sha256, "frozen_backup_bytes": destination.stat().st_size,
+            "snapshot_capacity": capacity})
+        receipt["durable_prekill_manifest_sha256"] = manifest_sha
+        cgroup.arm()
+        attempt_path = release / "frozen-kill-attempt.safe.json"
         try:
-            run(["docker", "rm", "--force", old_id], timeout=30)
+            durable_json(attempt_path, {
+                "kill_attempted": True, "container_id": old_id,
+                "prekill_manifest_sha256": manifest_sha, "automatic_kill_replay_allowed": False})
+        except BaseException:
+            # A partial marker, failed directory fsync or failed readback must
+            # also block automatic recovery. No kill exec has been invoked.
+            try:
+                attempt_path.lstat()
+                kill_attempted = True
+            except FileNotFoundError:
+                pass
+            except OSError:
+                kill_attempted = True
+            receipt["kill_journal_commit_uncertain"] = kill_attempted
+            receipt["kill_attempted"] = kill_attempted
+            raise
+        # Set immediately after the durable boundary, before any exec. Neither
+        # exit 137 nor missing stdout proves that the write did not happen.
+        kill_attempted = True
+        receipt["kill_attempted"] = True
+        receipt["kill_command_invocations"] = 1
+        try:
+            run(["docker", "exec", "-i", companion_id, "python", "-B", "-"],
+                input=cgroup_companion_program(identity, kill=True), timeout=20)
+        except Exception:
+            receipt["kill_command_acknowledgement_missing"] = True
+        death = cgroup.wait_empty(timeout=20)
+        if death.get("original_pid_gone") is not True or death.get("empty_proof") not in {
+                "held_events_populated_zero", "held_original_cgroup_deleted"}:
+            raise RuntimeError("CgroupDeathNotProven")
+        current = json.loads(run(["docker", "inspect", old_id], timeout=10))[0]
+        if (container_stable_facts(current) != stable_facts
+                or current["State"].get("Running") is not False or current["State"].get("Restarting")
+                or current["State"].get("Pid") != 0 or current.get("RestartCount") != original_restart_count
+                or current["HostConfig"].get("RestartPolicy") != {"Name": "no", "MaximumRetryCount": 0}):
+            raise RuntimeError("OriginalContainerDeathNotVerified")
+        receipt["cgroup_death"] = death
+        durable_json(release / "frozen-death.safe.json", {
+            "cgroup_death": death, "container_id": old_id, "original_process_stopped": True,
+            "restart_count": original_restart_count, "restart_policy": "no", "kill_attempts": 1})
+        # This is now only metadata cleanup of a proven stopped container.
+        # No force removal, Docker kill, unpause-to-kill, or fallback is allowed.
+        try:
+            run(["docker", "rm", old_id], timeout=30)
             removed = True
             receipt["original_removed_while_frozen"] = True
         except Exception:
@@ -227,14 +533,37 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
         receipt.update(passed=True)
         return receipt
     finally:
-        if paused and not removed:
+        if restart_update_attempted and not kill_attempted:
             try:
                 current = json.loads(run(["docker", "inspect", old_id], timeout=10))[0]
-                if current["Id"] == old_id and current["State"]["Running"] and current["State"].get("Paused"):
+                if (container_stable_facts(current) != stable_facts or not current["State"].get("Running")
+                        or current.get("RestartCount") != original_restart_count):
+                    raise RuntimeError("OriginalAbortIdentityChanged")
+                current_policy = current["HostConfig"].get("RestartPolicy")
+                if current_policy != {"Name": "no", "MaximumRetryCount": 0} and current_policy != policy:
+                    raise RuntimeError("OriginalAbortRestartPolicyChangedExternally")
+                cgroup.validate(frozen=bool(current["State"].get("Paused")))
+                try:
+                    run(["docker", "update", "--restart=" + original_restart, old_id], timeout=15)
+                except Exception:
+                    receipt["restart_restore_client_result_unknown"] = True
+                restored = json.loads(run(["docker", "inspect", old_id], timeout=10))[0]
+                if (container_stable_facts(restored) != stable_facts
+                        or restored["HostConfig"].get("RestartPolicy") != policy
+                        or restored.get("RestartCount") != original_restart_count
+                        or restored["State"].get("Pid") != identity["pid"]
+                        or restored["State"].get("Running") is not True
+                        or bool(restored["State"].get("Paused")) != bool(current["State"].get("Paused"))):
+                    raise RuntimeError("OriginalRestartRestorationNotVerified")
+                receipt["original_restart_policy_restored_after_abort"] = True
+                if paused and restored["State"]["Running"] and restored["State"].get("Paused"):
+                    cgroup.validate(frozen=True)
                     run(["docker", "unpause", old_id], timeout=15)
                     receipt["original_unpaused_after_abort"] = True
             except Exception:
-                receipt["unpause_requires_operator_review"] = True
+                receipt["prekill_abort_recovery_requires_operator_review"] = True
+        elif kill_attempted and not removed:
+            receipt["postkill_outcome_requires_operator_review"] = True
         try:
             # A startup timeout can lose stdout after the daemon created it.
             # Resolve only this operation's random name; never replay creation
@@ -257,6 +586,10 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
             # The --rm companion can already be gone. Failed observation or
             # cleanup must preserve the original outcome, never guess/remove.
             receipt["companion_cleanup_requires_operator_review"] = True
+        try:
+            cgroup.close()
+        except Exception:
+            receipt["cgroup_observer_close_failed"] = True
         try:
             (release / "frozen-cutover.safe.json").write_text(json.dumps(receipt, indent=2))
         except OSError:

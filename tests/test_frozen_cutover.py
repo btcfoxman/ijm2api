@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
 import importlib.util
 from contextlib import redirect_stderr
 import io
@@ -22,9 +23,60 @@ QUERY_IDS = "ijm_c1b4967e7b674cd2,ijm_4705618586294e2e,ijm_5f4677122fea4a08,ijm_
 BINDING = "a" * 64
 
 
+class FakeCgroup:
+    """No /proc or cgroup access; model only the controller's trusted seam."""
+    def __init__(self, docker):
+        self.docker = docker
+        self.closed = False
+        self.armed = False
+        self.capture_failure = False
+        self.validation_failure = False
+        self.death_proof = 'held_events_populated_zero'
+        self.identity = {'pid': 4321, 'startticks': 123456, 'container_id': docker.old_id,
+            'cgroup_path': '/system.slice/docker-' + docker.old_id + '.scope',
+            'host_cgroup_path': '/sys/fs/cgroup/system.slice/docker-' + docker.old_id + '.scope',
+            'files': {name: {'device': 1, 'inode': number} for number, name in enumerate(
+                ('cgroup.kill', 'cgroup.events', 'cgroup.freeze', 'cgroup.type'), 1)}}
+
+    def capture(self, original):
+        self.docker.calls.append(['cgroup_capture'])
+        if self.capture_failure:
+            raise RuntimeError('SyntheticCgroupUnavailable')
+        assert original['Id'] == self.identity['container_id'] and original['State']['Pid'] == self.identity['pid']
+        return deepcopy(self.identity)
+
+    def mount_args(self):
+        args = ['--cgroupns', 'host']
+        for name in ('cgroup.kill', 'cgroup.events', 'cgroup.freeze', 'cgroup.type'):
+            mount = 'type=bind,src=/sys/fake/' + name + ',dst=' + cutover.CGROUP_BIND_ROOT + '/' + name
+            args += ['--mount', mount + ('' if name == 'cgroup.kill' else ',readonly')]
+        return args
+
+    def validate(self, frozen=None):
+        self.docker.calls.append(['cgroup_validate', frozen])
+        if self.validation_failure:
+            raise RuntimeError('SyntheticCgroupIdentityChanged')
+        if frozen is not None:
+            assert self.docker.paused is frozen
+        return {'populated': 1, 'frozen': int(bool(self.docker.paused))}
+
+    def arm(self):
+        self.armed = True
+        self.docker.calls.append(['cgroup_arm'])
+
+    def wait_empty(self, timeout=20):
+        self.docker.calls.append(['cgroup_wait_empty'])
+        if not self.docker.old_stopped:
+            raise RuntimeError('CgroupDeathNotProven')
+        return {'empty_proof': self.death_proof, 'populated': 0, 'original_pid_gone': True}
+
+    def close(self):
+        self.closed = True
+
+
 class FakeDocker:
     def __init__(self):
-        self.old_id = "original-container-id"
+        self.old_id = "a" * 64
         self.companion_id = "c" * 64
         self.companion_name = None
         self.companion_image = None
@@ -37,6 +89,19 @@ class FakeDocker:
         self.empty_start_receipt = False
         self.paused = False
         self.old_removed = False
+        self.old_stopped = False
+        self.kill_count = 0
+        self.kill_failure_before_effect = False
+        self.kill_error_after_effect = None
+        self.access_allowed = True
+        self.restart_policy = {'Name': 'always', 'MaximumRetryCount': 0}
+        self.original_restart_policy = deepcopy(self.restart_policy)
+        self.restart_count = 0
+        self.restart_update_timeout_after_effect = False
+        self.restart_update_ignored = False
+        self.restart_restore_failure = False
+        self.external_policy_on_first_guard = None
+        self.release = None
         self.inspect_count = 0
         self.guard_count = 0
         self.calls = []
@@ -58,6 +123,7 @@ class FakeDocker:
         self.export_failure = False
         self.source_sizes = {'ijm2api.db': 69746688, 'ijm2api.db-wal': 0}
         self.snapshot_capacity_failure = False
+        self.cgroup = FakeCgroup(self)
 
     def export_backup(self, companion_id, destination):
         assert companion_id == self.companion_id and self.paused and self.guard_count == 1
@@ -90,10 +156,26 @@ class FakeDocker:
                 elif field == "original-id": value["Id"] = self.old_id
                 return json.dumps([value])
             self.inspect_count += 1
-            value = {"Id": self.old_id, "State": {"Running": not self.old_removed, "Paused": self.paused}}
-            if self.changed_before_pause and self.inspect_count == 2:
+            value = {"Id": self.old_id, 'Name': '/ijm2api', 'Image': 'sha256:' + 'b' * 64,
+                'Config': {'Image': 'original:immutable'}, 'Mounts': [], 'RestartCount': self.restart_count,
+                'HostConfig': {'AutoRemove': False, 'RestartPolicy': deepcopy(self.restart_policy)},
+                "State": {"Running": not self.old_stopped and not self.old_removed, "Paused": self.paused,
+                          'Pid': 0 if self.old_stopped else 4321, 'Restarting': False}}
+            if self.changed_before_pause and self.companion_exists and not self.paused and args[-1] == 'ijm2api':
                 value["Id"] = "concurrent-replacement-id"
             return json.dumps([value])
+        if args[:2] == ['docker', 'update']:
+            assert args[-1] == self.old_id
+            desired = args[2].removeprefix('--restart=')
+            if desired != 'no' and self.restart_restore_failure:
+                raise RuntimeError('SyntheticRestartRestoreFailed')
+            if not self.restart_update_ignored:
+                name, _, count = desired.partition(':')
+                self.restart_policy = {'Name': name, 'MaximumRetryCount': int(count or 0)}
+            if self.restart_update_timeout_after_effect:
+                self.restart_update_timeout_after_effect = False
+                raise TimeoutError('restart policy update acknowledged late')
+            return self.old_id
         if args[:2] == ["docker", "run"]:
             assert timeout == 90
             assert args.count("--label") == 1
@@ -115,6 +197,10 @@ class FakeDocker:
             assert args[args.index("--pull") + 1] == "never"
             assert args[args.index("--volumes-from") + 1] == self.old_id + ":ro"
             assert args[args.index("--pid") + 1] == "container:" + self.old_id
+            assert args[args.index('--cgroupns') + 1] == 'host'
+            mounts = [args[i + 1] for i, value in enumerate(args) if value == '--mount']
+            assert len(mounts) == 4 and sum(not value.endswith(',readonly') for value in mounts) == 1
+            assert all(value.endswith(',readonly') or '/cgroup.kill' in value for value in mounts)
             budget = cutover.snapshot_budget(self.source_sizes)
             assert args[args.index('--memory') + 1] == str(budget['memory_bytes'])
             assert args[args.index('--tmpfs') + 1] == '/tmp:rw,noexec,nosuid,size=' + str(budget['tmpfs_bytes']) + ',mode=0700'
@@ -137,9 +223,33 @@ class FakeDocker:
                 assert not self.paused and self.guard_count == 0
                 assert input == cutover.snapshot_sizing_program() and 'sqlite' not in input
                 return json.dumps(self.source_sizes)
+            if 'CGROUP_SINGLE_FILE_ACCESS' in (input or ''):
+                assert args[3] == self.companion_id and not self.paused
+                assert "os.write(fd,b'1')" not in input
+                return json.dumps({'access_verified': self.access_allowed})
+            if 'CGROUP_SINGLE_FILE_KILL' in (input or ''):
+                assert args[3] == self.companion_id and self.paused and self.guard_count == 2
+                assert self.restart_policy == {'Name': 'no', 'MaximumRetryCount': 0}
+                assert self.cgroup.armed and self.kill_count == 0
+                manifest = self.release / 'frozen-prekill.safe.json'
+                attempt = json.loads((self.release / 'frozen-kill-attempt.safe.json').read_text())
+                assert attempt['kill_attempted'] is True and attempt['automatic_kill_replay_allowed'] is False
+                assert attempt['prekill_manifest_sha256'] == hashlib.sha256(manifest.read_bytes()).hexdigest()
+                prekill = json.loads(manifest.read_text())
+                assert prekill['frozen_backup_sha256'] == hashlib.sha256(self.backup).hexdigest()
+                self.kill_count += 1
+                if self.kill_failure_before_effect:
+                    raise TimeoutError('kill command did not give a result')
+                self.old_stopped = True
+                self.paused = False
+                if self.kill_error_after_effect:
+                    raise self.kill_error_after_effect
+                return json.dumps({'access_verified': True})
             assert args[3] == self.companion_id and self.paused
             assert isinstance(input, str) and "FrozenGuardRejected" in input
             self.guard_count += 1
+            if self.guard_count == 1 and self.external_policy_on_first_guard is not None:
+                self.restart_policy = deepcopy(self.external_policy_on_first_guard)
             if self.snapshot_capacity_failure:
                 raise RuntimeError('FrozenSnapshotCapacityInsufficient')
             if self.guard_count == 1 and self.first_failure:
@@ -160,15 +270,16 @@ class FakeDocker:
             self.paused = False
             return ""
         if args[:3] == ["docker", "rm", "--force"]:
-            if args[-1] == self.old_id:
-                assert self.paused and self.guard_count == 2
-                self.old_removed = True
-                if self.removal_timeout_after_effect:
-                    raise TimeoutError("remove response lost after removing original")
-            else:
-                assert args[-1] == self.companion_id
-                self.companion_exists = False
+            assert args[-1] == self.companion_id
+            self.companion_exists = False
             return ""
+        if args[:2] == ['docker', 'rm']:
+            assert args == ['docker', 'rm', self.old_id] and self.old_stopped and self.kill_count == 1
+            assert self.guard_count == 2 and (self.release / 'frozen-death.safe.json').is_file()
+            self.old_removed = True
+            if self.removal_timeout_after_effect:
+                raise TimeoutError('remove response lost after stopping original')
+            return ''
         if args[:2] == ["docker", "ps"]:
             assert args == ["docker", "ps", "--all", "--no-trunc", "--format", "{{json .}}"]
             assert self.old_removed
@@ -185,8 +296,10 @@ class FrozenCutoverTests(unittest.TestCase):
         self.docker = FakeDocker()
 
     def invoke(self):
+        self.docker.release = self.release
         return cutover.freeze_remove("ijm2api", "ghcr.io/test/ijm2api:immutable", self.release,
-                                     QUERY_IDS, "b" * 64, run=self.docker, exporter=self.docker.export_backup)
+                                     QUERY_IDS, "b" * 64, run=self.docker, exporter=self.docker.export_backup,
+                                     cgroup_ops=self.docker.cgroup)
 
     def receipt(self):
         return json.loads((self.release / "frozen-cutover.safe.json").read_text())
@@ -244,8 +357,13 @@ class FrozenCutoverTests(unittest.TestCase):
         self.assertFalse(self.receipt()["passed"])
         self.assertIn(["docker", "rm", "--force", self.docker.companion_id], self.docker.calls)
         self.assertNotIn(["docker", "rm", "--force", self.docker.old_id], self.docker.calls)
+        self.assertNotIn(['docker', 'rm', self.docker.old_id], self.docker.calls)
+        self.assertFalse(self.docker.old_stopped)
+        self.assertEqual(self.docker.kill_count, 0)
+        self.assertEqual(self.docker.restart_policy, self.docker.original_restart_policy)
         unpause = self.docker.calls.index(["docker", "unpause", self.docker.old_id])
-        self.assertEqual(self.docker.calls[unpause - 1], ["docker", "inspect", self.docker.old_id])
+        self.assertEqual(self.docker.calls[unpause - 1], ['cgroup_validate', True])
+        self.assertEqual(self.docker.calls[unpause - 2], ["docker", "inspect", self.docker.old_id])
 
     def test_success_checks_twice_and_removes_original_without_unpausing(self):
         receipt = self.invoke()
@@ -253,7 +371,8 @@ class FrozenCutoverTests(unittest.TestCase):
         self.assertFalse(receipt["original_unpaused_after_abort"])
         actions = [args[1] if args[0] == 'docker' else args[0] for args in self.docker.calls]
         sizing = next(i for i, args in enumerate(self.docker.calls) if args[:4] == ['docker', 'exec', '-i', self.docker.old_id])
-        guard = next(i for i, args in enumerate(self.docker.calls) if args[:4] == ['docker', 'exec', '-i', self.docker.companion_id])
+        guard = next(i for i, args in enumerate(self.docker.calls) if i > actions.index('pause')
+                     and args[:4] == ['docker', 'exec', '-i', self.docker.companion_id])
         self.assertLess(sizing, actions.index('run'))
         self.assertLess(actions.index("pause"), guard)
         self.assertLess(guard, actions.index("binary_export"))
@@ -261,6 +380,10 @@ class FrozenCutoverTests(unittest.TestCase):
         self.assertFalse(any(args[:2] == ["docker", "cp"] for args in self.docker.calls))
         self.assertEqual(self.docker.guard_count, 2)
         self.assertTrue(self.docker.old_removed)
+        self.assertTrue(self.docker.old_stopped and self.docker.cgroup.closed)
+        self.assertEqual(self.docker.kill_count, 1)
+        self.assertIn(['docker', 'rm', self.docker.old_id], self.docker.calls)
+        self.assertNotIn(['docker', 'rm', '--force', self.docker.old_id], self.docker.calls)
         self.assertNotIn("unpause", actions)
         self.assertFalse(any(word in args for args in self.docker.calls for word in ["build", "compose", "pull"]))
         self.assertEqual((self.release / "frozen.ijm2api.db").read_bytes(), self.docker.backup)
@@ -326,7 +449,7 @@ class FrozenCutoverTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "OriginalAppChangedBeforeFreeze"):
             self.invoke()
         self.assertFalse(self.docker.paused or self.docker.old_removed)
-        self.assertFalse(any(args[0] == "binary_export" or args[1] in ["pause", "unpause", "cp"] for args in self.docker.calls))
+        self.assertFalse(any(args[0] == "binary_export" or args[0] == 'docker' and args[1] in ["pause", "unpause", "cp"] for args in self.docker.calls))
         self.assertIn(["docker", "rm", "--force", self.docker.companion_id], self.docker.calls)
 
     def test_removal_timeout_is_reconciled_as_gone_without_unpausing(self):
@@ -335,15 +458,15 @@ class FrozenCutoverTests(unittest.TestCase):
         self.assertTrue(receipt["passed"] and self.docker.old_removed)
         self.assertEqual(receipt["removal_timeout_resolved"], "original_absent")
         self.assertFalse(receipt["original_unpaused_after_abort"])
-        self.assertFalse(any(args[1] == "unpause" for args in self.docker.calls))
-        self.assertTrue(any(args[1] == "ps" for args in self.docker.calls))
+        self.assertFalse(any(args[:2] == ['docker', 'unpause'] for args in self.docker.calls))
+        self.assertTrue(any(args[:2] == ['docker', 'ps'] for args in self.docker.calls))
 
     def test_receipt_write_failure_cannot_replace_successful_cutover_return(self):
         messages = io.StringIO()
         with patch.object(Path, "write_text", side_effect=OSError("private receipt disk failure")), redirect_stderr(messages):
             receipt = self.invoke()
         self.assertTrue(receipt["passed"] and self.docker.old_removed)
-        self.assertNotIn("unpause", [args[1] for args in self.docker.calls])
+        self.assertFalse(any(args[:2] == ['docker', 'unpause'] for args in self.docker.calls))
         self.assertIn("Frozen cutover receipt could not be written", messages.getvalue())
         self.assertNotIn("private receipt disk failure", messages.getvalue())
         self.assertIn(["docker", "rm", "--force", self.docker.companion_id], self.docker.calls)
@@ -411,6 +534,197 @@ class FrozenCutoverTests(unittest.TestCase):
             self.invoke()
         self.assert_start_failure_preserves_original()
         self.assertFalse(self.docker.companion_exists)
+
+    def test_kill_missing_ack_after_effect_uses_host_proof_without_replay_or_restore(self):
+        for failure in (TimeoutError('exec response lost'), RuntimeError('exit137 namespace died')):
+            with self.subTest(error=type(failure).__name__), tempfile.TemporaryDirectory() as directory:
+                self.release = Path(directory)
+                (self.release / 'query-resume-baseline.safe.json').write_text(json.dumps({'binding_sha256': BINDING}))
+                self.docker = FakeDocker()
+                self.docker.kill_error_after_effect = failure
+                receipt = self.invoke()
+                self.assertTrue(receipt['passed'] and receipt['kill_command_acknowledgement_missing'])
+                self.assertEqual(self.docker.kill_count, 1)
+                self.assertEqual(receipt['kill_command_invocations'], 1)
+                self.assertTrue(self.docker.old_removed)
+                self.assertEqual(self.docker.restart_policy['Name'], 'no')
+                self.assertNotIn(['docker', 'unpause', self.docker.old_id], self.docker.calls)
+                updates = [call for call in self.docker.calls if call[:2] == ['docker', 'update']]
+                self.assertEqual(updates, [['docker', 'update', '--restart=no', self.docker.old_id]])
+
+    def test_kill_without_effect_is_irreversible_and_never_unpaused_or_replayed(self):
+        self.docker.kill_failure_before_effect = True
+        with self.assertRaisesRegex(RuntimeError, 'CgroupDeathNotProven'):
+            self.invoke()
+        self.assertEqual(self.docker.kill_count, 1)
+        self.assertTrue(self.docker.paused)
+        self.assertFalse(self.docker.old_stopped or self.docker.old_removed)
+        self.assertEqual(self.docker.restart_policy['Name'], 'no')
+        self.assertTrue(self.receipt()['postkill_outcome_requires_operator_review'])
+        self.assertFalse(self.receipt()['passed'])
+        self.assertNotIn(['docker', 'unpause', self.docker.old_id], self.docker.calls)
+        self.assertNotIn(['docker', 'rm', self.docker.old_id], self.docker.calls)
+        self.assertTrue((self.release / 'frozen-kill-attempt.safe.json').is_file())
+        with self.assertRaisesRegex(RuntimeError, 'OriginalAppNotRunningUnpaused|CutoverAttemptAlreadyRecorded'):
+            self.invoke()
+        self.assertEqual(self.docker.kill_count, 1)
+
+    def test_docker_stopped_without_complete_cgroup_death_proof_cannot_remove(self):
+        for proof in ({'empty_proof': 'unknown', 'original_pid_gone': True},
+                      {'empty_proof': 'held_events_populated_zero', 'original_pid_gone': False}):
+            with self.subTest(proof=proof), tempfile.TemporaryDirectory() as directory:
+                self.release = Path(directory)
+                (self.release / 'query-resume-baseline.safe.json').write_text(json.dumps({'binding_sha256': BINDING}))
+                self.docker = FakeDocker()
+                with patch.object(self.docker.cgroup, 'wait_empty', return_value=proof):
+                    with self.assertRaisesRegex(RuntimeError, 'CgroupDeathNotProven'):
+                        self.invoke()
+                self.assertTrue(self.docker.old_stopped)
+                self.assertFalse(self.docker.old_removed)
+                self.assertEqual(self.docker.restart_policy['Name'], 'no')
+                self.assertNotIn(['docker', 'unpause', self.docker.old_id], self.docker.calls)
+                self.assertNotIn(['docker', 'rm', self.docker.old_id], self.docker.calls)
+
+    def test_restart_update_result_is_read_back_and_original_retry_count_is_restored(self):
+        self.docker.restart_update_timeout_after_effect = True
+        self.assertTrue(self.invoke()['passed'])
+        self.assertTrue(self.receipt()['restart_update_client_result_unknown'])
+        self.assertEqual(sum(call[:2] == ['docker', 'update'] for call in self.docker.calls), 1)
+        with tempfile.TemporaryDirectory() as directory:
+            self.release = Path(directory)
+            (self.release / 'query-resume-baseline.safe.json').write_text(json.dumps({'binding_sha256': BINDING}))
+            self.docker = FakeDocker()
+            self.docker.restart_policy = {'Name': 'on-failure', 'MaximumRetryCount': 3}
+            self.docker.original_restart_policy = deepcopy(self.docker.restart_policy)
+            self.docker.first_failure = True
+            with self.assertRaisesRegex(RuntimeError, 'FrozenGuardRejected'):
+                self.invoke()
+            self.assert_aborted_safely()
+            self.assertIn(['docker', 'update', '--restart=on-failure:3', self.docker.old_id], self.docker.calls)
+
+    def test_capture_access_or_restart_suppression_failure_never_pauses_or_kills(self):
+        for failure in ('capture', 'access', 'restart'):
+            with self.subTest(failure=failure):
+                self.docker = FakeDocker()
+                if failure == 'capture': self.docker.cgroup.capture_failure = True
+                if failure == 'access': self.docker.access_allowed = False
+                if failure == 'restart': self.docker.restart_update_ignored = True
+                with self.assertRaisesRegex(RuntimeError, 'SyntheticCgroupUnavailable|SingleFileCgroupAccessNotVerified|OriginalRestartSuppressionNotVerified'):
+                    self.invoke()
+                self.assertTrue(self.docker.cgroup.closed)
+                self.assertFalse(self.docker.paused or self.docker.old_stopped or self.docker.old_removed)
+                self.assertEqual(self.docker.kill_count, 0)
+                self.assertEqual(self.docker.restart_policy, self.docker.original_restart_policy)
+                self.assertFalse(any(call[:2] in (['docker', 'pause'], ['docker', 'unpause']) for call in self.docker.calls))
+
+    def test_partial_kill_journal_blocks_recovery_but_no_marker_allows_safe_abort(self):
+        real_durable = cutover.durable_json
+        for partial in (False, True):
+            with self.subTest(partial=partial), tempfile.TemporaryDirectory() as directory:
+                self.release = Path(directory)
+                (self.release / 'query-resume-baseline.safe.json').write_text(json.dumps({'binding_sha256': BINDING}))
+                self.docker = FakeDocker()
+                def failing_journal(path, value):
+                    if Path(path).name == 'frozen-kill-attempt.safe.json':
+                        if partial: Path(path).write_bytes(b'partial-attempt-marker')
+                        raise OSError('synthetic journal commit failure')
+                    return real_durable(path, value)
+                with patch.object(cutover, 'durable_json', side_effect=failing_journal):
+                    with self.assertRaisesRegex(OSError, 'synthetic journal commit failure'):
+                        self.invoke()
+                self.assertEqual(self.docker.kill_count, 0)
+                self.assertEqual(self.receipt()['kill_command_invocations'], 0)
+                self.assertFalse(self.docker.old_stopped or self.docker.old_removed)
+                if partial:
+                    self.assertTrue(self.docker.paused)
+                    self.assertTrue(self.receipt()['kill_journal_commit_uncertain'])
+                    self.assertEqual(self.docker.restart_policy['Name'], 'no')
+                    self.assertNotIn(['docker', 'unpause', self.docker.old_id], self.docker.calls)
+                    self.assertEqual((self.release / 'frozen-kill-attempt.safe.json').read_bytes(), b'partial-attempt-marker')
+                else:
+                    self.assert_aborted_safely()
+
+    def test_abort_cas_never_overwrites_external_policy_or_unpauses_on_restore_failure(self):
+        for failure in ('external', 'restore'):
+            with self.subTest(failure=failure):
+                self.docker = FakeDocker()
+                self.docker.first_failure = True
+                if failure == 'external':
+                    self.docker.external_policy_on_first_guard = {'Name': 'on-failure', 'MaximumRetryCount': 2}
+                else:
+                    self.docker.restart_restore_failure = True
+                with self.assertRaisesRegex(RuntimeError, 'FrozenGuardRejected'):
+                    self.invoke()
+                self.assertTrue(self.docker.paused)
+                self.assertTrue(self.receipt()['prekill_abort_recovery_requires_operator_review'])
+                self.assertEqual(self.docker.kill_count, 0)
+                self.assertNotIn(['docker', 'unpause', self.docker.old_id], self.docker.calls)
+                if failure == 'external':
+                    self.assertEqual(self.docker.restart_policy, self.docker.external_policy_on_first_guard)
+                    self.assertEqual(sum(call[:2] == ['docker', 'update'] for call in self.docker.calls), 1)
+
+    def test_host_deletion_proof_requires_held_identity_deleted_link_and_absent_original(self):
+        path = Path('/sys/fs/cgroup/synthetic-original')
+        for case in ('events-zero', 'missing-only', 'renamed', 'deleted', 'replaced', 'still-original', 'held-changed'):
+            with self.subTest(case=case):
+                group = cutover.HostCgroup()
+                group.path = path
+                group.fds = {'directory': 7101, 'events': 7102}
+                group.identities = {'directory': {'device': 7, 'inode': 11}}
+                held = SimpleNamespace(st_dev=7, st_ino=12 if case == 'held-changed' else 11)
+                current = SimpleNamespace(st_dev=7, st_ino=99 if case == 'replaced' else 11)
+                link = str(path) + (' (deleted)' if case in {'deleted', 'replaced', 'still-original'} else '')
+                if case == 'renamed': link = str(path) + '-renamed'
+                event_bytes = b'populated 0\nfrozen 1\n' if case == 'events-zero' else b'populated 1\nfrozen 1\n'
+                effect = FileNotFoundError() if case in {'missing-only', 'renamed', 'deleted'} else None
+                with patch.object(cutover.os, 'fstat', return_value=held), \
+                        patch.object(cutover.os, 'lseek', return_value=0), \
+                        patch.object(cutover.os, 'read', return_value=event_bytes), \
+                        patch.object(cutover.os, 'readlink', return_value=link), \
+                        patch.object(Path, 'lstat', side_effect=effect, return_value=current):
+                    if case == 'held-changed':
+                        with self.assertRaisesRegex(RuntimeError, 'HeldCgroupDirectoryChanged'): group._empty()
+                    elif case in {'events-zero', 'deleted', 'replaced'}:
+                        proof = group._empty()
+                        self.assertEqual(proof['empty_proof'], 'held_events_populated_zero' if case == 'events-zero' else 'held_original_cgroup_deleted')
+                    else:
+                        self.assertIsNone(group._empty())
+
+    def test_companion_program_has_one_write_only_in_kill_and_shell_blocks_postkill_recovery(self):
+        access = cutover.cgroup_companion_program(self.docker.cgroup.identity)
+        kill = cutover.cgroup_companion_program(self.docker.cgroup.identity, kill=True)
+        compile(access, 'synthetic_access', 'exec')
+        compile(kill, 'synthetic_kill', 'exec')
+        self.assertNotIn('os.write(', access)
+        self.assertEqual(kill.count("os.write(fd,b'1')"), 1)
+        self.assertIn("events.get('frozen')!='1'", kill)
+        shell = (MODULE.parent / 'deploy_pre.sh').read_text()
+        branch = shell[shell.index('>"$release/frozen-cutover.private.log" 2>&1; then'):]
+        self.assertLess(branch.index('frozen-kill-attempt.safe.json'), branch.index('recovery="'))
+        self.assertIn('refusing automatic restart or rollback', branch)
+        self.assertIn('exit 1', branch[:branch.index('recovery="')])
+        marker_program = branch.split("<<'FROZEN_KILL_MARKER'\n", 1)[1].split('\nFROZEN_KILL_MARKER', 1)[0]
+        for name, failure, metadata, expected in (
+                ('missing', FileNotFoundError(), None, 0),
+                ('exists', None, SimpleNamespace(st_mode=0o100600, st_size=100), 1),
+                ('permission', PermissionError(), None, 1),
+                ('io', OSError(5, 'synthetic I/O error'), None, 1),
+                ('dangling-symlink', None, SimpleNamespace(st_mode=0o120777, st_size=20), 1),
+                ('partial-marker', None, SimpleNamespace(st_mode=0o100600, st_size=7), 1)):
+            with self.subTest(marker=name), \
+                    patch.object(cutover.os, 'lstat', side_effect=failure, return_value=metadata), \
+                    patch.object(cutover.sys, 'argv', ['shell-marker-guard', '/synthetic/attempt']):
+                with self.assertRaises(SystemExit) as result:
+                    exec(compile(marker_program, 'actual_shell_marker_guard', 'exec'), {})
+                self.assertEqual(result.exception.code, expected)
+
+    def test_deleted_cgroup_evidence_still_requires_pid_death_then_nonforce_remove(self):
+        self.docker.cgroup.death_proof = 'held_original_cgroup_deleted'
+        receipt = self.invoke()
+        self.assertTrue(receipt['passed'])
+        self.assertEqual(receipt['cgroup_death']['empty_proof'], 'held_original_cgroup_deleted')
+        self.assertEqual(self.docker.kill_count, 1)
+        self.assertNotIn(['docker', 'rm', '--force', self.docker.old_id], self.docker.calls)
 
 
 if __name__ == "__main__":

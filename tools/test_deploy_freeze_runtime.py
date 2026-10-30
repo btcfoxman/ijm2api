@@ -139,7 +139,7 @@ exec(heartbeat,{'name':'parent'})
 
 class Trace:
     def __init__(self, service, data, *, inject_race=False, expect_success=False, pause_timeout=False,
-                 exporter=None, companion_start_timeout=False):
+                 exporter=None, companion_start_timeout=False, release=None):
         self.service = service
         self.data = data
         self.inject_race = inject_race
@@ -147,12 +147,14 @@ class Trace:
         self.pause_timeout = pause_timeout
         self.companion_start_timeout = companion_start_timeout
         self.exporter = exporter
+        self.release = release
         self.paused = False
         self.companion = None
         self.heartbeat_stages = {}
         self.frozen_read_count = 0
         self.events = []
         self.frozen_heartbeats = None
+        self.kill_commands = 0
 
     def export_backup(self, companion_id, destination):
         assert self.paused and companion_id == self.companion
@@ -169,6 +171,12 @@ class Trace:
     def __call__(self, args, *, input=None, timeout=30):
         assert args[0] == "docker"
         command = args[1:]
+        if command[0] == 'update':
+            assert command[-1] == self.service
+            assert command[1] in {'--restart=no', '--restart=unless-stopped'}
+            value = docker(command, input=input, timeout=timeout)
+            self.events.append('restart_policy_suppressed' if command[1] == '--restart=no' else 'abort_restart_policy_restored')
+            return value
         if command[0] == "run":
             assert not self.paused and "--read-only" in command
             assert timeout == 90
@@ -181,8 +189,18 @@ class Trace:
             assert command[command.index("--network") + 1] == "none"
             assert command[command.index("--volumes-from") + 1] == self.service + ":ro"
             assert command[command.index("--pid") + 1] == "container:" + self.service
+            assert command[command.index('--cgroupns') + 1] == 'host'
+            mounts = [command[index + 1] for index, value in enumerate(command) if value == '--mount']
+            assert len(mounts) == 4
+            write_mounts = [value for value in mounts if not value.endswith(',readonly')]
+            assert len(write_mounts) == 1 and write_mounts[0].endswith('/cgroup.kill')
+            assert all('/sys/fs/cgroup/' in value and ',dst=/run/ijm-frozen-cgroup/cgroup.' in value for value in mounts)
             value = docker(command, input=input, timeout=timeout)
             self.companion = value
+            actual = json.loads(docker(['inspect', value]))[0]
+            persistent = [mount for mount in actual['Mounts'] if mount['Destination'] != '/tmp']
+            assert [mount['Destination'] for mount in persistent if mount['RW']] == ['/run/ijm-frozen-cgroup/cgroup.kill']
+            assert all(not mount['RW'] for mount in persistent if mount['Destination'].startswith('/app'))
             self.events.append("companion_joined_before_pause")
             if self.companion_start_timeout:
                 actual = json.loads(docker(['inspect', value]))[0]
@@ -218,6 +236,25 @@ class Trace:
             if command[2] == self.service and input and 'SnapshotSizingDatabaseMissing' in input:
                 assert not self.paused and self.companion is None and 'sqlite' not in input
                 return docker(command, input=input, timeout=timeout)
+            if input and 'CGROUP_SINGLE_FILE_ACCESS' in input:
+                assert not self.paused and command[2] == self.companion
+                self.events.append('single_file_access_checked_before_pause')
+                return docker(command, input=input, timeout=timeout)
+            if input and 'CGROUP_SINGLE_FILE_KILL' in input:
+                assert self.paused and command[2] == self.companion and self.frozen_read_count == 2
+                self.kill_commands += 1
+                assert self.kill_commands == 1
+                manifest = self.release / 'frozen-prekill.safe.json'
+                attempt = json.loads((self.release / 'frozen-kill-attempt.safe.json').read_text())
+                assert attempt['kill_attempted'] is True and attempt['automatic_kill_replay_allowed'] is False
+                assert attempt['prekill_manifest_sha256'] == hashlib.sha256(manifest.read_bytes()).hexdigest()
+                with (self.release / 'frozen.ijm2api.db').open('rb') as reader:
+                    assert hashlib.file_digest(reader, 'sha256').hexdigest() == json.loads(manifest.read_text())['frozen_backup_sha256']
+                self.events.append('durable_evidence_verified_before_kill')
+                self.pre_remove_heartbeats = {p.name:p.stat().st_size for p in self.data.glob('*.heartbeat')}
+                self.record_heartbeats('before_cgroup_kill')
+                self.events.append('single_file_cgroup_kill_once')
+                return docker(command, input=input, timeout=timeout)
             assert self.paused and command[2] == self.companion
             self.events.append("frozen_companion_read")
             value = docker(command, input=input, timeout=timeout)
@@ -227,10 +264,13 @@ class Trace:
         if command[0] == "unpause":
             assert command[1] == self.service
             self.events.append("abort_unpaused_original")
-        if command[:2] == ["rm", "--force"] and command[2] == self.service:
+        if command[0] == "rm" and command[-1] == self.service:
+            assert command == ['rm', self.service], 'ForceRemovalOfOriginalForbidden'
             assert self.paused
-            self.pre_remove_heartbeats = {p.name:p.stat().st_size for p in self.data.glob('*.heartbeat')}
-            self.record_heartbeats('before_remove')
+            assert self.kill_commands == 1
+            original = json.loads(docker(['inspect', self.service]))[0]
+            assert original['State']['Running'] is False and original['State']['Pid'] == 0
+            assert original['HostConfig']['RestartPolicy'] == {'Name': 'no', 'MaximumRetryCount': 0}
             self.events.append("old_removed_while_frozen")
             value = docker(command, input=input, timeout=timeout)
             self.post_remove_heartbeats = {p.name:p.stat().st_size for p in self.data.glob('*.heartbeat')}
@@ -292,6 +332,7 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
         (app / "service.py").write_bytes(SERVICE_SOURCE)
         try:
             old_id = docker(["run", "--detach", "--name", service, "--pull", "never",
+                '--restart', 'unless-stopped',
                 "--network", "none", "--read-only", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "DAC_OVERRIDE",
                 "--tmpfs", "/tmp:rw,noexec,nosuid,size=128m,mode=0700",
                 "--security-opt", "no-new-privileges", "--memory", "128m", "--pids-limit", "32",
@@ -320,7 +361,7 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
             should_reject = race or pause_timeout or companion_start_timeout or (active and not query)
             trace = Trace(old_id, data, inject_race=race, expect_success=not should_reject,
                 pause_timeout=pause_timeout, exporter=controller.export_frozen_backup,
-                companion_start_timeout=companion_start_timeout)
+                companion_start_timeout=companion_start_timeout, release=release)
             rejected = False
             original_error = None
             try:
@@ -335,12 +376,16 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                     "error_message": str(error)[-4000:], "receipt": receipt, "events": trace.events,
                     "expected_rejection": should_reject, "synthetic_only": True})
             assert rejected == should_reject, "UnexpectedCutoverDecision"
-            assert trace.events[0] == "companion_joined_before_pause"
+            assert trace.events[0] == 'restart_policy_suppressed'
+            assert trace.events.index('companion_joined_before_pause') > trace.events.index('restart_policy_suppressed')
             if not pause_timeout and not companion_start_timeout:
                 assert "frozen_companion_read" in trace.events
             if should_reject:
                 state = json.loads(docker(["inspect", service]))[0]["State"]
                 assert state["Running"] and not state["Paused"]
+                assert json.loads(docker(['inspect', service]))[0]['HostConfig']['RestartPolicy'] == {'Name': 'unless-stopped', 'MaximumRetryCount': 0}
+                assert receipt['original_restart_policy_restored_after_abort'] is True
+                assert trace.kill_commands == 0
                 assert not receipt["original_removed_while_frozen"]
                 assert "old_removed_while_frozen" not in trace.events
                 if companion_start_timeout:
@@ -362,12 +407,21 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                         assert query_fixture(image, data, "SELECT status FROM tasks WHERE id=?", (RACE_TASK,), service=service) == [["preparing"]]
             else:
                 assert receipt["passed"] and receipt["original_removed_while_frozen"]
+                assert receipt['kill_attempted'] is True and trace.kill_commands == 1
+                assert receipt['cgroup_death']['original_pid_gone'] is True
+                assert receipt['cgroup_death']['empty_proof'] in {'held_events_populated_zero', 'held_original_cgroup_deleted'}
+                assert 'abort_restart_policy_restored' not in trace.events
+                prekill = release / 'frozen-prekill.safe.json'
+                attempted = json.loads((release / 'frozen-kill-attempt.safe.json').read_text())
+                assert hashlib.sha256(prekill.read_bytes()).hexdigest() == attempted['prekill_manifest_sha256']
+                assert json.loads(prekill.read_text())['frozen_backup_sha256'] == receipt['frozen_backup_sha256']
+                assert json.loads((release / 'frozen-death.safe.json').read_text())['kill_attempts'] == 1
                 assert docker(["inspect", service], optional=True) is None
                 assert "abort_unpaused_original" not in trace.events
                 time.sleep(0.2)
                 assert_frozen_heartbeats(trace, data, name, receipt)
                 assert (data / 'queued-after-freeze').is_file()
-                assert not (data / 'executed-after-freeze').exists(), "QueuedRequestExecutedDuringForceRemoval"
+                assert not (data / 'executed-after-freeze').exists(), "QueuedRequestExecutedDuringCgroupKill"
                 snapshot = release / "frozen.ijm2api.db"
                 with snapshot.open('rb') as reader:
                     assert hashlib.file_digest(reader, 'sha256').hexdigest() == receipt["frozen_backup_sha256"]
@@ -391,6 +445,8 @@ def run_case(controller, guard, image, name, *, active, query, race=False, pause
                 "frozen_source_database_bytes": (frozen.get('ijm2api.db') or {}).get('size_bytes'),
                 "frozen_backup_bytes": (release / 'frozen.ijm2api.db').stat().st_size if (release / 'frozen.ijm2api.db').is_file() else None,
                 "tmpfs_budget_bytes": capacity.get('tmpfs_bytes'), "memory_limit_bytes": capacity.get('memory_bytes'),
+                "kill_commands": trace.kill_commands, "cgroup_death": receipt.get('cgroup_death'),
+                "restart_policy_restored_after_abort": receipt.get('original_restart_policy_restored_after_abort'),
                 "source_layout": "uncheckpointed_WAL" if active else "WAL_mode_without_sidecars"}
         finally:
             if trace and trace.companion:

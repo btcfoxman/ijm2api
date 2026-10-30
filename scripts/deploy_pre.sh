@@ -158,6 +158,20 @@ test "$(active_commands)" -eq 0 || { echo "New work arrived; service was not res
 if ! IJM_DEPLOY_QUERY_ONLY_TASK_IDS="$query_ids" IJM_DEPLOY_STARTUP_SHA256="$startup_sha" \
     python3 "$(dirname "${BASH_SOURCE[0]}")/frozen_cutover.py" --service "$DEPLOY_SERVICE" --image "$image" --release "$release" \
     >"$release/frozen-cutover.private.log" 2>&1; then
+  if ! python3 - "$release/frozen-kill-attempt.safe.json" <<'FROZEN_KILL_MARKER'
+import os,sys
+try:
+ os.lstat(sys.argv[1])
+except FileNotFoundError:
+ raise SystemExit(0)
+except OSError:
+ raise SystemExit(1)
+raise SystemExit(1)
+FROZEN_KILL_MARKER
+  then
+    echo "Cgroup stop was attempted; refusing automatic restart or rollback after an unverified cutover"
+    exit 1
+  fi
   echo "Frozen cutover did not complete; verifying whether the old service needs recovery"
   recovery="$(python3 - "$release/context.private.json" <<'PY'
 import json,subprocess,sys,time
