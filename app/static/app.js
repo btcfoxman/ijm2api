@@ -337,6 +337,27 @@ $("#taskLimit").addEventListener("change", () => {
 $("#addAccountButton").addEventListener("click", () => { $("#accountForm").reset(); $("#accountForm").elements.namedItem("max_concurrency").value = 1; $("#accountDialog").showModal(); });
 $("#batchButton").addEventListener("click", () => { renderBatchResult(); $("#batchDialog").showModal(); });
 $("#newTaskButton").addEventListener("click", () => { renderModels(); validateJson(); $("#taskDialog").showModal(); }); $("#requestJson").addEventListener("input", validateJson);
+function lowBalanceModelOptions(settings) {
+  const values = settings?.low_balance_seedream_target_options;
+  return Array.isArray(values) ? [...new Set(values.filter((value) => typeof value === "string" && /^[a-z0-9][a-z0-9._-]*$/.test(value)))] : [];
+}
+function renderLowBalanceSettings(form, settings) {
+  form.elements.namedItem("low_balance_image_rescue_threshold").value = String(settings.low_balance_image_rescue_threshold ?? 50);
+  const select = form.elements.namedItem("low_balance_seedream_target_model");
+  const target = settings.low_balance_seedream_target_model || "seedream-5.0-pro";
+  const options = lowBalanceModelOptions(settings);
+  select.innerHTML = options.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}${value === "seedream-5.0-pro" ? "（保持原模型）" : ""}</option>`).join("");
+  if (!options.includes(target)) select.innerHTML += `<option value="${escapeHtml(target)}" disabled>${escapeHtml(target)}（模型列表暂不可用）</option>`;
+  select.value = target;
+}
+function lowBalanceSettingsPayload(form, settings) {
+  const raw = form.elements.namedItem("low_balance_image_rescue_threshold").value.trim();
+  const threshold = Number(raw);
+  if (!raw || !Number.isFinite(threshold) || threshold < 0) throw new Error("余额门槛须为大于等于 0 的有效数字；0 表示关闭规则");
+  const target = form.elements.namedItem("low_balance_seedream_target_model").value;
+  if (!lowBalanceModelOptions(settings).includes(target)) throw new Error("实际生成模型不可用，请刷新设置后重新选择");
+  return { low_balance_image_rescue_threshold: threshold, low_balance_seedream_target_model: target };
+}
 $("#settingsButton").addEventListener("click", () => {
   const form = $("#settingsForm");
   Object.entries(state.settings).forEach(([key, value]) => {
@@ -345,6 +366,7 @@ $("#settingsButton").addEventListener("click", () => {
     if (input.type === "checkbox") input.checked = Boolean(value);
     else input.value = value ?? "";
   });
+  renderLowBalanceSettings(form, state.settings);
   form.elements.namedItem("result_s3_center_token").value = "";
   $("#s3TokenHint").textContent = state.settings.result_s3_center_token_configured
     ? "已配置；留空保留当前密钥" : "尚未配置";
@@ -370,7 +392,11 @@ $("#settingsForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
   const field = (name) => form.elements.namedItem(name);
+  let lowBalance;
+  try { lowBalance = lowBalanceSettingsPayload(form, state.settings); }
+  catch (error) { toast(error.message, true); return; }
   const payload = {
+    ...lowBalance,
     canvas_cli_enabled: field("canvas_cli_enabled").checked,
     task_workers: Number(field("task_workers").value),
     task_queue_capacity: Number(field("task_queue_capacity").value),

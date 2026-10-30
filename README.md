@@ -148,7 +148,7 @@ All task endpoints require `Authorization: Bearer <IJM_API_KEY>` or
 * `GET /v1/videos/{task_id}`: poll status and retrieve `data[].url`.
 * `GET /v1/videos/{task_id}/content`: redirect to the first result.
 * `GET /v1/models`: list models and media limits.
-* `POST /v1/responses`: submit an asynchronous Flare or Sunburst image task.
+* `POST /v1/responses`: submit an asynchronous image task.
 * `GET /v1/responses/{response_id}`: poll its status and image URLs.
 
 Image model names are `gpt-image-2.5-flare` and
@@ -158,6 +158,22 @@ Text-to-image and image edits share the OpenAI Responses input shape:
 `ratio` accepts `1:1`, `16:9`, `9:16`, `4:3`, `3:4`, `3:2`, `2:3`, or `21:9`;
 `resolution` accepts `1k`, `2k`, or `4k`. The service returns an image URL in
 `output[].url` when generation completes.
+
+Canvas CLI also supports `seedream-5.0-pro` (`1.5k`, `2k`, `4k`) and
+`seedream-5.0-lite` (`2k`, `4k`), with matching resolution suffixes.
+In management settings, `low_balance_image_rescue_threshold` defaults to 50;
+0 disables this independent rule. It applies only to Pro requests on accounts
+with a known positive balance below that threshold, including accounts
+automatically disabled for low balance. Manual disabling is respected.
+The separate global automatic-disable threshold is unchanged.
+
+`low_balance_seedream_target_model` selects the actual model for those requests
+and defaults to `seedream-5.0-pro`. The management page lists supported targets.
+The original request is retained; task details show the actual model. The
+target's resolution, input and output limits are checked before upload, and
+its own upstream quote governs credit reservation and submission. Incompatible
+requests are rejected without silently changing their parameters. Accepted
+tasks keep their original model and upstream binding after settings change.
 
 Example:
 

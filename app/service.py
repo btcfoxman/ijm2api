@@ -30,6 +30,10 @@ from .catalog import MODELS, normalize_request
 from .client import DreaminaClient, DreaminaError, InputAudioDurationError, SubmissionPreflightError
 from .image_client import DreaminaImageClient, resolve_image_model, image_model_requires_cli
 from .image_request import normalize_image_request
+from .image_model_routing import (DEFAULT_LOW_BALANCE_SEEDREAM_TARGET,
+    LOW_BALANCE_SEEDREAM_TARGET_OPTIONS, rescue_threshold,
+    validate_rescue_threshold, validate_target_model, recorded_image_route)
+from .account_policy import DEFAULT_LOW_BALANCE_IMAGE_RESCUE_THRESHOLD
 from .errors import public_error, upstream_review_error
 from .media import MediaError
 from .result_transfer import ResultTransferError, transfer, presign, expires_soon, _config
@@ -63,6 +67,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "chrome_executable": os.getenv("IJM_CHROME_EXECUTABLE", "/usr/bin/chromium" if os.name != "nt" else "chrome.exe"),
     "chrome_user_data_root": os.getenv("IJM_CHROME_USER_DATA_ROOT", "/app/data/chrome-profiles"),
     "low_balance_disable_threshold": 0,
+    "low_balance_image_rescue_threshold": DEFAULT_LOW_BALANCE_IMAGE_RESCUE_THRESHOLD,
+    "low_balance_seedream_target_model": DEFAULT_LOW_BALANCE_SEEDREAM_TARGET,
     "allow_video_reference_inputs": True,
     "excess_media_policy": "reject",
     "prompt_media_reference_cleanup_enabled": True,
@@ -104,11 +110,18 @@ class Service(CanvasServiceMixin):
         values["result_s3_center_token_configured"] = bool(values.get("result_s3_center_token"))
         values["result_s3_center_token"] = ""
         values['canvas_cli_runtime'] = dict(self.canvas_runtime)
+        values['low_balance_seedream_target_options'] = list(LOW_BALANCE_SEEDREAM_TARGET_OPTIONS)
         return values
 
     def update_settings(self, values: dict[str, Any]) -> dict[str, Any]:
         allowed = set(DEFAULT_SETTINGS)
         filtered = {key: value for key, value in values.items() if key in allowed}
+        if 'low_balance_image_rescue_threshold' in filtered:
+            filtered['low_balance_image_rescue_threshold'] = validate_rescue_threshold(
+                filtered['low_balance_image_rescue_threshold'])
+        if 'low_balance_seedream_target_model' in filtered:
+            filtered['low_balance_seedream_target_model'] = validate_target_model(
+                filtered['low_balance_seedream_target_model'])
         if "result_s3_center_token" in filtered and not str(filtered["result_s3_center_token"] or "").strip():
             filtered.pop("result_s3_center_token")
         for key in ("task_workers", "task_queue_capacity", "poll_interval_seconds", "task_timeout_seconds"):
@@ -537,13 +550,15 @@ class Service(CanvasServiceMixin):
                          task: dict | None = None) -> list[dict]:
         accounts, legacy, all_quotes = [], [], []
         threshold = number(self.settings().get('low_balance_disable_threshold')) or 0
+        image_rescue = rescue_threshold(self.settings())
         if task and (task.get('normalized') or {}).get('kind') != 'image':
             try:
                 all_quotes = self.store.canvas_quote_hints()
             except Exception as exc:
                 logger.warning('Canvas scheduling quote cache unavailable (%s)', type(exc).__name__)
         for item in self.store.accounts(private=True):
-            if (int(item['id']) in excluded or not account_accepts_task(item, task, threshold=threshold)
+            if (int(item['id']) in excluded or not account_accepts_task(item, task, threshold=threshold,
+                                                                       rescue_threshold=image_rescue)
                     or not item['proxy_url'] or not _credential_setup_ready(item)):
                 continue
             if not include_aux_busy and int(item['id']) in self._aux_account_owners:
@@ -559,7 +574,7 @@ class Service(CanvasServiceMixin):
             if unknown_hold or available is not None and available <= 0:
                 continue
             candidate = {**item, '_available_credits': available}
-            if low_balance_image_probe(item, task, threshold):
+            if low_balance_image_probe(item, task, threshold, rescue_threshold=image_rescue):
                 # A different account's estimate is not this account's quote.
                 # Reserve its entire available budget until its own quote so
                 # another preparation cannot reuse an inherited low estimate.
@@ -698,8 +713,9 @@ class Service(CanvasServiceMixin):
         """A request-local eligibility skip never consumes a credit attempt."""
         with self._lock:
             task = self.store.task(task_id) or {}
+            allowed = ADMISSION_AUDIT_FIELDS | ({'image_model_route'} if recorded_image_route(task) else set())
             if (not self._unaccepted_admission(task)
-                    or any(key not in ADMISSION_AUDIT_FIELDS for key in task.get('upstream_context') or {})):
+                    or any(key not in allowed for key in task.get('upstream_context') or {})):
                 return False
             context = dict(task.get('upstream_context') or {})
             history = list(context.get('model_eligibility_exclusions') or [])
@@ -760,7 +776,8 @@ class Service(CanvasServiceMixin):
             snapshots = [value for raw in (balance, current.get('balance')) if (value := number(raw)) is not None]
             checked = {**current, 'balance': min(snapshots) if snapshots else None}
             threshold = number(self.settings().get('low_balance_disable_threshold')) or 0
-            if not account_accepts_task(checked, self.store.task(task_id), threshold=threshold):
+            if not account_accepts_task(checked, self.store.task(task_id), threshold=threshold,
+                                        rescue_threshold=rescue_threshold(self.settings())):
                 return False
             available, unknown_hold = self._available_credits(checked, pending)
             return not unknown_hold and available is not None and available > 0 and available >= estimated_cost

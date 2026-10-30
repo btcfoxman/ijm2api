@@ -17,6 +17,7 @@ from .canvas_client import (CanvasClient, identity_network_error, preparation_se
 from .canvas_timing import PreparationTiming, archived_attempts, INITIAL_ADMISSION_UNSET
 from .canvas_quote_hints import new_hint
 from .account_policy import credit_rejected
+from .image_model_routing import plan_image_execution, recorded_image_route
 from .cost_adapter import input_evidence, number
 from .media import MediaError, _DIRECT_FIRST_MEDIA_HOSTS, _download, media_error_diagnostic
 from .upload import _probe_media
@@ -373,14 +374,16 @@ class CanvasServiceMixin:
 
     def _canvas_model_ineligible(self, task: dict, exc: CanvasCLIError, deadline: float) -> bool:
         """Only a valid account catalog with no requested model is ineligible."""
+        route = recorded_image_route(task)
+        allowed = ADMISSION_AUDIT_FIELDS | ({'image_model_route'} if route else set())
         if (time.monotonic() >= deadline or exc.outcome_unknown
                 or exc.code != 'CLI_CAPABILITY_UNAVAILABLE'
                 or not self._unaccepted_admission(task)
-                or any(key not in ADMISSION_AUDIT_FIELDS for key in task.get('upstream_context') or {})):
+                or any(key not in allowed for key in task.get('upstream_context') or {})):
             return False
         error = (getattr(exc, 'details', None) or {}).get('error') or {}
         return (isinstance(error, dict) and error.get('scope') == 'account' and error.get('reason') == 'model_not_in_catalog'
-            and error.get('requested_model') == task.get('model')
+            and error.get('requested_model') == (route['effective_model'] if route else task.get('model'))
             and error.get('kind') == ('image' if task['normalized'].get('kind') == 'image' else 'video'))
 
     def _execute_canvas(self, task_id: str, account: dict, deadline: float, *,
@@ -499,6 +502,18 @@ class CanvasServiceMixin:
             self._update_canvas_task(task_id, {"balance_before": fresh_before})
             normalized = dict(task["normalized"])
             normalized["_execution_backend"] = "canvas_cli"
+            if normalized.get('kind') == 'image':
+                try:
+                    normalized, image_route = plan_image_execution(task,
+                        {**account, 'balance': budget_balance}, self.settings())
+                except ValueError as exc:
+                    raise CanvasCLIError('CLI_CAPABILITY_UNAVAILABLE', str(exc)) from None
+                normalized['_execution_backend'] = 'canvas_cli'
+                if image_route is not None:
+                    context['image_model_route'] = image_route
+                    self._canvas_context(task_id, {'image_model_route': image_route})
+                    if self._canvas_task_terminated(self.store.task(task_id)):
+                        return True
             if task['model'] == 'sd-2-5-480p-x':
                 normalized['resolution'] = '720p'
             model_pending = True

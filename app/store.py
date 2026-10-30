@@ -14,6 +14,7 @@ from typing import Any
 
 from .catalog import MODELS
 from .account_import import masked_email, normalize_email
+from .image_model_routing import recorded_image_route
 
 
 ACCOUNT_SECRET_FIELDS = {"login_email", "login_password", "login_user_id", "login_enable_after", "cookie", "cookies", "user_agent", "cli_user_id"}
@@ -204,13 +205,24 @@ class Store:
         value["caller_request"] = value["request"]
         normalized = value["normalized"]
         if normalized.get("kind") == "image":
+            image_route = recorded_image_route(value)
+            context = value['upstream_context']
+            if (image_route and context.get('backend') == 'canvas_cli'
+                    and context.get('account_id') == value.get('account_id')
+                    and context.get('task_id') == value.get('id')
+                    and isinstance(context.get('model'), str) and context['model']):
+                image_route['resolved_upstream_model'] = context['model']
             value["upstream_request"] = {
-                "model": normalized["upstream_model"],
+                "model": image_route.get('resolved_upstream_model', image_route['effective_upstream_model'])
+                         if image_route else normalized["upstream_model"],
                 "resolution": normalized["resolution"],
                 "ratio": normalized["aspect_ratio"],
                 "count": normalized["count"],
                 "media_counts": {"images": len(normalized["images"])},
             }
+            if image_route:
+                value['image_model_route'] = image_route
+                value['upstream_request']['requested_model'] = image_route['requested_upstream_model']
         else:
             value["upstream_request"] = {"model": normalized["upstream_model"],
                 "duration_sec": normalized["duration"],

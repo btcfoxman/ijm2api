@@ -15,8 +15,9 @@ IMAGE_MODELS = {
     "gpt-image-2.5-flare": "dreamina_gpt_image_2_5_flare",
     "gpt-image-2.5-sunburst": "dreamina_gpt_image_2_5_sunburst",
     "seedream-5.0-pro": "seedream_5.0_pro",
+    "seedream-5.0-lite": "seedream_5.0_lite",
 }
-CLI_ONLY_IMAGE_MODELS = frozenset({"seedream_5.0_pro"})
+CLI_ONLY_IMAGE_MODELS = frozenset({"seedream_5.0_pro", "seedream_5.0_lite"})
 IMAGE_RATIOS = {
     "1:1": (1, 1024, 1024),
     "3:4": (2, 768, 1024),
@@ -52,6 +53,8 @@ def image_model_requires_cli(upstream_model: str) -> bool:
 
 
 def image_model_resolutions(upstream_model: str) -> tuple[str, ...]:
+    if upstream_model == 'seedream_5.0_lite':
+        return ('2k', '4k')
     return ("1.5k", "2k", "4k") if image_model_requires_cli(upstream_model) else ("1k", "2k", "4k")
 
 

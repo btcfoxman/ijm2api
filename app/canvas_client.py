@@ -486,6 +486,16 @@ class CanvasClient:
         self._remaining(deadline)
         kind = "image" if normalized.get("kind") == "image" else "video"
         selected = select_model(self.capabilities(kind, deadline=deadline), normalized)
+        if kind == 'image' and (normalized.get('_image_model_route') or {}).get('mapped'):
+            counts = {group: len(normalized.get(group) or []) for group in ('images', 'videos', 'audios')}
+            mode = select_mode(selected, normalized, counts)
+            generation_flags(mode, normalized)
+            prompt = str(normalized.get('prompt') or '')
+            rule = next((flag for flag in mode.get('flags') or []
+                         if flag.get('flag') == '--prompt'), {})
+            if ('maxLength' in rule and len(prompt) > rule['maxLength']
+                    or 'minLength' in rule and len(prompt) < rule['minLength']):
+                raise _unsupported('Configured image model does not support the requested prompt length')
         self._remaining(deadline)
         return selected
 
