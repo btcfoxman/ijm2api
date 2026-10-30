@@ -7,6 +7,7 @@ _LOW_BALANCE_IMAGE_MODELS = frozenset({
     'seedream-5.0-pro', 'seedream-5.0-pro-1.5k',
     'seedream-5.0-pro-2k', 'seedream-5.0-pro-4k',
 })
+_LOW_BALANCE_IMAGE_RESCUE_LIMIT = 50
 
 
 def _known_balance(account: dict) -> float | None:
@@ -28,12 +29,14 @@ def low_balance_image_task(task: dict | None) -> bool:
 
 
 def low_balance_image_probe(account: dict, task: dict | None, threshold: float) -> bool:
+    """The Pro 5 rescue range is independent of automatic disabling settings."""
     balance = _known_balance(account)
-    return (balance is not None and 0 < balance < threshold and low_balance_image_task(task))
+    return (balance is not None and 0 < balance < _LOW_BALANCE_IMAGE_RESCUE_LIMIT
+            and low_balance_image_task(task))
 
 
 def account_accepts_task(account: dict, task: dict | None = None, *, threshold: float = 0) -> bool:
-    """Preserve manual disable; low credits are usable only for Seedream Pro 5."""
+    """Keep normal threshold policy and narrowly rescue auto-disabled Pro 5 accounts."""
     balance = _known_balance(account)
     low = balance is not None and 0 <= balance < threshold
     image = low_balance_image_task(task)
@@ -43,7 +46,7 @@ def account_accepts_task(account: dict, task: dict | None = None, *, threshold: 
         return True
     return (not account.get('enabled') and account.get('status') == 'disabled_low_balance'
             and account.get('login_enable_after') not in (False, 0)
-            and balance is not None and 0 < balance < threshold and image)
+            and balance is not None and 0 < balance < _LOW_BALANCE_IMAGE_RESCUE_LIMIT and image)
 
 
 def credit_rejected(message: str) -> bool:

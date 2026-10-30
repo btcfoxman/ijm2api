@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app.account_policy import account_accepts_task
+from app.account_policy import account_accepts_task, low_balance_image_probe
 from app.catalog import normalize_request
 from app.image_client import resolve_image_model
 from app.image_request import normalize_image_request
@@ -41,9 +41,10 @@ def test_low_active_and_automatic_disabled_accounts_accept_only_supported_pro5(c
 
 
 @pytest.mark.parametrize('balance', [None, 0, -1])
-def test_unknown_empty_or_negative_automatic_disabled_balance_is_not_a_free_task(context, balance):
+@pytest.mark.parametrize('threshold', [0, 50])
+def test_unknown_empty_or_negative_automatic_disabled_balance_is_not_a_free_task(context, balance, threshold):
     store, service, _ = context
-    store.update_settings({'low_balance_disable_threshold': 50})
+    store.update_settings({'low_balance_disable_threshold': threshold})
     auto_low(store, balance=balance)
     assert not service._funded_accounts(0, set(), {}, task=image_task())
 
@@ -61,10 +62,32 @@ def test_threshold_zero_and_exact_boundary_preserve_existing_ordinary_active_pol
     assert not service._funded_accounts(10, set(), {}, task=video)
 
 
-@pytest.mark.parametrize('method', ['patch_intent', 'store_toggle', 'post_upsert'])
-def test_manual_disable_of_an_auto_low_account_cannot_be_bypassed(context, method):
+@pytest.mark.parametrize('threshold', [0, 50, 60])
+@pytest.mark.parametrize('balance,eligible', [(49.99, True), (50, False), (50.01, False),
+                                           (0, False), (None, False), (float('nan'), False)])
+def test_auto_disabled_pro5_rescue_has_an_independent_literal_50_limit(threshold, balance, eligible):
+    account = {'enabled': False, 'status': 'disabled_low_balance',
+               'login_enable_after': None, 'balance': balance}
+    task = image_task()
+    assert account_accepts_task(account, task, threshold=threshold) is eligible
+    assert low_balance_image_probe(account, task, threshold) is eligible
+
+
+def test_disabled_low_pool_with_threshold_off_cannot_supply_other_models(context):
     store, service, _ = context
-    store.update_settings({'low_balance_disable_threshold': 50})
+    low = auto_low(store)
+    assert service.settings()['low_balance_disable_threshold'] == 0
+    assert service._funded_accounts(0, set(), {}, task=image_task())[0]['id'] == low['id']
+    video = {'normalized': normalize_request({'model': 'sd-2-0-mini', 'prompt': 'Synthetic', 'duration': 4})}
+    assert not service._funded_accounts(0, set(), {}, task=video)
+    assert not service._funded_accounts(0, set(), {}, task=image_task('gpt-image-2.5-flare'))
+
+
+@pytest.mark.parametrize('method', ['patch_intent', 'store_toggle', 'post_upsert'])
+@pytest.mark.parametrize('threshold', [0, 50])
+def test_manual_disable_of_an_auto_low_account_cannot_be_bypassed(context, method, threshold):
+    store, service, _ = context
+    store.update_settings({'low_balance_disable_threshold': threshold})
     account = auto_low(store)
     if method == 'post_upsert':
         store.upsert_account({'name': account['name'], 'enabled': False})
@@ -111,9 +134,10 @@ def test_low_account_unknown_hold_blocks_even_a_read_only_quote_probe(context):
     assert not service._funded_accounts(0, set(), {'reserved': (account['id'], 40)}, task=image_task())
 
 
-def test_previous_accounts_estimate_does_not_prevent_an_account_specific_quote(context):
+@pytest.mark.parametrize('threshold', [0, 50])
+def test_previous_accounts_estimate_does_not_prevent_an_account_specific_quote(context, threshold):
     store, service, _ = context
-    store.update_settings({'low_balance_disable_threshold': 50})
+    store.update_settings({'low_balance_disable_threshold': threshold})
     account = auto_low(store)
     task = image_task()
     store.create_task('new-image', {'model': 'seedream-5.0-pro'}, task['normalized'])
@@ -126,9 +150,10 @@ def test_previous_accounts_estimate_does_not_prevent_an_account_specific_quote(c
 
 
 @pytest.mark.parametrize('inherited_estimate', [2, 90])
-def test_inherited_estimate_cannot_admit_parallel_preparations(context, inherited_estimate):
+@pytest.mark.parametrize('threshold', [0, 50])
+def test_inherited_estimate_cannot_admit_parallel_preparations(context, inherited_estimate, threshold):
     store, service, _ = context
-    store.update_settings({'low_balance_disable_threshold': 50})
+    store.update_settings({'low_balance_disable_threshold': threshold})
     account = auto_low(store)
     normalized = image_task()['normalized']
     for identifier in ('first-probe', 'second-probe'):
@@ -157,9 +182,10 @@ def test_low_balance_quote_must_fit_credits_left_after_other_known_holds(context
 
 
 @pytest.mark.parametrize('mixed_unready_pool', [False, True])
-def test_only_auto_low_ready_pool_runs_pro5_once_without_enabling_account(context, mixed_unready_pool):
+@pytest.mark.parametrize('threshold', [0, 50])
+def test_only_auto_low_ready_pool_runs_pro5_once_without_enabling_account(context, mixed_unready_pool, threshold):
     store, service, _ = context
-    store.update_settings({'low_balance_disable_threshold': 50})
+    store.update_settings({'low_balance_disable_threshold': threshold})
     low = auto_low(store)
     if mixed_unready_pool:
         owner(store, 'unready', balance=100, authorized=False)
@@ -177,9 +203,10 @@ def test_only_auto_low_ready_pool_runs_pro5_once_without_enabling_account(contex
 
 
 @pytest.mark.parametrize('manual_disable', [False, True])
-def test_actual_quote_or_new_manual_disable_prevents_paid_dispatch(context, manual_disable):
+@pytest.mark.parametrize('threshold', [0, 50])
+def test_actual_quote_or_new_manual_disable_prevents_paid_dispatch(context, manual_disable, threshold):
     store, service, _ = context
-    store.update_settings({'low_balance_disable_threshold': 50})
+    store.update_settings({'low_balance_disable_threshold': threshold})
     low = auto_low(store)
     response = service.create_image({'model': 'seedream-5.0-pro', 'prompt': 'Synthetic landscape'})
     client = fake_client(store, service, low, quote=32 if manual_disable else 41, kind='image')
