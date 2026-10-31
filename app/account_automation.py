@@ -399,6 +399,8 @@ class AccountAutomation:
     def _enable_watermark(self) -> None:
         deadline = time.monotonic() + min(30, self.timeout)
         actions: set[str] = set()
+        avatar_dispatches = 0
+        next_avatar_at = 0.0
         while time.monotonic() < deadline:
             current = self._watermark_action()
             stage = current.get('stage')
@@ -420,9 +422,15 @@ class AccountAutomation:
                 continue
             if 'save' in actions and self._settings().get('close_watermark') is True:
                 return
-            if stage == 'avatar' and 'open_avatar' not in actions:
-                self._watermark_action('open_avatar')
-                actions.add('open_avatar')
+            if (stage == 'avatar' and avatar_dispatches < 3 and time.monotonic() >= next_avatar_at
+                    and not actions.intersection({'open_setting', 'toggle', 'save'})):
+                # A first normal header click can navigate to Profile before
+                # its menu is initialized. Retry only this harmless navigation;
+                # each call rechecks the visible target, hit test and modal guard.
+                opened = self._watermark_action('open_avatar')
+                if opened.get('stage') == 'opened':
+                    avatar_dispatches += 1
+                    next_avatar_at = time.monotonic() + 1.0
             elif stage == 'menu' and 'open_setting' not in actions:
                 self._watermark_action('open_setting')
                 actions.add('open_setting')

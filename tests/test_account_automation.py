@@ -214,6 +214,82 @@ Promise.resolve(vm.runInNewContext(payload.source,context)).then(result=>process
         self.assertEqual(actions, ['open_avatar', 'open_setting', 'toggle', 'save'])
         self.assertGreaterEqual(clock[0], 4)
 
+    def test_watermark_rechecks_avatar_after_first_profile_navigation_then_completes_once(self):
+        # Real account56: first opened click left stage=avatar on Personal;
+        # a fresh second normal click exposed menu -> modal -> saved readback.
+        for opens_needed in (2, 3):
+            with self.subTest(opens_needed=opens_needed):
+                browser = browser_with_settings(READY)
+                automation = AccountAutomation(ACCOUNT, browser=browser)
+                clock, dispatches, actions = [0.0], [], []
+                state = {'stage': 'avatar', 'checked': False, 'saved': False, 'target_changed': True}
+
+                def action(command='view'):
+                    if command == 'view':
+                        return state.copy()
+                    if command == 'open_avatar':
+                        # A rejected fresh hit test sends no mouse events and
+                        # must not consume one of the three actual clicks.
+                        if state['target_changed']:
+                            state['target_changed'] = False
+                            return {'stage': 'waiting'}
+                        dispatches.append(clock[0])
+                        if len(dispatches) == opens_needed:
+                            state['stage'] = 'menu'
+                        return {'stage': 'opened'}
+                    actions.append(command)
+                    if command == 'open_setting':
+                        state['stage'] = 'modal'
+                    elif command == 'toggle':
+                        state['checked'] = True
+                    elif command == 'save':
+                        state.update(stage='unknown', saved=True)
+                    return {'stage': 'saved' if command == 'save' else 'opened'}
+
+                with patch.object(automation, '_watermark_action', side_effect=action), \
+                     patch.object(automation, '_settings', side_effect=lambda: {'close_watermark': state['saved']}), \
+                     patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]), \
+                     patch('app.account_automation.time.sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+                    automation._enable_watermark()
+                self.assertEqual(len(dispatches), opens_needed)
+                self.assertTrue(all(right-left >= 1 for left, right in zip(dispatches, dispatches[1:])))
+                self.assertEqual(actions, ['open_setting', 'toggle', 'save'])
+                self.assertLess(clock[0], 30)
+                browser.post.assert_not_called()
+
+    def test_watermark_avatar_retry_is_bounded_and_never_replays_other_actions_or_blocked_ui(self):
+        for after_first, expected_clicks, expected_actions in (
+                ('avatar', 3, []), ('blocked', 1, []), ('menu_then_avatar', 1, ['open_setting'])):
+            with self.subTest(after_first=after_first):
+                browser = browser_with_settings(READY)
+                automation = AccountAutomation(ACCOUNT, browser=browser)
+                clock, dispatches, actions = [0.0], [], []
+                state = {'stage': 'avatar'}
+
+                def action(command='view'):
+                    if command == 'view':
+                        return state.copy()
+                    if command == 'open_avatar':
+                        dispatches.append(clock[0])
+                        state['stage'] = 'menu' if after_first == 'menu_then_avatar' else after_first
+                    else:
+                        actions.append(command)
+                        state['stage'] = 'avatar'
+                    return {'stage': 'opened'}
+
+                with patch.object(automation, '_watermark_action', side_effect=action), \
+                     patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]), \
+                     patch('app.account_automation.time.sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+                    with self.assertRaises(AutomationError) as caught:
+                        automation._enable_watermark()
+                self.assertEqual(caught.exception.status, 'setup_required')
+                self.assertEqual(len(dispatches), expected_clicks)
+                self.assertTrue(all(right-left >= 1 for left, right in zip(dispatches, dispatches[1:])))
+                self.assertEqual(actions, expected_actions)
+                self.assertGreaterEqual(clock[0], 30)
+                self.assertLess(clock[0], 30.31)
+                browser.post.assert_not_called()
+
     def test_watermark_saved_readback_wins_over_unknown_close_animation(self):
         automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
         stages = iter([{'stage': 'modal', 'checked': True}, {'stage': 'unknown'}])
