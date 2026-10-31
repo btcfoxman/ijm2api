@@ -26,6 +26,7 @@ from .canvas_auth import CanvasAuthManager
 from .canvas_cli import CanvasCLIError
 from .catalog import public_models
 from .image_client import IMAGE_MODELS, image_model_requires_cli
+from .result_delivery import result_delivery_projection
 from .service import Service
 from .store import ACCOUNT_SECRET_FIELDS, ACCOUNT_SETUP_FIELDS, Store
 
@@ -616,6 +617,7 @@ def _with_cost_observations(task: dict[str, Any]) -> dict[str, Any]:
     full_task = task
     task = {key: value for key, value in task.items() if key != 'upstream_context'}
     task['upstream_identifiers'] = upstream_identifiers(full_task)
+    task.update(result_delivery_projection(full_task))
     if task.get('execution_backend') == 'canvas_cli':
         from .canvas_cli import sanitize
         context = full_task.get('upstream_context') or {}

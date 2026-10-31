@@ -6,7 +6,9 @@ import copy
 import hashlib
 import ipaddress
 import math
+import os
 import re
+import stat
 import time
 import uuid
 from contextlib import nullcontext
@@ -957,48 +959,165 @@ class CanvasClient:
                 raise
             raise exc from caught
 
+    @staticmethod
+    def _download_retryable(exc: CanvasCLIError) -> bool:
+        error = exc.details.get("error")
+        error = error if isinstance(error, dict) else {}
+        # This documented native read failure is specific to resource download.
+        # It never authorizes another generation command or a new deadline.
+        read_failed = (exc.code == "cli.download_read_failed"
+            and error.get("code") in (None, "cli.download_read_failed")
+            and error.get("class") == "retryable_failure"
+            and error.get("retryable") is True and error.get("requiredAction") == "retry"
+            and error.get("serviceCode") in (None, "")
+            and error.get("reason") in (None, "", "network_timeout", "dns_resolution_failed",
+                                        "network_error", "transport_error"))
+        return (read_failed or exc.code in {"CLI_COMMAND_TIMEOUT", "CLI_INVALID_RESPONSE", "cli.invalid_service_response"}
+                or bool(error.get("retryable")) and error.get("reason") in _TRANSIENT)
+
+    @staticmethod
+    def _download_safe_path(path: Path) -> None:
+        """Reject symlinks/junctions before reading or writing a result path."""
+        for part in reversed((path, *path.parents)):
+            try:
+                info = part.lstat()
+            except FileNotFoundError:
+                continue
+            if (stat.S_ISLNK(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+                raise CanvasCLIError("CLI_RESULT_INVALID", "Canvas result path cannot contain a symbolic link")
+
+    def _download_binding(self, context: dict[str, Any], resource_id: str, media_type: str) -> dict[str, Any] | None:
+        fields = ("task_id", "profile", "project_id", "node_id", "submit_id", "expected_user_id")
+        outputs = context.get("resource_ids")
+        if (any(not isinstance(context.get(key), str) or not context[key].strip() for key in fields)
+                or type(context.get("account_id")) is not int or media_type not in {"video", "image"}
+                or not isinstance(outputs, list) or not outputs
+                or any(not isinstance(value, str) or not value.strip() for value in outputs)
+                or len(set(outputs)) != len(outputs) or resource_id not in outputs):
+            return None  # Old direct callers can download, but cannot reuse a file.
+        if (context["account_id"] != int(self.account["id"]) or context.get("kind") != media_type
+                or context["expected_user_id"] != str(self.account.get("login_user_id") or self.account.get("cli_user_id") or "")):
+            raise CanvasCLIError("CLI_ACCOUNT_MISMATCH", "Canvas download does not match its original account identity")
+        return {"version": 1, **{key: context[key] for key in ("account_id", *fields)},
+                "resource_id": resource_id, "kind": media_type}
+
+    def _verify_download_file(self, path: Path, size: Any, expected_hash: Any, media_type: str, *,
+                              deadline: float | None = None, durable: bool = False) -> str:
+        self._remaining(deadline)
+        self._download_safe_path(path)
+        if (type(size) is not int or size <= 0 or not isinstance(expected_hash, str)
+                or re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash) is None):
+            raise CanvasCLIError("CLI_RESULT_DOWNLOAD_FAILED", "Canvas original-media receipt is invalid")
+        # Windows FlushFileBuffers requires a writable handle even after reading.
+        flags = (os.O_RDWR if durable else os.O_RDONLY) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(path, flags), "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size != size:
+                raise CanvasCLIError("CLI_RESULT_DOWNLOAD_FAILED", "Canvas result size did not match its receipt")
+            digest = hashlib.sha256()
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                self._remaining(deadline)
+                digest.update(block)
+            mime = _file_mime(path, media_type)
+            after, current = os.fstat(stream.fileno()), path.lstat()
+            signature = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+            self._download_safe_path(path)
+            if (digest.hexdigest() != expected_hash.lower() or signature(before) != signature(after)
+                    or signature(after) != signature(current)):
+                raise CanvasCLIError("CLI_RESULT_DOWNLOAD_FAILED", "Canvas result checksum or file identity changed")
+            if durable:
+                os.fsync(stream.fileno())
+        self._remaining(deadline)
+        return mime
+
+    def _persist_download(self, context: dict[str, Any], receipt: dict[str, Any],
+                          persist_download: Callable[[dict[str, Any]], Any] | None) -> None:
+        if persist_download is None:
+            return
+        try:
+            accepted = persist_download(copy.deepcopy(receipt))
+        except Exception as exc:
+            raise CanvasCLIError("CLI_DOWNLOAD_RECEIPT_PERSIST_FAILED", "Canvas download receipt could not be saved") from exc
+        if accepted is False:
+            raise CanvasCLIError("CLI_STOPPING", "Canvas result observation was stopped before delivery")
+        receipts = context.get("download_receipts")
+        receipts = copy.deepcopy(receipts) if isinstance(receipts, dict) else {}
+        receipts[receipt["resource_id"]] = copy.deepcopy(receipt)
+        context["download_receipts"] = receipts
+
     def download_result(self, context: dict[str, Any], resource_id: str, media_type: str, *,
-                        deadline: float | None = None) -> dict[str, Any]:
+                        deadline: float | None = None,
+                        persist_download: Callable[[dict[str, Any]], Any] | None = None) -> dict[str, Any]:
         if (not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", str(context["task_id"]))
                 or not re.fullmatch(r"[a-f0-9-]{36}", resource_id)):
             raise CanvasCLIError("CLI_RESULT_INVALID", "Canvas result identifiers are invalid")
-        base = self.runner.account_directory(self.account) / "results" / context["task_id"]
+        self._remaining(deadline)
+        base = self.runner.account_directory(self.account).absolute() / "results" / context["task_id"]
+        self._download_safe_path(base)
         base.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._download_safe_path(base)
         suffix = ".mp4" if media_type == "video" else ".png"
         path = base / (resource_id + suffix)
-        # An old final file has no authenticated completion receipt after a
-        # process interruption. Always fetch this resource again, using a new
-        # per-attempt partial path, and publish only after validating the CLI's
-        # complete size/checksum receipt. Never reuse magic-valid partial media.
+        self._download_safe_path(path)
+        binding = self._download_binding(context, resource_id, media_type)
+        if persist_download is not None and binding is None:
+            raise CanvasCLIError("CLI_RESULT_INVALID", "Canvas download is missing its durable task binding")
+        if binding is not None:
+            self._check_context(context, deadline=deadline)
+        receipts = context.get("download_receipts")
+        receipt = receipts.get(resource_id) if isinstance(receipts, dict) else None
+        if (binding is not None and isinstance(receipt, dict)
+                and type(receipt.get("version")) is int
+                and all(type(receipt.get(key)) is type(value) and receipt.get(key) == value for key, value in binding.items())
+                and receipt.get("filename") == path.name):
+            try:
+                mime = self._verify_download_file(path, receipt.get("size_bytes"), receipt.get("sha256"), media_type, deadline=deadline)
+                if mime != receipt.get("mime"):
+                    raise CanvasCLIError("CLI_RESULT_INVALID", "Canvas cached result media type changed")
+            except (OSError, CanvasCLIError) as exc:
+                if isinstance(exc, CanvasCLIError) and exc.code == "CLI_TASK_DEADLINE_EXCEEDED":
+                    raise
+            else:
+                self._persist_download(context, receipt, persist_download)
+                self._remaining(deadline)
+                return {"path": str(path), "mime": mime, "resource_id": resource_id,
+                        "download_receipt": copy.deepcopy(receipt)}
+        # Files without a matching durable receipt are always fetched again.
         for attempt in range(3):
             partial = base / (resource_id + "." + uuid.uuid4().hex + ".part")
             try:
                 data = self._call(["resource", "download", resource_id,
                     "--project-id", context["project_id"], "--output", str(partial)],
                     timeout=180, read_only=False, deadline=deadline)
-                returned = Path(str(data.get("path") or "")).resolve()
+                returned = Path(str(data.get("path") or "")).absolute()
                 size, expected_hash = data.get("size"), data.get("sha256")
-                if (data.get("resourceId") != resource_id or returned != partial.resolve() or not partial.is_file()
+                if (data.get("resourceId") != resource_id or returned != partial or not partial.is_file()
                         or isinstance(size, bool) or not isinstance(size, int) or size <= 0
                         or partial.stat().st_size != size
                         or not isinstance(expected_hash, str)
                         or re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash) is None):
                     raise CanvasCLIError("CLI_RESULT_DOWNLOAD_FAILED", "Canvas download did not return a complete original-media receipt")
-                digest = hashlib.sha256()
-                with partial.open("rb") as stream:
-                    for block in iter(lambda: stream.read(1024 * 1024), b""):
-                        self._remaining(deadline)
-                        digest.update(block)
-                if digest.hexdigest() != expected_hash.lower():
-                    raise CanvasCLIError("CLI_RESULT_DOWNLOAD_FAILED", "Canvas result download checksum did not match")
-                mime = _file_mime(partial, media_type)
+                mime = self._verify_download_file(partial, size, expected_hash, media_type, deadline=deadline, durable=True)
+                self._download_safe_path(path)
                 partial.replace(path)
-                return {"path": str(path), "mime": mime, "resource_id": resource_id}
+                if os.name != "nt":
+                    directory = os.open(base, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
+                result = {"path": str(path), "mime": mime, "resource_id": resource_id}
+                if binding is not None:
+                    receipt = {**binding, "filename": path.name, "size_bytes": size,
+                               "sha256": expected_hash.lower(), "mime": mime}
+                    self._remaining(deadline)
+                    self._persist_download(context, receipt, persist_download)
+                    self._remaining(deadline)
+                    result["download_receipt"] = copy.deepcopy(receipt)
+                return result
             except CanvasCLIError as exc:
-                error = exc.details.get("error", {})
-                transient = (exc.code in {"CLI_COMMAND_TIMEOUT", "CLI_INVALID_RESPONSE", "cli.invalid_service_response"}
-                             or bool(error.get("retryable")) and error.get("reason") in _TRANSIENT)
-                if attempt == 2 or not transient:
+                if attempt == 2 or not self._download_retryable(exc):
                     raise
                 self._sleep(0.25 * 2 ** attempt, deadline)
             finally:
@@ -1051,12 +1170,21 @@ class CanvasClient:
                 "error_message": message or f"Canvas generation failed ({code or data.get('state') or 'unknown'})",
                 "upstream_error_code": str(code or ""), "credit_facts": facts}
 
-    def poll(self, context: dict[str, Any], *, deadline: float | None = None) -> dict[str, Any]:
+    def poll(self, context: dict[str, Any], *, deadline: float | None = None,
+             persist_download: Callable[[dict[str, Any]], Any] | None = None,
+             on_phase: Callable[[str], Any] | None = None) -> dict[str, Any]:
         with self.runner.account_guard(self.account, deadline=deadline):
             self._check_context(context, deadline=deadline)
-            return self._poll(context, deadline=deadline)
+            return self._poll(context, deadline=deadline, persist_download=persist_download, on_phase=on_phase)
 
-    def _poll(self, context: dict[str, Any], *, deadline: float | None = None) -> dict[str, Any]:
+    def _poll(self, context: dict[str, Any], *, deadline: float | None = None,
+              persist_download: Callable[[dict[str, Any]], Any] | None = None,
+              on_phase: Callable[[str], Any] | None = None) -> dict[str, Any]:
+        def phase(name: str) -> None:
+            self._remaining(deadline)
+            if on_phase is not None and on_phase(name) is False:
+                raise CanvasCLIError("CLI_STOPPING", "Canvas result observation was stopped before delivery")
+        phase("querying")
         data = self._call(["operation", "status", context["submit_id"],
                            "--project-id", context["project_id"]], read_only=True, deadline=deadline)
         reference = data.get("operationRef")
@@ -1111,11 +1239,16 @@ class CanvasClient:
             if not resources and summary in {"absent", "unknown"}:
                 result.update(status="unknown", error_code="UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
                               error_message="Canvas submission could not be resolved; automatic resubmission is disabled")
+            else:
+                phase("generating")
             return result
         if len(resources) != int(context.get("output_count") or 1):
             result.update(status="failed", progress=100, error_code="CLI_RESULT_INCOMPLETE",
                           error_message="Canvas completed with an unexpected number of generated outputs")
             return result
+        if expected:
+            positions = {resource_id: index for index, resource_id in enumerate(expected)}
+            resources = sorted(resources, key=lambda resource: positions[resource["resourceId"]])
         for resource in resources:
             resource_id = str(resource.get("resourceId") or "")
             if not resource_id:
@@ -1129,7 +1262,11 @@ class CanvasClient:
                 result["credit_facts"].append({"source": "precharge", "amount": amount,
                     "field": "resource.creditsAmount", "resource_id": resource_id,
                     "submit_id": context["submit_id"], "settled": False})
-            downloaded = self.download_result(context, resource_id, str(facts.get("type") or context["kind"]), deadline=deadline)
+            phase("downloading")
+            download_kwargs = {"deadline": deadline}
+            if persist_download is not None:
+                download_kwargs["persist_download"] = persist_download
+            downloaded = self.download_result(context, resource_id, str(facts.get("type") or context["kind"]), **download_kwargs)
             result["result_files"].append(downloaded)
             result["result_paths"].append(downloaded["path"])
         result.update(status="succeeded", progress=100)

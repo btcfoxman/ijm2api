@@ -18,7 +18,29 @@ import requests
 
 
 class ResultTransferError(Exception):
-    pass
+    def __init__(self, *args, stage: str | None = None, code: str | None = None,
+                 http_status: int | None = None, retryable: bool | None = None):
+        super().__init__(*args)
+        self.stage = stage
+        self.code = code
+        self.http_status = http_status
+        self.retryable = retryable
+
+
+def _transfer_error(stage: str, code: str, *, http_status: int | None = None,
+                    retryable: bool = False) -> ResultTransferError:
+    # Only fixed local enums and the HTTP integer cross the task audit boundary.
+    return ResultTransferError(f'{stage}: {code}', stage=stage, code=code,
+                               http_status=http_status, retryable=retryable)
+
+
+def _http_error(label: str, status: int, stage: str | None) -> ResultTransferError:
+    code = {401: 'S3_AUTH_FAILED', 403: 'S3_AUTH_FAILED', 404: 'S3_NOT_FOUND',
+            409: 'S3_SESSION_CONFLICT', 410: 'S3_SESSION_EXPIRED',
+            507: 'S3_INSUFFICIENT_CAPACITY'}.get(status, 'S3_HTTP_ERROR')
+    return ResultTransferError(f'{label} HTTP {status}', stage=stage,
+        code=code if stage else None, http_status=status if stage else None,
+        retryable=(status in {408, 425, 429} or status >= 500) if stage else None)
 
 
 MAX_RESULT_BYTES = 512 * 1024 * 1024
@@ -56,31 +78,38 @@ def _config(storage: dict | None = None) -> tuple[str, str, str, str]:
     return base, token, bucket, prefix
 
 
-def _json_response(response: requests.Response, label: str) -> dict:
+def _json_response(response: requests.Response, label: str, *, stage: str | None = None) -> dict:
     if not 200 <= response.status_code < 300:
-        raise ResultTransferError(f"{label} HTTP {response.status_code}")
+        raise _http_error(label, response.status_code, stage)
     try:
         value = response.json()
-    except ValueError as exc:
-        raise ResultTransferError(f"{label} returned invalid JSON") from exc
+    except ValueError:
+        raise ResultTransferError(f"{label} returned invalid JSON", stage=stage,
+            code='S3_RESPONSE_INVALID' if stage else None,
+            http_status=response.status_code if stage else None, retryable=False if stage else None) from None
     if not isinstance(value, dict):
-        raise ResultTransferError(f"{label} returned invalid JSON")
+        raise ResultTransferError(f"{label} returned invalid JSON", stage=stage,
+            code='S3_RESPONSE_INVALID' if stage else None,
+            http_status=response.status_code if stage else None, retryable=False if stage else None)
     return value
 
 
 def _post(http: requests.Session, url: str, token: str, body: dict | None, label: str,
-          headers: dict | None = None) -> dict:
+          headers: dict | None = None, *, stage: str | None = None) -> dict:
     for attempt in range(3):
         try:
+            options = {'allow_redirects': False} if stage else {}
             response = http.post(url, headers={"Authorization": f"Bearer {token}", **(headers or {})},
-                                 json=body, timeout=60)
+                                 json=body, timeout=60, **options)
             if response.status_code in {408, 425, 429, 500, 502, 503, 504} and attempt < 2:
                 time.sleep(2 ** attempt)
                 continue
-            return _json_response(response, label)
+            return _json_response(response, label, stage=stage)
         except requests.RequestException as exc:
             if attempt == 2:
-                raise ResultTransferError(f"{label} transport failure: {type(exc).__name__}") from exc
+                raise ResultTransferError(f"{label} transport failure: {type(exc).__name__}",
+                    stage=stage, code='S3_TRANSPORT_ERROR' if stage else None,
+                    retryable=True if stage else None) from None
             time.sleep(2 ** attempt)
     raise ResultTransferError(f"{label} failed")
 
@@ -229,13 +258,15 @@ def presign(bucket: str, key: str, expected_size: int | None = None,
         http.trust_env = False
         grant = _post(http, f"{base}/v1/objects/presign", token,
                       {"bucket": bucket, "key": key, "method": "GET", "expires_seconds": 0},
-                      "s3-center presign")
+                      "s3-center presign", stage='s3_presign')
     request = grant.get("request") or {}
+    if not isinstance(request, dict):
+        raise _transfer_error('s3_presign', 'S3_RESPONSE_INVALID')
     url = str(request.get("url") or "")
     if (grant.get("bucket") != bucket or grant.get("key") != key or request.get("method") != "GET"
             or not url.startswith("https://") or (expected_size is not None and
-            int(grant.get("size_bytes") or -1) != expected_size)):
-        raise ResultTransferError("s3-center presign response does not match object")
+            (type(grant.get('size_bytes')) is not int or grant['size_bytes'] != expected_size))):
+        raise _transfer_error('s3_presign', 'S3_RESPONSE_INVALID')
     return url, {"bucket": bucket, "key": key, "size_bytes": int(grant.get("size_bytes") or 0),
                  "expires_at": str(request.get("expires_at") or "")}
 
@@ -303,65 +334,195 @@ def transfer(url: str, proxy_url: str, task_id: str,
         return signed_url, metadata
 
 
+_CHECKPOINT_FIELDS = frozenset({'version', 'task_id', 'index', 'bucket', 'key', 'size_bytes',
+    'sha256', 'content_type', 'idempotency_key', 'upload_id', 'state'})
+_CHECKPOINT_STATES = frozenset({'creating', 'url_issued', 'uploaded', 'committed'})
+_RETRY_HTTP = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def _get_upload(http, base, token, upload_id):
+    for attempt in range(3):
+        try:
+            response = http.get(f'{base}/v1/uploads/{quote(upload_id, safe="")}',
+                headers={'Authorization': f'Bearer {token}'}, timeout=60, allow_redirects=False)
+            if response.status_code in _RETRY_HTTP and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            return _json_response(response, 's3-center resume', stage='s3_resume')
+        except requests.RequestException:
+            if attempt == 2:
+                raise _transfer_error('s3_resume', 'S3_TRANSPORT_ERROR', retryable=True) from None
+            time.sleep(2 ** attempt)
+    raise AssertionError('unreachable')
+
+
 def store_original(path: Path, task_id: str, storage: dict | None = None, *,
-                   index: int = 0, content_type: str = 'video/mp4') -> tuple[str, dict]:
-    """Publish the CLI's original bytes; never re-encode or use a preview URL."""
-    base, token, bucket, prefix = _config(storage)
+                   index: int = 0, content_type: str = 'video/mp4',
+                   checkpoint: dict | None = None, persist_checkpoint=None,
+                   on_phase=None) -> tuple[str, dict]:
+    """Publish original bytes, resuming a bound session when its checkpoint exists.
+
+    The persistence callback must acknowledge each boundary before its next HTTP
+    effect. Callers without callbacks retain the original stateless API.
+    """
+    try:
+        base, token, bucket, prefix = _config(storage)
+    except (ResultTransferError, ValueError, TypeError):
+        raise _transfer_error('s3_checkpoint', 'S3_CONFIG_INVALID') from None
+    if (not isinstance(task_id, str) or re.fullmatch(r'[A-Za-z0-9_-]{1,120}', task_id) is None
+            or type(index) is not int or not 0 <= index < 10000
+            or not isinstance(content_type, str)
+            or re.fullmatch(r'[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+', content_type) is None):
+        raise _transfer_error('s3_checkpoint', 'S3_FILE_BINDING_INVALID')
     path = Path(path)
-    size = path.stat().st_size
-    if not path.is_file() or not 0 < size <= MAX_SINGLE_UPLOAD_BYTES:
-        raise ResultTransferError('Canvas result exceeds s3-center single-upload limit or is empty')
+    try:
+        initial = path.stat()
+        size = initial.st_size
+        if not path.is_file() or not 0 < size <= MAX_SINGLE_UPLOAD_BYTES:
+            raise _transfer_error('s3_checkpoint', 'S3_FILE_INVALID')
+        hasher = hashlib.sha256()
+        with path.open('rb') as contents:
+            for chunk in iter(lambda: contents.read(1024 * 1024), b''):
+                hasher.update(chunk)
+    except OSError:
+        raise _transfer_error('s3_checkpoint', 'S3_FILE_INVALID') from None
     suffix = (mimetypes.guess_extension(content_type) or path.suffix).lower()
     if suffix not in {'.mp4', '.mov', '.webm', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.avif'}:
-        raise ResultTransferError('Canvas result format is unsupported')
-    key = f'{prefix}/{task_id}/original-{index}{suffix}'
-    hasher = hashlib.sha256()
-    with path.open('rb') as contents:
-        for chunk in iter(lambda: contents.read(1024 * 1024), b''):
-            hasher.update(chunk)
-    digest = hasher.hexdigest()
-    idempotency = 'ijm2api:' + hashlib.sha256(f'{task_id}:{bucket}:{key}:{digest}'.encode()).hexdigest()
+        raise _transfer_error('s3_checkpoint', 'S3_FILE_TYPE_UNSUPPORTED')
+    key, digest = f'{prefix}/{task_id}/original-{index}{suffix}', hasher.hexdigest()
+    base_idem = 'ijm2api:' + hashlib.sha256(f'{task_id}:{bucket}:{key}:{digest}'.encode()).hexdigest()
+    binding = {'version': 1, 'task_id': task_id, 'index': index, 'bucket': bucket, 'key': key,
+               'size_bytes': size, 'sha256': digest, 'content_type': content_type}
+    current = {**binding, 'idempotency_key': base_idem, 'upload_id': '', 'state': 'creating'}
+    if checkpoint is not None:
+        if (not isinstance(checkpoint, dict) or set(checkpoint) != _CHECKPOINT_FIELDS
+                or any(type(checkpoint.get(k)) is not type(v) or checkpoint[k] != v for k, v in binding.items())
+                or not isinstance(checkpoint.get('state'), str) or checkpoint['state'] not in _CHECKPOINT_STATES
+                or not isinstance(checkpoint.get('idempotency_key'), str)
+                or re.fullmatch(re.escape(base_idem) + r'(?::resume:[1-9][0-9]{0,8})?', checkpoint['idempotency_key']) is None
+                or (checkpoint['state'] == 'creating' and checkpoint.get('upload_id') != '')
+                or (checkpoint['state'] != 'creating' and (not isinstance(checkpoint.get('upload_id'), str)
+                    or re.fullmatch(r'du_[a-f0-9]{32}', checkpoint['upload_id']) is None))):
+            raise _transfer_error('s3_checkpoint', 'S3_CHECKPOINT_MISMATCH')
+        current = dict(checkpoint)
+
+    def phase(name):
+        if on_phase is not None:
+            try:
+                acknowledged = on_phase(name)
+            except Exception:
+                raise _transfer_error(name, 'S3_TRANSFER_INTERRUPTED') from None
+            if acknowledged is False:
+                raise _transfer_error(name, 'S3_TRANSFER_INTERRUPTED')
+
+    def save(**changes):
+        nonlocal current
+        value = {**current, **changes}
+        phase('s3_checkpoint')
+        if persist_checkpoint is not None:
+            try:
+                acknowledged = persist_checkpoint(dict(value))
+            except Exception:
+                raise _transfer_error('s3_checkpoint', 'S3_CHECKPOINT_PERSIST_FAILED', retryable=True) from None
+            if acknowledged is False:
+                raise _transfer_error('s3_checkpoint', 'S3_CHECKPOINT_PERSIST_FAILED')
+        current = value
+
+    def validate_session(value, stage):
+        if (not isinstance(value, dict) or value.get('id') != current['upload_id']
+                or value.get('logical_key') != f'{bucket}/{key}'
+                or type(value.get('declared_bytes')) is not int or value['declared_bytes'] != size):
+            raise _transfer_error(stage, 'S3_SESSION_BINDING_MISMATCH')
+        if not isinstance(value.get('status'), str):
+            raise _transfer_error(stage, 'S3_RESPONSE_INVALID')
+        return value.get('status')
+
     with requests.Session() as http:
         http.trust_env = False
-        created = _post(http, f'{base}/v1/uploads', token,
-            {'bucket': bucket, 'key': key, 'size': size, 'content_type': content_type},
-            's3-center create', {'Idempotency-Key': idempotency})
-        upload_id = str(created.get('id') or '')
-        upload = created.get('upload') or {}
-        if (created.get('status') == 'committed'
-                and created.get('logical_key') == f'{bucket}/{key}'
-                and int(created.get('declared_bytes') or -1) == size):
-            url, metadata = presign(bucket, key, size, storage)
-            metadata.update(upload_id=upload_id, sha256=digest, original_bytes=True,
-                            content_type=content_type)
-            return url, metadata
-        if (not re.fullmatch(r'du_[a-f0-9]{32}', upload_id)
-                or created.get('status') != 'url_issued'
-                or int(created.get('declared_bytes') or -1) != size
-                or upload.get('method') != 'PUT'
-                or not str(upload.get('url') or '').startswith('https://')):
-            raise ResultTransferError('s3-center create response is invalid')
-        headers = _upload_headers(upload.get('headers'))
-        for attempt in range(3):
-            try:
-                with path.open('rb') as contents:
-                    response = http.put(upload['url'], headers=headers, data=contents,
-                                        timeout=(30, 300), allow_redirects=False)
-                if 200 <= response.status_code < 300:
-                    break
-                if response.status_code not in {408, 425, 429, 500, 502, 503, 504} or attempt == 2:
-                    raise ResultTransferError(f's3-center upload HTTP {response.status_code}')
-            except requests.RequestException as exc:
-                if attempt == 2:
-                    raise ResultTransferError(f's3-center upload failed: {type(exc).__name__}') from exc
-            time.sleep(2 ** attempt)
-        committed = _post(http, f'{base}/v1/uploads/{quote(upload_id, safe="")}/complete',
-                          token, None, 's3-center complete')
-        if (committed.get('id') != upload_id or committed.get('status') != 'committed'
-                or committed.get('logical_key') != f'{bucket}/{key}'
-                or int(committed.get('declared_bytes') or -1) != size):
-            raise ResultTransferError('s3-center committed object does not match upload')
-    url, metadata = presign(bucket, key, size, storage)
-    metadata.update(upload_id=upload_id, sha256=digest, original_bytes=True,
+        need_upload = True
+        if current['upload_id']:
+            phase('s3_resume')
+            session = _get_upload(http, base, token, current['upload_id'])
+            state = validate_session(session, 's3_resume')
+            if state == 'committed':
+                save(state='committed')
+                need_upload = False
+            elif current['state'] == 'committed':
+                raise _transfer_error('s3_resume', 'S3_SESSION_STATE_CONFLICT')
+            elif state in {'expired', 'aborted'}:
+                ordinal = int(current['idempotency_key'].split(':resume:')[-1]) + 1 if ':resume:' in current['idempotency_key'] else 1
+                if ordinal > 999999999:
+                    raise _transfer_error('s3_checkpoint', 'S3_CHECKPOINT_INVALID')
+                save(idempotency_key=f'{base_idem}:resume:{ordinal}', upload_id='', state='creating')
+            elif state in {'reserved', 'url_issued'}:
+                need_upload = current['state'] != 'uploaded'
+            else:
+                raise _transfer_error('s3_resume', 'S3_SESSION_STATE_INVALID')
+        if need_upload:
+            if checkpoint is None:
+                save()  # Persist the first deterministic intent before create.
+            phase('s3_create')
+            created = _post(http, f'{base}/v1/uploads', token,
+                {'bucket': bucket, 'key': key, 'size': size, 'content_type': content_type},
+                's3-center create', {'Idempotency-Key': current['idempotency_key']}, stage='s3_create')
+            upload_id = created.get('id')
+            if (not isinstance(upload_id, str) or re.fullmatch(r'du_[a-f0-9]{32}', upload_id) is None
+                    or type(created.get('declared_bytes')) is not int or created['declared_bytes'] != size
+                    or 'logical_key' in created and created['logical_key'] != f'{bucket}/{key}'
+                    or current['upload_id'] and current['upload_id'] != upload_id):
+                raise _transfer_error('s3_create', 'S3_RESPONSE_INVALID')
+            if created.get('status') == 'committed':
+                if created.get('logical_key') != f'{bucket}/{key}':
+                    raise _transfer_error('s3_create', 'S3_SESSION_BINDING_MISMATCH')
+                save(upload_id=upload_id, state='committed')
+            else:
+                upload = created.get('upload')
+                if (created.get('status') != 'url_issued' or not isinstance(upload, dict)
+                        or upload.get('method') != 'PUT' or not isinstance(upload.get('url'), str)):
+                    raise _transfer_error('s3_create', 'S3_RESPONSE_INVALID')
+                signed = urlsplit(upload['url'])
+                if signed.scheme != 'https' or not signed.hostname or signed.username or signed.password or signed.fragment:
+                    raise _transfer_error('s3_create', 'S3_RESPONSE_INVALID')
+                try:
+                    headers = _upload_headers(upload.get('headers'))
+                except ResultTransferError:
+                    raise _transfer_error('s3_create', 'S3_RESPONSE_INVALID') from None
+                save(upload_id=upload_id, state='url_issued')
+                phase('s3_put')
+                for attempt in range(3):
+                    try:
+                        with path.open('rb') as contents:
+                            actual = os.fstat(contents.fileno())
+                            if (actual.st_dev, actual.st_ino, actual.st_size, actual.st_mtime_ns) != (
+                                    initial.st_dev, initial.st_ino, size, initial.st_mtime_ns):
+                                raise _transfer_error('s3_put', 'S3_FILE_CHANGED')
+                            response = http.put(upload['url'], headers=headers, data=contents,
+                                                timeout=(30, 300), allow_redirects=False)
+                        if 200 <= response.status_code < 300:
+                            break
+                        if response.status_code not in _RETRY_HTTP or attempt == 2:
+                            raise _http_error('s3-center upload', response.status_code, 's3_put')
+                    except requests.RequestException:
+                        if attempt == 2:
+                            raise _transfer_error('s3_put', 'S3_TRANSPORT_ERROR', retryable=True) from None
+                    except OSError:
+                        raise _transfer_error('s3_put', 'S3_FILE_INVALID') from None
+                    time.sleep(2 ** attempt)
+                save(state='uploaded')
+        if current['state'] != 'committed':
+            phase('s3_complete')
+            committed = _post(http, f'{base}/v1/uploads/{quote(current["upload_id"], safe="")}/complete',
+                              token, None, 's3-center complete', stage='s3_complete')
+            if validate_session(committed, 's3_complete') != 'committed':
+                raise _transfer_error('s3_complete', 'S3_RESPONSE_INVALID')
+            save(state='committed')
+    phase('s3_presign')
+    try:
+        url, metadata = presign(bucket, key, size, storage)
+    except ResultTransferError as exc:
+        if exc.stage:
+            raise
+        raise _transfer_error('s3_presign', 'S3_RESPONSE_INVALID') from None
+    metadata.update(upload_id=current['upload_id'], sha256=digest, original_bytes=True,
                     content_type=content_type)
     return url, metadata

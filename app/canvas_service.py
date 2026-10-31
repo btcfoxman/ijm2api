@@ -82,6 +82,107 @@ class CanvasServiceMixin:
             result = self._update_canvas_task(task_id, {'upstream_context': context})
             return dict(result.get('upstream_context') or {})
 
+    def _canvas_delivery_progress(self, task_id: str, *, phase: str | None = None,
+                                  stage: str | None = None, retrying: bool = False,
+                                  error: dict | None = None, download: dict | None = None,
+                                  resource_id: str | None = None, upload: dict | None = None) -> bool:
+        """Durable delivery checkpoints never override an operator stop or another writer."""
+        with self._lock:
+            task = self.store.task(task_id) or {}
+            if self._stop.is_set() or self._canvas_task_terminated(task):
+                return False
+            context = dict(task.get('upstream_context') or {})
+            delivery = dict(context.get('result_delivery') or {})
+            if phase is not None:
+                if phase not in {'querying', 'generating', 'downloading', 'transferring'}:
+                    return False
+                delivery.update(version=1, phase=phase, retrying=bool(retrying), updated_at=time.time())
+                if stage is not None:
+                    delivery['stage'] = stage
+                if phase == 'downloading':
+                    delivery.setdefault('generation_success_observed_at', time.time())
+                if phase == 'transferring':
+                    delivery.setdefault('download_completed_at', time.time())
+                if error is not None:
+                    delivery['last_error'] = dict(error)
+                    old_errors = delivery.get('errors')
+                    history = [item for item in old_errors if isinstance(item, dict)] if isinstance(old_errors, list) else []
+                    delivery['errors'] = [*history[-15:], dict(error)]
+                    delivery.setdefault('first_error_at', error['at'])
+                elif not retrying:
+                    delivery.pop('last_error', None)
+                context['result_delivery'] = delivery
+            if download is not None:
+                resource_id = download.get('resource_id')
+                if resource_id not in (context.get('resource_ids') or []):
+                    raise CanvasCLIError('CLI_RESOURCE_MISMATCH', 'Canvas download receipt changed its original resource')
+                expected = {**context, 'account_id': task.get('account_id'), 'task_id': task_id}
+                if any(download.get(key) != expected.get(key) for key in
+                       ('account_id', 'task_id', 'profile', 'project_id', 'node_id', 'submit_id',
+                        'expected_user_id', 'kind')):
+                    raise CanvasCLIError('CLI_RESOURCE_MISMATCH', 'Canvas download receipt changed its original binding')
+                receipts = dict(context.get('download_receipts') or {})
+                receipts[resource_id] = dict(download)
+                context['download_receipts'] = receipts
+            if upload is not None:
+                if resource_id not in (context.get('resource_ids') or []):
+                    raise CanvasCLIError('CLI_RESOURCE_MISMATCH', 'Canvas upload checkpoint changed its original resource')
+                if upload.get('task_id') != task_id:
+                    raise CanvasCLIError('CLI_RESOURCE_MISMATCH', 'Canvas upload checkpoint changed its original task')
+                checkpoints = dict(context.get('upload_checkpoints') or {})
+                previous = checkpoints.get(resource_id)
+                if isinstance(previous, dict):
+                    binding = ('version', 'task_id', 'index', 'bucket', 'key', 'size_bytes', 'sha256', 'content_type')
+                    if any(previous.get(key) != upload.get(key) for key in binding):
+                        return False
+                    def revision(value):
+                        base, separator, ordinal = str(value.get('idempotency_key') or '').partition(':resume:')
+                        return base, int(ordinal) if separator and ordinal.isdigit() else 0
+                    old_base, old_revision = revision(previous)
+                    new_base, new_revision = revision(upload)
+                    ranks = {'creating': 0, 'url_issued': 1, 'uploaded': 2, 'committed': 3}
+                    if old_base != new_base or new_revision < old_revision:
+                        return False
+                    if new_revision == old_revision:
+                        if (ranks.get(upload.get('state'), -1) < ranks.get(previous.get('state'), -1)
+                                or previous.get('upload_id') and previous.get('upload_id') != upload.get('upload_id')):
+                            return False
+                    elif (new_revision != old_revision + 1 or upload.get('state') != 'creating'
+                          or upload.get('upload_id') != ''):
+                        return False
+                checkpoints[resource_id] = dict(upload)
+                context['upload_checkpoints'] = checkpoints
+            values = {'upstream_context': context}
+            if phase in {'downloading', 'transferring'}:
+                values['progress'] = max(task.get('progress') or 0, 90 if phase == 'downloading' else 95)
+            saved = self.store.update_task(task_id, values, preserve_terminal=True,
+                                           expected_updated_at=task['updated_at'])
+            return bool(saved and not self._canvas_task_terminated(saved)
+                        and saved.get('upstream_context') == context)
+
+    def _canvas_delivery_error(self, task_id: str, error, *, phase: str | None = None) -> dict:
+        context = (self.store.task(task_id) or {}).get('upstream_context') or {}
+        delivery = context.get('result_delivery') or {}
+        code = getattr(error, 'code', None) or ('RESULT_FILE_UNAVAILABLE' if isinstance(error, OSError)
+                                               else 'RESULT_TRANSFER_FAILED')
+        code = code if isinstance(code, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,100}', code) else 'RESULT_TRANSFER_FAILED'
+        if phase is None:
+            phase = delivery.get('phase') if delivery.get('phase') in {'querying', 'downloading', 'transferring'} else 'querying'
+        if code.startswith('cli.download_'):
+            phase = 'downloading'
+        raw_stage = getattr(error, 'stage', None) or delivery.get('stage') or ('download' if phase == 'downloading' else 'query')
+        stage = str(raw_stage).removeprefix('s3_')
+        stage = {'put': 'upload'}.get(stage, stage)
+        if stage not in {'query', 'download', 'resume', 'create', 'upload', 'complete', 'presign', 'checkpoint', 'validation'}:
+            stage = 'transfer' if phase == 'transferring' else 'query'
+        diagnostic = {'code': code, 'stage': stage, 'retryable': bool(getattr(error, 'retryable', True)),
+                      'at': time.time()}
+        status = getattr(error, 'http_status', None)
+        if type(status) is int and 100 <= status <= 599:
+            diagnostic['http_status'] = status
+        self._canvas_delivery_progress(task_id, phase=phase, stage=stage, retrying=True, error=diagnostic)
+        return diagnostic
+
     @staticmethod
     def _canvas_dispatch_evidence(task: dict) -> bool:
         """Any prior/uncertain dispatch evidence vetoes a new no-send proof."""
@@ -852,6 +953,8 @@ class CanvasServiceMixin:
             current = self.store.task(task_id) or {}
             if not accepted_canvas_result(current):
                 return
+            if not self._canvas_delivery_progress(task_id, phase='querying', stage='query'):
+                return
             client = self.canvas_client(account)
             if isinstance(client, CanvasClient):
                 timing = client.preparation_timing = PreparationTiming(task_id)
@@ -869,11 +972,17 @@ class CanvasServiceMixin:
                             'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'}:
                 blocked = exc.code
             if not self._stop.is_set():
+                self._canvas_delivery_error(task_id, exc)
                 diagnostic = {'last_result_query_error': self._canvas_diagnostic(exc, 'query')}
                 if timing is not None:
                     timing.finish()
                     diagnostic['last_result_query_timing'] = timing.snapshot()
                 self._canvas_context(task_id, diagnostic)
+        except (ResultTransferError, OSError) as exc:
+            if not self._stop.is_set():
+                diagnostic = self._canvas_delivery_error(task_id, exc, phase='transferring')
+                self._canvas_context(task_id, {'last_result_query_error': {
+                    **diagnostic, 'code': 'RESULT_TRANSFER_FAILED'}})
         except Exception as exc:
             if not self._stop.is_set():
                 self._canvas_context(task_id, {'last_result_query_error': {'code': type(exc).__name__}})
@@ -920,6 +1029,17 @@ class CanvasServiceMixin:
         def wait(delay):
             self._stop.wait(min(delay, max(0, query_deadline - time.monotonic())))
 
+        def client_phase(value):
+            retrying = value.endswith('_retry')
+            phase = value.removesuffix('_retry') if retrying else value
+            return self._canvas_delivery_progress(task_id, phase=phase,
+                stage='download' if phase == 'downloading' else 'query', retrying=retrying)
+
+        def storage_phase(value):
+            stage = value.removeprefix('s3_')
+            return self._canvas_delivery_progress(task_id, phase='transferring',
+                                                  stage='upload' if stage == 'put' else stage)
+
         queried = False
         while not self._stop.is_set() and (one_shot and not queried or not one_shot
                 and time.monotonic() < query_deadline and time.time() < absolute_deadline):
@@ -930,18 +1050,31 @@ class CanvasServiceMixin:
             if context.get('reconciliation_paused') and not one_shot:
                 return
             queried = True
+            query_timing = None
             try:
-                state = client.poll(context, deadline=query_deadline)
+                kwargs = {'deadline': query_deadline}
+                if isinstance(client, CanvasClient):
+                    query_timing = client.preparation_timing
+                    if query_timing is None or query_timing.snapshot()['finished']:
+                        query_timing = client.preparation_timing = PreparationTiming(task_id)
+                    kwargs.update(persist_download=lambda receipt: self._canvas_delivery_progress(task_id, download=receipt),
+                                  on_phase=client_phase)
+                try:
+                    state = client.poll(context, **kwargs)
+                finally:
+                    if query_timing is not None:
+                        query_timing.finish()
+                        snapshot = query_timing.snapshot()
+                        snapshot['observation_attempt'] = (context.get('result_observation') or {}).get('attempts')
+                        self._canvas_context(task_id, {'last_result_query_timing': snapshot})
                 if self._stop.is_set() or self._canvas_task_terminated(self.store.task(task_id)):
                     return
-                if result_observer and isinstance(client, CanvasClient) and client.preparation_timing is not None:
-                    client.preparation_timing.finish()
-                    self._canvas_context(task_id, {'last_result_query_timing': client.preparation_timing.snapshot()})
                 errors = 0
             except CanvasCLIError as exc:
                 if self._canvas_task_terminated(self.store.task(task_id)):
                     return
                 errors += 1
+                self._canvas_delivery_error(task_id, exc)
                 if result_observer or accepted_canvas_result(task):
                     self._canvas_context(task_id, {'last_result_query_error': self._canvas_diagnostic(exc, 'query')})
                     if not result_observer:
@@ -970,6 +1103,7 @@ class CanvasServiceMixin:
                 count = int(context.get('consecutive_submission_absent') or 0) + 1 if absent else 0
                 diagnostic = CanvasCLIError(state.get('error_code') or 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN',
                     state.get('error_message') or 'Canvas original submission could not be matched')
+                self._canvas_delivery_error(task_id, diagnostic, phase='querying')
                 if result_observer or accepted_canvas_result(task):
                     self._canvas_context(task_id, {'last_result_query_error': self._canvas_diagnostic(diagnostic, 'query')})
                     if not result_observer:
@@ -1015,10 +1149,11 @@ class CanvasServiceMixin:
                         urls, receipts, source_files = [], [], []
                         base = self.canvas_cli.account_directory(client.account).resolve()
                         for index, raw in enumerate(files):
-                            path = Path(raw.get('path') if isinstance(raw, dict) else raw).resolve()
-                            if not path.is_relative_to(base) or path.is_symlink():
+                            candidate = Path(raw.get('path') if isinstance(raw, dict) else raw)
+                            path = candidate.resolve()
+                            if not path.is_relative_to(base) or candidate.is_symlink():
                                 raise ResultTransferError('Canvas result path does not belong to its account')
-                            if result_observer:
+                            if result_observer or isinstance(client, CanvasClient):
                                 digest = hashlib.sha256()
                                 with path.open('rb') as stream:
                                     for block in iter(lambda: stream.read(1024 * 1024), b''):
@@ -1026,21 +1161,39 @@ class CanvasServiceMixin:
                                 source_files.append({'resource_id': raw.get('resource_id'),
                                     'size_bytes': path.stat().st_size, 'sha256': digest.hexdigest(),
                                     'mime': raw.get('mime')})
+                                verified = ((self.store.task(task_id) or {}).get('upstream_context') or {}).get('download_receipts', {}).get(raw.get('resource_id'))
+                                if isinstance(client, CanvasClient) and (not isinstance(verified, dict)
+                                        or any(verified.get(key) != source_files[-1][key]
+                                               for key in ('size_bytes', 'sha256', 'mime'))):
+                                    raise ResultTransferError('Canvas verified result changed before storage',
+                                        stage='s3_checkpoint', code='RESULT_FILE_CHANGED', retryable=True)
                             if self._stop.is_set() or self._canvas_task_terminated(self.store.task(task_id)):
                                 return
+                            if not storage_phase('s3_checkpoint'):
+                                return
+                            resource_id = raw.get('resource_id') if isinstance(raw, dict) else None
+                            latest_context = (self.store.task(task_id) or {}).get('upstream_context') or {}
+                            checkpoint = (latest_context.get('upload_checkpoints') or {}).get(resource_id)
                             url, receipt = store_original(path, task_id, self.settings(), index=index,
                                 content_type=(raw.get('mime') if isinstance(raw, dict) else None)
-                                    or mimetypes.guess_type(path.name)[0] or 'application/octet-stream')
+                                    or mimetypes.guess_type(path.name)[0] or 'application/octet-stream',
+                                checkpoint=checkpoint,
+                                persist_checkpoint=lambda value, rid=resource_id: self._canvas_delivery_progress(
+                                    task_id, resource_id=rid, upload=value), on_phase=storage_phase)
                             urls.append(url)
                             receipts.append(receipt)
                         metadata = {'items': receipts, 'original_bytes': True}
-                        if result_observer:
+                        if source_files:
                             metadata['source_files'] = source_files
                     except (ResultTransferError, OSError, TypeError) as exc:
+                        if self._stop.is_set() or self._canvas_task_terminated(self.store.task(task_id)):
+                            return
                         transfer_errors += 1
                         result_storage_pending = True
+                        diagnostic = self._canvas_delivery_error(task_id, exc, phase='transferring')
                         if result_observer or accepted_canvas_result(task):
-                            self._canvas_context(task_id, {'last_result_query_error': {'code': 'RESULT_TRANSFER_FAILED'}})
+                            self._canvas_context(task_id, {'last_result_query_error': {
+                                **diagnostic, 'code': 'RESULT_TRANSFER_FAILED'}})
                             if not result_observer:
                                 pending = self.store.task(task_id) or {}
                                 self.store.queue_canvas_result_observation(task_id, pending.get('updated_at'))
@@ -1082,7 +1235,19 @@ class CanvasServiceMixin:
                     signed, metadata = transfer(urls[0], str(client.account["proxy_url"]), task_id,
                         self.settings(), aspect_ratio=task["normalized"]["aspect_ratio"])
                     values.update(result_urls=[signed], upstream_result_urls=urls, result_transfer=metadata)
-                saved = self._update_canvas_task(task_id, values)
+                with self._lock:
+                    current = self.store.task(task_id) or {}
+                    if self._stop.is_set() or self._canvas_task_terminated(current):
+                        return
+                    completed_context = dict(current.get('upstream_context') or {})
+                    completed_delivery = dict(completed_context.get('result_delivery') or {})
+                    completed_delivery.update(version=1, phase='completed', stage='done', retrying=False,
+                        updated_at=time.time(), transfer_completed_at=time.time())
+                    completed_delivery.pop('last_error', None)
+                    completed_context['result_delivery'] = completed_delivery
+                    values['upstream_context'] = completed_context
+                    saved = self.store.update_task(task_id, values, preserve_terminal=True,
+                                                    expected_updated_at=current['updated_at'])
                 if saved.get('status') != 'succeeded':
                     return
                 for raw in state.get('result_files') or state.get('result_paths') or []:

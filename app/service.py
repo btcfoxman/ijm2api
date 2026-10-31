@@ -39,6 +39,7 @@ from .media import MediaError
 from .result_transfer import ResultTransferError, transfer, presign, expires_soon, _config
 from .upload import UploadError
 from .store import Store, accepted_canvas_result
+from .result_delivery import result_delivery_projection
 
 
 TERMINAL = {"succeeded", "failed", "expired"}
@@ -1388,6 +1389,7 @@ class Service(CanvasServiceMixin):
             result = self.image_response(task)
             result["progress"] = task["progress"]
             result["data"] = [{"url": url} for url in task["result_urls"]]
+            result.update(result_delivery_projection(task))
             return result
         if (task["status"] == "succeeded" and task["model"] == "sd-2-5-480p-x"
                 and task["result_urls"] and expires_soon(task.get("result_transfer") or {})):
@@ -1409,4 +1411,5 @@ class Service(CanvasServiceMixin):
             result['error'], facts = self._public_task_failure(task)
             if facts:
                 result['provider_context'] = facts
+        result.update(result_delivery_projection(task))
         return result
