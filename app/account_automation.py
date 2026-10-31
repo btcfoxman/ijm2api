@@ -234,11 +234,18 @@ _WATERMARK = r"""(() => {
  }
  const entries=controls(document).filter(e=>text(e)==='Remove watermarks');
  if(entries.length===1){if(action==='open_setting'){entries[0].click();return {stage:'opened'};}return {stage:'menu'};}
- let avatars=[...document.querySelectorAll('[class*="top-actions-logged-in-"] [class*="avatar-action-shell-"] [class*="avatar-container-"]')]
+ let avatars=[...document.querySelectorAll('[class*="top-actions-logged-in-"] [class*="avatar-action-shell-"] > [class*="avatar-action-"]')]
    .filter(visible);
- if(!avatars.length)avatars=[...document.querySelectorAll('[class*="top-actions-logged-in-"] [class*="avatar-action-shell-"] > [class*="avatar-action-"]')]
+ if(!avatars.length)avatars=[...document.querySelectorAll('[class*="top-actions-logged-in-"] [class*="avatar-action-shell-"] [class*="avatar-container-"]')]
    .filter(visible);
- if(avatars.length===1){if(action==='open_avatar'){avatars[0].click();return {stage:'opened'};}return {stage:'avatar'};}
+ if(avatars.length===1){
+   if(action!=='open_avatar')return {stage:'avatar'};
+   const target=avatars[0],r=target.getBoundingClientRect();
+   const x=(Math.max(0,r.left)+Math.min(innerWidth,r.right))/2,y=(Math.max(0,r.top)+Math.min(innerHeight,r.bottom))/2;
+   const hit=document.elementFromPoint(x,y);
+   if(!hit||!(hit===target||target.contains(hit)))return {stage:'waiting'};
+   return {stage:'avatar_target',x,y};
+ }
  return {stage:'waiting'};
 })()"""
 
@@ -373,6 +380,20 @@ class AccountAutomation:
         with _UI_LOCK:
             self.browser.command('Page.bringToFront')
             value = self.browser.evaluate(_WATERMARK.replace('__ACTION__', json.dumps(action)))
+            if action == 'open_avatar' and isinstance(value, dict) and value.get('stage') == 'avatar_target':
+                coordinates = {key: value.get(key) for key in ('x', 'y')}
+                if not all(isinstance(coordinate, (int, float)) and not isinstance(coordinate, bool)
+                           and math.isfinite(coordinate) and coordinate >= 0 for coordinate in coordinates.values()):
+                    return {'stage': 'waiting'}
+                self.browser.command('Input.dispatchMouseEvent', {'type': 'mouseMoved', **coordinates,
+                                                                 'button': 'none', 'buttons': 0})
+                try:
+                    self.browser.command('Input.dispatchMouseEvent', {'type': 'mousePressed', **coordinates,
+                                                                     'button': 'left', 'buttons': 1, 'clickCount': 1})
+                finally:
+                    self.browser.command('Input.dispatchMouseEvent', {'type': 'mouseReleased', **coordinates,
+                                                                     'button': 'left', 'buttons': 0, 'clickCount': 1})
+                return {'stage': 'opened'}
         return value if isinstance(value, dict) else {'stage': 'unknown'}
 
     def _enable_watermark(self) -> None:

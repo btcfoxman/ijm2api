@@ -824,10 +824,10 @@ class LoginTests(unittest.TestCase):
 const vm=require('vm'),payload=JSON.parse(require('fs').readFileSync(0,'utf8')),cfg=payload.config;
 let clicks=[];
 const make=name=>({checkVisibility:()=>true,getBoundingClientRect:()=>({width:40,height:40,left:10,right:50,top:10,bottom:50}),
- click(){clicks.push(name);},querySelectorAll:()=>[],innerText:'',textContent:''});
+ click(){clicks.push(name);},contains(e){return e===this;},querySelectorAll:()=>[],innerText:'',textContent:''});
 const inner=make('menu-inner'),outer=make('profile-outer');
 const exact='[class*="top-actions-logged-in-"] [class*="avatar-action-shell-"] [class*="avatar-container-"]';
-const doc={querySelectorAll(s){
+const doc={elementFromPoint:()=>inner,querySelectorAll(s){
  if(s===exact)return cfg.missing?[]:cfg.duplicate?[inner,inner]:[inner];
  if(s==='[class*="top-actions-logged-in-"] [class*="avatar-action-shell-"] > [class*="avatar-action-"]')return [];
  if(s.includes('avatar-action-'))return [outer];
@@ -843,20 +843,21 @@ const result=vm.runInNewContext(payload.source,context);process.stdout.write(JSO
                                            text=True, capture_output=True, check=False)
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 result = json.loads(completed.stdout)
-                self.assertEqual(result['result']['stage'], 'opened' if allowed else 'waiting')
-                self.assertEqual(result['clicks'], ['menu-inner'] if allowed else [])
+                self.assertEqual(result['result']['stage'], 'avatar_target' if allowed else 'waiting')
+                self.assertEqual(result['clicks'], [])
 
     @unittest.skipUnless(shutil.which('node'), 'Node is needed for DOM allowlist verification')
-    def test_watermark_avatar_matches_observed_account38_hierarchy_without_clicking_outer_or_unknown_ui(self):
-        # Sanitized from the real account38 DOM: the action is the shell's
-        # direct child, while avatar-container is absent on the current site.
+    def test_watermark_avatar_matches_observed_account40_hierarchy_without_synthetic_clicks(self):
+        # Account40 has a modern action wrapping the legacy profile link.
+        # Only a trusted click on the modern action opened its menu in the real UI.
         program = r'''
 const vm=require('vm'),payload=JSON.parse(require('fs').readFileSync(0,'utf8')),cfg=payload.config;
-let clicks=[],nodes=[];
+let clicks=[],nodes=[],queries=[];
 function make(id,cls,parent=null){const e={id,className:cls,parentElement:parent,innerText:'',textContent:'',
  checkVisibility:()=>!(cfg.hidden&&id==='menu-inner'),
  getBoundingClientRect:()=>({width:40,height:40,left:10,right:50,top:10,bottom:50}),
- click(){clicks.push(id);},querySelectorAll:()=>[]};nodes.push(e);return e;}
+ click(){clicks.push(id);},contains(other){while(other){if(other===this)return true;other=other.parentElement;}return false;},
+ querySelectorAll:()=>[]};nodes.push(e);return e;}
 const top=make('logged-top',cfg.foreign?'top-actions-logged-out-X':'top-actions-BtxNrX top-actions-logged-in-S1DSeN');
 const credit=make('credits','credit-action-surEHb',top),shell=make('profile-shell','avatar-action-shell-eadixq',credit);
 if(!cfg.missing){
@@ -866,6 +867,7 @@ if(!cfg.missing){
 }
 const unrelated=make('unrelated-avatar','avatar-action-unrelated');
 const modal=make('unknown-or-paid','lv-modal-wrapper');
+let hitId=null;
 function has(e,part){const m=/^\[class\*="([^"]+)"\]$/.exec(part);return !!(e&&m&&e.className.includes(m[1]));}
 function matches(e,selector){const parts=selector.split(/\s+/),last=parts.pop();if(!has(e,last))return false;
  let cursor=e;
@@ -875,17 +877,19 @@ function matches(e,selector){const parts=selector.split(/\s+/),last=parts.pop();
  }
  return true;
 }
-const document={querySelectorAll(s){
+const document={elementFromPoint(){const hit=cfg.covered?unrelated:nodes.find(e=>e.id===(cfg.nestedLegacy?'legacy-inner':'menu-inner'));
+ hitId=hit?.id||null;return hit;},querySelectorAll(s){
+ queries.push(s);
  if(s==='[role=dialog],dialog,.lv-modal-wrapper')return cfg.modal?[modal]:[];
  return nodes.filter(e=>matches(e,s));
 }};
 const context={document,innerHeight:960,innerWidth:1280,getComputedStyle:()=>({display:'block',visibility:'visible',opacity:'1'})};
-const result=vm.runInNewContext(payload.source,context);process.stdout.write(JSON.stringify({result,clicks}));
+const result=vm.runInNewContext(payload.source,context);process.stdout.write(JSON.stringify({result,clicks,queries,hitId}));
 '''
         cases = [({}, 'menu-inner'), ({'legacy': True}, 'menu-inner'),
-                 ({'nestedLegacy': True}, 'legacy-inner'), ({'missing': True}, None),
+                 ({'nestedLegacy': True}, 'menu-inner'), ({'missing': True}, None),
                  ({'duplicate': True}, None), ({'hidden': True}, None),
-                 ({'foreign': True}, None), ({'modal': True}, None)]
+                 ({'foreign': True}, None), ({'modal': True}, None), ({'covered': True}, None)]
         for config, target in cases:
             with self.subTest(config=config):
                 completed = subprocess.run(['node', '-e', program],
@@ -893,8 +897,43 @@ const result=vm.runInNewContext(payload.source,context);process.stdout.write(JSO
                     text=True, capture_output=True, check=False)
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 result = json.loads(completed.stdout)
-                self.assertEqual(result['result']['stage'], 'blocked' if config.get('modal') else 'opened' if target else 'waiting')
-                self.assertEqual(result['clicks'], [target] if target else [])
+                self.assertEqual(result['result']['stage'], 'blocked' if config.get('modal') else 'avatar_target' if target else 'waiting')
+                self.assertEqual(result['clicks'], [])
+                if target:
+                    self.assertEqual(result['result'], {'stage': 'avatar_target', 'x': 30, 'y': 30})
+                if config.get('nestedLegacy') or config.get('duplicate'):
+                    self.assertFalse(any('avatar-container-' in query for query in result['queries']))
+
+    def test_watermark_avatar_dispatches_trusted_mouse_click_and_releases_after_press_failure(self):
+        browser = browser_with_settings(READY)
+        browser.evaluate.side_effect = None
+        browser.evaluate.return_value = {'stage': 'avatar_target', 'x': 30, 'y': 40}
+        automation = AccountAutomation(ACCOUNT, browser=browser)
+        self.assertEqual(automation._watermark_action('open_avatar'), {'stage': 'opened'})
+        events = [call.args[1] for call in browser.command.call_args_list if call.args[0] == 'Input.dispatchMouseEvent']
+        self.assertEqual(events, [
+            {'type': 'mouseMoved', 'x': 30, 'y': 40, 'button': 'none', 'buttons': 0},
+            {'type': 'mousePressed', 'x': 30, 'y': 40, 'button': 'left', 'buttons': 1, 'clickCount': 1},
+            {'type': 'mouseReleased', 'x': 30, 'y': 40, 'button': 'left', 'buttons': 0, 'clickCount': 1},
+        ])
+        for value in (True, float('nan'), -1, None):
+            with self.subTest(invalid_coordinate=value):
+                browser.command.reset_mock()
+                browser.evaluate.return_value = {'stage': 'avatar_target', 'x': value, 'y': 40}
+                self.assertEqual(automation._watermark_action('open_avatar'), {'stage': 'waiting'})
+                browser.command.assert_called_once_with('Page.bringToFront')
+        browser.command.reset_mock()
+        browser.evaluate.return_value = {'stage': 'blocked'}
+        self.assertEqual(automation._watermark_action('open_avatar'), {'stage': 'blocked'})
+        browser.command.assert_called_once_with('Page.bringToFront')
+        browser.evaluate.return_value = {'stage': 'avatar_target', 'x': 30, 'y': 40}
+        def command(name, arguments=None):
+            if name == 'Input.dispatchMouseEvent' and arguments['type'] == 'mousePressed':
+                raise BrowserError('synthetic press failure')
+        browser.command.side_effect = command
+        with self.assertRaises(BrowserError):
+            automation._watermark_action('open_avatar')
+        self.assertEqual(browser.command.call_args.args[1]['type'], 'mouseReleased')
 
     @unittest.skipUnless(shutil.which('node'), 'Node is needed for DOM allowlist verification')
     def test_known_promotion_dom_only_allows_close_and_rejects_other_offers_or_additional_dialogs(self):
