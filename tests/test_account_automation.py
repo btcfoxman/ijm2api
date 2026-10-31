@@ -829,6 +829,7 @@ const inner=make('menu-inner'),outer=make('profile-outer');
 const exact='[class*="top-actions-logged-in-"] [class*="avatar-action-shell-"] [class*="avatar-container-"]';
 const doc={querySelectorAll(s){
  if(s===exact)return cfg.missing?[]:cfg.duplicate?[inner,inner]:[inner];
+ if(s==='[class*="top-actions-logged-in-"] [class*="avatar-action-shell-"] > [class*="avatar-action-"]')return [];
  if(s.includes('avatar-action-'))return [outer];
  return [];
 }};
@@ -844,6 +845,56 @@ const result=vm.runInNewContext(payload.source,context);process.stdout.write(JSO
                 result = json.loads(completed.stdout)
                 self.assertEqual(result['result']['stage'], 'opened' if allowed else 'waiting')
                 self.assertEqual(result['clicks'], ['menu-inner'] if allowed else [])
+
+    @unittest.skipUnless(shutil.which('node'), 'Node is needed for DOM allowlist verification')
+    def test_watermark_avatar_matches_observed_account38_hierarchy_without_clicking_outer_or_unknown_ui(self):
+        # Sanitized from the real account38 DOM: the action is the shell's
+        # direct child, while avatar-container is absent on the current site.
+        program = r'''
+const vm=require('vm'),payload=JSON.parse(require('fs').readFileSync(0,'utf8')),cfg=payload.config;
+let clicks=[],nodes=[];
+function make(id,cls,parent=null){const e={id,className:cls,parentElement:parent,innerText:'',textContent:'',
+ checkVisibility:()=>!(cfg.hidden&&id==='menu-inner'),
+ getBoundingClientRect:()=>({width:40,height:40,left:10,right:50,top:10,bottom:50}),
+ click(){clicks.push(id);},querySelectorAll:()=>[]};nodes.push(e);return e;}
+const top=make('logged-top',cfg.foreign?'top-actions-logged-out-X':'top-actions-BtxNrX top-actions-logged-in-S1DSeN');
+const credit=make('credits','credit-action-surEHb',top),shell=make('profile-shell','avatar-action-shell-eadixq',credit);
+if(!cfg.missing){
+ const inner=make('menu-inner',cfg.legacy?'avatar-container-legacy':'avatar-action-t6xclo',shell);
+ if(cfg.nestedLegacy)make('legacy-inner','avatar-container-legacy',inner);
+ if(cfg.duplicate)make('menu-duplicate','avatar-action-t6xclo',shell);
+}
+const unrelated=make('unrelated-avatar','avatar-action-unrelated');
+const modal=make('unknown-or-paid','lv-modal-wrapper');
+function has(e,part){const m=/^\[class\*="([^"]+)"\]$/.exec(part);return !!(e&&m&&e.className.includes(m[1]));}
+function matches(e,selector){const parts=selector.split(/\s+/),last=parts.pop();if(!has(e,last))return false;
+ let cursor=e;
+ while(parts.length){const part=parts.pop();
+  if(part==='>'){cursor=cursor.parentElement;if(!has(cursor,parts.pop()))return false;}
+  else {cursor=cursor.parentElement;while(cursor&&!has(cursor,part))cursor=cursor.parentElement;if(!cursor)return false;}
+ }
+ return true;
+}
+const document={querySelectorAll(s){
+ if(s==='[role=dialog],dialog,.lv-modal-wrapper')return cfg.modal?[modal]:[];
+ return nodes.filter(e=>matches(e,s));
+}};
+const context={document,innerHeight:960,innerWidth:1280,getComputedStyle:()=>({display:'block',visibility:'visible',opacity:'1'})};
+const result=vm.runInNewContext(payload.source,context);process.stdout.write(JSON.stringify({result,clicks}));
+'''
+        cases = [({}, 'menu-inner'), ({'legacy': True}, 'menu-inner'),
+                 ({'nestedLegacy': True}, 'legacy-inner'), ({'missing': True}, None),
+                 ({'duplicate': True}, None), ({'hidden': True}, None),
+                 ({'foreign': True}, None), ({'modal': True}, None)]
+        for config, target in cases:
+            with self.subTest(config=config):
+                completed = subprocess.run(['node', '-e', program],
+                    input=json.dumps({'config': config, 'source': _WATERMARK.replace('__ACTION__', json.dumps('open_avatar'))}),
+                    text=True, capture_output=True, check=False)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                result = json.loads(completed.stdout)
+                self.assertEqual(result['result']['stage'], 'blocked' if config.get('modal') else 'opened' if target else 'waiting')
+                self.assertEqual(result['clicks'], [target] if target else [])
 
     @unittest.skipUnless(shutil.which('node'), 'Node is needed for DOM allowlist verification')
     def test_known_promotion_dom_only_allows_close_and_rejects_other_offers_or_additional_dialogs(self):

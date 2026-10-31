@@ -88,6 +88,32 @@ def test_wrong_existing_identity_never_authorizes_account(context):
     client.logout.assert_not_called()
 
 
+@pytest.mark.parametrize('mode', ['active', 'disabled', 'low_balance', 'wrong_identity'])
+def test_stale_setup_error_is_cleared_only_by_verified_active_authorization(context, mode):
+    store, service, client, browser, manager, identifier = context
+    old_error = 'Account settings were not confirmed'
+    store.update_account(identifier, {'last_error': old_error})
+    if mode == 'disabled':
+        store.update_account(identifier, {'enabled': False, 'status': 'disabled', 'login_enable_after': False})
+    if mode == 'low_balance':
+        service.settings = lambda: {'low_balance_disable_threshold': 50}
+    client.identity.return_value = {'id': 'someone-else' if mode == 'wrong_identity' else 'account-123',
+                                    'credits': 20}
+    execute(context)
+    saved = store.account(identifier, private=True)
+    assert saved['last_error'] == ('' if mode == 'active' else old_error)
+    assert bool(saved['enabled']) is (mode == 'active')
+    if mode != 'wrong_identity':
+        assert saved['status'] == {'active': 'active', 'disabled': 'disabled',
+                                    'low_balance': 'disabled_low_balance'}[mode]
+        assert saved['cli_user_id'] == saved['login_user_id'] == 'account-123'
+    else:
+        assert saved['cli_user_id'] == '' and manager.status(identifier)['state'] == 'failed'
+    client.auth_start.assert_not_called()
+    client.submit.assert_not_called()
+    browser.open.assert_not_called()
+
+
 def test_normal_device_confirmation_keeps_browser_until_cli_proves_authorized(context):
     store, service, client, browser, manager, identifier = context
     client.identity.side_effect = [RuntimeError('no authorization'), {'id': 'account-123', 'credits': 20}]

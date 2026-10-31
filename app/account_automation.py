@@ -233,7 +233,9 @@ _WATERMARK = r"""(() => {
  }
  const entries=controls(document).filter(e=>text(e)==='Remove watermarks');
  if(entries.length===1){if(action==='open_setting'){entries[0].click();return {stage:'opened'};}return {stage:'menu'};}
- const avatars=[...document.querySelectorAll('[class*="top-actions-logged-in-"] [class*="avatar-action-shell-"] [class*="avatar-container-"]')]
+ let avatars=[...document.querySelectorAll('[class*="top-actions-logged-in-"] [class*="avatar-action-shell-"] [class*="avatar-container-"]')]
+   .filter(visible);
+ if(!avatars.length)avatars=[...document.querySelectorAll('[class*="top-actions-logged-in-"] [class*="avatar-action-shell-"] > [class*="avatar-action-"]')]
    .filter(visible);
  if(avatars.length===1){if(action==='open_avatar'){avatars[0].click();return {stage:'opened'};}return {stage:'avatar'};}
  return {stage:'waiting'};

@@ -259,6 +259,8 @@ class CanvasAuthManager:
             values = {'cli_user_id': user_id, 'cli_auth_status': 'ready', 'cli_auth_error': '',
                 'enabled': enable_after and not low,
                 'status': 'disabled_low_balance' if low else 'active' if enable_after else 'disabled'}
+            if enable_after and not low:
+                values['last_error'] = ''
             if numeric:
                 values['balance'] = balance
             self.store.update_account(account_id, values)
