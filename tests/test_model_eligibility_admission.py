@@ -126,22 +126,37 @@ def test_model_exclusion_and_identity_retry_keep_one_credit_budget_and_original_
 
 
 @pytest.mark.parametrize('kind', ['video', 'image'])
-def test_model_skip_retains_shared_priority_and_smallest_funded_selection(mixed, kind):
+def test_model_skip_retains_initial_budget_selection_without_repreparing_funded_account(mixed, kind):
     missing = mixed.add('missing-model', mode='canvas_cli', priority=9, kind=kind)
     larger = mixed.add('larger', mode='canvas_cli', balance=30, priority=5, kind=kind)
     fitting = mixed.add('fitting', mode='canvas_cli', balance=20, priority=5, kind=kind)
     lower = mixed.add('lower-priority', mode='canvas_cli', balance=15, priority=4, kind=kind)
     identifier = mixed.create(kind)
+    assert mixed.store.task(identifier)['estimated_cost'] == (10 if kind == 'video' else 0)
     mixed.clients[missing['id']].preflight_model.side_effect = missing_model(mixed.store.task(identifier)['model'], kind)
-    mixed.service._run(identifier)
+    with patch.object(mixed.service, '_canvas_local_assets',
+                      return_value={'images': [], 'videos': [], 'audios': []}) as material:
+        mixed.service._run(identifier)
     result = mixed.store.task(identifier)
-    assert result['status'] == 'succeeded' and result['account_id'] == fitting['id']
-    assert result['attempted_account_ids'] == [fitting['id']]
-    # Image admission retains its original unknown-cost probe; after a quote,
-    # the smaller sufficient account must own the only paid dispatch.
-    mixed.clients[larger['id']].submit.assert_not_called()
-    if kind == 'video':
-        mixed.clients[larger['id']].identity.assert_not_called()
+    # Known video cost chooses the smallest sufficient balance up front;
+    # unknown image cost probes the larger balance and keeps its funded quote.
+    expected, unused = (fitting, larger) if kind == 'video' else (larger, fitting)
+    assert result['status'] == 'succeeded' and result['account_id'] == expected['id']
+    assert result['attempted_account_ids'] == [expected['id']]
+    assert result['estimated_cost'] == result['actual_cost'] == 10
+    assert result['upstream_context']['quoted_credits'] == 10
+    assert [entry['account_id'] for entry in result['upstream_context']['model_eligibility_exclusions']] == [missing['id']]
+    mixed.clients[missing['id']].preflight_model.assert_called_once()
+    mixed.clients[missing['id']].prepare.assert_not_called()
+    mixed.clients[missing['id']].submit.assert_not_called()
+    material.assert_called_once()
+    assert material.call_args.args[1]['id'] == expected['id']
+    mixed.clients[expected['id']].prepare.assert_called_once()
+    mixed.clients[expected['id']].submit.assert_called_once()
+    assert mixed.clients[expected['id']].submit.call_args.args[0]['account_id'] == expected['id']
+    mixed.clients[unused['id']].identity.assert_not_called()
+    mixed.clients[unused['id']].prepare.assert_not_called()
+    mixed.clients[unused['id']].submit.assert_not_called()
     mixed.clients[lower['id']].identity.assert_not_called()
 
 
