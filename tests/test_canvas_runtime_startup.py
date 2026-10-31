@@ -43,8 +43,29 @@ def start_service(tmp_path, results):
     service.canvas_cli.run = Mock(side_effect=AssertionError('no account command may be started'))
     service._pool.submit = Mock()
     with patch('app.service.threading.Thread') as thread, patch('app.service.time.sleep') as sleep:
+        thread.instances = {}
+        def background_thread(*args, **kwargs):
+            name = kwargs['name']
+            assert name not in thread.instances
+            instance = Mock(name=name)
+            instance.is_alive.return_value = False
+            thread.instances[name] = instance
+            return instance
+        thread.side_effect = background_thread
         service.start()
     return service, before, thread, sleep
+
+
+def assert_background_threads_started(service, thread):
+    thread.assert_has_calls([
+        call(target=service._maintain_accounts, daemon=True, name='ijm-account-maintenance'),
+        call(target=service._canvas_result_loop, daemon=True, name='ijm-result-observation')])
+    assert thread.call_count == 2
+    assert set(thread.instances) == {'ijm-account-maintenance', 'ijm-result-observation'}
+    assert service._maintenance is thread.instances['ijm-account-maintenance']
+    assert service._canvas_result_maintenance is thread.instances['ijm-result-observation']
+    for instance in thread.instances.values():
+        instance.start.assert_called_once_with()
 
 
 def assert_original_recovery_unchanged(service, before):
@@ -76,7 +97,7 @@ def test_transient_local_failure_retries_once_and_preserves_recovery(tmp_path, c
         assert all(x not in json.dumps(service.canvas_runtime) + caplog.text for x in
                    ['private-token', 'private.test', 'secret=value'])
         sleep.assert_called_once_with(0.25)
-        thread.return_value.start.assert_called_once()
+        assert_background_threads_started(service, thread)
         assert_original_recovery_unchanged(service, before)
     finally:
         service.stop()
@@ -92,7 +113,7 @@ def test_persistent_local_failure_is_bounded_and_keeps_browser_available(tmp_pat
         assert service.canvas_runtime['startup_attempts'] == 2
         assert service.canvas_runtime['startup_last_error']['transport_diagnostic']['command_pair'] == ['version']
         sleep.assert_called_once_with(0.25)
-        thread.return_value.start.assert_called_once()
+        assert_background_threads_started(service, thread)
         assert_original_recovery_unchanged(service, before)
     finally:
         service.stop()
@@ -109,18 +130,19 @@ def test_other_startup_errors_are_not_retried(tmp_path, code):
         assert service.canvas_runtime['startup_attempts'] == 1
         assert service.canvas_runtime['last_error_code'] == code
         sleep.assert_not_called()
-        thread.return_value.start.assert_called_once()
+        assert_background_threads_started(service, thread)
         assert_original_recovery_unchanged(service, before)
     finally:
         service.stop()
 
 
 def test_successful_first_probe_does_not_add_an_extra_invocation(tmp_path):
-    service, before, _, sleep = start_service(tmp_path, [RUNTIME])
+    service, before, thread, sleep = start_service(tmp_path, [RUNTIME])
     try:
         service.canvas_cli.verify_runtime.assert_called_once_with()
         assert service.canvas_runtime == {**RUNTIME, 'startup_attempts': 1, 'last_error_code': None}
         sleep.assert_not_called()
+        assert_background_threads_started(service, thread)
         assert_original_recovery_unchanged(service, before)
     finally:
         service.stop()
