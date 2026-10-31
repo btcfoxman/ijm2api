@@ -12,6 +12,7 @@ import pytest
 from app.canvas_cli import CanvasCLI, CanvasCLIError
 from app.canvas_client import CanvasClient
 from app.canvas_timing import PreparationTiming
+from app.result_delivery import result_delivery_projection
 from test_canvas_execution import context, owner, task, fake_client
 from test_canvas_confirmation_boundary import boundary, TOKEN
 
@@ -163,7 +164,8 @@ def test_admission_reselection_keeps_priority_and_does_not_gain_a_top_level_timi
 def test_admin_details_expose_timing_but_strip_the_raw_context():
     path=Path(__file__).parents[1]/'app/main.py';tree=ast.parse(path.read_text(encoding='utf-8'))
     function=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='_with_cost_observations')
-    namespace={'__package__':'app','Any':Any,'build_observations':lambda task:[]}
+    namespace={'__package__':'app','Any':Any,'build_observations':lambda task:[],
+               'result_delivery_projection':result_delivery_projection}
     exec(compile(ast.Module(body=[function],type_ignores=[]),str(path),'exec'),namespace)
     row={'id':'task','execution_backend':'canvas_cli','upstream_context':{'private_field':'not exposed',
         'preparation_timing':PreparationTiming('task').snapshot()}}
