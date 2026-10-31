@@ -186,18 +186,23 @@ def test_prediction_does_not_replace_fresh_quote_or_balance_check(context):
     assert store.canvas_quote_hints()[0]['amount']==44
 
 
-def test_three_preparation_rounds_keep_timings_and_initial_queue(context):
+def test_real_funding_rejection_keeps_both_preparation_timings_and_initial_queue(context):
     store,service,_=context
     big=owner(store,'big',balance=44743);small=owner(store,'small',balance=42);row=target(store)
-    clients={a['id']:fake_client(store,service,a,quote=q) for a,q in [(big,40),(small,44)]}
+    clients={a['id']:fake_client(store,service,a,quote=40) for a in (big,small)}
+    # The initial cached balance admits big; its real read then proves it
+    # cannot fund the quote, so this switch is required rather than best fit.
+    clients[big['id']].identity.return_value={'user_id':big['login_user_id'],'available_balance':30}
+    clients[big['id']].identity.side_effect=None
     with patch.object(service,'canvas_client',side_effect=lambda account:clients[account['id']]):service._run(row['id'])
     final=store.task(row['id']);history=final['upstream_context']['preparation_attempts']
-    assert [h['account_id'] for h in history]==[big['id'],small['id'],big['id']]
-    assert [h['reason'] for h in history]==['best_fit_reselect','insufficient_credits','accepted']
-    assert [h['ordinal'] for h in history]==[1,2,3] and all(h['timing']['finished'] for h in history)
+    assert [h['account_id'] for h in history]==[big['id'],small['id']]
+    assert [h['reason'] for h in history]==['insufficient_credits','accepted']
+    assert [h['ordinal'] for h in history]==[1,2] and all(h['timing']['finished'] for h in history)
     assert len({h['timing']['first_admission_queue_ms'] for h in history})==1
     assert history[-1]['timing']['elapsed_before_attempt_ms']>history[0]['timing']['queue_wait_ms']
-    assert clients[big['id']].submit.call_count==1 and clients[small['id']].submit.call_count==0
+    assert clients[big['id']].prepare.call_count==1 and clients[big['id']].submit.call_count==0
+    assert clients[small['id']].prepare.call_count==1 and clients[small['id']].submit.call_count==1
 
 
 @pytest.mark.parametrize('status',['running','submitted','submission_unknown'])

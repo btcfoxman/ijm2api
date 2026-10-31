@@ -137,6 +137,80 @@ def eligible():
             'preparation_timing': {'commands': {'node run': {'count': 1}}}}}
 
 
+def transport_diagnostic():
+    # The observed native failure has no reason, serviceCode or nested error.
+    return {'code': 'cli.transport_failed', 'class': 'retryable_failure',
+            'requiredAction': 'retry', 'retryable': True, 'exit_code': 21,
+            'phase': 'run_dispatching', 'dispatch_started': True,
+            'outcome_unknown': True, 'message': 'private transport diagnostic'}
+
+
+def eligible_transport():
+    value = eligible()
+    value['upstream_context']['submit_error'] = transport_diagnostic()
+    return value
+
+
+@pytest.mark.parametrize('reason', [None, '', 'network_error', 'network_timeout',
+                                    'dns_resolution_failed', 'transport_error'])
+def test_closed_single_transport_dispatch_allows_fallback_without_no_send_or_financial_rewrite(reason):
+    value = eligible_transport()
+    if reason is not None:
+        value['upstream_context']['submit_error']['reason'] = reason
+    before = deepcopy(value)
+    assert CanvasServiceMixin._canvas_retryable_submission_failure(value) == FACTS
+    assert value == before
+    assert value['actual_cost'] is None
+    assert not {'generation_request_sent', 'refunded', 'actual_cost'} & FACTS.keys()
+    assert not preparation_retryable_failure(CanvasCLIError('cli.transport_failed', '',
+        details={'error': value['upstream_context']['submit_error']}))
+
+
+@pytest.mark.parametrize('change', [
+    {'code': 'CLI_INVALID_RESPONSE'}, {'class': 'authentication_failure'},
+    {'class': ''}, {'retryable': 'true'}, {'retryable': False},
+    {'requiredAction': 'contact_support'}, {'requiredAction': 'login'},
+    {'requiredAction': ''}, {'serviceCode': 1}, {'serviceCode': '1'},
+    {'reason': 'content_policy_violation'}, {'reason': 'unknown'},
+    {'dispatch_started': False}, {'outcome_unknown': False}, {'phase': 'confirming'},
+])
+def test_transport_failover_requires_native_typed_retry_contract(change):
+    value = eligible_transport()
+    value['upstream_context']['submit_error'].update(change)
+    assert CanvasServiceMixin._canvas_retryable_submission_failure(value) == {}
+
+
+@pytest.mark.parametrize('timing', [None, {}, {'commands': {}},
+    {'commands': {'node run': {'count': 0}}}, {'commands': {'node run': {'count': 2}}},
+    {'commands': {'node run': {'count': True}}}, {'commands': {'node run': {'count': '1'}}}])
+def test_transport_failover_requires_exactly_one_recorded_original_paid_dispatch(timing):
+    value = eligible_transport()
+    value['upstream_context']['preparation_timing'] = timing
+    assert CanvasServiceMixin._canvas_retryable_submission_failure(value) == {}
+
+
+@pytest.mark.parametrize('change', [
+    {'resource_ids': ['known-output']}, {'phase': 'accepted'},
+    {'run_receipt': {'state': 'RUN_ACCEPTED'}}, {'consecutive_submission_absent': 2},
+    {'reconciliation_closed': False}, {'last_query_error': {'code': 'CLI_COMMAND_TIMEOUT'}},
+    {'previous_submissions': [{'submit_id': 'prior-dispatch'}]},
+    {'submission_evidence': {'version': 1, 'accepted': True, 'output_resources': False,
+        'receipt': False, 'identity_conflict': False, 'ambiguous_partial': False}},
+])
+def test_transport_failover_keeps_original_receipt_and_closed_absence_vetoes(change):
+    value = eligible_transport()
+    value['upstream_context'].update(change)
+    assert CanvasServiceMixin._canvas_retryable_submission_failure(value) == {}
+
+
+def test_transport_failover_preserves_normalized_identity_and_receipt_vetoes():
+    value = eligible_transport()
+    value['normalized'] = {'_execution': {'profile': 'another-profile'}}
+    assert CanvasServiceMixin._canvas_retryable_submission_failure(value) == {}
+    value['normalized']['_execution'] = {'resource_ids': ['known-output']}
+    assert CanvasServiceMixin._canvas_retryable_submission_failure(value) == {}
+
+
 def test_historical_projection_is_pure_and_does_not_claim_no_send_or_refund():
     value = eligible()
     before = deepcopy(value)
@@ -182,11 +256,14 @@ def test_retryable_terminal_contract_never_overrides_receipts_unknown_families_o
     assert CanvasServiceMixin._canvas_retryable_submission_failure(value) == {}
 
 
-def test_exact_absence_closes_known_failure_but_never_replays_or_rewrites_finance(context):
+@pytest.mark.parametrize('transport', [False, True])
+def test_exact_absence_closes_known_failure_but_never_replays_or_rewrites_finance(context, transport):
     store, service, _ = context
     account = owner(store)
     retained_operation(store, account, paused=False, deadline=time.time() + 60)
     original = eligible()['upstream_context']
+    if transport:
+        original['submit_error'] = transport_diagnostic()
     current = store.task('task')
     original.update(account_id=account['id'], expected_user_id=account['login_user_id'])
     original.pop('reconciliation_closed')

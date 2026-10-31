@@ -178,7 +178,7 @@ def test_insufficient_quote_never_invokes_paid_run(context):
     client.poll.assert_not_called()
 
 
-def test_same_priority_reselects_smallest_funded_account_before_paid_run(context):
+def test_prepared_funded_account_is_retained_instead_of_late_best_fit_reselection(context):
     store, service, _ = context
     big = owner(store, "big", balance=100)
     small = owner(store, "small", balance=15)
@@ -189,14 +189,16 @@ def test_same_priority_reselects_smallest_funded_account_before_paid_run(context
         service._run("task")
     result = store.task("task")
     assert result["status"] == "succeeded", result["error_message"]
-    assert result["account_id"] == small["id"]
-    assert result["attempted_account_ids"] == [small["id"]]
-    clients[big["id"]].submit.assert_not_called()
+    assert result["account_id"] == big["id"]
+    assert result["attempted_account_ids"] == [big["id"]]
+    clients[big["id"]].prepare.assert_called_once()
+    clients[big["id"]].submit.assert_called_once()
+    clients[small["id"]].prepare.assert_not_called()
     clients[tiny["id"]].submit.assert_not_called()
-    clients[small["id"]].submit.assert_called_once()
+    clients[small["id"]].submit.assert_not_called()
 
 
-def test_cli_image_reselection_retains_quote_and_uses_smallest_funded_account(context):
+def test_cli_image_retains_prepared_funded_account_and_its_quote(context):
     store, service, _ = context
     big = owner(store, "big", balance=100)
     small = owner(store, "small", balance=15)
@@ -207,14 +209,15 @@ def test_cli_image_reselection_retains_quote_and_uses_smallest_funded_account(co
         service._run_image(response["id"])
     result = store.task(response["id"])
     assert result["status"] == "succeeded", result["error_message"]
-    assert result["account_id"] == small["id"]
+    assert result["account_id"] == big["id"]
     assert result["estimated_cost"] == 10
-    assert result["attempted_account_ids"] == [small["id"]]
+    assert result["attempted_account_ids"] == [big["id"]]
     clients[big["id"]].prepare.assert_called_once()
-    clients[big["id"]].submit.assert_not_called()
+    clients[big["id"]].submit.assert_called_once()
     clients[tiny["id"]].prepare.assert_not_called()
     clients[tiny["id"]].submit.assert_not_called()
-    clients[small["id"]].submit.assert_called_once()
+    clients[small["id"]].prepare.assert_not_called()
+    clients[small["id"]].submit.assert_not_called()
     service.browser_runtime.acquire.assert_not_called()
 
 
@@ -767,8 +770,8 @@ def test_manual_result_storage_failure_keeps_confirmed_operation_and_credit_hold
     client.submit.assert_not_called()
 
 
-@pytest.mark.parametrize('transition', ['funding', 'reselect'])
-def test_pre_run_account_change_keeps_acknowledged_history_and_attempt_deadline(context, transition):
+@pytest.mark.parametrize('transition', ['funding', 'retained'])
+def test_pre_run_binding_policy_keeps_acknowledged_history_and_attempt_deadline(context, transition):
     store, service, _ = context
     first = owner(store, 'first', balance=5 if transition == 'funding' else 100,
                   priority=5 if transition == 'funding' else 0)
@@ -792,12 +795,16 @@ def test_pre_run_account_change_keeps_acknowledged_history_and_attempt_deadline(
         service._run('task')
     result = store.task('task')
     assert result['status'] == 'succeeded', result['error_message']
-    assert result['account_id'] == second['id']
+    expected = second if transition == 'funding' else first
+    unused = first if transition == 'funding' else second
+    assert result['account_id'] == expected['id']
     assert result['upstream_context']['previous_submissions'] == archive
     assert result['upstream_context']['recovery_resolution'] == resolution
     assert result['upstream_context']['observation_deadline'] == pytest.approx(resolution['attempt_started_at'] + 5)
-    clients[first['id']].submit.assert_not_called()
-    clients[second['id']].submit.assert_called_once()
+    clients[unused['id']].submit.assert_not_called()
+    clients[expected['id']].submit.assert_called_once()
+    if transition == 'retained':
+        clients[second['id']].prepare.assert_not_called()
 
 
 def manually_stop(store, identifier='task'):
@@ -1127,6 +1134,9 @@ def test_identity_failover_retains_priority_and_smallest_sufficient_account_sele
                 owner(store, 'fitting', balance=20, priority=5),
                 owner(store, 'lower-priority', balance=15, priority=4)]
     identifier = preflight_task(store, service, kind)
+    # Images do not use video history estimates. Supply the known admission
+    # estimate explicitly so the next account is chosen before preparation.
+    store.update_task(identifier, {'estimated_cost': 10})
     clients = {a['id']: fake_client(store, service, a, kind=kind, quote=10) for a in accounts}
     clients[accounts[0]['id']].identity.side_effect = CanvasCLIError('CLI_COMMAND_TIMEOUT', 'identity timeout')
     with patch.object(service, 'canvas_client', side_effect=lambda a: clients[a['id']]), \
@@ -1138,6 +1148,7 @@ def test_identity_failover_retains_priority_and_smallest_sufficient_account_sele
     assert result['upstream_context']['preflight_failures'][0]['account_id'] == accounts[0]['id']
     assert sum(client.submit.call_count for client in clients.values()) == 1
     clients[accounts[0]['id']].identity.assert_called_once()
+    clients[accounts[1]['id']].prepare.assert_not_called()
     clients[accounts[3]['id']].identity.assert_not_called()
 
 
@@ -1408,7 +1419,7 @@ def test_cached_balance_limits_budget_and_quote_reselection_without_becoming_fre
 
 
 @pytest.mark.parametrize('kind', ['video', 'image'])
-def test_cached_balance_preserves_same_priority_smallest_funded_quote_reselection(context, kind):
+def test_cached_balance_keeps_the_original_prepared_funded_account(context, kind):
     store, service, _ = context
     accounts = [owner(store, 'big', balance=100, priority=5),
                 owner(store, 'fit', balance=20, priority=5),
@@ -1422,9 +1433,11 @@ def test_cached_balance_preserves_same_priority_smallest_funded_quote_reselectio
     with patch.object(service, 'canvas_client', side_effect=lambda a: clients[a['id']]):
         service._run(identifier)
     result = store.task(identifier)
-    assert result['status'] == 'succeeded' and result['account_id'] == accounts[1]['id']
+    assert result['status'] == 'succeeded' and result['account_id'] == accounts[0]['id']
     assert result['balance_before'] is None and result['actual_cost'] is None
-    assert result['attempted_account_ids'] == [accounts[1]['id']]
+    assert result['attempted_account_ids'] == [accounts[0]['id']]
     assert sum(client.submit.call_count for client in clients.values()) == 1
+    clients[accounts[0]['id']].prepare.assert_called_once()
+    clients[accounts[1]['id']].prepare.assert_not_called()
     clients[accounts[2]['id']].identity.assert_not_called()
     clients[accounts[3]['id']].identity.assert_not_called()

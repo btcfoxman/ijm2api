@@ -144,6 +144,17 @@ class CanvasServiceMixin:
                                             'automatic_resubmission')}
 
     @staticmethod
+    def _canvas_retryable_submit_transport(error: dict) -> bool:
+        """Typed dispatch failure only; never permission to repeat node.run."""
+        return (error.get('code') == 'cli.transport_failed'
+                and error.get('class') == 'retryable_failure'
+                and error.get('retryable') is True
+                and error.get('requiredAction') == 'retry'
+                and error.get('serviceCode') in (None, '')
+                and error.get('reason') in (None, '', 'network_error', 'network_timeout',
+                                             'dns_resolution_failed', 'transport_error'))
+
+    @staticmethod
     def _canvas_retryable_submission_failure(task: dict) -> dict:
         """Caller may fail over after bounded absence; this is not no-send proof."""
         context = task.get('upstream_context') or {}
@@ -168,10 +179,11 @@ class CanvasServiceMixin:
                 or any(not isinstance(context.get(key), str) or not context[key]
                        for key in ('profile', 'project_id', 'node_id', 'submit_id'))):
             return {}
-        # Only the observed service/decode families are eligible. In particular,
-        # an arbitrary unknown, auth error or policy rejection is not a retry.
+        # These families qualify only after the same operation's bounded
+        # absence has closed. This does not authorize another paid dispatch.
         error = CanvasCLIError(str(original.get('code') or ''), '', details={'error': original})
-        if not preparation_retryable_failure(error):
+        transport_failure = CanvasServiceMixin._canvas_retryable_submit_transport(original)
+        if not preparation_retryable_failure(error) and not transport_failure:
             return {}
         normalized = task.get('normalized') or {}
         if not isinstance(normalized, dict):
@@ -198,6 +210,14 @@ class CanvasServiceMixin:
             if key in normalized_context and normalized_context[key] != context.get(key):
                 return {}
         timings = [context.get('preparation_timing')]
+        if transport_failure:
+            # Unlike older service/decode records, newly eligible transport
+            # failures require an explicit single original dispatch count.
+            timing = timings[0]
+            commands = timing.get('commands') if isinstance(timing, dict) else None
+            run = commands.get('node run') if isinstance(commands, dict) else None
+            if not isinstance(run, dict) or type(run.get('count')) is not int or run['count'] != 1:
+                return {}
         for attempt in context.get('preparation_attempts') or []:
             if not isinstance(attempt, dict) or attempt.get('reason') == 'accepted':
                 return {}
@@ -643,22 +663,10 @@ class CanvasServiceMixin:
                             error_code='INSUFFICIENT_CREDITS',
                             error_message='Canvas quote exceeds available unreserved credits') else True
                     if funded:
-                        if not (task['normalized'].get('_cost_evidence') or {}).get('canvas_budget_checked'):
-                            pending = self._pending_credits(self.store.scheduling_rows(), task_id)
-                            current_available, _ = self._available_credits({**account, 'balance': budget_balance}, pending)
-                            candidates = self._funded_accounts(quote, set(task.get('attempted_account_ids') or [])
-                                | self._model_excluded_accounts(task), pending,
-                                self._required_execution_backend(task) or None, task=self.store.task(task_id))
-                            candidates = [a for a in candidates if int(a['id']) != account_id
-                                and int(a['priority']) == int(account['priority'])
-                                and a.get('_available_credits') is not None
-                                and current_available is not None and a['_available_credits'] < current_available
-                                and max(self._active.get(int(a['id']), 0),
-                                    sum(owner == int(a['id']) for owner, _ in pending.values())) < int(a['max_concurrency'])]
-                            self._update_canvas_task(task_id, {'cost_evidence': {'canvas_budget_checked': True}})
-                            if candidates:
-                                finish_attempt('best_fit_reselect')
-                                return 'reselect' if self._requeue_unaccepted_task(task_id) else True
+                        # Priority, best fit and account-specific quote hints
+                        # select an account before preparation. Keep its ready
+                        # inputs and fresh quote once it is still eligible and
+                        # funded; a smaller balance alone must not repeat uploads.
                         attempts = list(task.get("attempted_account_ids") or [])
                         if account_id not in attempts:
                             attempts.append(account_id)

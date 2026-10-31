@@ -66,7 +66,7 @@ def mixed(context, monkeypatch):
 
 @pytest.mark.parametrize('kind', ['video', 'image'])
 @pytest.mark.parametrize('first_mode', ['canvas_cli', 'browser'])
-def test_proven_credit_rejection_selects_other_configured_mode_by_priority_and_best_fit(mixed, kind, first_mode):
+def test_proven_credit_rejection_selects_other_mode_with_original_admission_policy(mixed, kind, first_mode):
     other_mode = 'browser' if first_mode == 'canvas_cli' else 'canvas_cli'
     first = mixed.add('first', mode=first_mode, priority=9, kind=kind)
     larger = mixed.add('larger', mode=other_mode, balance=30, priority=5, kind=kind)
@@ -86,10 +86,15 @@ def test_proven_credit_rejection_selects_other_configured_mode_by_priority_and_b
     mixed.service._run(identifier)
     result = mixed.store.task(identifier)
     assert result['status'] == 'succeeded', result['error_message']
-    assert result['execution_backend'] == other_mode and result['account_id'] == fitting['id']
-    assert result['attempted_account_ids'] == [first['id'], fitting['id']]
-    mixed.clients[larger['id']].submit.assert_not_called()
-    mixed.browser[larger['id']].submit.assert_not_called()
+    # Browser-image rejection has no measured quote: its unchanged early
+    # policy probes the larger balance. Keep that account once its quote fits.
+    expected = larger if kind == 'image' and first_mode == 'browser' else fitting
+    unused = fitting if expected is larger else larger
+    assert result['execution_backend'] == other_mode and result['account_id'] == expected['id']
+    assert result['attempted_account_ids'] == [first['id'], expected['id']]
+    mixed.clients[unused['id']].prepare.assert_not_called()
+    mixed.clients[unused['id']].submit.assert_not_called()
+    mixed.browser[unused['id']].submit.assert_not_called()
     mixed.clients[lower['id']].submit.assert_not_called()
     mixed.browser[lower['id']].submit.assert_not_called()
     if other_mode == 'browser':
@@ -98,7 +103,7 @@ def test_proven_credit_rejection_selects_other_configured_mode_by_priority_and_b
         assert result['upstream_context']['preparation_attempt_count'] == 1
         assert not result['normalized']['_cost_evidence'].get('canvas_quote')
     else:
-        assert result['upstream_context']['account_id'] == fitting['id']
+        assert result['upstream_context']['account_id'] == expected['id']
 
 
 @pytest.mark.parametrize('kind', ['video', 'image'])
@@ -119,16 +124,17 @@ def test_unfunded_quote_or_fresh_balance_can_choose_other_mode_without_paid_retr
 
 
 @pytest.mark.parametrize('kind', ['video', 'image'])
-def test_quoted_same_priority_best_fit_can_reselect_browser_before_any_paid_dispatch(mixed, kind):
+def test_prepared_funded_cli_does_not_switch_to_smaller_same_priority_browser(mixed, kind):
     first = mixed.add('large-cli', mode='canvas_cli', balance=100, kind=kind)
     fitting = mixed.add('small-browser', mode='browser', balance=15, kind=kind)
     identifier = mixed.create(kind)
     mixed.service._run(identifier)
     result = mixed.store.task(identifier)
-    assert result['status'] == 'succeeded' and result['account_id'] == fitting['id']
-    assert result['attempted_account_ids'] == [fitting['id']]
+    assert result['status'] == 'succeeded' and result['account_id'] == first['id']
+    assert result['attempted_account_ids'] == [first['id']]
     mixed.clients[first['id']].prepare.assert_called_once()
-    mixed.clients[first['id']].submit.assert_not_called()
+    mixed.clients[first['id']].submit.assert_called_once()
+    mixed.browser[fitting['id']].submit.assert_not_called()
 
 
 @pytest.mark.parametrize('kind', ['video', 'image'])
