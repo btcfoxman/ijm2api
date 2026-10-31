@@ -61,6 +61,60 @@ def _priority(value: Any) -> int:
     return result
 
 
+def accepted_canvas_result(task: dict[str, Any], *, allow_closed: bool = False) -> bool:
+    """A bound, affirmative output receipt; never an uncertain submission."""
+    context = task.get('upstream_context') or {}
+    if not isinstance(context, dict) or task.get('execution_backend') != 'canvas_cli':
+        return False
+    if ('manual_termination' in context or context.get('submit_error')
+            or context.get('previous_submissions') or task.get('result_urls')
+            or task.get('upstream_result_urls') or task.get('run_id') or task.get('thread_id')
+            or type(task.get('account_id')) is not int or task['account_id'] < 1
+            or context.get('account_id') != task['account_id'] or context.get('task_id') != task.get('id')
+            or context.get('backend') != 'canvas_cli'
+            or context.get('phase') != 'accepted' or context.get('submission_phase') != 'accepted'
+            or any(not isinstance(context.get(key), str) or not context[key]
+                   for key in ('profile', 'project_id', 'node_id', 'submit_id', 'expected_user_id'))):
+        return False
+    evidence = context.get('submission_evidence')
+    flags = {'accepted', 'output_resources', 'receipt', 'identity_conflict', 'ambiguous_partial'}
+    if (not isinstance(evidence, dict) or set(evidence) != flags | {'version'}
+            or type(evidence.get('version')) is not int or evidence['version'] != 1
+            or any(type(evidence.get(key)) is not bool for key in flags)
+            or evidence['accepted'] is not True or evidence['output_resources'] is not True
+            or evidence['identity_conflict']):
+        return False
+    resources = context.get('resource_ids')
+    if (not isinstance(resources, list) or not resources
+            or any(not isinstance(item, str) or not item for item in resources)
+            or len(set(resources)) != len(resources)
+            or type(context.get('output_count')) is not int or context['output_count'] != len(resources)):
+        return False
+    normalized = task.get('normalized') or {}
+    old = normalized.get('_execution') or {} if isinstance(normalized, dict) else None
+    if not isinstance(old, dict):
+        return False
+    if any(key in old and old[key] != context.get(key) for key in
+           ('account_id', 'task_id', 'profile', 'project_id', 'node_id', 'submit_id', 'expected_user_id')):
+        return False
+    if (old.get('resource_ids') and old['resource_ids'] != resources
+            or isinstance(old.get('submission_evidence'), dict)
+                and old['submission_evidence'].get('identity_conflict')):
+        return False
+    if task.get('status') in {'submitted', 'running'}:
+        return True
+    if (not allow_closed or task.get('status') not in {'failed', 'expired'}
+            or task.get('error_code') != 'CLI_SUBMISSION_UNCONFIRMED'
+            or context.get('reconciliation_closed') is not True
+            or context.get('reconciliation_close_reason') != 'observation_deadline_reached'):
+        return False
+    timing = context.get('preparation_timing')
+    commands = timing.get('commands') if isinstance(timing, dict) else None
+    run = commands.get('node run') if isinstance(commands, dict) else None
+    return (isinstance(run, dict) and type(run.get('count')) is int and run['count'] == 1
+            and type(run.get('failed')) is int and run['failed'] == 0)
+
+
 class Store:
     def __init__(self, path: str):
         self.path = Path(path)
@@ -579,8 +633,65 @@ class Store:
             rows = db.execute("SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
         return [self._task(row) for row in rows]
 
+    def canvas_result_candidates(self) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute("""SELECT * FROM tasks WHERE execution_backend='canvas_cli' AND
+                (status IN ('submitted','running') OR
+                 (status IN ('failed','expired') AND error_code='CLI_SUBMISSION_UNCONFIRMED'))
+                ORDER BY updated_at,id""").fetchall()
+        return [self._task(row) for row in rows]
+
+    def queue_canvas_result_observation(self, task_id: str, expected_updated_at: float,
+                                        *, claim: bool = False) -> dict[str, Any]:
+        """CAS only an affirmative original output into automatic result reads."""
+        with self._lock, self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            raw = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if raw is None or raw['updated_at'] != expected_updated_at:
+                return {}
+            task = self._task(raw)
+            if not accepted_canvas_result(task, allow_closed=True):
+                return {}
+            context = dict(task['upstream_context'])
+            recovery = context.get('result_observation')
+            if recovery is None:
+                now = time.time()
+                recovery = {'version': 1, 'started_at': now,
+                    'attempts': 0, 'next_poll_at': now,
+                    'preserve_finance': task['status'] in {'failed', 'expired'}}
+                if recovery['preserve_finance']:
+                    recovery['original_failure'] = {key: task.get(key) for key in
+                        ('status', 'error_code', 'error_message', 'completed_at', 'updated_at',
+                         'estimated_cost', 'actual_cost', 'balance_before', 'balance_after')}
+                    recovery['original_closure'] = {key: context.get(key) for key in
+                        ('reconciliation_closed', 'reconciliation_close_reason',
+                         'reconciliation_closed_at', 'financial_outcome')}
+                context['result_observation'] = recovery
+            elif not isinstance(recovery, dict) or recovery.get('version') != 1:
+                return {}
+            recovery = dict(recovery)
+            if claim:
+                now = time.time()
+                attempts = recovery.get('attempts')
+                due = recovery.get('next_poll_at')
+                if (recovery.get('blocked_reason') or type(attempts) is not int or attempts < 0
+                        or not isinstance(due, (int, float)) or isinstance(due, bool)
+                        or not math.isfinite(due) or due > now):
+                    return {}
+                recovery.update(attempts=attempts + 1, last_started_at=now,
+                    next_poll_at=now + 120 + min(300, 30 * 2 ** min(attempts, 4)))
+            context['result_observation'] = recovery
+            context['reconciliation_paused'] = False
+            context['reconciliation_closed'] = False
+            db.execute("""UPDATE tasks SET status='running',completed_at=NULL,error_code='',error_message='',
+                progress=MAX(45,MIN(95,progress)),upstream_context_json=?,updated_at=?
+                WHERE id=? AND updated_at=?""",
+                (_upstream_context(context), time.time(), task_id, expected_updated_at))
+        return self.task(task_id) or {}
+
     def update_task(self, task_id: str, values: dict[str, Any], *,
-                    preserve_terminal: bool = False) -> dict[str, Any]:
+                    preserve_terminal: bool = False,
+                    expected_updated_at: float | None = None) -> dict[str, Any]:
         data = {key: value for key, value in values.items() if key in {"account_id", "status", "progress",
             "thread_id", "run_id", "error_code", "error_message", "estimated_cost", "actual_cost",
             "balance_before", "balance_after", "completed_at", "execution_backend"}}
@@ -607,11 +718,13 @@ class Store:
             # An explicit user stop always wins over stale background work.
             # Read only control fields until a full returned task is required.
             db.execute('BEGIN IMMEDIATE')
-            current = db.execute('SELECT status,error_code,upstream_context_json FROM tasks WHERE id=?', (task_id,)).fetchone()
+            current = db.execute('SELECT status,error_code,upstream_context_json,updated_at FROM tasks WHERE id=?', (task_id,)).fetchone()
             if current is None:
                 return {}
             context = json.loads(current['upstream_context_json'])
-            if (context.get('manual_termination') or preserve_terminal
+            if ('manual_termination' in context
+                    or expected_updated_at is not None and current['updated_at'] != expected_updated_at
+                    or preserve_terminal
                     and current['status'] in {'succeeded', 'failed', 'expired', 'cancelled'}
                     and current['error_code'] != 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'):
                 return self._task(db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())

@@ -38,7 +38,7 @@ from .errors import public_error, upstream_review_error
 from .media import MediaError
 from .result_transfer import ResultTransferError, transfer, presign, expires_soon, _config
 from .upload import UploadError
-from .store import Store
+from .store import Store, accepted_canvas_result
 
 
 TERMINAL = {"succeeded", "failed", "expired"}
@@ -86,6 +86,9 @@ class Service(CanvasServiceMixin):
     def __init__(self, store: Store):
         self.store = store
         self._pool = ThreadPoolExecutor(max_workers=50, thread_name_prefix="ijm-task")
+        self._canvas_result_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='ijm-result')
+        self._canvas_result_inflight: set[str] = set()
+        self._canvas_result_maintenance: threading.Thread | None = None
         self._lock = threading.RLock()
         self._active: dict[int, int] = {}
         self._aux_account_owners: dict[int, object] = {}
@@ -173,6 +176,10 @@ class Service(CanvasServiceMixin):
                                              name="ijm-account-maintenance")
         self._maintenance.start()
         for task in reversed(self.store.tasks(1000)):
+            if accepted_canvas_result(task, allow_closed=True) and (task['status'] in {'failed', 'expired'}
+                    or (task.get('upstream_context') or {}).get('result_observation')):
+                self.store.queue_canvas_result_observation(task['id'], task['updated_at'])
+                continue  # The separate, bounded query-only dispatcher owns these.
             if (task.get('execution_backend') == 'canvas_cli'
                     and (task.get('upstream_context') or {}).get('reconciliation_paused') is True):
                 context = task['upstream_context']
@@ -203,9 +210,15 @@ class Service(CanvasServiceMixin):
                     "error_code": "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
                     "error_message": "service restarted during preparation; automatic resubmission is disabled",
                     "completed_at": time.time()})
+        self._canvas_result_maintenance = threading.Thread(target=self._canvas_result_loop,
+            daemon=True, name='ijm-result-observation')
+        self._canvas_result_maintenance.start()
 
     def stop(self) -> None:
         self._stop.set()
+        if self._canvas_result_maintenance and self._canvas_result_maintenance.is_alive():
+            self._canvas_result_maintenance.join(timeout=5)
+        self._canvas_result_pool.shutdown(wait=False, cancel_futures=True)
         if self._maintenance and self._maintenance.is_alive():
             self._maintenance.join(timeout=5)
         self._pool.shutdown(wait=False, cancel_futures=False)
