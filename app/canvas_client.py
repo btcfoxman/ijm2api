@@ -34,6 +34,72 @@ _TRANSPORT_RETRY_READS = frozenset({('auth', 'account'), ('model', 'list'), ('ca
     ('node', 'quote'), ('node', 'show'), ('resource', 'get'), ('operation', 'status')})
 _PREPARATION_RETRY_READS = frozenset({('auth', 'account'), ('model', 'list'),
     ('canvas', 'ls'), ('node', 'quote'), ('resource', 'get')})
+_SUBMISSION_EVIDENCE_FLAGS = ('accepted', 'output_resources', 'receipt', 'identity_conflict', 'ambiguous_partial')
+
+
+def submission_evidence_blocks_fallback(value: dict[str, Any]) -> bool:
+    """A legacy partial-response bit is not affirmative acceptance evidence."""
+    evidence = value.get('submission_evidence')
+    if evidence is None:
+        return False
+    if (not isinstance(evidence, dict) or type(evidence.get('version')) is not int
+            or evidence['version'] != 1 or set(evidence) != {'version', *_SUBMISSION_EVIDENCE_FLAGS}
+            or any(type(evidence.get(key)) is not bool for key in _SUBMISSION_EVIDENCE_FLAGS)):
+        return True  # An incompatible evidence format cannot grant failover.
+    return any(evidence[key] for key in _SUBMISSION_EVIDENCE_FLAGS if key != 'ambiguous_partial')
+
+
+def _remember_submission_evidence(context: dict[str, Any], envelope: dict[str, Any]) -> None:
+    """Keep only monotonic, safe receipt facts before the raw envelope is redacted.
+
+    A partial/unknown response still means the paid outcome is unknown. It is
+    distinct from an accepted state, output identity or contradictory binding.
+    Neither category authorizes another node run on this task.
+    """
+    evidence = {'version': 1, **{key: False for key in _SUBMISSION_EVIDENCE_FLAGS}}
+    evidence['ambiguous_partial'] = bool(envelope.get('partialData')) or _has_accepted(envelope)
+    error = envelope.get('error')
+    if isinstance(error, dict) and any(error.get(key) for key in ('resources', 'submission', 'items', 'accepted')):
+        evidence['ambiguous_partial'] = True
+    bindings = {'projectId': context.get('project_id'), 'nodeId': context.get('node_id'),
+                'submitId': context.get('submit_id'), 'operationRef': context.get('submit_id')}
+    pending = [envelope]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, dict):
+            for key, content in value.items():
+                if key in bindings and content not in (None, '') and content != bindings[key]:
+                    evidence['identity_conflict'] = True
+                if (key in {'state', 'submissionState', 'status'} and isinstance(content, str)
+                        and content.strip().upper().removeprefix('RUN_') in {
+                            'ACCEPTED', 'SUBMITTED', 'RUNNING', 'PROCESSING', 'SUCCEEDED', 'COMPLETED', 'SUCCESS'}):
+                    evidence['accepted'] = True
+                if key == 'accepted' and content is True:
+                    evidence['accepted'] = True
+                if key in {'resources', 'resourceIds', 'resource_ids'} and isinstance(content, list) and content:
+                    evidence['output_resources'] = True
+                if key == 'resourceId' and content:
+                    evidence['output_resources'] = True
+                if key in {'receipt', 'run_receipt', 'runReceipt', 'generationId', 'generation_id'} and content:
+                    evidence['receipt'] = True
+                # Journal spec/references describe the input, not output resources.
+                if key not in {'spec', 'references', 'request', 'arguments', 'params', 'validation'} and isinstance(content, (dict, list)):
+                    pending.append(content)
+    previous = context.get('submission_evidence')
+    if previous is not None:
+        if (not isinstance(previous, dict) or type(previous.get('version')) is not int
+                or previous['version'] != 1 or set(previous) != set(evidence)
+                or any(type(previous.get(key)) is not bool for key in _SUBMISSION_EVIDENCE_FLAGS)):
+            evidence['receipt'] = True
+        else:
+            for key in _SUBMISSION_EVIDENCE_FLAGS:
+                evidence[key] = evidence[key] or previous[key]
+    context['submission_evidence'] = evidence
+    if any(evidence[key] for key in _SUBMISSION_EVIDENCE_FLAGS):
+        # Preserve the old diagnostic marker for stored/debug compatibility.
+        context['submission_receipt_evidence'] = True
 
 
 def preparation_service_unavailable(exc: CanvasCLIError) -> bool:
@@ -849,8 +915,7 @@ class CanvasClient:
                 result = self._call(["node", "run", "--project-id", context["project_id"],
                                      "--node-id", context["node_id"], "--submit-id", context["submit_id"],
                                      "--credit-token", token], timeout=budget, deadline=deadline)
-                if _has_accepted({'data': result}):
-                    context['submission_receipt_evidence'] = True
+                _remember_submission_evidence(context, {'data': result})
                 items = result.get("items")
                 if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
                     raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas acceptance result is incomplete", outcome_unknown=True)
@@ -876,13 +941,7 @@ class CanvasClient:
             # already changed the caller's in-memory phase before failing.
             if not dispatched:
                 exc.outcome_unknown = False
-            # Preserve only a veto bit before diagnostic redaction discards an
-            # ambiguous/partial receipt. No raw envelope or resource ID is added.
-            source = exc.details.get('error') or {}
-            if (_has_accepted(exc.details) or exc.details.get('partialData')
-                    or isinstance(source, dict) and any(source.get(key)
-                        for key in ('resources', 'submission', 'items', 'accepted'))):
-                context['submission_receipt_evidence'] = True
+            _remember_submission_evidence(context, exc.details)
             diagnostic = safe_cli_diagnostic(exc, secrets=(token,) if isinstance(token, str) else ())
             diagnostic.update({"dispatch_started": dispatched, "phase": context.get("submission_phase", "confirming")})
             context["submit_error"] = diagnostic

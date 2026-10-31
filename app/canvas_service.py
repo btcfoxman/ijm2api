@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 from .canvas_cli import TRANSPORT_DIAGNOSTIC_COMMANDS, CanvasCLIError, sanitize
 from .canvas_client import (CanvasClient, identity_network_error, preparation_retryable_failure,
-                            public_image_source_url)
+                            public_image_source_url, submission_evidence_blocks_fallback)
 from .canvas_timing import PreparationTiming, archived_attempts, INITIAL_ADMISSION_UNSET
 from .canvas_quote_hints import new_hint
 from .account_policy import credit_rejected
@@ -180,7 +180,7 @@ class CanvasServiceMixin:
         if not isinstance(normalized_context, dict):
             return {}
         for value in (context, normalized_context):
-            if (value.get('accepted') or value.get('submission_receipt_evidence')
+            if (value.get('accepted') or submission_evidence_blocks_fallback(value)
                     or value.get('resource_ids') or value.get('resourceIds')
                     or isinstance(value.get('resources'), list) and bool(value['resources'])
                     or value.get('phase') in {'accepted', 'submitted', 'running', 'succeeded', 'completed'}

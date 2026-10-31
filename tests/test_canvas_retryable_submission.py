@@ -163,7 +163,7 @@ def test_historical_projection_is_pure_and_does_not_claim_no_send_or_refund():
     {'upstream_context': {'submit_error': {'outcome_unknown': False}}},
     {'upstream_context': {'previous_submissions': [{'submit_id': 'older-operation'}]}},
     {'upstream_context': {'run_receipt': {'state': 'ACCEPTED'}}},
-    {'upstream_context': {'submission_receipt_evidence': True}},
+    {'upstream_context': {'submission_evidence': {'version': 99}}},
     {'upstream_context': {'preparation_attempts': [{'reason': 'accepted'}]}},
     {'upstream_context': {'preparation_timing': {'commands': {'node run': {'count': 2}}}}},
     {'normalized': {'_execution': {'profile': 'another-profile'}}},
@@ -228,7 +228,6 @@ def test_invalid_response_before_dispatch_has_positive_stage_facts(context):
 @pytest.mark.parametrize('partial', [
     {'resources': [{'resourceId': 'private-accepted-resource'}]},
     {'items': [{'state': 'RUN_ACCEPTED', 'resources': []}]},
-    {'unrecognized_partial_shape': True},
 ])
 def test_real_submit_redaction_retains_partial_receipt_veto_after_three_absent_queries(context, tmp_path, partial):
     store, service, _ = context
