@@ -167,7 +167,7 @@ Promise.resolve(vm.runInNewContext(payload.source,context)).then(result=>process
                 automation.ensure_ready()
         self.assertEqual(caught.exception.status, 'setup_required')
         self.assertTrue(all(call.args == () for call in action.call_args_list))
-        self.assertEqual(clock[0], 30)
+        self.assertEqual(clock[0], automation.timeout)
         browser.post.assert_called_once_with('/mweb/v1/get_settings', {})
 
     def test_watermark_ui_only_opens_known_settings_toggles_and_saves(self):
@@ -214,28 +214,32 @@ Promise.resolve(vm.runInNewContext(payload.source,context)).then(result=>process
         self.assertEqual(actions, ['open_avatar', 'open_setting', 'toggle', 'save'])
         self.assertGreaterEqual(clock[0], 4)
 
-    def test_watermark_rechecks_avatar_after_first_profile_navigation_then_completes_once(self):
-        # Real account56: first opened click left stage=avatar on Personal;
-        # a fresh second normal click exposed menu -> modal -> saved readback.
-        for opens_needed in (2, 3):
-            with self.subTest(opens_needed=opens_needed):
+    def test_watermark_waits_for_real_submenu_after_35_seconds_without_clicking_profile_placeholder(self):
+        # The paired success had a hidden panel/card/Remove watermarks subtree;
+        # the profile placeholder alone did not establish menu readiness.
+        for initially_rejected_target in (False, True):
+            with self.subTest(initially_rejected_target=initially_rejected_target):
                 browser = browser_with_settings(READY)
-                automation = AccountAutomation(ACCOUNT, browser=browser)
+                automation = AccountAutomation(ACCOUNT, {'auto_login_timeout_seconds': 60}, browser=browser)
                 clock, dispatches, actions = [0.0], [], []
-                state = {'stage': 'avatar', 'checked': False, 'saved': False, 'target_changed': True}
+                state = {'stage': 'avatar_loading', 'checked': False, 'saved': False,
+                         'target_changed': initially_rejected_target}
 
                 def action(command='view'):
                     if command == 'view':
+                        if clock[0] >= 35 and state['stage'] == 'avatar_loading':
+                            state['stage'] = 'avatar'
                         return state.copy()
+                    if command == 'warm_avatar':
+                        actions.append(command)
+                        return {'stage': 'warmed'}
                     if command == 'open_avatar':
-                        # A rejected fresh hit test sends no mouse events and
-                        # must not consume one of the three actual clicks.
+                        self.assertGreaterEqual(clock[0], 35)
                         if state['target_changed']:
                             state['target_changed'] = False
                             return {'stage': 'waiting'}
                         dispatches.append(clock[0])
-                        if len(dispatches) == opens_needed:
-                            state['stage'] = 'menu'
+                        state['stage'] = 'menu'
                         return {'stage': 'opened'}
                     actions.append(command)
                     if command == 'open_setting':
@@ -251,31 +255,28 @@ Promise.resolve(vm.runInNewContext(payload.source,context)).then(result=>process
                      patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]), \
                      patch('app.account_automation.time.sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
                     automation._enable_watermark()
-                self.assertEqual(len(dispatches), opens_needed)
-                self.assertTrue(all(right-left >= 1 for left, right in zip(dispatches, dispatches[1:])))
-                self.assertEqual(actions, ['open_setting', 'toggle', 'save'])
-                self.assertLess(clock[0], 30)
+                self.assertEqual(len(dispatches), 1)
+                self.assertEqual(actions, ['warm_avatar', 'open_setting', 'toggle', 'save'])
+                self.assertGreater(clock[0], 35)
+                self.assertLess(clock[0], automation.timeout)
                 browser.post.assert_not_called()
 
-    def test_watermark_avatar_retry_is_bounded_and_never_replays_other_actions_or_blocked_ui(self):
-        for after_first, expected_clicks, expected_actions in (
-                ('avatar', 3, []), ('blocked', 1, []), ('menu_then_avatar', 1, ['open_setting'])):
-            with self.subTest(after_first=after_first):
+    def test_watermark_semantic_wait_and_real_interaction_have_separate_bounded_deadlines(self):
+        for ready_at, total_budget, expected_deadline, expected_actions in (
+                (None, 40, 40, ['warm_avatar']),
+                (0, 80, 30, ['open_avatar']),
+                (35, 80, 65.1, ['warm_avatar', 'open_avatar']),
+                (35, 40, 40, ['warm_avatar', 'open_avatar'])):
+            with self.subTest(ready_at=ready_at, total_budget=total_budget):
                 browser = browser_with_settings(READY)
-                automation = AccountAutomation(ACCOUNT, browser=browser)
-                clock, dispatches, actions = [0.0], [], []
-                state = {'stage': 'avatar'}
+                automation = AccountAutomation(ACCOUNT, {'auto_login_timeout_seconds': total_budget}, browser=browser)
+                clock, actions = [0.0], []
 
                 def action(command='view'):
                     if command == 'view':
-                        return state.copy()
-                    if command == 'open_avatar':
-                        dispatches.append(clock[0])
-                        state['stage'] = 'menu' if after_first == 'menu_then_avatar' else after_first
-                    else:
-                        actions.append(command)
-                        state['stage'] = 'avatar'
-                    return {'stage': 'opened'}
+                        return {'stage': 'avatar' if ready_at is not None and clock[0] >= ready_at else 'avatar_loading'}
+                    actions.append(command)
+                    return {'stage': 'warmed' if command == 'warm_avatar' else 'opened'}
 
                 with patch.object(automation, '_watermark_action', side_effect=action), \
                      patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]), \
@@ -283,11 +284,9 @@ Promise.resolve(vm.runInNewContext(payload.source,context)).then(result=>process
                     with self.assertRaises(AutomationError) as caught:
                         automation._enable_watermark()
                 self.assertEqual(caught.exception.status, 'setup_required')
-                self.assertEqual(len(dispatches), expected_clicks)
-                self.assertTrue(all(right-left >= 1 for left, right in zip(dispatches, dispatches[1:])))
                 self.assertEqual(actions, expected_actions)
-                self.assertGreaterEqual(clock[0], 30)
-                self.assertLess(clock[0], 30.31)
+                self.assertAlmostEqual(clock[0], expected_deadline, places=5)
+                self.assertLessEqual(clock[0], automation.timeout)
                 browser.post.assert_not_called()
 
     def test_watermark_saved_readback_wins_over_unknown_close_animation(self):
@@ -318,7 +317,7 @@ Promise.resolve(vm.runInNewContext(payload.source,context)).then(result=>process
             with self.assertRaises(AutomationError) as caught:
                 automation._enable_watermark()
         self.assertEqual(caught.exception.status, 'setup_required')
-        self.assertEqual(clock[0], 30)
+        self.assertEqual(clock[0], automation.timeout)
         self.assertTrue(all(call.args == () for call in action.call_args_list))
         readback.assert_not_called()
 
@@ -902,6 +901,9 @@ let clicks=[];
 const make=name=>({checkVisibility:()=>true,getBoundingClientRect:()=>({width:40,height:40,left:10,right:50,top:10,bottom:50}),
  click(){clicks.push(name);},contains(e){return e===this;},querySelectorAll:()=>[],innerText:'',textContent:''});
 const inner=make('menu-inner'),outer=make('profile-outer');
+inner.className='avatar-container-legacy';
+const entry={innerText:'Remove watermarks'},card={querySelectorAll:()=>[entry]},panel={querySelectorAll:()=>[card]};
+inner.querySelectorAll=s=>s==='[class*="panel-slot-"]'?[panel]:[];
 const exact='[class*="top-actions-logged-in-"] [class*="avatar-action-shell-"] [class*="avatar-container-"]';
 const doc={elementFromPoint:()=>inner,querySelectorAll(s){
  if(s===exact)return cfg.missing?[]:cfg.duplicate?[inner,inner]:[inner];
@@ -930,22 +932,31 @@ const result=vm.runInNewContext(payload.source,context);process.stdout.write(JSO
 const vm=require('vm'),payload=JSON.parse(require('fs').readFileSync(0,'utf8')),cfg=payload.config;
 let clicks=[],nodes=[],queries=[];
 function make(id,cls,parent=null){const e={id,className:cls,parentElement:parent,innerText:'',textContent:'',
- checkVisibility:()=>!(cfg.hidden&&id==='menu-inner'),
+ checkVisibility(){if(['panel','card','remove'].includes(id))return false;
+  let p=this;while(p){if(cfg.hidden&&p.id==='menu-inner')return false;p=p.parentElement;}return true;},
  getBoundingClientRect:()=>({width:40,height:40,left:10,right:50,top:10,bottom:50}),
  click(){clicks.push(id);},contains(other){while(other){if(other===this)return true;other=other.parentElement;}return false;},
- querySelectorAll:()=>[]};nodes.push(e);return e;}
+ querySelectorAll(s){return nodes.filter(n=>n!==this&&this.contains(n)&&matches(n,s));}};nodes.push(e);return e;}
 const top=make('logged-top',cfg.foreign?'top-actions-logged-out-X':'top-actions-BtxNrX top-actions-logged-in-S1DSeN');
 const credit=make('credits','credit-action-surEHb',top),shell=make('profile-shell','avatar-action-shell-eadixq',credit);
 if(!cfg.missing){
  const inner=make('menu-inner',cfg.legacy?'avatar-container-legacy':'avatar-action-t6xclo',shell);
- if(cfg.nestedLegacy)make('legacy-inner','avatar-container-legacy',inner);
+ const container=cfg.legacy?inner:make('legacy-inner',cfg.placeholder?'avatar-container-kHdhqx':'avatar-container-Jp7eDT',inner);
+ if(!cfg.placeholder&&!cfg.noPanel){
+  const panel=make('panel','panel-slot-_2sECV',container);
+  if(!cfg.noCard){const card=make('card','panel-card-DRAyGt',panel);
+   const entry=make('remove','menu-entry',card);entry.innerText=entry.textContent=cfg.wrongLabel?'Profile':'Remove watermarks';entry.control=true;
+   if(cfg.duplicateEntry){const extra=make('remove','menu-entry',card);extra.innerText=extra.textContent='Remove watermarks';extra.control=true;}
+  }
+ }
  if(cfg.duplicate)make('menu-duplicate','avatar-action-t6xclo',shell);
 }
 const unrelated=make('unrelated-avatar','avatar-action-unrelated');
 const modal=make('unknown-or-paid','lv-modal-wrapper');
 let hitId=null;
 function has(e,part){const m=/^\[class\*="([^"]+)"\]$/.exec(part);return !!(e&&m&&e.className.includes(m[1]));}
-function matches(e,selector){const parts=selector.split(/\s+/),last=parts.pop();if(!has(e,last))return false;
+function matches(e,selector){if(selector==='button,[role=button],[role=menuitem]')return e.control===true;
+ const parts=selector.split(/\s+/),last=parts.pop();if(!has(e,last))return false;
  let cursor=e;
  while(parts.length){const part=parts.pop();
   if(part==='>'){cursor=cursor.parentElement;if(!has(cursor,parts.pop()))return false;}
@@ -965,18 +976,27 @@ const result=vm.runInNewContext(payload.source,context);process.stdout.write(JSO
         cases = [({}, 'menu-inner'), ({'legacy': True}, 'menu-inner'),
                  ({'nestedLegacy': True}, 'menu-inner'), ({'missing': True}, None),
                  ({'duplicate': True}, None), ({'hidden': True}, None),
-                 ({'foreign': True}, None), ({'modal': True}, None), ({'covered': True}, None)]
+                 ({'foreign': True}, None), ({'modal': True}, None), ({'covered': True}, None),
+                 ({'placeholder': True}, None), ({'noPanel': True}, None), ({'noCard': True}, None),
+                 ({'wrongLabel': True}, None), ({'duplicateEntry': True}, None),
+                 ({'placeholder': True, 'warm': True}, 'menu-inner'),
+                 ({'placeholder': True, 'warm': True, 'covered': True}, None)]
         for config, target in cases:
             with self.subTest(config=config):
                 completed = subprocess.run(['node', '-e', program],
-                    input=json.dumps({'config': config, 'source': _WATERMARK.replace('__ACTION__', json.dumps('open_avatar'))}),
+                    input=json.dumps({'config': config, 'source': _WATERMARK.replace('__ACTION__', json.dumps('warm_avatar' if config.get('warm') else 'open_avatar'))}),
                     text=True, capture_output=True, check=False)
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 result = json.loads(completed.stdout)
-                self.assertEqual(result['result']['stage'], 'blocked' if config.get('modal') else 'avatar_target' if target else 'waiting')
+                loading = not config.get('warm') and any(config.get(key) for key in ('placeholder', 'noPanel', 'noCard', 'wrongLabel', 'duplicateEntry'))
+                self.assertEqual(result['result']['stage'], 'blocked' if config.get('modal') else
+                                 'avatar_loading' if loading else ('avatar_warmup_target' if config.get('warm') else 'avatar_target') if target else 'waiting')
                 self.assertEqual(result['clicks'], [])
                 if target:
-                    self.assertEqual(result['result'], {'stage': 'avatar_target', 'x': 30, 'y': 30})
+                    self.assertEqual(result['result'], {'stage': 'avatar_warmup_target' if config.get('warm') else 'avatar_target', 'x': 30, 'y': 30})
+                if loading:
+                    self.assertNotIn('x', result['result'])
+                    self.assertNotIn('y', result['result'])
                 if config.get('nestedLegacy') or config.get('duplicate'):
                     self.assertFalse(any('avatar-container-' in query for query in result['queries']))
 
@@ -998,6 +1018,16 @@ const result=vm.runInNewContext(payload.source,context);process.stdout.write(JSO
                 browser.evaluate.return_value = {'stage': 'avatar_target', 'x': value, 'y': 40}
                 self.assertEqual(automation._watermark_action('open_avatar'), {'stage': 'waiting'})
                 browser.command.assert_called_once_with('Page.bringToFront')
+        browser.command.reset_mock()
+        browser.evaluate.return_value = {'stage': 'avatar_warmup_target', 'x': 30, 'y': 40}
+        self.assertEqual(automation._watermark_action('warm_avatar'), {'stage': 'warmed'})
+        self.assertEqual(browser.command.call_count, 2)
+        self.assertEqual(browser.command.call_args.args[1],
+                         {'type': 'mouseMoved', 'x': 30, 'y': 40, 'button': 'none', 'buttons': 0})
+        browser.command.reset_mock()
+        browser.evaluate.return_value = {'stage': 'avatar_loading'}
+        self.assertEqual(automation._watermark_action('open_avatar'), {'stage': 'avatar_loading'})
+        browser.command.assert_called_once_with('Page.bringToFront')
         browser.command.reset_mock()
         browser.evaluate.return_value = {'stage': 'blocked'}
         self.assertEqual(automation._watermark_action('open_avatar'), {'stage': 'blocked'})

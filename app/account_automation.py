@@ -236,15 +236,28 @@ _WATERMARK = r"""(() => {
  if(entries.length===1){if(action==='open_setting'){entries[0].click();return {stage:'opened'};}return {stage:'menu'};}
  let avatars=[...document.querySelectorAll('[class*="top-actions-logged-in-"] [class*="avatar-action-shell-"] > [class*="avatar-action-"]')]
    .filter(visible);
+ const modern=avatars.length>0;
  if(!avatars.length)avatars=[...document.querySelectorAll('[class*="top-actions-logged-in-"] [class*="avatar-action-shell-"] [class*="avatar-container-"]')]
    .filter(visible);
  if(avatars.length===1){
-   if(action!=='open_avatar')return {stage:'avatar'};
-   const target=avatars[0],r=target.getBoundingClientRect();
+   const target=avatars[0];
+   const containers=String(target.className||'').includes('avatar-container-')?[target]:
+     [...target.querySelectorAll('[class*="avatar-container-"]')].filter(visible);
+   const panels=containers.length===1?[...containers[0].querySelectorAll('[class*="panel-slot-"]')]:[];
+   const cards=panels.length===1?[...panels[0].querySelectorAll('[class*="panel-card-"]')]:[];
+   const remove=cards.length===1?[...cards[0].querySelectorAll('button,[role=button],[role=menuitem]')]
+     .filter(e=>text(e)==='Remove watermarks'):[];
+   const ready=remove.length===1;
+   // A visible profile shortcut is not evidence that its dropdown has mounted.
+   // The real menu may still be hidden until the first normal pointer click.
+   if(!ready&&!(action==='warm_avatar'&&modern))return {stage:'avatar_loading'};
+   if(action!=='open_avatar'&&action!=='warm_avatar')return {stage:'avatar'};
+   if(action==='warm_avatar'&&!modern)return {stage:'avatar'};
+   const r=target.getBoundingClientRect();
    const x=(Math.max(0,r.left)+Math.min(innerWidth,r.right))/2,y=(Math.max(0,r.top)+Math.min(innerHeight,r.bottom))/2;
    const hit=document.elementFromPoint(x,y);
    if(!hit||!(hit===target||target.contains(hit)))return {stage:'waiting'};
-   return {stage:'avatar_target',x,y};
+   return {stage:action==='warm_avatar'?'avatar_warmup_target':'avatar_target',x,y};
  }
  return {stage:'waiting'};
 })()"""
@@ -375,18 +388,21 @@ class AccountAutomation:
         raise AutomationError('setup_required', 'Dreamina optional offer could not be closed')
 
     def _watermark_action(self, action: str = 'view') -> dict[str, Any]:
-        if action not in {'view', 'open_avatar', 'open_setting', 'toggle', 'save'}:
+        if action not in {'view', 'warm_avatar', 'open_avatar', 'open_setting', 'toggle', 'save'}:
             raise ValueError('unsupported watermark UI action')
         with _UI_LOCK:
             self.browser.command('Page.bringToFront')
             value = self.browser.evaluate(_WATERMARK.replace('__ACTION__', json.dumps(action)))
-            if action == 'open_avatar' and isinstance(value, dict) and value.get('stage') == 'avatar_target':
+            target_stage = {'open_avatar': 'avatar_target', 'warm_avatar': 'avatar_warmup_target'}.get(action)
+            if target_stage and isinstance(value, dict) and value.get('stage') == target_stage:
                 coordinates = {key: value.get(key) for key in ('x', 'y')}
                 if not all(isinstance(coordinate, (int, float)) and not isinstance(coordinate, bool)
                            and math.isfinite(coordinate) and coordinate >= 0 for coordinate in coordinates.values()):
                     return {'stage': 'waiting'}
                 self.browser.command('Input.dispatchMouseEvent', {'type': 'mouseMoved', **coordinates,
                                                                  'button': 'none', 'buttons': 0})
+                if action == 'warm_avatar':
+                    return {'stage': 'warmed'}
                 try:
                     self.browser.command('Input.dispatchMouseEvent', {'type': 'mousePressed', **coordinates,
                                                                      'button': 'left', 'buttons': 1, 'clickCount': 1})
@@ -397,19 +413,22 @@ class AccountAutomation:
         return value if isinstance(value, dict) else {'stage': 'unknown'}
 
     def _enable_watermark(self) -> None:
-        deadline = time.monotonic() + min(30, self.timeout)
+        deadline = time.monotonic() + self.timeout
+        interaction_deadline: float | None = None
         actions: set[str] = set()
-        avatar_dispatches = 0
-        next_avatar_at = 0.0
-        while time.monotonic() < deadline:
+        while time.monotonic() < min(deadline, interaction_deadline or deadline):
             current = self._watermark_action()
             stage = current.get('stage')
+            if stage in {'avatar', 'menu', 'modal'} and interaction_deadline is None:
+                interaction_deadline = min(deadline, time.monotonic() + 30)
             view = self.browser.evaluate(_VIEW)
             observed = view.get('stage') if isinstance(view, dict) else 'unknown'
             if observed == 'challenge':
                 raise AutomationError('challenge_required', 'Dreamina login requires a human security challenge')
             if observed == 'verification':
                 raise AutomationError('verification_required', 'Dreamina login requires email or security verification')
+            if time.monotonic() >= min(deadline, interaction_deadline or deadline):
+                break
             if stage in {'blocked', 'unknown'}:
                 if 'save' in actions and self._settings().get('close_watermark') is True:
                     return
@@ -418,19 +437,17 @@ class AccountAutomation:
                 # Opening/saving the known settings dialog can leave a
                 # temporary wrapper before its controls mount or disappear.
                 # Wait only; never click unknown, subscription, or paid UI.
-                time.sleep(.3)
+                time.sleep(min(.3, max(0, min(deadline, interaction_deadline or deadline) - time.monotonic())))
                 continue
             if 'save' in actions and self._settings().get('close_watermark') is True:
                 return
-            if (stage == 'avatar' and avatar_dispatches < 3 and time.monotonic() >= next_avatar_at
-                    and not actions.intersection({'open_setting', 'toggle', 'save'})):
-                # A first normal header click can navigate to Profile before
-                # its menu is initialized. Retry only this harmless navigation;
-                # each call rechecks the visible target, hit test and modal guard.
+            if stage == 'avatar_loading' and 'warm_avatar' not in actions:
+                if self._watermark_action('warm_avatar').get('stage') == 'warmed':
+                    actions.add('warm_avatar')
+            elif stage == 'avatar' and 'open_avatar' not in actions:
                 opened = self._watermark_action('open_avatar')
                 if opened.get('stage') == 'opened':
-                    avatar_dispatches += 1
-                    next_avatar_at = time.monotonic() + 1.0
+                    actions.add('open_avatar')
             elif stage == 'menu' and 'open_setting' not in actions:
                 self._watermark_action('open_setting')
                 actions.add('open_setting')
@@ -443,7 +460,7 @@ class AccountAutomation:
                     actions.add('save')
             if 'save' in actions and self._settings().get('close_watermark') is True:
                 return
-            time.sleep(.3)
+            time.sleep(min(.3, max(0, min(deadline, interaction_deadline or deadline) - time.monotonic())))
         raise AutomationError('setup_required', 'Dreamina watermark preference was not confirmed')
 
     def _view(self) -> dict[str, Any]:
