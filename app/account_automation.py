@@ -78,7 +78,8 @@ _PROMOTION = r"""const promotion=()=>{
  const root=roots[0],body=text(root);
  if(!body.includes('Save up to 50% on plans to unlock Seedance.')||
    !body.includes('Seedance 2.5 at 720p from A$0.12/sec.')||
-   !body.includes('Upgrade for up to 500 free Seedance 2.5 videos + 6,000 free GPT Image 2.5'))return null;
+   !(body.includes('Upgrade for up to 500 free Seedance 2.5 videos + 6,000 free GPT Image 2.5')||
+     body.includes('Upgrade for up to 500 Seedance 2.5 + 6,000 GPT Image 2.5 free generations.')))return null;
  const panels=[...root.querySelectorAll('.lv-modal.lv-modal-simple.lv-modal-closable')].filter(visible);
  const buttons=[...root.querySelectorAll('button')].filter(visible);
  const close=[...root.querySelectorAll('.lv-modal-close-icon')].filter(visible)

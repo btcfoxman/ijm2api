@@ -920,7 +920,10 @@ const context={document,innerHeight:960,innerWidth:1280,getComputedStyle:()=>({d
 const view=vm.runInNewContext(payload.view,context),action=vm.runInNewContext(payload.action,context);
 process.stdout.write(JSON.stringify({view,action,clicks}));
 '''
-        variants = [({}, True), ({'body': 'Upgrade now. Get offer'}, False), ({'otherClass': True}, False),
+        variants = [({}, True), ({'body': 'Save up to 50% on plans to unlock Seedance. '
+            'Seedance 2.5 at 720p from A$0.12/sec. Upgrade for up to 500 Seedance 2.5 + '
+            '6,000 GPT Image 2.5 free generations. Get offer'}, True),
+                    ({'body': 'Upgrade now. Get offer'}, False), ({'otherClass': True}, False),
                     ({'extraDialog': True}, False), ({'extraButton': True}, False), ({'badClose': True}, False),
                     ({'duplicateClose': True}, False), ({'input': True}, False), ({'badPanel': True}, False)]
         for config, allowed in variants:
