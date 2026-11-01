@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 import threading
 import time
@@ -66,7 +67,15 @@ def accepted_canvas_result(task: dict[str, Any], *, allow_closed: bool = False) 
     context = task.get('upstream_context') or {}
     if not isinstance(context, dict) or task.get('execution_backend') != 'canvas_cli':
         return False
-    if ('manual_termination' in context or context.get('submit_error')
+    binding = context.get('output_binding')
+    recovered = (isinstance(binding, dict) and binding.get('durable') is True
+        and type(binding.get('version')) is int and binding['version'] == 1
+        and binding.get('source') == 'operation_status'
+        and binding.get('operation_ref') == context.get('submit_id')
+        and all(binding.get(key) == context.get(key) for key in (
+            'account_id', 'task_id', 'profile', 'project_id', 'node_id', 'submit_id',
+            'expected_user_id', 'kind', 'resource_ids')))
+    if ('manual_termination' in context or context.get('submit_error') and not recovered
             or context.get('previous_submissions') or task.get('result_urls')
             or task.get('upstream_result_urls') or task.get('run_id') or task.get('thread_id')
             or type(task.get('account_id')) is not int or task['account_id'] < 1
@@ -731,6 +740,96 @@ class Store:
             db.execute("UPDATE tasks SET " + ",".join(f"{key}=?" for key in data) + " WHERE id=?",
                        (*data.values(), task_id))
         return self.task(task_id) or {}
+
+    def claim_canvas_preparation_budget(self, task_id: str, budget: dict[str, Any], *,
+                                        expected_updated_at: float, expected_token: str | None,
+                                        account_id: int, expected_context: dict[str, Any]) -> bool:
+        from .canvas_retry_budget import budget_token
+        with self._lock, self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if row is None:
+                return False
+            task = self._task(row)
+            context = task['upstream_context']
+            old = context.get('preparation_retry_budget')
+            actual_token = budget_token(old, task_id=task_id) if old is not None else None
+            if (task['updated_at'] != expected_updated_at or actual_token != expected_token
+                    or context != expected_context
+                    or task.get('account_id') != account_id or 'manual_termination' in context
+                    or task['status'] not in {'queued', 'preparing'}):
+                return False
+            context['preparation_retry_budget'] = budget
+            db.execute('UPDATE tasks SET upstream_context_json=?,updated_at=? WHERE id=?',
+                (_upstream_context(context), time.time(), task_id))
+        return True
+
+    def bind_canvas_outputs(self, task_id: str, binding: dict[str, Any], *,
+                            expected_updated_at: float,
+                            expected_account: dict[str, Any]) -> bool:
+        """Commit an original-operation output receipt with task/account CAS.
+
+        The account check shares the write transaction with the task check:
+        another connection cannot rotate its identity between those checks.
+        This receipt is generation evidence, never financial settlement.
+        """
+        fields = ('account_id', 'task_id', 'profile', 'project_id', 'node_id',
+                  'submit_id', 'expected_user_id', 'kind')
+        ids = binding.get('resource_ids') if isinstance(binding, dict) else None
+        if (not isinstance(binding, dict) or type(binding.get('version')) is not int
+                or binding['version'] != 1 or binding.get('source') != 'operation_status'
+                or binding.get('operation_ref') != binding.get('submit_id')
+                or binding.get('task_id') != task_id or type(binding.get('account_id')) is not int
+                or binding.get('kind') not in {'image', 'video'}
+                or any(not isinstance(binding.get(key), str) or not binding[key].strip()
+                       for key in fields if key != 'account_id')
+                or not isinstance(ids, list) or not ids
+                or any(not isinstance(value, str) or re.fullmatch(r'[a-f0-9-]{36}', value) is None
+                       for value in ids) or len(set(ids)) != len(ids)):
+            return False
+        account_fields = ('login_user_id', 'cli_user_id', 'execution_mode', 'project_id')
+        with self._lock, self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if row is None:
+                return False
+            task = self._task(row)
+            context = task['upstream_context']
+            account = db.execute('SELECT * FROM accounts WHERE id=?', (binding['account_id'],)).fetchone()
+            if (account is None or task['updated_at'] != expected_updated_at
+                    or task.get('execution_backend') != 'canvas_cli'
+                    or 'manual_termination' in context
+                    or task['status'] in {'failed', 'expired', 'succeeded', 'cancelled'}
+                       and task.get('error_code') != 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'
+                    or task.get('account_id') != binding['account_id']
+                    or any(account[key] != expected_account.get(key) for key in account_fields)
+                    or str(account['login_user_id'] or account['cli_user_id'] or '') != binding['expected_user_id']
+                    or any(str(account[key] or '') not in {'', binding['expected_user_id']}
+                           for key in ('login_user_id', 'cli_user_id'))
+                    or any(context.get(key) != binding.get(key) for key in fields)
+                    or (task.get('normalized') or {}).get('kind', 'video') != binding['kind']
+                    or type(context.get('output_count', 1)) is not int
+                    or len(ids) != context.get('output_count', 1)
+                    or context.get('resource_ids') and context['resource_ids'] != ids
+                    or (context.get('submission_evidence') or {}).get('identity_conflict')):
+                return False
+            context.update(resource_ids=list(ids), output_binding={**binding, 'durable': True},
+                           phase='accepted', submission_phase='accepted', reconciliation_paused=False)
+            evidence = {'version': 1, 'accepted': False, 'output_resources': False,
+                'receipt': False, 'identity_conflict': False, 'ambiguous_partial': False,
+                **dict(context.get('submission_evidence') or {})}
+            evidence.update(version=1, accepted=True, output_resources=True, receipt=True)
+            context['submission_evidence'] = evidence
+            recovery = context.get('missing_resource_recovery')
+            if isinstance(recovery, dict):
+                context['missing_resource_recovery'] = {**recovery, 'active': False,
+                    'resolved_at': time.time(), 'resolution': 'verified_output_binding'}
+            for key in ('last_query_error', 'reconciliation_pause_reason', 'reconciliation_paused_at'):
+                context.pop(key, None)
+            db.execute("""UPDATE tasks SET status='running',completed_at=NULL,error_code='',error_message='',
+                progress=MAX(45,MIN(95,progress)),upstream_context_json=?,updated_at=? WHERE id=?""",
+                (_upstream_context(context), time.time(), task_id))
+        return True
 
     def active_count(self) -> int:
         with self._connect() as db:

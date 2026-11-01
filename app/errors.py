@@ -7,6 +7,7 @@ import re
 
 CONTENT_MODERATION_MESSAGE = "检测到内容可能违规，请修改提示词或参考素材后重试~"
 RETRYABLE_SUBMISSION_MESSAGE = "生成提交失败，请稍后重试~"
+BOUNDED_RETRY_FAILURE_MESSAGE = "视频生成提交失败，请稍后重试~"
 
 
 def upstream_review_error(code: str, message: str) -> str | None:
@@ -23,6 +24,8 @@ def upstream_review_error(code: str, message: str) -> str | None:
 def public_error(code: str, message: str) -> dict[str, str]:
     raw = (message or "").lower()
     kind = (code or "").upper()
+    if kind in {'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED', 'CLI_PREPARATION_RETRY_EXHAUSTED'}:
+        return {'code': kind, 'message': BOUNDED_RETRY_FAILURE_MESSAGE}
     if kind in {'CLI_PREPARATION_TRANSIENT_FAILED', 'CLI_SUBMISSION_RETRYABLE'}:
         # Call-stage classification is authoritative. Raw diagnostics can quote
         # arbitrary upstream prose and must not fabricate a policy/refund verdict.

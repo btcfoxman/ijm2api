@@ -1172,26 +1172,33 @@ class CanvasClient:
 
     def poll(self, context: dict[str, Any], *, deadline: float | None = None,
              persist_download: Callable[[dict[str, Any]], Any] | None = None,
+              persist_output_binding: Callable[[dict[str, Any]], Any] | None = None,
              on_phase: Callable[[str], Any] | None = None) -> dict[str, Any]:
         with self.runner.account_guard(self.account, deadline=deadline):
             self._check_context(context, deadline=deadline)
-            return self._poll(context, deadline=deadline, persist_download=persist_download, on_phase=on_phase)
+            return self._poll(context, deadline=deadline, persist_download=persist_download,
+                              persist_output_binding=persist_output_binding, on_phase=on_phase)
 
     def _poll(self, context: dict[str, Any], *, deadline: float | None = None,
               persist_download: Callable[[dict[str, Any]], Any] | None = None,
+               persist_output_binding: Callable[[dict[str, Any]], Any] | None = None,
               on_phase: Callable[[str], Any] | None = None) -> dict[str, Any]:
         def phase(name: str) -> None:
             self._remaining(deadline)
             if on_phase is not None and on_phase(name) is False:
                 raise CanvasCLIError("CLI_STOPPING", "Canvas result observation was stopped before delivery")
         phase("querying")
+        query_deadline = min(deadline, time.monotonic() + 15) if deadline is not None and not context.get('resource_ids') else deadline
         data = self._call(["operation", "status", context["submit_id"],
-                           "--project-id", context["project_id"]], read_only=True, deadline=deadline)
+                           "--project-id", context["project_id"]], read_only=True, deadline=query_deadline)
         reference = data.get("operationRef")
         if not isinstance(reference, str) or not reference.strip():
             raise CanvasCLIError("CLI_INVALID_RESPONSE", "Canvas operation response omitted its submission identity", outcome_unknown=True)
         if reference != context["submit_id"]:
-            raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas returned another submission identity", outcome_unknown=True)
+            raise CanvasCLIError("CLI_RESOURCE_MISMATCH", "Canvas returned another submission identity", outcome_unknown=True)
+        for key, expected_key in (("projectId", "project_id"), ("nodeId", "node_id"), ("submitId", "submit_id")):
+            if data.get(key) not in (None, "", context.get(expected_key)):
+                raise CanvasCLIError("CLI_RESOURCE_MISMATCH", "Canvas operation changed its original binding", outcome_unknown=True)
         raw_state = data.get("state")
         state = raw_state.strip().lower() if isinstance(raw_state, str) else ""
         if state not in {"pending", "queued", "accepted", "running", "in_progress", "processing",
@@ -1215,11 +1222,12 @@ class CanvasClient:
         if (not isinstance(expected, list) or any(not isinstance(value, str) or not value.strip() for value in expected)
                 or len(set(expected)) != len(expected)
                 or expected and not set(resource_ids).issubset(expected)):
-            raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas operation resources do not match the original receipt", outcome_unknown=True)
-        submission = data.get("submission") if isinstance(data.get("submission"), dict) else {}
+            raise CanvasCLIError("CLI_RESOURCE_MISMATCH", "Canvas operation resources do not match the original receipt", outcome_unknown=True)
         result: dict[str, Any] = {"status": "running", "progress": 45, "result_urls": [],
                                   "result_paths": [], "result_files": [], "credit_facts": [],
-                                  "error_code": "", "error_message": ""}
+                                   "error_code": "", "error_message": "", "operation_state": state,
+                                   "output_resources_missing": not resources,
+                                   "resource_recovery_required": not resources and state in {"completed", "success", "succeeded"}}
         if state in {"absent", "unknown"}:
             result.update(status="unknown", error_code="UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
                           error_message="Canvas submission could not be resolved; automatic resubmission is disabled")
@@ -1231,15 +1239,13 @@ class CanvasClient:
             return result
         terminal = state in {"completed", "success", "succeeded"}
         successful = [x for x in resources if str(x.get("state") or "").lower() in {"success", "succeeded", "completed"}]
+        if terminal and (not resources or len(successful) != len(resources)):
+            result['resource_recovery_required'] = True
         if not terminal or not resources or len(successful) != len(resources):
             # operation.submission summarizes the lifecycle (e.g. completed),
             # unlike node.run's ACCEPTED/REJECTED admission receipt. Concrete
             # original-operation resources/terminal states outrank that summary.
-            summary = str(submission.get("state") or "").strip().lower().removeprefix("run_")
-            if not resources and summary in {"absent", "unknown"}:
-                result.update(status="unknown", error_code="UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
-                              error_message="Canvas submission could not be resolved; automatic resubmission is disabled")
-            else:
+            if not terminal:
                 phase("generating")
             return result
         if len(resources) != int(context.get("output_count") or 1):
@@ -1249,19 +1255,50 @@ class CanvasClient:
         if expected:
             positions = {resource_id: index for index, resource_id in enumerate(expected)}
             resources = sorted(resources, key=lambda resource: positions[resource["resourceId"]])
+        checked_resources = []
         for resource in resources:
             resource_id = str(resource.get("resourceId") or "")
-            if not resource_id:
+            if re.fullmatch(r"[a-f0-9-]{36}", resource_id) is None:
                 raise CanvasCLIError("CLI_RESULT_INVALID", "Canvas completed a task without its output resource ID")
             facts = self._call(["resource", "get", resource_id, "--project-id", context["project_id"]],
                                read_only=True, deadline=deadline)
             if facts.get("resourceId") != resource_id or facts.get("type") != context["kind"]:
-                raise CanvasCLIError("CLI_RESULT_INVALID", "Canvas returned another output resource or media type")
+                raise CanvasCLIError("CLI_RESOURCE_MISMATCH", "Canvas returned another output resource or media type")
+            for key, expected_key in (("projectId", "project_id"), ("nodeId", "node_id"), ("submitId", "submit_id")):
+                if facts.get(key) not in (None, "", context.get(expected_key)):
+                    raise CanvasCLIError("CLI_RESOURCE_MISMATCH", "Canvas output changed its original binding", outcome_unknown=True)
+            checked_resources.append((resource_id, facts))
             amount = _number(facts.get("creditsAmount"))
             if amount is not None:
                 result["credit_facts"].append({"source": "precharge", "amount": amount,
                     "field": "resource.creditsAmount", "resource_id": resource_id,
                     "submit_id": context["submit_id"], "settled": False})
+        # Publish the complete original-operation binding before the first file
+        # operation. A later download failure must not lose recovered output IDs.
+        outputs = [resource_id for resource_id, _ in checked_resources]
+        receipt = {"version": 1, "source": "operation_status", "operation_ref": reference,
+                   **{key: context.get(key) for key in ("account_id", "task_id", "profile", "project_id", "node_id",
+                                                       "submit_id", "expected_user_id", "kind")},
+                   "resource_ids": outputs}
+        if persist_output_binding is not None:
+            candidate = {**context, "resource_ids": outputs}
+            if self._download_binding(candidate, outputs[0], context["kind"]) is None:
+                raise CanvasCLIError("CLI_OUTPUT_BINDING_PERSIST_FAILED", "Canvas output has no complete original task binding", outcome_unknown=True)
+            try:
+                saved = persist_output_binding(copy.deepcopy(receipt))
+            except CanvasCLIError:
+                raise
+            except Exception as exc:
+                raise CanvasCLIError("CLI_OUTPUT_BINDING_PERSIST_FAILED", "Canvas output binding could not be durably saved", outcome_unknown=True) from exc
+            if saved is not True:
+                raise CanvasCLIError("CLI_STOPPING", "Canvas output binding changed before delivery")
+        elif persist_download is not None and not expected:
+            raise CanvasCLIError("CLI_OUTPUT_BINDING_PERSIST_FAILED", "Canvas output binding must be saved before durable download", outcome_unknown=True)
+        context["resource_ids"] = outputs
+        if persist_output_binding is not None:
+            context["output_binding"] = copy.deepcopy(receipt)
+        result["resource_ids"] = list(outputs)
+        for resource_id, facts in checked_resources:
             phase("downloading")
             download_kwargs = {"deadline": deadline}
             if persist_download is not None:

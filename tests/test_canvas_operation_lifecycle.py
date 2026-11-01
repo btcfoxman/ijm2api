@@ -66,9 +66,11 @@ def test_true_unknown_top_level_operation_stays_unknown_even_with_resources(tmp_
 
 
 @pytest.mark.parametrize('summary', ['unknown', 'absent', 'RUN_UNKNOWN'])
-def test_bare_unresolved_summary_without_resources_is_not_claimed_running(tmp_path, summary):
+def test_matching_pending_operation_outranks_unresolved_nested_summary(tmp_path, summary):
     runner, client, context, _ = operation_reply(tmp_path, state='pending', summary=summary, resources=[])
-    assert client.poll(context)['status'] == 'unknown'
+    result = client.poll(context)
+    assert result['status'] == 'running' and result['operation_state'] == 'pending'
+    assert result['resource_recovery_required'] is False
     assert len(runner.calls) == 1
 
 

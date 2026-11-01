@@ -63,6 +63,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "task_queue_capacity": 100,
     "poll_interval_seconds": 8,
     "task_timeout_seconds": 1800,
+    "canvas_missing_resource_query_attempts": 3,
+    "canvas_missing_resource_timeout_seconds": 60,
     "account_maintenance_interval_seconds": 300,
     "daily_checkin_enabled": False,
     "chrome_executable": os.getenv("IJM_CHROME_EXECUTABLE", "/usr/bin/chromium" if os.name != "nt" else "chrome.exe"),
@@ -130,6 +132,10 @@ class Service(CanvasServiceMixin):
             filtered.pop("result_s3_center_token")
         for key in ("task_workers", "task_queue_capacity", "poll_interval_seconds", "task_timeout_seconds"):
             if key in filtered and not 1 <= int(filtered[key]) <= (3600 if key != "task_queue_capacity" else 10000):
+                raise ValueError(f"invalid {key}")
+        for key, upper in (("canvas_missing_resource_query_attempts", 10),
+                           ("canvas_missing_resource_timeout_seconds", 300)):
+            if key in filtered and (type(filtered[key]) is not int or not 1 <= filtered[key] <= upper):
                 raise ValueError(f"invalid {key}")
         candidate = {**self.settings(), **filtered}
         if candidate["enable_sd_2_5_480p_x"]:
@@ -749,6 +755,18 @@ class Service(CanvasServiceMixin):
         return deadline
 
     def _admission_expired(self, task_id: str, deadline: float) -> bool:
+        budget = ((self.store.task(task_id) or {}).get('upstream_context') or {}).get('preparation_retry_budget')
+        if budget is not None:
+            from .canvas_retry_budget import budget_token, RetryBudgetError
+            try:
+                budget_token(budget, task_id=task_id)
+                expired = time.time() >= budget['deadline']
+            except RetryBudgetError:
+                expired = True
+            if expired:
+                self._fail(task_id, 'CLI_PREPARATION_RETRY_EXHAUSTED',
+                    'Canvas preparation retry deadline passed; no further generation was submitted')
+                return True
         if time.monotonic() < self._admission_deadline(task_id, deadline):
             return False
         if not self._admission_history(self.store.task(task_id) or {}):
@@ -902,11 +920,15 @@ class Service(CanvasServiceMixin):
             task = self._update_cost_estimate(self.store.task(task_id) or task)
             estimated_cost = float(task.get('estimated_cost') or 0)
             while not self._stop.is_set() and time.monotonic() < deadline:
+                if self._admission_expired(task_id, deadline):
+                    return
                 if len(attempted) >= MAX_CREDIT_ACCOUNT_ATTEMPTS:
                     self._fail(task_id, admission_code, credit_reason)
                     return
                 account = None
                 while not self._stop.is_set() and time.monotonic() < deadline:
+                    if self._admission_expired(task_id, deadline):
+                        return
                     excluded = set(attempted) | funding_excluded
                     account = self._reserve_account(estimated_cost, exclude_ids=excluded,
                                                     prefer_balance=bool(attempted), task_id=task_id)
@@ -940,11 +962,12 @@ class Service(CanvasServiceMixin):
                         result = self._execute_canvas(task_id, account, deadline, initial_admission_at=initial_admission_at)
                         if result is True:
                             return
-                        if result in {'retry', 'retry_preflight', 'skip_model'}:
+                        if result in {'retry', 'retry_preflight', 'retry_preparation', 'skip_model'}:
                             retry = self.store.task(task_id) or {}
                             attempted = list(retry.get('attempted_account_ids') or [])
                             credit_reason = retry.get('error_message') or credit_reason
-                            admission_code = retry.get('error_code') or 'INSUFFICIENT_CREDITS'
+                            admission_code = ('CLI_PREPARATION_RETRY_EXHAUSTED' if result == 'retry_preparation'
+                                              else retry.get('error_code') or 'INSUFFICIENT_CREDITS')
                             if result == 'retry':
                                 deadline = self._admission_deadline(task_id,
                                     time.monotonic() + int(self.settings()['task_timeout_seconds']))
@@ -1063,6 +1086,8 @@ class Service(CanvasServiceMixin):
             if self._admission_history(task) and task.get('error_code') else None)
         try:
             while not self._stop.is_set() and time.monotonic() < deadline:
+                if self._admission_expired(task_id, deadline):
+                    return
                 excluded = set(attempted) | funding_excluded
                 account = self._reserve_account(estimated_cost, exclude_ids=excluded,
                                                 prefer_balance=bool(attempted), task_id=task_id)
@@ -1090,11 +1115,12 @@ class Service(CanvasServiceMixin):
                         result = self._execute_canvas(task_id, account, deadline, initial_admission_at=initial_admission_at)
                         if result is True:
                             return
-                        if result in {'retry', 'retry_preflight', 'skip_model'}:
+                        if result in {'retry', 'retry_preflight', 'retry_preparation', 'skip_model'}:
                             retry = self.store.task(task_id) or {}
                             attempted = list(retry.get('attempted_account_ids') or [])
-                            preflight_failure = ((retry.get('error_code'), retry.get('error_message'))
-                                if result in {'retry_preflight', 'skip_model'} else None)
+                            preflight_failure = (('CLI_PREPARATION_RETRY_EXHAUSTED' if result == 'retry_preparation'
+                                                  else retry.get('error_code'), retry.get('error_message'))
+                                if result in {'retry_preflight', 'retry_preparation', 'skip_model'} else None)
                         elif result != 'reselect':
                             funding_excluded.add(account_id)
                         estimated_cost = float((self.store.task(task_id) or {}).get('estimated_cost') or 0)
@@ -1357,7 +1383,9 @@ class Service(CanvasServiceMixin):
         # Only a bounded, empty original-submission lookup enables route retry.
         facts = self._canvas_retryable_submission_failure(task)
         if facts:
-            return public_error('CLI_SUBMISSION_RETRYABLE', task['error_message']), facts
+            code = (task['error_code'] if task['error_code'] == 'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED'
+                    else 'CLI_SUBMISSION_RETRYABLE')
+            return public_error(code, task['error_message']), facts
         if task['error_code'] == 'CLI_SUBMISSION_RETRYABLE':
             # A stale retry label cannot override a later receipt or conflict.
             return public_error('CLI_SUBMISSION_UNCONFIRMED', task['error_message']), {}

@@ -195,15 +195,15 @@ def test_future_preparation_transient_has_positive_no_send_facts_without_financi
 
     client.prepare.side_effect = fail_prepare
     with patch.object(service, 'canvas_client', return_value=client):
-        service._execute_canvas('task', account, time.monotonic() + 30)
+        assert service._execute_canvas('task', account, time.monotonic() + 30) == 'retry_preparation'
     row = store.task('task')
     before = deepcopy(row)
-    assert row['error_code'] == 'CLI_PREPARATION_TRANSIENT_FAILED' and row['status'] == 'failed'
+    assert row['error_code'] == 'CLI_PREPARATION_TRANSIENT_FAILED' and row['status'] == 'queued'
     assert row['actual_cost'] is None
-    assert row['upstream_context']['preparation_error']['code'] == 'service.1'
+    assert len(row['upstream_context']['preparation_retry_budget']['attempts']) == 2
     result = service.public_task(row)
-    assert result['error'] == {'code': 'CLI_PREPARATION_TRANSIENT_FAILED', 'message': PUBLIC}
-    assert result['provider_context'] == FACTS
+    assert 'error' not in result  # A bounded replacement is still queued.
+    assert 'provider_context' not in result  # Still preparing a bounded alternative.
     assert row == before
     client.submit.assert_not_called()
     client.poll.assert_not_called()
@@ -219,10 +219,10 @@ def test_confirmation_failure_before_run_can_emit_same_positive_stage_proof(cont
     failure.details.update(dispatch_started=False, phase='confirming')
     client.submit.side_effect = failure
     with patch.object(service, 'canvas_client', return_value=client):
-        service._execute_canvas('task', account, time.monotonic() + 30)
+        assert service._execute_canvas('task', account, time.monotonic() + 30) == 'retry_preparation'
     row = store.task('task')
     assert row['error_code'] == 'CLI_PREPARATION_TRANSIENT_FAILED'
-    assert service.public_task(row)['provider_context'] == FACTS
+    assert 'provider_context' not in service.public_task(row)
     assert row['upstream_context']['pre_dispatch_failure']['stage'] == 'confirming'
     client.poll.assert_not_called()
 

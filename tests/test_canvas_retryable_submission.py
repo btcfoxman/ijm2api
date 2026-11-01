@@ -275,7 +275,7 @@ def test_exact_absence_closes_known_failure_but_never_replays_or_rewrites_financ
     client.poll.side_effect = [CanvasCLIError('cli.operation_submission_absent', 'not found') for _ in range(3)]
     service._poll_canvas('task', client, time.monotonic() + 60)
     result = store.task('task')
-    assert result['status'] == 'failed' and result['error_code'] == 'CLI_SUBMISSION_RETRYABLE'
+    assert result['status'] == 'failed' and result['error_code'] == 'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED'
     assert client.poll.call_count == 3
     client.submit.assert_not_called()
     client.prepare.assert_not_called()
@@ -296,7 +296,7 @@ def test_invalid_response_before_dispatch_has_positive_stage_facts(context):
     with patch.object(service, 'canvas_client', return_value=client):
         service._run('task')
     result = store.task('task')
-    assert result['error_code'] == 'CLI_PREPARATION_TRANSIENT_FAILED'
+    assert result['error_code'] == 'CLI_PREPARATION_RETRY_EXHAUSTED'
     assert result['upstream_context']['pre_dispatch_failure']['generation_request_sent'] is False
     client.submit.assert_not_called()
     assert result['actual_cost'] is None
@@ -326,8 +326,8 @@ def test_real_submit_redaction_retains_partial_receipt_veto_after_three_absent_q
     poller.poll.side_effect = [CanvasCLIError('cli.operation_submission_absent', 'not found') for _ in range(3)]
     service._poll_canvas('task', poller, time.monotonic() + 60)
     result = store.task('task')
-    assert result['error_code'] == 'CLI_SUBMISSION_UNCONFIRMED'
+    assert result['error_code'] == 'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED'
     assert result['upstream_context']['submission_receipt_evidence'] is True
-    assert service._canvas_retryable_submission_failure(result) == {}
+    assert service._canvas_retryable_submission_failure(result) == FACTS
     assert sum(args[:2] == ['node', 'run'] for args in runner.calls) == 1
     poller.submit.assert_not_called()

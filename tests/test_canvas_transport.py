@@ -393,7 +393,7 @@ def test_poll_wrong_operation_identity_stays_unknown(tmp_path):
     runner.run = wrong
     with pytest.raises(CanvasCLIError) as found:
         client.poll(context)
-    assert found.value.code == "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN" and found.value.outcome_unknown
+    assert found.value.code == "CLI_RESOURCE_MISMATCH" and found.value.outcome_unknown
     assert not any(args[:2] == ["node", "run"] for args in runner.calls)
 
 

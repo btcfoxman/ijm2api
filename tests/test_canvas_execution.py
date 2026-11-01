@@ -418,9 +418,9 @@ def test_three_explicit_absences_fail_without_resubmission_and_keep_financial_au
         service._run('task')
     result = store.task('task')
     context = result['upstream_context']
-    assert result['status'] == 'failed' and result['error_code'] == 'CLI_SUBMISSION_UNCONFIRMED'
+    assert result['status'] == 'failed' and result['error_code'] == 'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED'
     assert context['reconciliation_paused'] is False and context['reconciliation_closed'] is True
-    assert context['reconciliation_close_reason'] == 'operation_submission_absent'
+    assert context['reconciliation_close_reason'] == 'missing_output_resource_budget_exhausted'
     assert context['financial_outcome'] == 'unconfirmed' and result['completed_at'] is not None
     assert context['consecutive_submission_absent'] == 3
     assert context['submit_error']['code'] == 'cli.invalid_service_response'
@@ -710,7 +710,7 @@ def test_manual_completed_without_final_output_remains_pending_and_keeps_hold(co
     assert result['status'] == 'submitted' and result['completed_at'] is None
     assert result['error_code'] == 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'
     assert result['upstream_context']['reconciliation_pause_reason'] == 'result_pending'
-    assert result['upstream_context']['submission_phase'] == 'accepted'
+    assert result['upstream_context']['submission_phase'] == 'submitting'
     assert 'generation completed' in result['error_message']
     assert store.active_account_count(account['id']) == 1
     client.poll.assert_called_once()
@@ -727,7 +727,7 @@ def test_confirmed_completion_without_result_parks_without_repeating_generation(
     result = store.task('task')
     assert result['status'] == 'submitted' and result['completed_at'] is None
     assert result['upstream_context']['reconciliation_pause_reason'] == 'result_pending'
-    assert result['upstream_context']['submission_phase'] == 'accepted'
+    assert result['upstream_context']['submission_phase'] == 'submitting'
     assert store.active_account_count(account['id']) == 1
     client.poll.assert_called_once()
     client.submit.assert_not_called()
@@ -932,7 +932,7 @@ def test_old_paused_unconfirmed_operation_resumes_bounded_reads_and_ends_without
     with patch.object(service, 'canvas_client', return_value=client):
         service._resume_canvas_poll('task')
     result = store.task('task')
-    assert result['status'] == 'failed' and result['error_code'] == 'CLI_SUBMISSION_UNCONFIRMED'
+    assert result['status'] == 'failed' and result['error_code'] == 'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED'
     assert result['upstream_context']['reconciliation_closed'] is True
     assert result['upstream_context']['financial_outcome'] == 'unconfirmed'
     assert result['upstream_context']['submit_id'] == 'retained-submit'

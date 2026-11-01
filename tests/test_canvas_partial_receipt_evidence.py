@@ -158,7 +158,7 @@ def test_real_submit_redaction_then_three_absences_preserves_receipt_strength_an
     poller.poll.side_effect = [CanvasCLIError('cli.operation_submission_absent', 'not found') for _ in range(3)]
     instance._poll_canvas('task', poller, time.monotonic() + 60)
     result = store.task('task')
-    assert result['error_code'] == ('CLI_SUBMISSION_UNCONFIRMED' if strong else 'CLI_SUBMISSION_RETRYABLE')
+    assert result['error_code'] == 'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED'
     assert result['upstream_context']['submission_receipt_evidence'] is True
     assert result['upstream_context']['financial_outcome'] == 'unconfirmed'
     for field in ('actual_cost', 'estimated_cost', 'balance_before', 'balance_after', 'normalized'):
