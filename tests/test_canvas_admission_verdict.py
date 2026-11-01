@@ -101,7 +101,7 @@ def test_partial_error_envelope_cannot_become_safe_balance_retry(tmp_path, monke
 
 
 @pytest.mark.parametrize('submission,expected', [
-    (' RUN_ACCEPTED ', 'running'), ('RUN_UNKNOWN', 'unknown'), ('processing', 'running'),
+    (' RUN_ACCEPTED ', 'running'), ('RUN_UNKNOWN', 'running'), ('processing', 'running'),
 ])
 def test_original_operation_keeps_generation_and_admission_contracts_separate(boundary, submission, expected):
     runner, client, context, calls, _ = boundary
@@ -116,7 +116,11 @@ def test_original_operation_keeps_generation_and_admission_contracts_separate(bo
         return execute(account, args, timeout, deadline=deadline)
 
     runner._execute = reply
-    assert client.poll(context)['status'] == expected
+    before = deepcopy(context)
+    result = client.poll(context)
+    assert result['status'] == expected and result['operation_state'] == 'running'
+    # Observing the original generation never upgrades its admission verdict.
+    assert context == before and context['phase'] == 'quoted'
     assert calls == [(19, ('operation', 'status'))]
 
 
@@ -131,13 +135,17 @@ def test_three_absent_queries_close_with_original_safe_error_without_replay_or_f
         'traceId': 'private-upstream-id', 'node_id': 'private-node', 'rawHTTP': 'private-body'}
     task = store.task('task')
     before_context = {**task['upstream_context'], 'submit_error': original}
-    store.update_task('task', {'upstream_context': before_context, 'estimated_cost': 40, 'actual_cost': None})
+    before = store.update_task('task', {'upstream_context': before_context, 'estimated_cost': 40, 'actual_cost': None})
     client = fake_client(store, service, account)
     client.poll.side_effect = [CanvasCLIError('cli.operation_submission_absent', 'not found') for _ in range(3)]
     service._poll_canvas('task', client, time.monotonic() + 60)
     result = store.task('task')
-    assert result['status'] == 'failed' and result['error_code'] == 'CLI_SUBMISSION_UNCONFIRMED'
+    assert result['status'] == 'failed' and result['error_code'] == 'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED'
     assert client.poll.call_count == 3
+    recovery = result['upstream_context']['missing_resource_recovery']
+    assert recovery['attempts'] == recovery['max_attempts'] == 3
+    assert result['upstream_context']['reconciliation_close_reason'] == 'missing_output_resource_budget_exhausted'
+    assert not result['upstream_context'].get('resource_ids')
     client.submit.assert_not_called()
     client.prepare.assert_not_called()
     assert result['upstream_context']['submit_error'] == original
@@ -145,6 +153,8 @@ def test_three_absent_queries_close_with_original_safe_error_without_replay_or_f
     assert result['upstream_context']['project_id'] == before_context['project_id']
     assert result['upstream_context']['node_id'] == before_context['node_id']
     assert result['estimated_cost'] == 40 and result['actual_cost'] is None
+    for field in ('request', 'normalized', 'estimated_cost', 'actual_cost', 'balance_before', 'balance_after'):
+        assert result[field] == before[field]
     assert result['upstream_context']['financial_outcome'] == 'unconfirmed'
     diagnostic = result['upstream_context']['closed_submission_diagnostic']
     assert diagnostic['code'] == 'cli.invalid_service_response' and diagnostic['phase'] == 'run_dispatching'

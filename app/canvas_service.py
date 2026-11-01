@@ -29,7 +29,8 @@ from .store import accepted_canvas_result
 logger = logging.getLogger(__name__)
 ADMISSION_AUDIT_FIELDS = frozenset({'previous_submissions', 'recovery_resolution',
     'preflight_failures', 'model_eligibility_exclusions', 'preparation_admission_at',
-    'preparation_attempts', 'preparation_attempt_count', 'preparation_retry_budget', 'pre_dispatch_failure'})
+    'preparation_attempts', 'preparation_attempt_count', 'preparation_retry_budget', 'pre_dispatch_failure',
+    'preparation_failures'})
 
 
 def execution_mode(account: dict) -> str:
@@ -956,8 +957,17 @@ class CanvasServiceMixin:
                 if not submission_started:
                     phase = str((current_task.get('upstream_context') or {}).get('phase')
                         or ('identity' if identity_pending else 'model_selection' if model_pending else 'preparing'))
-                    self._canvas_context(task_id, {'preparation_error': {**self._canvas_diagnostic(exc, phase),
-                        'preparation_timing': timing.snapshot()}, 'preparation_timing': timing.snapshot()})
+                    diagnostic = {**self._canvas_diagnostic(exc, phase), 'preparation_timing': timing.snapshot()}
+                    with self._lock:
+                        previous = (self.store.task(task_id) or {}).get('upstream_context') or {}
+                        failures = previous.get('preparation_failures')
+                        failures = [value for value in failures if isinstance(value, dict)] if isinstance(failures, list) else []
+                        failure = {'account_id': account_id, 'error': diagnostic,
+                            **{key: previous[key] for key in ('project_id', 'node_id', 'submit_id')
+                               if isinstance(previous.get(key), str) and previous[key]}}
+                        self._canvas_context(task_id, {'preparation_error': diagnostic,
+                            'preparation_failures': [*failures[-15:], failure],
+                            'preparation_timing': timing.snapshot()})
                 expired_preparation = not submission_started and time.monotonic() >= deadline
                 facts = (self._canvas_pre_dispatch_facts(self.store.task(task_id) or {}, exc, submission_started)
                          if preparation_retryable_failure(exc) and not prior_dispatch_evidence else {})

@@ -168,6 +168,8 @@ def test_public_material_route_does_not_change_account_for_any_cli_rpc(context, 
             super().__init__(service.canvas_cli.account_directory(account))
             self.accounts = []
             self.persisted.append({"fixture": True})
+        def profile(self, selected):
+            return service.canvas_cli.profile(selected)
         def run(self, selected, args, **kwargs):
             self.accounts.append(dict(selected))
             return super().run(selected, args, **kwargs)

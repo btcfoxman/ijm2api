@@ -9,13 +9,13 @@ from test_canvas_transport import FakeRunner
 class BoundRunner(FakeRunner):
     def __init__(self, store, service, account, identifier, *, fresh_balance=None):
         super().__init__(service.canvas_cli.account_directory(account))
-        self.store, self.account, self.identifier = store, account, identifier
+        self.store, self.service, self.account, self.identifier = store, service, account, identifier
         self.fresh_balance = account['balance'] if fresh_balance is None else fresh_balance
         self.runs = 0
 
     def profile(self, account):
         assert account['id'] == self.account['id']
-        return f"bound-profile-{account['id']}"
+        return self.service.canvas_cli.profile(account)
 
     def run(self, account, args, **kwargs):
         assert account['id'] == self.account['id']
@@ -39,6 +39,7 @@ class BoundRunner(FakeRunner):
 
 def setup_seven_sources(context, monkeypatch, *, first_fresh_balance=None):
     store, service, _ = context
+    store.update_settings({'task_timeout_seconds': 30})  # Two full local account preparations on slower platforms.
     first = owner(store, 'larger-ready', balance=100)
     backup = owner(store, 'smaller-ready', balance=50)
     sources = [f'https://fixture.example/image-{index}.png' for index in range(7)]
