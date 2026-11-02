@@ -632,8 +632,8 @@ def _verified_download_results(detail: Any, record: dict[str, Any], state: dict[
                 raise JimengResultDownloadError("JIMENG_DOWNLOAD_BINDING_MISMATCH", retryable=False)
         author, old_author = item.get("author") or {}, original.get("author") or {}
         for key in ("sec_uid", "user_unique_id"):
-            if author.get(key) not in (None, "") and (not isinstance(old_author, dict)
-                    or not old_author.get(key) or author[key] != old_author[key]):
+            if (isinstance(old_author, dict) and author.get(key) not in (None, "")
+                    and old_author.get(key) not in (None, "") and author[key] != old_author[key]):
                 raise JimengResultDownloadError("JIMENG_DOWNLOAD_BINDING_MISMATCH", retryable=False)
         chosen = _download_video_choice(video)
         if chosen is None:

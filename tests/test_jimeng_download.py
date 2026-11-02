@@ -92,7 +92,6 @@ def test_success_resolves_the_bound_official_download_instead_of_publishing_prev
     lambda d: d["item_list"][0]["video"].update(video_id="v-synthetic-foreign"),
     lambda d: d["item_list"][0]["video"]["transcoded_video"]["origin"].update(vid="v-synthetic-foreign"),
     lambda d: d["item_list"][0].update(author={"uid": "foreign-owner"}),
-    lambda d: d["item_list"][0].update(author={"sec_uid": "foreign-owner"}),
     lambda d: d["item_list"].append(copy.deepcopy(d["item_list"][0])),
 ])
 def test_wrong_item_video_or_author_cannot_be_delivered(change):
@@ -100,6 +99,31 @@ def test_wrong_item_video_or_author_cannot_be_delivered(change):
     change(data)
     with pytest.raises(JimengResultDownloadError) as raised:
         poll(download=data)
+    assert raised.value.code == "JIMENG_DOWNLOAD_BINDING_MISMATCH"
+    assert not raised.value.retryable
+
+
+@pytest.mark.parametrize("history_author", [None, {}, "missing"])
+def test_download_additional_author_alias_does_not_require_an_alias_in_history(history_author):
+    data, download = history(), detail()
+    original = data[SUBMIT]["item_list"][0]
+    if history_author == "missing":
+        original.pop("author")
+    else:
+        original["author"] = history_author
+    download["item_list"][0]["author"] = {"uid": USER, "sec_uid": "synthetic-current-sec-uid"}
+    state, _ = poll(data=data, download=download)
+    assert state["result_urls"] == [DOWNLOAD]
+    assert verified_result_download_receipts(state, account_id=ACCOUNT, submit_id=SUBMIT, history_id=HISTORY)
+
+
+@pytest.mark.parametrize("alias", ["sec_uid", "user_unique_id"])
+def test_author_alias_is_compared_when_both_history_and_download_provide_it(alias):
+    data, download = history(), detail()
+    data[SUBMIT]["item_list"][0]["author"] = {alias: "synthetic-original-alias"}
+    download["item_list"][0]["author"] = {"uid": USER, alias: "synthetic-foreign-alias"}
+    with pytest.raises(JimengResultDownloadError) as raised:
+        poll(data=data, download=download)
     assert raised.value.code == "JIMENG_DOWNLOAD_BINDING_MISMATCH"
     assert not raised.value.retryable
 
