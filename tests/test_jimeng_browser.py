@@ -11,7 +11,7 @@ from fastapi import FastAPI
 
 from app import browser, browser_login, browser_runtime
 from app.browser_login_api import register_browser_login
-from app.jimeng_client import JimengProtocolUnavailable
+from app.jimeng_client import JimengPageNotReady, JimengProtocolUnavailable
 
 
 def target(identity, url):
@@ -316,3 +316,30 @@ def test_pending_login_endpoint_preserves_explicit_backend_and_region():
     response = endpoint({"name": "mainland", "execution_mode": "jimeng_web", "region": "us"})
     assert json.loads(response.body) == {"id": 8}
     store.create_pending_account.assert_called_once_with("mainland", "", 1, execution_mode="jimeng_web", region="us")
+
+
+@pytest.mark.parametrize('stage', ['identity', 'credits'])
+def test_page_still_loading_keeps_login_desktop_for_verification_retry(monkeypatch, tmp_path, stage):
+    context = login_context(monkeypatch, tmp_path)
+    client = Mock()
+    client.login_identity.return_value = {'authenticated': True, 'user_id': 'synthetic-jimeng-user'}
+    target = client.login_identity if stage == 'identity' else client.account_state
+    target.side_effect = JimengPageNotReady('modules', 'factories-pending')
+    monkeypatch.setattr('app.jimeng_client.JimengWebClient', Mock(return_value=client))
+
+    async def run():
+        try:
+            await context.manager.start(8)
+            desktop = context.manager.active['desktop']
+            with pytest.raises(browser_login.LoginError, match='still loading; wait and retry verification'):
+                await context.manager.finish(context.manager.active['id'])
+            assert context.manager.active['desktop'] is desktop and desktop.alive()
+            assert context.manager.active['phase'] == 'login'
+            assert context.store.row['status'] == 'logging_in'
+            assert context.store.row.get('login_user_id') is None
+            context.automation.assert_not_called()
+            context.international.assert_not_called()
+        finally:
+            await context.manager.close()
+
+    asyncio.run(run())

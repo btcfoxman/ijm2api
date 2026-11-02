@@ -9,13 +9,60 @@ from .auto_login import verified_login_user_id
 from .browser import BrowserError, BrowserRejected
 from .cost_adapter import input_evidence, number
 from .errors import RegionGenerationDenied, upstream_review_error
-from .jimeng_client import JimengProtocolUnavailable
+from .jimeng_client import JimengPageNotReady, JimengProtocolUnavailable
 from .image_model_routing import plan_image_execution
 from .media import MediaError, media_error_diagnostic
 from .upload import UploadError
 
 
 class JimengServiceMixin:
+    @staticmethod
+    def _jimeng_public_pre_dispatch_facts(task: dict) -> dict:
+        context = task.get('upstream_context') or {}
+        facts = context.get('pre_dispatch_failure')
+        if (task.get('execution_backend') != 'jimeng_web'
+                or task.get('status') != 'failed' or task.get('error_code') != 'JIMENG_PROTOCOL_UNAVAILABLE'
+                or task.get('run_id') or task.get('thread_id') or task.get('result_urls')
+                or task.get('upstream_result_urls') or context.get('upstream_task_id')
+                or task.get('actual_cost') is not None
+                or context.get('submission_phase') != 'not_dispatched'
+                or not isinstance(facts, dict) or facts.get('generation_request_sent') is not False
+                or facts.get('financial_outcome') != 'not_charged_this_invocation'
+                or facts.get('automatic_resubmission') is not False):
+            return {}
+        return {key: facts[key] for key in ('generation_request_sent', 'financial_outcome',
+                                            'automatic_resubmission')}
+
+    def _jimeng_not_dispatched(self, task_id: str, exc: JimengPageNotReady, *, submit_id: str = '') -> bool:
+        """Only the native pre-call gate can disprove a persisted dispatch intent."""
+        if exc.did_dispatch is not False:
+            return False
+        with self._lock:
+            task = self.store.task(task_id) or {}
+            context = dict(task.get('upstream_context') or {})
+            if (not self._jimeng_open(task)
+                    or task.get('run_id') and task['run_id'] != submit_id
+                    or task.get('thread_id') or task.get('result_urls') or task.get('upstream_result_urls')
+                    or context.get('upstream_task_id')
+                    or task.get('actual_cost') is not None
+                    or context.get('submission_phase') in {'accepted', 'submitted', 'unknown'}
+                    or (context.get('submit_error') or {}).get('outcome_unknown') is True):
+                return False
+            facts = {'generation_request_sent': False, 'financial_outcome': 'not_charged_this_invocation',
+                     'automatic_resubmission': False, 'stage': exc.stage, 'reason': exc.reason}
+            context.update(submission_phase='not_dispatched', pre_dispatch_failure=facts)
+            saved = self.store.update_task(task_id, {'status': 'failed', 'progress': 100, 'run_id': '', 'thread_id': '',
+                'error_code': 'JIMENG_PROTOCOL_UNAVAILABLE', 'error_message': str(exc)[:600],
+                'completed_at': time.time(), 'upstream_context': context}, preserve_terminal=True,
+                expected_updated_at=task['updated_at'])
+            if not self._jimeng_public_pre_dispatch_facts(saved):
+                return False
+            account_id = task.get('account_id')
+            account = self.store.account(account_id, private=True) if account_id else None
+            if account and account.get('status') == 'active':
+                self.store.update_account(account_id, {'status': 'network_error', 'last_error': str(exc)[:300]})
+            return True
+
     @staticmethod
     def _jimeng_open(task: dict | None) -> bool:
         return bool(task and 'manual_termination' not in (task.get('upstream_context') or {})
@@ -191,6 +238,9 @@ class JimengServiceMixin:
                 self._fail(task_id, 'JIMENG_UPSTREAM_REJECTED', 'Jimeng rejected the generation request')
                 return True
             except Exception as exc:
+                if isinstance(exc, JimengPageNotReady) and self._jimeng_not_dispatched(
+                        task_id, exc, submit_id=prepared.submit_id):
+                    return True
                 self._jimeng_update(task_id, {'error_code': 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN',
                     'error_message': 'Jimeng submission receipt was lost; querying the original submission only'},
                     {'submit_error': {'code': type(exc).__name__, 'outcome_unknown': True},
@@ -199,6 +249,11 @@ class JimengServiceMixin:
             return True
         except RegionGenerationDenied as exc:
             self._fail(task_id, 'REGION_GENERATION_DENIED', str(exc))
+            return True
+        except JimengPageNotReady as exc:
+            if not dispatched and self._jimeng_not_dispatched(task_id, exc):
+                return True
+            self._fail(task_id, 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN', str(exc))
             return True
         except (MediaError, UploadError) as exc:
             if dispatched:

@@ -53,19 +53,22 @@ _VIDEO_MODELS = {
 
 # Verified against the site's repository client and four successful read calls
 # on 2026-11-02.  Signing remains inside these genuine website interceptors.
-_NATIVE_POST = r"""(async()=>{
- if(location.origin!==__ORIGIN__)return JSON.stringify({transport_error:'wrong-site'});
- try{
+_NATIVE_BOOTSTRAP = r"""
+  const pending=(stage,reason)=>JSON.stringify({transport_error:'native-not-ready',
+   stage,reason,did_dispatch:false});
+  stage='runtime';
+  if(location.origin!==__ORIGIN__)return JSON.stringify({transport_error:'wrong-site'});
   const chunks=window.rspackChunkdreamina;
-  if(!chunks)return JSON.stringify({transport_error:'native-client-unavailable'});
+  if(!chunks||chunks.push===Array.prototype.push)return pending(stage,'runtime-pending');
   let req=window.__ijm_cn_require;
   if(!req){chunks.push([['ijm-native-'+crypto.randomUUID()],{},r=>{req=r}]);
    if(req)window.__ijm_cn_require=req;}
-  if(typeof req!=='function')return JSON.stringify({transport_error:'native-client-unavailable'});
-  const hw=req('hw'),cBI=req('cBI'),dR=req('dR'),qN=req('qN'),yF=req('yF'),hI=req('hI');
-  if(typeof hw?.LL!=='function'||typeof cBI?.U!=='function'||typeof dR?.vo!=='function'||
-    typeof qN?.Wh!=='function'||typeof yF?.P!=='function'||typeof hI?.m!=='function')
-   return JSON.stringify({transport_error:'native-client-unavailable'});
+  if(typeof req!=='function'||req.j!=='wl4')return pending(stage,'runtime-pending');
+  stage='modules';
+  const moduleIds=['hw','cBI','dR','qN','yF','hI','M8X','bE'];
+  if(!req.m||moduleIds.some(id=>typeof req.m[id]!=='function'))
+   return pending(stage,'factories-pending');
+  stage='container';
   let container;
   const seen=new Set();
   for(const element of document.querySelectorAll('*')){
@@ -79,30 +82,56 @@ _NATIVE_POST = r"""(async()=>{
    }
    if(container)break;
   }
-  if(!container)return JSON.stringify({transport_error:'native-container-unavailable'});
+  if(!container)return pending(stage,'container-pending');
+  stage='profile';
+  const getService=req('M8X')?.cQ,accountToken=req('bE')?.c;
+  if(typeof getService!=='function'||!accountToken)return pending(stage,'profile-pending');
+  const profile=getService(container,accountToken)?.userProfile;
+  if(profile?.uid&&__EXPECTED_UID__&&String(profile.uid)!==__EXPECTED_UID__)
+   return JSON.stringify({transport_error:'account-mismatch',stage,did_dispatch:false});
+  if(!profile?.uid||(__ADD_WEB_ID__&&!profile?.webId))return pending(stage,'profile-pending');
+  // Never require SDK modules until their factories and the signed-in page exist.
+  // Requiring an absent Rspack module can cache its empty exports permanently.
+  stage='modules';
+  const hw=req('hw'),cBI=req('cBI'),dR=req('dR'),qN=req('qN'),yF=req('yF'),hI=req('hI');
+  if(typeof hw?.LL!=='function'||typeof cBI?.U!=='function'||typeof dR?.vo!=='function'||
+    typeof qN?.Wh!=='function'||typeof yF?.P!=='function'||typeof hI?.m!=='function')
+   return pending(stage,'exports-pending');
+"""
+
+_NATIVE_READY = r"""(()=>{
+ let stage='runtime';
+ try{
+  __BOOTSTRAP__
+  return JSON.stringify({ready:true});
+ }catch(_){return JSON.stringify({transport_error:'native-not-ready',stage,
+  reason:'bootstrap-pending',did_dispatch:false});}
+})()""".replace("__BOOTSTRAP__", _NATIVE_BOOTSTRAP)
+
+_NATIVE_POST = r"""(async()=>{
+ let stage='runtime',didDispatch=false;
+ try{
+  __BOOTSTRAP__
   const options=__OPTIONS__;
-  if(__ACCOUNT_CONTEXT__){
-   const getService=req('M8X')?.cQ,accountToken=req('bE')?.c;
-   if(typeof getService!=='function'||!accountToken)
-    return JSON.stringify({transport_error:'account-context-unavailable'});
-   const profile=getService(container,accountToken)?.userProfile;
-   if(!profile?.uid||(__ADD_WEB_ID__&&!profile?.webId)||
-     (__EXPECTED_UID__&&String(profile.uid)!==__EXPECTED_UID__))
-    return JSON.stringify({transport_error:'account-context-unavailable'});
-   if(__ADD_WEB_ID__)options.params.webId=String(profile.webId);
-  }
+  if(__ADD_WEB_ID__)options.params.webId=String(profile.webId);
+  stage='client-build';
   const client=new(hw.LL)().build({headers:{'Content-Type':'application/json'},withCredentials:true});
+  stage='interceptors';
   cBI.U(container,client);dR.vo(client);qN.Wh(client);
   const oneShot=options.networkCtx?.reconcileBySubmitId===true;
   yF.P(client,{isRetry:e=>!oneShot&&e.config?.networkCtx?.reconcileBySubmitId!==true});hI.m(client);
+  stage='request';didDispatch=true;
   const response=await client.post(__URL__,__BODY__,options);
   return JSON.stringify({http:200,body:response});
  }catch(e){
   if(e?.response)return JSON.stringify({http:e.response.status,body:e.response.data});
   if(e?.ret!==undefined)return JSON.stringify({http:200,body:e});
-  return JSON.stringify({transport_error:'native-client'});
+  if(!didDispatch&&['runtime','modules','container','profile'].includes(stage))
+   return JSON.stringify({transport_error:'native-not-ready',stage,
+    reason:'bootstrap-pending',did_dispatch:false});
+  return JSON.stringify({transport_error:'native-client',stage,did_dispatch:didDispatch});
  }
-})()"""
+})()""".replace("__BOOTSTRAP__", _NATIVE_BOOTSTRAP)
 
 _NATIVE_QUOTE = r"""(async()=>{
  if(location.origin!=='https://jimeng.jianying.com')return JSON.stringify({error:'wrong-site'});
@@ -188,6 +217,13 @@ def _quote_expression(input_value: dict[str, Any], expected_user_id: str) -> str
         values[match.group()], ensure_ascii=True, separators=(",", ":")), _NATIVE_QUOTE)
 
 
+def _ready_expression(expected_user_id: str, *, require_web_id: bool = False) -> str:
+    values = {"__ORIGIN__": JIMENG_ORIGIN, "__EXPECTED_UID__": expected_user_id,
+              "__ADD_WEB_ID__": require_web_id}
+    return re.sub(r"__(?:ORIGIN|EXPECTED_UID|ADD_WEB_ID)__", lambda match: json.dumps(
+        values[match.group()], ensure_ascii=True, separators=(",", ":")), _NATIVE_READY)
+
+
 def _request_digest(body: dict[str, Any], query: dict[str, Any]) -> str:
     encoded = json.dumps({"body": body, "query": query}, sort_keys=True,
                          ensure_ascii=True, separators=(",", ":"))
@@ -226,7 +262,20 @@ def _native_response(value: Any) -> dict[str, Any]:
     if response.get("transport_error"):
         if response["transport_error"] == "wrong-site":
             raise BrowserError("Jimeng request requires the original account's Jimeng page")
-        raise BrowserError("Jimeng authenticated page client is unavailable or failed")
+        if response["transport_error"] == "account-mismatch":
+            raise JimengReceiptMismatch("Jimeng signed-in account does not match this account")
+        if (response["transport_error"] == "native-not-ready"
+                and response.get("did_dispatch") is False
+                and isinstance(response.get("stage"), str)
+                and response["stage"] in {"runtime", "modules", "container", "profile"}
+                and isinstance(response.get("reason"), str)
+                and response["reason"] in {"runtime-pending", "factories-pending", "container-pending",
+                                           "profile-pending", "exports-pending", "bootstrap-pending"}):
+            raise JimengPageNotReady(response.get("stage"), response.get("reason"))
+        stage = response.get("stage")
+        safe_stage = stage if isinstance(stage, str) and stage in {
+            "runtime", "modules", "container", "profile", "client-build", "interceptors", "request"} else "unknown"
+        raise BrowserError(f"Jimeng authenticated page client failed at {safe_stage}")
     status = response.get("http")
     if isinstance(status, bool) or not isinstance(status, int):
         raise BrowserError("Jimeng returned an invalid HTTP status")
@@ -258,6 +307,20 @@ class JimengProtocolUnavailable(BrowserError):
 
 class JimengReceiptMismatch(BrowserError):
     """A response does not belong to the originally dispatched submission."""
+
+
+class JimengPageNotReady(BrowserError):
+    """The pure bootstrap gate proved that no business POST was invoked."""
+
+    did_dispatch = False
+
+    def __init__(self, stage: Any = "runtime", reason: Any = "bootstrap-pending"):
+        self.stage = stage if isinstance(stage, str) and stage in {
+            "runtime", "modules", "container", "profile"} else "runtime"
+        self.reason = reason if isinstance(reason, str) and reason in {
+            "runtime-pending", "factories-pending", "container-pending",
+            "profile-pending", "exports-pending", "bootstrap-pending"} else "bootstrap-pending"
+        super().__init__(f"Jimeng page is not ready ({self.stage}/{self.reason}); request was not sent")
 
 
 def parse_credit_state(data: dict[str, Any]) -> dict[str, Any]:
@@ -663,6 +726,47 @@ class JimengWebClient:
     def preflight_model(normalized: dict[str, Any]) -> None:
         preflight_model(normalized)
 
+    def wait_until_ready(self, *, timeout_seconds: float = 30,
+                         poll_interval_seconds: float = 0.25,
+                         require_web_id: bool = False) -> None:
+        """Wait only on the pure page bootstrap; never replay a business POST."""
+        if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
+                or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 30):
+            raise ValueError("Jimeng readiness timeout must be between 0 and 30 seconds")
+        if (isinstance(poll_interval_seconds, bool) or not isinstance(poll_interval_seconds, (int, float))
+                or not math.isfinite(poll_interval_seconds) or not 0 < poll_interval_seconds <= 1):
+            raise ValueError("Jimeng readiness poll interval must be between 0 and 1 seconds")
+        original_timeout = self.browser.timeout
+        deadline = time.monotonic() + min(timeout_seconds, original_timeout)
+        expression = _ready_expression(str(self.account.get("login_user_id") or ""),
+                                       require_web_id=require_web_id)
+        last_pending = JimengPageNotReady("runtime", "runtime-pending")
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise last_pending
+                self.browser.timeout = min(original_timeout, remaining)
+                raw = self.browser.evaluate(expression)
+                try:
+                    response = json.loads(raw)
+                except (TypeError, ValueError) as exc:
+                    raise BrowserError("Jimeng returned an unreadable readiness result") from exc
+                if isinstance(response, dict) and response.get("ready") is True:
+                    return
+                try:
+                    _native_response(raw)
+                except JimengPageNotReady as exc:
+                    last_pending = exc
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    time.sleep(min(poll_interval_seconds, remaining))
+                    continue
+                raise BrowserError("Jimeng returned an invalid readiness result")
+        finally:
+            self.browser.timeout = original_timeout
+
     def login_identity(self) -> dict[str, Any]:
         config = self._post("/mweb/v1/get_common_config", {})
         sec_uid = config.get("sec_uid")
@@ -678,6 +782,10 @@ class JimengWebClient:
 
     def _post(self, path: str, body: dict[str, Any], *,
               query: dict[str, str] | None = None, one_shot: bool = False) -> dict[str, Any]:
+        # A paid write must reach its single bootstrap gate immediately, without
+        # sleeping past the service's final cancellation/dispatch boundary.
+        if not one_shot and path != "/mweb/v1/aigc_draft/generate":
+            self.wait_until_ready(require_web_id=path == "/mweb/v1/get_history_by_ids")
         expression = _native_expression(path, body, query, one_shot=one_shot,
                                          expected_user_id=str(self.account.get("login_user_id") or ""))
         return _native_response(self.browser.evaluate(expression, await_promise=True))
@@ -687,6 +795,7 @@ class JimengWebClient:
 
     def workspace_id(self) -> int:
         """Bind only an explicitly selected workspace in the signed own list."""
+        self.wait_until_ready()
         account_id = int(self.account["id"])
         with _WORKSPACE_LOCK_GUARD:
             lock = _WORKSPACE_LOCKS.setdefault(account_id, threading.RLock())
@@ -753,7 +862,7 @@ class JimengWebClient:
             for attempt in range(max_attempts):
                 try:
                     return parse_credit_state(self._post("/commerce/v1/benefits/user_credit", {}))
-                except BrowserRejected:
+                except (BrowserRejected, JimengPageNotReady, JimengReceiptMismatch):
                     raise
                 except BrowserError:
                     if attempt + 1 == max_attempts:
@@ -765,6 +874,7 @@ class JimengWebClient:
     def upload_inputs(self, normalized: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         preflight_model(normalized)
         if any(normalized.get(kind) for kind in ("images", "videos", "audios")):
+            self.wait_until_ready()
             from .jimeng_upload import JimengUploader
             return JimengUploader(self.account, post=self._post, store=self.store).upload_inputs(normalized)
         return {"images": [], "videos": [], "audios": []}
@@ -777,6 +887,7 @@ class JimengWebClient:
         if not isinstance(assets, dict):
             raise ValueError("Jimeng uploaded references must be an object")
         materials, _, video_seconds = _video_materials(normalized, spec, assets)
+        self.wait_until_ready(require_web_id=True)
         workspace_id = self.workspace_id()
         input_value = {"model": spec.upstream_model, "duration": normalized["duration"],
                        "resolution": spec.resolution,

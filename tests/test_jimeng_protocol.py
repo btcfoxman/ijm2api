@@ -4,16 +4,18 @@ import subprocess
 import unittest
 import uuid
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.browser import BrowserError, BrowserRejected
 from app.jimeng_client import (
     JimengWebClient,
     JimengReceiptMismatch,
+    JimengPageNotReady,
     PreparedJimengSubmission,
     _native_expression,
     _native_response,
     _quote_expression,
+    _ready_expression,
     build_mini_text_submission,
     build_video_submission,
     parse_credit_state,
@@ -117,6 +119,7 @@ class JimengPreparedSubmissionTests(unittest.TestCase):
     def _client_and_quote(self):
         with patch("app.jimeng_client.CDPBrowser"):
             client = JimengWebClient({"id": 1, "cdp_port": 19301})
+        client.wait_until_ready = Mock()
         quote = {"input": {"model": "dreamina_seedance_40_mini", "duration": 4,
                            "resolution": "720p", "refs": [], "inputVideoDuration": 0},
                  "commerceInfos": [{"benefitType": "seedance_20_mini_720p_output_5s",
@@ -327,6 +330,99 @@ class JimengReadTransportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "original CN account region"):
             _native_expression("/mweb/v1/get_common_config", {}, {"region": "SG"})
 
+    def test_bootstrap_wait_does_not_replay_business_posts(self):
+        with patch("app.jimeng_client.CDPBrowser") as browser:
+            browser.return_value.timeout = 90
+            client = JimengWebClient({"id": 1, "cdp_port": 19301, "login_user_id": "original-account"})
+        pending = json.dumps({"transport_error": "native-not-ready", "stage": "modules",
+                              "reason": "factories-pending", "did_dispatch": False})
+        clock = [0.0]
+        client.browser.evaluate.side_effect = [pending, pending, json.dumps({"ready": True}),
+                                               json.dumps({"http": 200, "body": {"ret": "0", "data": {}}})]
+        with patch("app.jimeng_client.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("app.jimeng_client.time.sleep", side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)):
+            self.assertEqual(client._post("/mweb/v1/get_common_config", {}), {})
+        expressions = [call.args[0] for call in client.browser.evaluate.call_args_list]
+        self.assertEqual(sum("await client.post(" in expression for expression in expressions), 1)
+        self.assertEqual(len(expressions), 4)
+        self.assertEqual(clock[0], 0.5)
+        self.assertEqual(client.browser.timeout, 90)
+
+    def test_bootstrap_timeout_and_mismatched_identity_cannot_send_a_post(self):
+        with patch("app.jimeng_client.CDPBrowser") as browser:
+            browser.return_value.timeout = 90
+            client = JimengWebClient({"id": 1, "cdp_port": 19301})
+        client.browser.evaluate.return_value = json.dumps({"transport_error": "native-not-ready",
+            "stage": "profile", "reason": "profile-pending", "did_dispatch": False})
+        clock = [0.0]
+        with patch("app.jimeng_client.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("app.jimeng_client.time.sleep", side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)):
+            with self.assertRaises(JimengPageNotReady) as caught:
+                client.wait_until_ready(timeout_seconds=0.5)
+        self.assertIs(caught.exception.did_dispatch, False)
+        self.assertEqual(caught.exception.stage, "profile")
+        self.assertFalse(any("await client.post(" in call.args[0]
+                             for call in client.browser.evaluate.call_args_list))
+        client.browser.evaluate.reset_mock()
+        client.browser.evaluate.return_value = json.dumps({"transport_error": "account-mismatch"})
+        with patch("app.jimeng_client.time.sleep") as sleep:
+            with self.assertRaises(JimengReceiptMismatch):
+                client._post("/mweb/v1/get_common_config", {})
+            sleep.assert_not_called()
+        self.assertEqual(client.browser.evaluate.call_count, 1)
+
+    def test_paid_gate_never_waits_and_dispatched_failures_are_not_not_ready(self):
+        with patch("app.jimeng_client.CDPBrowser"):
+            client = JimengWebClient({"id": 1, "cdp_port": 19301})
+        client.browser.evaluate.return_value = json.dumps({"transport_error": "native-not-ready",
+            "stage": "modules", "reason": "factories-pending", "did_dispatch": False})
+        with patch.object(client, "wait_until_ready") as wait:
+            with self.assertRaises(JimengPageNotReady):
+                client._post("/mweb/v1/aigc_draft/generate", {}, one_shot=True)
+            wait.assert_not_called()
+        self.assertEqual(client.browser.evaluate.call_count, 1)
+        for response in ({"transport_error": "native-client", "stage": "request", "did_dispatch": True},
+                         {"transport_error": "native-not-ready", "stage": "request", "did_dispatch": True},
+                         {"transport_error": "native-not-ready", "stage": "request", "did_dispatch": False}):
+            with self.subTest(response=response):
+                with self.assertRaises(BrowserError) as caught:
+                    _native_response(json.dumps(response))
+                self.assertNotIsInstance(caught.exception, JimengPageNotReady)
+
+    def test_credit_bootstrap_respects_short_browser_budget_and_restores_timeout(self):
+        with patch("app.jimeng_client.CDPBrowser") as browser:
+            browser.return_value.timeout = 90
+            client = JimengWebClient({"id": 1, "cdp_port": 19301})
+        pending = json.dumps({"transport_error": "native-not-ready", "stage": "modules",
+                              "reason": "factories-pending", "did_dispatch": False})
+        budgets = []
+
+        def evaluate(expression):
+            budgets.append(client.browser.timeout)
+            self.assertNotIn("await client.post(", expression)
+            return pending
+
+        clock = [0.0]
+        client.browser.evaluate.side_effect = evaluate
+        with patch("app.jimeng_client.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("app.jimeng_client.time.sleep", side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)):
+            with self.assertRaises(JimengPageNotReady):
+                client.account_state(timeout_seconds=6)
+        self.assertEqual(clock[0], 6)
+        self.assertTrue(budgets)
+        self.assertLessEqual(max(budgets), 6)
+        self.assertEqual(client.browser.timeout, 90)
+
+    def test_credit_read_does_not_retry_readiness_timeout_or_identity_mismatch(self):
+        with patch("app.jimeng_client.CDPBrowser"):
+            client = JimengWebClient({"id": 1, "cdp_port": 19301})
+        for error in (JimengPageNotReady(), JimengReceiptMismatch("synthetic mismatch")):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(client, "_post", side_effect=error) as post:
+                    with self.assertRaises(type(error)):
+                        client.account_state()
+                    self.assertEqual(post.call_count, 1)
+
 
 class JimengWorkspaceTests(unittest.TestCase):
     class AccountStore:
@@ -351,7 +447,9 @@ class JimengWorkspaceTests(unittest.TestCase):
     def client(self, store, selected=""):
         with patch("app.jimeng_client.CDPBrowser") as browser:
             browser.return_value.evaluate.return_value = selected
-            return JimengWebClient({"id": 7, "cdp_port": 19307}, store=store)
+            client = JimengWebClient({"id": 7, "cdp_port": 19307}, store=store)
+        client.wait_until_ready = Mock()
+        return client
 
     def test_new_workspace_is_created_once_and_verified_against_the_own_list(self):
         store = self.AccountStore()
@@ -402,37 +500,44 @@ class JimengWorkspaceTests(unittest.TestCase):
 class JimengNativePageTests(unittest.TestCase):
     def evaluate(self, *, origin="https://jimeng.jianying.com", missing_module=False,
                  missing_container=False, one_shot=False,
-                 path="/mweb/v1/get_common_config", expected_user_id="", profile_uid="original-account"):
+                 path="/mweb/v1/get_common_config", expected_user_id="", profile_uid="original-account",
+                 missing_factory=False, bootstrap_only=False, request_fails=False):
         program = r"""
 const vm=require('node:vm'),input=JSON.parse(require('node:fs').readFileSync(0,'utf8'));
 let retryPolicy;
-const calls=[],interceptors=[],ctx={location:{origin:input.origin},
+const calls=[],interceptors=[],required=[],ctx={location:{origin:input.origin},
 crypto:{randomUUID:()=> 'synthetic-random-chunk'}};
-const client={post:async(...args)=>{calls.push(args);return {ret:'0',data:{credit:{vip_credit:1}}}}};
+const client={post:async(...args)=>{calls.push(args);if(input.requestFails)throw Error('secret-must-not-leak');
+return {ret:'0',data:{credit:{vip_credit:1}}}}};
 const modules={hw:{LL:class{build(){return client}}},cBI:{U:()=>interceptors.push('cBI')},
 dR:{vo:()=>interceptors.push('dR')},qN:{Wh:()=>interceptors.push('qN')},
 yF:{P:(_,options)=>{interceptors.push('yF');retryPolicy=options.isRetry}},hI:{m:()=>interceptors.push('hI')}};
 modules.M8X={cQ:()=>({userProfile:{uid:input.profileUid,webId:'synthetic-web-id'}})};
 modules.bE={c:'synthetic-account-token'};
 if(input.missingModule)modules.dR={};
-const req=name=>modules[name],container={createInstance(){},invokeFunction(){}};
+const req=name=>{required.push(name);return modules[name]},container={createInstance(){},invokeFunction(){}};
+req.j='wl4';req.m=Object.fromEntries(Object.keys(modules).map(name=>[name,()=>{}]));
+if(input.missingFactory)delete req.m.hI;
 ctx.rspackChunkdreamina={push:entry=>entry[2](req)};
 ctx.window=ctx;
 ctx.document={querySelectorAll:()=>input.missingContainer?[]:[{
 '__reactFiber$synthetic':{memoizedProps:{value:container},return:null}}]};
 ctx.fetch=()=>{throw Error('unexpected unsigned fallback')};
 (async()=>{const result=await vm.runInNewContext(input.expression,ctx);
-process.stdout.write(JSON.stringify({result:JSON.parse(result),calls,interceptors,
+process.stdout.write(JSON.stringify({result:JSON.parse(result),calls,interceptors,required,
 retryAllowed:retryPolicy?retryPolicy({config:calls[0]?.[2]}):null}));})();
 """
         expression = _native_expression(path, {
             "prompt": "literal __OPTIONS__ and __ORIGIN__ and ` ${never_execute}"},
             one_shot=one_shot, expected_user_id=expected_user_id)
+        if bootstrap_only:
+            expression = _ready_expression(expected_user_id)
         result = subprocess.run([shutil.which("node"), "-e", program],
                                 input=json.dumps({"expression": expression, "origin": origin,
                                                   "missingModule": missing_module,
                                                   "missingContainer": missing_container,
-                                                  "profileUid": profile_uid}),
+                                                  "profileUid": profile_uid, "missingFactory": missing_factory,
+                                                  "requestFails": request_fails}),
                                 text=True, capture_output=True, check=True, timeout=10)
         return json.loads(result.stdout)
 
@@ -451,6 +556,34 @@ retryAllowed:retryPolicy?retryPolicy({config:calls[0]?.[2]}):null}));})();
         self.assertEqual(result["calls"][0][2]["networkCtx"], {"reconcileBySubmitId": True})
         self.assertEqual(len(result["calls"]), 1)
 
+    def test_missing_factory_never_requires_modules_or_builds_a_client(self):
+        for bootstrap_only in (True, False):
+            with self.subTest(bootstrap_only=bootstrap_only):
+                result = self.evaluate(missing_factory=True, bootstrap_only=bootstrap_only, one_shot=True)
+                self.assertEqual(result["result"], {"transport_error": "native-not-ready",
+                    "stage": "modules", "reason": "factories-pending", "did_dispatch": False})
+                self.assertEqual(result["required"], [])
+                self.assertEqual(result["calls"], [])
+                self.assertEqual(result["interceptors"], [])
+
+    def test_profile_must_be_ready_before_requiring_any_sdk_module(self):
+        result = self.evaluate(profile_uid="", bootstrap_only=True)
+        self.assertEqual(result["result"]["stage"], "profile")
+        self.assertEqual(result["result"]["reason"], "profile-pending")
+        self.assertEqual(result["required"], ["M8X", "bE"])
+        self.assertEqual(result["calls"], [])
+        result = self.evaluate(bootstrap_only=True)
+        self.assertEqual(result["result"], {"ready": True})
+        self.assertEqual(result["interceptors"], [])
+        self.assertEqual(result["calls"], [])
+
+    def test_native_request_exception_is_dispatched_and_never_contains_raw_error(self):
+        result = self.evaluate(one_shot=True, request_fails=True)
+        self.assertEqual(result["result"], {"transport_error": "native-client",
+            "stage": "request", "did_dispatch": True})
+        self.assertEqual(len(result["calls"]), 1)
+        self.assertNotIn("secret-must-not-leak", json.dumps(result))
+
     def test_foreign_page_or_missing_native_components_cannot_send_any_request(self):
         for config in ({"origin": "https://dreamina.capcut.com"}, {"missing_module": True},
                        {"missing_container": True}):
@@ -467,7 +600,7 @@ retryAllowed:retryPolicy?retryPolicy({config:calls[0]?.[2]}):null}));})();
                 result = self.evaluate(path=path, expected_user_id="original-account",
                                        profile_uid="different-account")
                 self.assertEqual(result["calls"], [])
-                self.assertEqual(result["result"]["transport_error"], "account-context-unavailable")
+                self.assertEqual(result["result"]["transport_error"], "account-mismatch")
         for path in ("/mweb/v1/get_upload_token", "/mweb/v1/workspace/list", "/mweb/v1/workspace/create"):
             with self.subTest(path=path):
                 result = self.evaluate(path=path, expected_user_id="original-account")

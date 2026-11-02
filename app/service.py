@@ -38,7 +38,8 @@ from .account_policy import DEFAULT_LOW_BALANCE_IMAGE_RESCUE_THRESHOLD
 from .errors import GenerationCapabilityDenied, RegionGenerationDenied, public_error, upstream_review_error
 from .region_policy import (DEFAULT_REGION_GENERATION_POLICY, validate_region_generation_policy,
     region_denial_detail, account_requires_proxy)
-from .jimeng_client import JimengWebClient, JimengProtocolUnavailable, preflight_model as jimeng_preflight_model
+from .jimeng_client import (JimengWebClient, JimengPageNotReady, JimengProtocolUnavailable,
+                            preflight_model as jimeng_preflight_model)
 from .jimeng_service import JimengServiceMixin
 from .media import MediaError
 from .result_transfer import ResultTransferError, transfer, presign, expires_soon, _config
@@ -942,6 +943,8 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
         account = self.store.account(account_id, private=True)
         if not account:
             raise KeyError(account_id)
+        if execution_mode(account) == 'jimeng_web' and account.get('status') == 'logging_in':
+            raise AccountMaintenanceBusy('Account is in online browser login; account check is deferred')
         if not start_browser and execution_mode(account) == 'canvas_cli':
             if account.get('cli_auth_status') != 'ready':
                 return self.store.update_account(account_id, {'status': 'cli_auth_required',
@@ -955,10 +958,29 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
 
     def _check_account_live(self, account: dict[str, Any]) -> dict[str, Any]:
         account_id = int(account["id"])
+        jimeng = execution_mode(account) == 'jimeng_web'
+
+        def assert_login_binding(current: dict[str, Any]) -> None:
+            if current.get('status') == 'logging_in':
+                raise AccountMaintenanceBusy('Account is in online browser login; account check is deferred')
+            if any(current.get(key) != account.get(key) for key in (
+                    'execution_mode', 'cdp_port', 'login_user_id', 'setup_checked_at')):
+                raise AccountMaintenanceBusy('Account login binding changed; account check is deferred')
+
+        def update_check(values: dict[str, Any]) -> dict[str, Any]:
+            if not jimeng:
+                return self.store.update_account(account_id, values)
+            with self._lock:
+                current = self.store.account(account_id, private=True) or {}
+                assert_login_binding(current)
+                return self.store.update_account(account_id, values)
+
+        if jimeng:
+            assert_login_binding(self.store.account(account_id, private=True) or {})
         port = int(account["cdp_port"] or 0)
         if not browser_alive(port, **account_browser_options(account)):
             label = 'Jimeng' if execution_mode(account) == 'jimeng_web' else 'Dreamina'
-            return self.store.update_account(account_id, {"status": "login_required",
+            return update_check({"status": "login_required",
                                                          "last_error": f"{label} account browser is unavailable"})
         # Chrome exposes a CDP page before Dreamina's JavaScript has finished
         # loading. After a service restart, one early fetch failure should not
@@ -971,11 +993,13 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                     verified = self._jimeng_identity(client, str(account.get('login_user_id') or ''))
                 state = client.account_state()
                 break
+            except JimengPageNotReady as exc:
+                return update_check({"status": "network_error", "last_error": str(exc)[:300]})
             except BrowserRejected as exc:
-                return self.store.update_account(account_id, {"status": "login_required", "last_error": str(exc)[:300]})
+                return update_check({"status": "login_required", "last_error": str(exc)[:300]})
             except BrowserError as exc:
                 if attempt == 2:
-                    return self.store.update_account(account_id, {"status": "login_required", "last_error": str(exc)[:300]})
+                    return update_check({"status": "login_required", "last_error": str(exc)[:300]})
                 time.sleep(1)
         balance = state["available_balance"]
         project_id = client.browser.project_id()
@@ -992,7 +1016,7 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
         if threshold > 0 and balance < threshold:
             values.update({"enabled": False, "status": "disabled_low_balance",
                            "last_error": f"credit balance below {threshold}"})
-        return self.store.update_account(account_id, values)
+        return update_check(values)
 
     def _run(self, task_id: str) -> None:
         task = self.store.task(task_id)
@@ -1547,6 +1571,9 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
             "error_code": code, "error_message": message[:600], "completed_at": time.time()}, preserve_terminal=True)
 
     def _public_task_failure(self, task: dict[str, Any]) -> tuple[dict, dict]:
+        facts = self._jimeng_public_pre_dispatch_facts(task)
+        if facts:
+            return public_error(task['error_code'], task['error_message']), facts
         if task.get('execution_backend') == 'jimeng_web' and task.get('error_code') == 'MEDIA_UPLOAD_FAILED':
             notice = public_error('JIMENG_PROTOCOL_UNAVAILABLE', '')
             return {'code': 'MEDIA_UPLOAD_FAILED', 'message': notice['message']}, {}

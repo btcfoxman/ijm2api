@@ -32,6 +32,10 @@ class LoginError(Exception):
 
 def _verification_failure(exc: Exception, stage: str, *, site: str = "dreamina") -> str:
     """Explain a failed admin check without returning browser or response data."""
+    if site == "jimeng":
+        from .jimeng_client import JimengPageNotReady
+        if isinstance(exc, JimengPageNotReady):
+            return f"browser login verification pending ({stage}): Jimeng page is still loading; wait and retry verification"
     known_browser_errors = {
         "account proxy must be a SOCKS5 or HTTP proxy with host and port":
             "account proxy configuration is invalid",

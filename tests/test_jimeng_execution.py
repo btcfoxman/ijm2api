@@ -11,11 +11,11 @@ import uuid
 import pytest
 
 from app.browser import BrowserError, BrowserRejected
-from app.jimeng_client import JimengProtocolUnavailable, PreparedJimengSubmission
+from app.jimeng_client import JimengPageNotReady, JimengProtocolUnavailable, PreparedJimengSubmission
 from app.media import MediaError
 from app.upload import UploadError
 from app.region_policy import DEFAULT_REGION_GENERATION_POLICY
-from app.service import Service
+from app.service import AccountMaintenanceBusy, Service
 from app.store import Store
 
 
@@ -28,7 +28,7 @@ def context(tmp_path, monkeypatch):
     store.update_settings({'region_generation_policy': policies, 'task_timeout_seconds': 10})
     service = Service(store)
     monkeypatch.setattr(service._pool, 'submit', Mock())
-    monkeypatch.setattr(service.browser_runtime, 'acquire', Mock(side_effect=lambda a: (a, False)))
+    monkeypatch.setattr(service.browser_runtime, 'acquire', Mock(side_effect=lambda a, **_: (a, False)))
     monkeypatch.setattr(service.browser_runtime, 'release', Mock())
     account = store.upsert_account({'name': 'mainland', 'execution_mode': 'jimeng_web',
         'proxy_url': '', 'cdp_port': 19008})
@@ -139,6 +139,141 @@ def test_complete_rejection_preserves_original_id_without_resubmitting(context):
     assert result['actual_cost'] is None
     context.client.poll.assert_not_called()
     context.service._run(identifier)
+    context.client.submit_prepared.assert_called_once()
+
+
+def test_page_readiness_failure_preserves_login_and_blocks_scheduling_until_recovered(context, monkeypatch):
+    identifier = create(context)
+    context.store.update_account(context.account['id'], {'login_stage': 'ready', 'setup_checked_at': 12345,
+        'balance_details': {'gift_credit': 100}})
+    previous = context.store.account(context.account['id'], private=True)
+    context.client.login_identity.side_effect = JimengPageNotReady('modules', 'factories-pending')
+    monkeypatch.setattr('app.service.browser_alive', Mock(return_value=True))
+    checked = context.service.check_account(context.account['id'])
+    assert checked['status'] == 'network_error'
+    checked = context.store.account(context.account['id'], private=True)
+    for key in ('login_user_id', 'balance', 'balance_details_json', 'enabled', 'login_stage', 'setup_checked_at'):
+        assert checked[key] == previous[key]
+    assert context.service._reserve_account(0, task_id=identifier) is None
+    context.client.account_state.assert_not_called()
+    context.client.login_identity.assert_called_once()
+    context.client.login_identity.side_effect = None
+    context.client.browser.project_id.return_value = ''
+    recovered = context.service.check_account(context.account['id'])
+    assert recovered['status'] == 'active' and recovered['last_error'] == ''
+    assert context.store.account(context.account['id'], private=True)['login_user_id'] == previous['login_user_id']
+    assert context.service._funded_accounts(0, set(), {}, task=context.store.task(identifier))
+
+
+def test_actual_page_identity_mismatch_remains_a_login_failure(context, monkeypatch):
+    context.client.login_identity.return_value = {'authenticated': True, 'user_id': 'different-account'}
+    monkeypatch.setattr('app.service.browser_alive', Mock(return_value=True))
+    monkeypatch.setattr('app.service.time.sleep', Mock())
+    checked = context.service.check_account(context.account['id'])
+    assert checked['status'] == 'login_required'
+    assert context.store.account(context.account['id'], private=True)['login_user_id'] == context.account['login_user_id']
+    assert checked['balance'] == context.account['balance']
+    context.client.account_state.assert_not_called()
+
+
+def test_account_check_cannot_use_an_unmanaged_profile_during_online_login(context):
+    context.store.update_account(context.account['id'], {'status': 'logging_in', 'managed_profile': False})
+    with pytest.raises(AccountMaintenanceBusy):
+        context.service.check_account(context.account['id'])
+    assert context.store.account(context.account['id'])['status'] == 'logging_in'
+    context.service.browser_runtime.acquire.assert_not_called()
+    context.client.login_identity.assert_not_called()
+    context.client.account_state.assert_not_called()
+
+
+def test_late_page_readiness_failure_cannot_overwrite_online_login(context, monkeypatch):
+    monkeypatch.setattr('app.service.browser_alive', Mock(return_value=True))
+
+    def login_started():
+        context.store.update_account(context.account['id'], {'status': 'logging_in', 'enabled': False})
+        raise JimengPageNotReady('profile', 'profile-pending')
+
+    context.client.login_identity.side_effect = login_started
+    with pytest.raises(AccountMaintenanceBusy):
+        context.service.check_account(context.account['id'])
+    account = context.store.account(context.account['id'], private=True)
+    assert account['status'] == 'logging_in' and not account['enabled']
+    assert account['login_user_id'] == context.account['login_user_id']
+    context.client.account_state.assert_not_called()
+
+
+@pytest.mark.parametrize('result', ['ready', 'not_ready'])
+def test_old_account_check_cannot_overwrite_a_completed_new_login(context, monkeypatch, result):
+    monkeypatch.setattr('app.service.browser_alive', Mock(return_value=True))
+    context.client.browser.project_id.return_value = ''
+
+    def login_completed():
+        context.store.update_account(context.account['id'], {'status': 'active', 'login_stage': 'ready',
+            'setup_checked_at': 54321, 'login_user_id': 'newly-verified-account', 'balance': 456,
+            'cdp_port': 19300 + context.account['id']})
+        if result == 'not_ready':
+            raise JimengPageNotReady('profile', 'profile-pending')
+        return {'authenticated': True, 'user_id': context.account['login_user_id']}
+
+    context.client.login_identity.side_effect = login_completed
+    with pytest.raises(AccountMaintenanceBusy, match='binding changed'):
+        context.service.check_account(context.account['id'])
+    account = context.store.account(context.account['id'], private=True)
+    assert account['login_user_id'] == 'newly-verified-account' and account['balance'] == 456
+    assert account['status'] == 'active' and account['setup_checked_at'] == 54321
+
+
+@pytest.mark.parametrize('method', ['login_identity', 'account_state', 'prepare_submit', 'submit_prepared'])
+def test_proven_page_not_ready_is_unsubmitted_even_after_dispatch_intent_was_persisted(context, method):
+    identifier = create(context)
+    calls = getattr(context.client, method)
+
+    def not_ready(*args, **kwargs):
+        durable = context.store.task(identifier)
+        if method == 'submit_prepared':
+            assert durable['run_id'] == context.prepared.submit_id
+            assert durable['upstream_context']['submission_phase'] == 'dispatching'
+        raise JimengPageNotReady('profile', 'profile-pending')
+
+    calls.side_effect = not_ready
+    context.service._run(identifier)
+    result = context.store.task(identifier)
+    assert result['status'] == 'failed' and result['error_code'] == 'JIMENG_PROTOCOL_UNAVAILABLE'
+    assert result['run_id'] == '' and result['thread_id'] == '' and result['actual_cost'] is None
+    assert result['upstream_context']['submission_phase'] == 'not_dispatched'
+    assert result['upstream_context']['pre_dispatch_failure']['generation_request_sent'] is False
+    public = context.service.public_task(result)
+    assert public['provider_context'] == {'generation_request_sent': False,
+        'financial_outcome': 'not_charged_this_invocation', 'automatic_resubmission': False}
+    assert public['error']['message'] == context.service.public_task({**result,
+        'upstream_context': {}})['error']['message']
+    assert context.store.account(context.account['id'])['status'] == 'network_error'
+    context.client.poll.assert_not_called()
+    if method != 'submit_prepared':
+        context.client.submit_prepared.assert_not_called()
+    else:
+        context.client.submit_prepared.assert_called_once()
+    context.service._run(identifier)
+    context.service._resume_poll(identifier)
+    context.client.poll.assert_not_called()
+
+
+def test_page_not_ready_proof_cannot_clear_later_acceptance_evidence(context):
+    identifier = create(context)
+
+    def accepted_then_pending(prepared):
+        context.service._jimeng_update(identifier, {'thread_id': 'own-history'},
+            {'submission_phase': 'accepted', 'upstream_task_id': 'own-provider-task'})
+        raise JimengPageNotReady('modules', 'factories-pending')
+
+    context.client.submit_prepared.side_effect = accepted_then_pending
+    context.service._run(identifier)
+    result = context.store.task(identifier)
+    assert result['status'] == 'succeeded'
+    assert result['run_id'] == context.prepared.submit_id and result['thread_id'] == 'own-history'
+    assert result['upstream_context']['submit_error']['outcome_unknown'] is True
+    assert 'provider_context' not in context.service.public_task(result)
+    context.client.poll.assert_called_once_with(context.prepared.submit_id, 'own-history')
     context.client.submit_prepared.assert_called_once()
 
 
