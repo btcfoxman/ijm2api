@@ -186,8 +186,9 @@ def test_public_material_route_does_not_change_account_for_any_cli_rpc(context, 
     assert runner.accounts and all(selected == account for selected in runner.accounts)
     assert sum(args[:2] == ["node", "run"] for args in runner.calls) == 1
     assert store.account(account["id"], private=True)["proxy_url"] == PROXY
-    assert opened == []
+    assert len(opened) == 1
+    assert opened[0].get.call_args.kwargs['proxies'] == {}
     uploads = [args for args in runner.calls if args[:2] == ["resource", "upload"]]
-    assert len(uploads) == 1 and "--file" not in uploads[0]
-    assert uploads[0][uploads[0].index("--source-url") + 1] == image_source
+    assert len(uploads) == 1 and "--file" in uploads[0]
+    assert '--source-url' not in uploads[0]
     service.browser_runtime.acquire.assert_not_called()

@@ -49,7 +49,8 @@ def test_service_skips_image_download_without_changing_video_audio_or_data_paths
     with patch('app.canvas_service._download', side_effect=download) as fetched, \
          patch('app.canvas_service._probe_media', return_value={'duration':6.0}) as probe:
         assets = service._canvas_local_assets(original, account, tmp_path, deadline=deadline)
-    assert assets['images'][0] == {'source_url': URL}
+    assert assets['images'][0]['source_url'] == URL
+    assert callable(assets['images'][0]['fallback_file'])
     assert [call.args[0] for call in fetched.call_args_list] == [data, video, audio]
     assert probe.call_count == 2
     for kind in ('videos', 'audios'):

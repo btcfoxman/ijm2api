@@ -48,7 +48,8 @@ def public_error(code: str, message: str) -> dict[str, str]:
         return {'code': kind, 'message': PARAMETER_VALIDATION_MESSAGE}
     if kind in {'JIMENG_QUERY_FAILED', 'JIMENG_RESULT_MISSING'}:
         return {'code': kind, 'message': UNCERTAIN_SUBMISSION_MESSAGE}
-    if kind in {'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED', 'CLI_PREPARATION_RETRY_EXHAUSTED'}:
+    if kind in {'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED', 'CLI_PREPARATION_RETRY_EXHAUSTED',
+                'CLI_PREPARATION_TIMEOUT'}:
         return {'code': kind, 'message': BOUNDED_RETRY_FAILURE_MESSAGE}
     if kind in {'CLI_PREPARATION_TRANSIENT_FAILED', 'CLI_SUBMISSION_RETRYABLE'}:
         # Call-stage classification is authoritative. Raw diagnostics can quote

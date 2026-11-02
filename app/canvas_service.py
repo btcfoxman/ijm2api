@@ -302,6 +302,7 @@ class CanvasServiceMixin:
         facts = context.get('pre_dispatch_failure')
         if (task.get('status') not in {'failed', 'expired'}
                 or task.get('error_code') not in {'CLI_PREPARATION_TRANSIENT_FAILED', 'CLI_PREPARATION_RETRY_EXHAUSTED',
+                                                'CLI_PREPARATION_TIMEOUT',
                                                 'INSUFFICIENT_CREDITS'}
                 or not isinstance(facts, dict) or facts.get('generation_request_sent') is not False
                 or facts.get('financial_outcome') != 'not_charged_this_invocation'
@@ -309,8 +310,69 @@ class CanvasServiceMixin:
                 or facts.get('stage') not in {'preparation', 'confirming'}
                 or CanvasServiceMixin._canvas_dispatch_evidence(task)):
             return {}
-        return {key: facts[key] for key in ('generation_request_sent', 'financial_outcome',
-                                            'automatic_resubmission')}
+        expiry = context.get('preparation_expiry')
+        if expiry is not None and (not isinstance(expiry, dict) or expiry.get('pre_dispatch_proven') is not True):
+            return {}
+        result = {key: facts[key] for key in ('generation_request_sent', 'financial_outcome',
+                                             'automatic_resubmission')}
+        if facts.get('fallback_allowed') is True or task.get('error_code') == 'CLI_PREPARATION_TIMEOUT':
+            result['fallback_allowed'] = True
+        return result
+
+    def _canvas_expire_preparation(self, task_id: str, deadline: float, *,
+                                   cause: Exception | None = None,
+                                   submission_started: bool = False,
+                                   prior_dispatch_evidence: bool = False) -> dict:
+        """Describe the exhausted window without renewing it or inferring a refund."""
+        task = self.store.task(task_id) or {}
+        context = task.get('upstream_context') or {}
+        budget = context.get('preparation_retry_budget')
+        now = time.time()
+        retry_expired = False
+        if budget is not None:
+            try:
+                budget_token(budget, task_id=task_id)
+                retry_expired = now >= budget['deadline']
+            except RetryBudgetError:
+                pass  # An invalid ledger is never replaced or given more time.
+        original = context.get('preparation_error') or {}
+        phase = str(original.get('phase') or context.get('phase') or 'preparation')
+        if not re.fullmatch(r'[A-Za-z0-9_]{1,40}', phase):
+            phase = 'preparation'
+        source_code = str(getattr(cause, 'code', type(cause).__name__ if cause is not None else '')
+                          or original.get('code') or 'CLI_TASK_DEADLINE_EXCEEDED')
+        if not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', source_code):
+            source_code = 'CLI_TASK_DEADLINE_EXCEEDED'
+        # A direct local cutoff is reached before submit() by construction.
+        # Other failures need their typed, non-unknown call-stage evidence.
+        proof_error = (cause if isinstance(cause, CanvasCLIError) else
+                       CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Local preparation cutoff')
+                       if cause is None else None)
+        failure_evidence = (proof_error.details if proof_error is not None
+                            and isinstance(proof_error.details, dict) else {})
+        failure_dispatch = any(self._canvas_dispatch_evidence({'upstream_context': item})
+            for item in (failure_evidence, failure_evidence.get('error')) if isinstance(item, dict))
+        facts = (self._canvas_pre_dispatch_facts(task, proof_error, False)
+                 if proof_error is not None and not submission_started
+                 and not prior_dispatch_evidence and not failure_dispatch else {})
+        expiry = {'scope': 'retry_window' if retry_expired else 'task_window', 'at': now,
+                  'effective_deadline': now + deadline - time.monotonic(),
+                  'phase': phase, 'source_error_code': source_code,
+                  'pre_dispatch_proven': bool(facts)}
+        if isinstance(budget, dict):
+            expiry.update({key: budget[key] for key in ('version', 'started_at', 'deadline', 'task_deadline')
+                           if key in budget})
+        changes = {'preparation_expiry': expiry}
+        if facts:
+            previous = context.get('pre_dispatch_failure')
+            changes['pre_dispatch_failure'] = {**(previous if isinstance(previous, dict) else {}),
+                                               **facts, 'fallback_allowed': True}
+        self._canvas_context(task_id, changes)
+        window = 'retry window' if retry_expired else 'task window'
+        code = 'CLI_PREPARATION_RETRY_EXHAUSTED' if retry_expired else 'CLI_PREPARATION_TIMEOUT'
+        verdict = 'no generation was submitted' if facts else 'submission evidence was retained'
+        return self._fail_canvas_task(task_id, code,
+            f'Canvas preparation {window} expired at {phase}; {verdict} (cause: {source_code})')
 
     @staticmethod
     def _canvas_retryable_submit_transport(error: dict) -> bool:
@@ -647,31 +709,52 @@ class CanvasServiceMixin:
 
     def _canvas_local_assets(self, normalized: dict, account: dict, directory: Path, *,
                              deadline: float | None = None) -> dict:
+        def local_asset(source, kind, index, *, fetch_deadline):
+            try:
+                if not str(source).startswith(("https://", "http://", "data:")):
+                    raise MediaError("Canvas reference requires a media URL; browser asset IDs cannot be reused",
+                                     category="invalid_source", attempt_count=0)
+                contents, mime, filename = _download(str(source), kind,
+                    str(account["proxy_url"]),
+                    allow_direct_fallback=self._canvas_direct_media_allowed(str(source)), deadline=fetch_deadline)
+            except MediaError as exc:
+                exc.diagnostic.update(media_kind=kind, media_index=index + 1)
+                raise
+            suffix = Path(filename).suffix.lower()
+            if not suffix or len(suffix) > 12 or not suffix[1:].isalnum():
+                suffix = {"images": ".png", "videos": ".mp4", "audios": ".mp3"}[kind]
+            path = directory / f"{kind}-{index + 1}{suffix}"
+            path.write_bytes(contents)
+            meta = _probe_media(contents, suffix) if kind != "images" else {}
+            return {"path": str(path), "mime": mime, **meta}
+
+        def image_fallback(source, index):
+            # The fixed direct-first policy or a proven missing registration
+            # can select this transport. Keep it inside the preparation cutoff;
+            # a slow media route must not consume the whole retry allowance.
+            def download():
+                fetch_deadline = time.monotonic() + 30
+                if deadline is not None:
+                    fetch_deadline = min(fetch_deadline, deadline)
+                return Path(local_asset(source, 'images', index, fetch_deadline=fetch_deadline)['path'])
+            return download
+
         assets = {kind: [] for kind in ("images", "videos", "audios")}
         for kind in assets:
             for index, source in enumerate(normalized.get(kind) or []):
                 if kind == 'images' and str(source).startswith(('https://', 'http://')):
-                    # The pinned CLI imports public image URLs server-side. Its
-                    # request still uses the selected account proxy transport.
-                    assets[kind].append({'source_url': public_image_source_url(source)})
+                    source_url = public_image_source_url(source)
+                    if self._canvas_direct_media_allowed(source_url):
+                        # URL import bypasses our known public-host transport
+                        # policy. Fetch these images through the existing direct
+                        # first route, then keep official CLI calls on the account
+                        # proxy. The content hash still binds stable file IDs.
+                        assets[kind].append({'path': str(image_fallback(source_url, index)())})
+                        continue
+                    assets[kind].append({'source_url': source_url,
+                        'fallback_file': image_fallback(source_url, index)})
                     continue
-                try:
-                    if not str(source).startswith(("https://", "http://", "data:")):
-                        raise MediaError("Canvas reference requires a media URL; browser asset IDs cannot be reused",
-                                         category="invalid_source", attempt_count=0)
-                    contents, mime, filename = _download(str(source), kind,
-                        str(account["proxy_url"]),
-                        allow_direct_fallback=self._canvas_direct_media_allowed(str(source)), deadline=deadline)
-                except MediaError as exc:
-                    exc.diagnostic.update(media_kind=kind, media_index=index + 1)
-                    raise
-                suffix = Path(filename).suffix.lower()
-                if not suffix or len(suffix) > 12 or not suffix[1:].isalnum():
-                    suffix = {"images": ".png", "videos": ".mp4", "audios": ".mp3"}[kind]
-                path = directory / f"{kind}-{index + 1}{suffix}"
-                path.write_bytes(contents)
-                meta = _probe_media(contents, suffix) if kind != "images" else {}
-                assets[kind].append({"path": str(path), "mime": mime, **meta})
+                assets[kind].append(local_asset(source, kind, index, fetch_deadline=deadline))
         return assets
 
     @staticmethod
@@ -960,9 +1043,12 @@ class CanvasServiceMixin:
         if isinstance(client, CanvasClient):
             client.preparation_timing = timing
 
-        def fail_preparation(code, message):
+        def fail_preparation(code, message, *, cause=None):
             finish_attempt('preparation_failed')
             self._canvas_context(task_id, {'preparation_timing': timing.snapshot()})
+            if code == 'CLI_PREPARATION_TIMEOUT':
+                return self._canvas_expire_preparation(task_id, deadline, cause=cause,
+                    submission_started=submission_started, prior_dispatch_evidence=prior_dispatch_evidence)
             return self._fail_canvas_task(task_id, code, message)
 
         def persist(value):
@@ -1187,15 +1273,15 @@ class CanvasServiceMixin:
                             'preparation_failures': [*failures[-15:], failure],
                             'preparation_timing': timing.snapshot()})
                 expired_preparation = not submission_started and time.monotonic() >= deadline
+                if expired_preparation:
+                    fail_preparation('CLI_PREPARATION_TIMEOUT', '', cause=exc)
+                    return True
                 facts = (self._canvas_pre_dispatch_facts(self.store.task(task_id) or {}, exc, submission_started)
                          if preparation_retryable_failure(exc) and not prior_dispatch_evidence else {})
                 if facts:
                     self._canvas_context(task_id, {'pre_dispatch_failure': facts})
                     return self._canvas_retry_preparation(task_id, account, exc, generation_deadline, facts)
-                self._fail_canvas_task(task_id, 'CLI_PREPARATION_TRANSIENT_FAILED' if facts else
-                    'CLI_PREPARATION_TIMEOUT' if expired_preparation else exc.code,
-                    'Task deadline passed during Canvas preparation; no generation was submitted'
-                    if expired_preparation else str(exc))
+                self._fail_canvas_task(task_id, exc.code, str(exc))
             return True
         except Exception as exc:
             finish_attempt('preparation_failed')
@@ -1216,7 +1302,7 @@ class CanvasServiceMixin:
                     self._canvas_context(task_id, {"media_download_error": diagnostic})
                     logger.warning("Canvas media download failed task=%s account=%s diagnostic=%s",
                                    task_id, account_id, diagnostic)
-                fail_preparation(code, f"{type(exc).__name__}: Canvas preparation failed")
+                fail_preparation(code, f"{type(exc).__name__}: Canvas preparation failed", cause=exc)
             logger.warning("Canvas task %s failed in %s (%s)", task_id,
                            "submission" if submission_started else "preparation", type(exc).__name__)
             return True

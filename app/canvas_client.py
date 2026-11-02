@@ -177,6 +177,30 @@ def preparation_retryable_failure(exc: CanvasCLIError) -> bool:
         and not exc.details.get('partialData'))
 
 
+def _source_url_fallback_allowed(exc: CanvasCLIError) -> bool:
+    """A local file is an alternate input transport, not a policy/auth retry."""
+    if exc.outcome_unknown:
+        return False
+    error = exc.details.get('error') or {}
+    if not isinstance(error, dict):
+        return False
+    if ('retryable' in error and error['retryable'] is not True
+            or error.get('class') in {'permanent_failure', 'business_failure', 'human_intervention'}):
+        return False
+    facts = ' '.join(str(value).lower() for value in
+                     (exc.code, error.get('code'), error.get('class'), error.get('reason')))
+    if (any(word in facts for word in ('auth', 'credential', 'identity', 'permission',
+            'policy', 'moderation', 'copyright', 'content_rejected', 'invalid_input',
+            'invalid_argument', 'validation', 'insufficient', 'credit', 'balance'))
+            or error.get('requiredAction') not in (None, '', 'none', 'retry', 'contact_support')):
+        return False
+    if preparation_retryable_failure(exc):
+        return True
+    return (exc.code == 'CLI_COMMAND_TIMEOUT' and error.get('serviceCode') in (None, '')
+        and not exc.details.get('partialData')
+        and not any(error.get(key) for key in ('resources', 'submission', 'items', 'accepted')))
+
+
 def _read_only_transport_retry(args: list[str], exc: CanvasCLIError) -> bool:
     """An exact read may reconnect after a typed transport failure."""
     if exc.code != 'cli.transport_failed' or tuple(args[:2]) not in _TRANSPORT_RETRY_READS:
@@ -686,6 +710,18 @@ class CanvasClient:
             if not any(x.get("projectId") == wanted for x in data.get("items", []) if isinstance(x, dict)):
                 raise
 
+    @staticmethod
+    def _reference_state(data: dict, resource_id: str, media_type: str | None) -> str:
+        if data.get('resourceId') != resource_id:
+            raise CanvasCLIError('CLI_RESOURCE_MISMATCH', 'Canvas returned another reference resource')
+        if media_type and any(value not in (None, '', media_type)
+                              for value in (data.get('type'), data.get('mediaType'))):
+            raise CanvasCLIError('CLI_RESOURCE_MISMATCH', 'Canvas returned another reference media type')
+        state = str(data.get('status') or '').lower()
+        if state in {'failed', 'error', 'canceled', 'cancelled', 'rejected'}:
+            raise CanvasCLIError('MEDIA_UPLOAD_FAILED', f"Canvas reference upload failed ({data.get('errorCode', state)})")
+        return state
+
     def _resource_ready(self, resource_id: str, project_id: str, *, timeout: float = 120,
                         deadline: float | None = None, media_type: str | None = None) -> dict[str, Any]:
         ready_deadline = time.monotonic() + timeout
@@ -703,16 +739,9 @@ class CanvasClient:
                     observed_missing = True
                     self._sleep(1, ready_deadline)
                     continue
-                if data.get('resourceId') != resource_id:
-                    raise CanvasCLIError('CLI_RESOURCE_MISMATCH', 'Canvas returned another reference resource')
-                if media_type and any(value not in (None, '', media_type)
-                                      for value in (data.get('type'), data.get('mediaType'))):
-                    raise CanvasCLIError('CLI_RESOURCE_MISMATCH', 'Canvas returned another reference media type')
-                state = str(data.get("status") or "").lower()
+                state = self._reference_state(data, resource_id, media_type)
                 if state in {"success", "succeeded", "completed"}:
                     return data
-                if state in {"failed", "error", "canceled", "cancelled", "rejected"}:
-                    raise CanvasCLIError("MEDIA_UPLOAD_FAILED", f"Canvas reference upload failed ({data.get('errorCode', state)})")
                 self._sleep(1, ready_deadline)
         except CanvasCLIError as exc:
             if exc.code == 'CLI_TASK_DEADLINE_EXCEEDED' and (observed_missing or deadline is None or time.monotonic() < deadline):
@@ -721,12 +750,15 @@ class CanvasClient:
 
     def _upload_resource(self, path: Path | None, media_type: str, resource_id: str, project_id: str, *,
                          deadline: float | None = None, source_url: str | None = None,
-                         on_registered: Callable[[str], Any] | None = None) -> None:
+                          on_registered: Callable[[str], Any] | None = None,
+                          fallback_file: Callable[[], Path] | None = None) -> None:
         """Retries keep the same documented registration idempotency key."""
         if source_url is not None:
             if media_type != 'image' or path is not None:
                 raise CanvasCLIError('MEDIA_INPUT_MISSING', 'Canvas source-url imports require an image and no local file')
             source = ['--source-url', public_image_source_url(source_url)]
+            if fallback_file is not None and not callable(fallback_file):
+                raise CanvasCLIError('MEDIA_INPUT_MISSING', 'Canvas image fallback provider is invalid')
         elif isinstance(path, Path):
             source = ['--file', str(path.resolve())]
         else:
@@ -747,7 +779,7 @@ class CanvasClient:
                     raise  # An acknowledged upload only needs observation; never write it again.
                 if exc.code == "MEDIA_UPLOAD_FAILED":
                     raise
-                if exc.code == "cli.upload_state_unknown":
+                if exc.code == "cli.upload_state_unknown" or exc.outcome_unknown:
                     # The CLI explicitly forbids replaying an unknown upload.
                     # Only observe its original registration ID; this is not a
                     # node.run recovery and must never allocate another ID.
@@ -759,6 +791,52 @@ class CanvasClient:
                         if observed.code == "MEDIA_UPLOAD_PENDING":
                             raise exc from observed
                         raise
+                    return
+                if source[0] == '--source-url' and fallback_file is not None:
+                    if not _source_url_fallback_allowed(exc):
+                        raise
+                    # Only exact registration absence permits changing the
+                    # transport of this same planned ID. A failed/pending read
+                    # is not evidence that a new write is safe.
+                    probe_deadline = time.monotonic() + 5
+                    if deadline is not None:
+                        probe_deadline = min(probe_deadline, deadline)
+                    try:
+                        existing = self._call(['resource', 'get', resource_id, '--project-id', project_id],
+                            timeout=5, read_only=True, deadline=probe_deadline)
+                    except CanvasCLIError as check:
+                        if not _planned_resource_not_found(check, resource_id):
+                            retryable_read = (not check.outcome_unknown and (
+                                preparation_retryable_failure(check) or identity_network_error(check)
+                                or check.code in {'CLI_COMMAND_TIMEOUT', 'CLI_INVALID_RESPONSE', 'CLI_TASK_DEADLINE_EXCEEDED'}))
+                            if not retryable_read or _resource_read_intervention(check):
+                                raise
+                            if on_registered is not None:
+                                on_registered('unknown')
+                            raise exc from check
+                        if attempt == 2:
+                            raise exc from check  # The three-write cap is shared by both transports.
+                        self._remaining(deadline)
+                        closed = getattr(self.runner, '_closed', None)
+                        if isinstance(closed, Event) and closed.is_set():
+                            raise CanvasCLIError('CLI_STOPPING', 'Canvas reference preparation stopped')
+                        # The service owns validated download diagnostics and
+                        # normalization, including its structured MediaError.
+                        fallback_path = fallback_file()
+                        self._remaining(deadline)
+                        if isinstance(closed, Event) and closed.is_set():
+                            raise CanvasCLIError('CLI_STOPPING', 'Canvas reference preparation stopped')
+                        if not isinstance(fallback_path, Path) or not fallback_path.is_file():
+                            raise CanvasCLIError('MEDIA_INPUT_MISSING', 'Canvas image fallback file is unavailable')
+                        source = ['--file', str(fallback_path.resolve())]
+                        self._sleep(0.5 * 2 ** attempt, deadline)
+                        continue
+                    state = self._reference_state(existing, resource_id, media_type)
+                    if state in {'success', 'succeeded', 'completed'}:
+                        return
+                    if on_registered is not None:
+                        on_registered('acknowledged')
+                    self._resource_ready(resource_id, project_id, deadline=deadline, media_type=media_type)
                     return
                 # A lost response can follow successful storage/registration.
                 # Observe the persisted ID before another same-ID upload.
@@ -824,11 +902,14 @@ class CanvasClient:
             for index, asset in enumerate(assets.get(group, [])):
                 self._remaining(deadline)
                 source_url = asset.get('source_url') if isinstance(asset, dict) else None
+                fallback_file = asset.get('fallback_file') if isinstance(asset, dict) else None
                 path = asset.get('path') if isinstance(asset, dict) else asset
                 if source_url is not None:
                     if media_type != 'image' or path is not None:
                         raise CanvasCLIError('MEDIA_INPUT_MISSING', 'Canvas remote references require an image URL only')
                     source_url = public_image_source_url(source_url)
+                    if fallback_file is not None and not callable(fallback_file):
+                        raise CanvasCLIError('MEDIA_INPUT_MISSING', 'Canvas image fallback provider is invalid')
                     source_kind, source_hash = 'url', hashlib.sha256(source_url.encode()).hexdigest()
                     path = None
                 else:
@@ -843,7 +924,7 @@ class CanvasClient:
                     source_kind, source_hash = 'file', hasher.hexdigest()
                 jobs.append({'group': group, 'index': index, 'media_type': media_type,
                     'source_kind': source_kind, 'source_sha256': source_hash,
-                    'path': path, 'source_url': source_url})
+                    'path': path, 'source_url': source_url, 'fallback_file': fallback_file})
         binding = {'task_id': task_id, 'account_id': int(self.account['id']),
             'profile_sha256': digest(context['profile']),
             'user_id_sha256': digest(str(self.account.get('login_user_id') or self.account.get('cli_user_id') or '')),
@@ -958,7 +1039,7 @@ class CanvasClient:
                             else:
                                 self._upload_resource(job['path'], job['media_type'], job['resource_id'],
                                     context['project_id'], deadline=deadline, source_url=job['source_url'],
-                                    on_registered=registered)
+                                     on_registered=registered, fallback_file=job['fallback_file'])
                         self._remaining(deadline)
                         # Successful siblings remain useful after another worker fails.
                         with state_lock:
