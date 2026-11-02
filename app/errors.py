@@ -14,7 +14,7 @@ class GenerationCapabilityDenied(ValueError):
 
 
 CONTENT_MODERATION_MESSAGE = "检测到内容可能违规，请修改提示词或参考素材后重试~"
-RETRYABLE_SUBMISSION_MESSAGE = "生成提交失败，请稍后重试~"
+RETRYABLE_SUBMISSION_MESSAGE = "视频生成提交失败，请稍后重试~"
 BOUNDED_RETRY_FAILURE_MESSAGE = "视频生成提交失败，请稍后重试~"
 UNCERTAIN_SUBMISSION_MESSAGE = "提交结果未确认，请核对上游任务，暂勿重复提交~"
 PARAMETER_VALIDATION_MESSAGE = "请求参数未通过上游校验，请检查参数或参考素材后重试~"
@@ -34,6 +34,11 @@ def upstream_review_error(code: str, message: str) -> str | None:
 def public_error(code: str, message: str) -> dict[str, str]:
     raw = (message or "").lower()
     kind = (code or "").upper()
+    # Command/admission failures do not prove a refund or an accepted
+    # generation. Keep the code and leave routing facts to the task's
+    # recorded dispatch/reconciliation evidence.
+    if kind in {'CLI.TRANSPORT_FAILED', 'SERVICE.1', 'INSUFFICIENT_CREDITS'}:
+        return {'code': kind, 'message': BOUNDED_RETRY_FAILURE_MESSAGE}
     # Typed phases win over arbitrary diagnostic prose. These codes retain
     # routing detail while callers receive only the approved message set.
     if kind in {'REGION_GENERATION_DENIED', 'JIMENG_PROTOCOL_UNAVAILABLE',
@@ -124,8 +129,6 @@ def public_error(code: str, message: str) -> dict[str, str]:
         "CLI_TASK_DEADLINE_EXCEEDED": "生成请求处理超时，请稍后查询~",
         "CLI_INVALID_RESPONSE": "生成服务响应异常，请稍后重试~",
         "CLI.INVALID_SERVICE_RESPONSE": "生成服务响应异常，请稍后重试~",
-        # A historical service.1 alone proves no financial outcome or dispatch boundary.
-        "SERVICE.1": "生成服务暂时不可用，请稍后重试~",
     }
     if kind in messages:
         return {"code": kind, "message": messages[kind]}

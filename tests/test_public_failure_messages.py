@@ -30,9 +30,12 @@ UNKNOWN = '提交结果未确认，请核对上游任务，暂勿重复提交~'
     ('CLI_TASK_DEADLINE_EXCEEDED', '生成请求处理超时，请稍后查询~'),
     ('CLI_INVALID_RESPONSE', '生成服务响应异常，请稍后重试~'),
     ('cli.invalid_service_response', '生成服务响应异常，请稍后重试~'),
-    ('SERVICE.1', '生成服务暂时不可用，请稍后重试~'),
-    ('CLI_PREPARATION_TRANSIENT_FAILED', '生成提交失败，请稍后重试~'),
-    ('CLI_SUBMISSION_RETRYABLE', '生成提交失败，请稍后重试~'),
+    ('SERVICE.1', '视频生成提交失败，请稍后重试~'),
+    ('cli.transport_failed', '视频生成提交失败，请稍后重试~'),
+    ('CLI_PREPARATION_RETRY_EXHAUSTED', '视频生成提交失败，请稍后重试~'),
+    ('INSUFFICIENT_CREDITS', '视频生成提交失败，请稍后重试~'),
+    ('CLI_PREPARATION_TRANSIENT_FAILED', '视频生成提交失败，请稍后重试~'),
+    ('CLI_SUBMISSION_RETRYABLE', '视频生成提交失败，请稍后重试~'),
     ('CLI_UNRECOGNIZED_FAILURE', '生成请求处理失败，请稍后查询或联系管理员~'),
     ('cli.unrecognized_failure', '生成请求处理失败，请稍后查询或联系管理员~'),
 ])
@@ -42,6 +45,23 @@ def test_failure_categories_use_fixed_reasons_without_maintenance_or_financial_c
     assert '维护' not in result['message']
     assert not any(word in result['message'] for word in ['已返还', '已退还', '退款'])
     assert not any(secret in str(result) for secret in ['private-', 'https://', 'socks5://', 'signature='])
+
+
+@pytest.mark.parametrize('code', ['cli.transport_failed', 'service.1',
+    'CLI_PREPARATION_TRANSIENT_FAILED', 'CLI_PREPARATION_RETRY_EXHAUSTED',
+    'CLI_SUBMISSION_RETRYABLE', 'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED',
+    'INSUFFICIENT_CREDITS'])
+@pytest.mark.parametrize('raw', [
+    'The service could not be reached. Check network and proxy access, then retry safely.',
+    'The service is temporarily unavailable. Retry this command.',
+    'Canvas preparation retry budget unavailable: ATTEMPTS_EXHAUSTED',
+    'Canvas generation failed (20115)',
+    'video may contain third-party content',
+])
+def test_transient_command_diagnostics_use_approved_message_without_inventing_policy_or_refund(code, raw):
+    assert public_error(code, raw) == {
+        'code': code.upper(), 'message': '视频生成提交失败，请稍后重试~',
+    }
 
 
 @pytest.mark.parametrize('code', [

@@ -134,9 +134,37 @@ def preparation_service_unavailable(exc: CanvasCLIError) -> bool:
         and not any(error.get(key) for key in ('resources', 'submission', 'items', 'accepted')))
 
 
+def preparation_transport_failure(exc: CanvasCLIError) -> bool:
+    """Typed transport failure before paid dispatch, never permission to replay run."""
+    details = exc.details
+    error = details.get('error') if isinstance(details, dict) else None
+    if (exc.outcome_unknown or exc.code != 'cli.transport_failed'
+            or not isinstance(error, dict) or error.get('code') != 'cli.transport_failed'
+            or error.get('class') != 'retryable_failure' or error.get('retryable') is not True
+            or error.get('requiredAction') != 'retry' or error.get('serviceCode') not in (None, '')
+            or str(error.get('reason') or '') not in {'', *_TRANSIENT}):
+        return False
+    # A structured error may carry a partial operation/receipt. A local
+    # transport label cannot override that evidence or a dispatch boundary.
+    local_storages = [value['localStorage'] for value in (details, error) if value.get('localStorage')]
+    if any(not isinstance(value, dict) or value.get('submissionPhase') != 'before_submit'
+           for value in local_storages):
+        return False
+    for value in (details, error, *local_storages):
+        if (value.get('dispatch_started') is True or value.get('outcome_unknown') is True
+                or value.get('phase') in {'run_dispatching', 'submitted', 'accepted', 'unknown'}
+                or any(value.get(key) for key in ('partialData', 'data', 'accepted', 'resources',
+                    'items', 'submission', 'receipt', 'run_receipt', 'run_data', 'operation',
+                    'operationRef', 'operation_ref', 'operation_id', 'operationId', 'resource_ids',
+                    'resourceIds', 'run_id', 'runId', 'thread_id', 'threadId',
+                    'submission_evidence', 'submission_receipt_evidence'))):
+            return False
+    return True
+
+
 def preparation_retryable_failure(exc: CanvasCLIError) -> bool:
-    """Known service/decoding failures of a command which cannot generate."""
-    if preparation_service_unavailable(exc):
+    """Known service/transport/decoding failures before a generation command."""
+    if preparation_service_unavailable(exc) or preparation_transport_failure(exc):
         return True
     error = exc.details.get('error') or {}
     return (not exc.outcome_unknown
@@ -534,6 +562,10 @@ class CanvasClient:
                              or read_only and _read_only_transport_retry(args, exc)
                              or (tuple(args[:2]) in _PREPARATION_RETRY_READS
                                  and preparation_service_unavailable(exc)))
+                if exc.code == 'cli.transport_failed':
+                    # Explicit auth/business/action vetoes in the transport
+                    # contract must not be bypassed by a generic network reason.
+                    transient = read_only and _read_only_transport_retry(args, exc)
                 if not read_only or attempt == 2 or not transient:
                     raise
                 self._sleep(0.25 * 2 ** attempt, deadline)

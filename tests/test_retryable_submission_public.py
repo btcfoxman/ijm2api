@@ -12,7 +12,7 @@ from app.errors import public_error
 @pytest.mark.parametrize('raw', ['Canvas generation failed (20115)',
     'video may contain third-party content', 'image you uploaded community guidelines'])
 def test_typed_service_retry_failure_cannot_be_reclassified_by_raw_policy_words(code, raw):
-    assert public_error(code, raw) == {'code': code, 'message': '生成提交失败，请稍后重试~'}
+    assert public_error(code, raw) == {'code': code, 'message': '视频生成提交失败，请稍后重试~'}
 
 
 def closed_task(kind='video', code='CLI_SUBMISSION_UNCONFIRMED'):
@@ -62,7 +62,7 @@ def test_bounded_empty_service_failure_all_public_routes_allow_next_channel_with
     instance = service()
     result = getattr(instance, entrypoint)(task)
     assert result['id'] == task['id'] and result['status'] == 'failed'
-    assert result['error'] == {'code': 'CLI_SUBMISSION_RETRYABLE', 'message': '生成提交失败，请稍后重试~'}
+    assert result['error'] == {'code': 'CLI_SUBMISSION_RETRYABLE', 'message': '视频生成提交失败，请稍后重试~'}
     assert result['provider_context'] == {
         'may_have_been_accepted': True, 'financial_outcome': 'unconfirmed',
         'automatic_resubmission': False, 'fallback_allowed': True,

@@ -671,6 +671,14 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                          backend: str | None = None, *, include_aux_busy: bool = False,
                          task: dict | None = None) -> list[dict]:
         accounts, legacy, all_quotes = [], [], []
+        try:
+            exhausted, blocked, allowed = self._canvas_preparation_capacity(task or {})
+        except ValueError:
+            return []  # Admission will report the invalid durable ledger.
+        if exhausted or (task and (task.get('upstream_context') or {}).get('preparation_retry_budget') is not None
+                         and self._canvas_dispatch_evidence(task)):
+            return []
+        excluded = excluded | blocked
         normalized = (task or {}).get('normalized') or {}
         multi_reference_video = (normalized.get('kind') != 'image'
             and sum(len(normalized.get(kind) or []) for kind in ('images', 'videos', 'audios')) > 1)
@@ -682,6 +690,8 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
             except Exception as exc:
                 logger.warning('Canvas scheduling quote cache unavailable (%s)', type(exc).__name__)
         for item in self.store.accounts(private=True):
+            if allowed is not None and int(item['id']) not in allowed:
+                continue
             if (int(item['id']) in excluded or not account_accepts_task(item, task, threshold=threshold,
                                                                        rescue_threshold=image_rescue)
                     or account_requires_proxy(item) and not item['proxy_url']
@@ -1104,6 +1114,11 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
         task = self.store.task(task_id)
         if not task or task["status"] != "queued":
             return
+        if task.get('execution_backend') == 'canvas_cli' and self._canvas_current_dispatch(task):
+            self._resume_canvas_poll(task_id)
+            return
+        if self._canvas_preparation_admission_stopped(task_id, set()):
+            return
         try:
             self._assert_region_pool_allows(task['normalized'])
         except RegionGenerationDenied as exc:
@@ -1157,6 +1172,8 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                     if self._admission_expired(task_id, deadline):
                         return
                     excluded = set(attempted) | funding_excluded
+                    if self._canvas_preparation_admission_stopped(task_id, excluded):
+                        return
                     account = self._reserve_account(estimated_cost, exclude_ids=excluded,
                                                     prefer_balance=bool(attempted), task_id=task_id)
                     if account or ((attempted or funding_excluded or self._model_excluded_accounts(self.store.task(task_id) or {}))
@@ -1183,9 +1200,14 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                     backend = execution_mode(account)
                     with self._lock:
                         current = self.store.task(task_id) or {}
-                        if (backend == 'jimeng_web' or current.get('execution_backend') == 'jimeng_web') and (
+                        if (backend in {'jimeng_web', 'canvas_cli'} or current.get('execution_backend') in {'jimeng_web', 'canvas_cli'}) and (
                                 current.get('status') != 'queued' or current.get('run_id')):
                             return
+                        if self._canvas_preparation_admission_stopped(task_id, excluded):
+                            return
+                        _, blocked, allowed = self._canvas_preparation_capacity(current)
+                        if account_id in blocked or allowed is not None and account_id not in allowed:
+                            continue
                         self.store.update_task(task_id, {"account_id": account_id,
                             "status": "preparing", "progress": 5, "balance_before": None,
                             "execution_backend": backend, "cost_evidence": {'execution_backend': backend},
@@ -1310,6 +1332,11 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
         task = self.store.task(task_id)
         if not task or task["status"] != "queued":
             return
+        if task.get('execution_backend') == 'canvas_cli' and self._canvas_current_dispatch(task):
+            self._resume_canvas_poll(task_id)
+            return
+        if self._canvas_preparation_admission_stopped(task_id, set()):
+            return
         try:
             self._assert_region_pool_allows(task['normalized'])
         except RegionGenerationDenied as exc:
@@ -1346,6 +1373,8 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                 if self._admission_expired(task_id, deadline):
                     return
                 excluded = set(attempted) | funding_excluded
+                if self._canvas_preparation_admission_stopped(task_id, excluded):
+                    return
                 account = self._reserve_account(estimated_cost, exclude_ids=excluded,
                                                 prefer_balance=bool(attempted), task_id=task_id)
                 if not account:
@@ -1365,9 +1394,14 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                     backend = execution_mode(account)
                     with self._lock:
                         current = self.store.task(task_id) or {}
-                        if (backend == 'jimeng_web' or current.get('execution_backend') == 'jimeng_web') and (
+                        if (backend in {'jimeng_web', 'canvas_cli'} or current.get('execution_backend') in {'jimeng_web', 'canvas_cli'}) and (
                                 current.get('status') != 'queued' or current.get('run_id')):
                             return
+                        if self._canvas_preparation_admission_stopped(task_id, excluded):
+                            return
+                        _, blocked, allowed = self._canvas_preparation_capacity(current)
+                        if account_id in blocked or allowed is not None and account_id not in allowed:
+                            continue
                         self.store.update_task(task_id, {"account_id": account_id,
                             "status": "preparing", "progress": 5, "error_code": "", "error_message": "",
                             "execution_backend": backend, 'cost_evidence': {'execution_backend': backend}})

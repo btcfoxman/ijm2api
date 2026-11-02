@@ -18,7 +18,8 @@ from .canvas_client import (CanvasClient, identity_network_error, preparation_re
 from .canvas_timing import PreparationTiming, archived_attempts, INITIAL_ADMISSION_UNSET
 from .canvas_quote_hints import new_hint
 from .canvas_retry_budget import (new_retry_budget, budget_token, claim_attempt,
-                                 seed_from_verified_preparations, RetryBudgetError)
+                                 seed_from_verified_preparations, RetryBudgetError,
+                                 MAX_ATTEMPTS, MAX_ACCOUNTS, MAX_ATTEMPTS_PER_ACCOUNT)
 from .account_policy import credit_rejected
 from .daily_checkin import AccountMaintenanceBusy, cli_credit_details, decode_details, identity_binding, read_state
 from .image_model_routing import plan_image_execution, recorded_image_route
@@ -225,6 +226,11 @@ class CanvasServiceMixin:
                 or context.get('resource_ids') or context.get('dispatch_started_at') or context.get('accepted')
                 or context.get('dispatch_started') is True or error.get('dispatch_started') is True
                 or context.get('operation_ref') or context.get('operationRef') or context.get('operation_id')
+                or context.get('operationId') or submission_evidence_blocks_fallback(context)
+                or context.get('receipt') or context.get('run_receipt')
+                or context.get('submission_receipt_evidence') is True
+                or isinstance(context.get('submission_evidence'), dict)
+                    and context['submission_evidence'].get('ambiguous_partial') is True
                 or context.get('phase') in {'accepted', 'unknown', 'submission_unconfirmed'}
                 or context.get('submission_phase') not in {None, '', 'confirming'}
                 or context.get('financial_outcome') in {'unknown', 'unconfirmed'}
@@ -249,6 +255,14 @@ class CanvasServiceMixin:
         return False
 
     @staticmethod
+    def _canvas_current_dispatch(task: dict) -> bool:
+        """A current operation needs polling; rejected history is not one."""
+        context = dict(task.get('upstream_context') or {})
+        context.pop('previous_submissions', None)
+        context.pop('preparation_attempts', None)
+        return CanvasServiceMixin._canvas_dispatch_evidence({**task, 'upstream_context': context})
+
+    @staticmethod
     def _canvas_pre_dispatch_facts(task: dict, exc: CanvasCLIError, submission_started: bool) -> dict:
         """Positive call-stage evidence, not an inference from missing outputs."""
         if (exc.outcome_unknown or task.get('status') not in {'queued', 'preparing'}
@@ -268,7 +282,8 @@ class CanvasServiceMixin:
         context = task.get('upstream_context') or {}
         facts = context.get('pre_dispatch_failure')
         if (task.get('status') not in {'failed', 'expired'}
-                or task.get('error_code') not in {'CLI_PREPARATION_TRANSIENT_FAILED', 'CLI_PREPARATION_RETRY_EXHAUSTED'}
+                or task.get('error_code') not in {'CLI_PREPARATION_TRANSIENT_FAILED', 'CLI_PREPARATION_RETRY_EXHAUSTED',
+                                                'INSUFFICIENT_CREDITS'}
                 or not isinstance(facts, dict) or facts.get('generation_request_sent') is not False
                 or facts.get('financial_outcome') != 'not_charged_this_invocation'
                 or facts.get('automatic_resubmission') is not False
@@ -667,6 +682,60 @@ class CanvasServiceMixin:
         return (isinstance(error, dict) and error.get('scope') == 'account' and error.get('reason') == 'model_not_in_catalog'
             and error.get('requested_model') == (route['effective_model'] if route else task.get('model'))
             and error.get('kind') == ('image' if task['normalized'].get('kind') == 'image' else 'video'))
+
+    @staticmethod
+    def _canvas_preparation_capacity(task: dict) -> tuple[bool, set[int], set[int] | None]:
+        """Read the original ledger without granting a claim or renewing it.
+
+        Earlier owners cannot be revisited. Once two owners were used, only
+        the last owner's remaining preparation may still be admitted.
+        """
+        budget = (task.get('upstream_context') or {}).get('preparation_retry_budget')
+        if budget is None:
+            return False, set(), None
+        budget_token(budget, task_id=task['id'])
+        owners = [entry['account_id'] for entry in budget['attempts']]
+        blocked = set(owners[:-1])
+        if owners:
+            blocked.discard(owners[-1])
+            if owners.count(owners[-1]) >= MAX_ATTEMPTS_PER_ACCOUNT:
+                blocked.add(owners[-1])
+        allowed = set(owners) if len(set(owners)) >= MAX_ACCOUNTS else None
+        return len(owners) >= MAX_ATTEMPTS, blocked, allowed
+
+    def _canvas_preparation_admission_stopped(self, task_id: str, excluded: set[int]) -> bool:
+        """End exhausted admission before reserving or binding another account."""
+        with self._lock:
+            task = self.store.task(task_id) or {}
+            if (task.get('upstream_context') or {}).get('preparation_retry_budget') is None:
+                return False
+            if self._canvas_task_terminated(task):
+                return True
+            if self._canvas_dispatch_evidence(task):
+                if self._canvas_current_dispatch(task):
+                    return True  # The original operation's dispatcher owns it.
+                # A restored ledger with only historical dispatch evidence
+                # cannot authorize a new zero-send claim. End explicitly,
+                # rather than leaving a queued task without an owner.
+                self._fail_canvas_task(task_id, 'CLI_PREPARATION_RETRY_EXHAUSTED',
+                    task.get('error_message') or 'Canvas preparation retry cannot reuse prior dispatch history')
+                return True
+            try:
+                exhausted, blocked, allowed = self._canvas_preparation_capacity(task)
+            except RetryBudgetError:
+                self._fail_canvas_task(task_id, 'CLI_PREPARATION_RETRY_EXHAUSTED',
+                    'Canvas preparation retry budget is invalid; no further generation was submitted')
+                return True
+            if not exhausted and (allowed is None or allowed - blocked - excluded):
+                return False
+            # A successful quote can exhaust the last account's funds without
+            # an upstream error. Keep that authoritative cause, instead of
+            # assigning a new owner and reporting a fourth rejected claim.
+            code = ('INSUFFICIENT_CREDITS' if task.get('error_code') == 'INSUFFICIENT_CREDITS'
+                    else 'CLI_PREPARATION_RETRY_EXHAUSTED')
+            message = task.get('error_message') or 'Canvas preparation retry limit reached; no further generation was submitted'
+            self._fail_canvas_task(task_id, code, message)
+            return True
 
     def _canvas_claim_preparation(self, task_id: str, account_id: int, deadline: float, *,
                                   initial_failure: bool = False) -> dict:
