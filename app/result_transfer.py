@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+import ipaddress
+import math
 import mimetypes
 import os
 import re
@@ -12,7 +14,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import requests
 
@@ -526,3 +528,289 @@ def store_original(path: Path, task_id: str, storage: dict | None = None, *,
     metadata.update(upload_id=current['upload_id'], sha256=digest, original_bytes=True,
                     content_type=content_type)
     return url, metadata
+
+
+_JIMENG_MEDIA_DOMAINS = ('jimeng.com', 'vlabvod.com')
+_JIMENG_DOWNLOAD_ATTEMPTS = 3
+_JIMENG_PUBLIC_ATTEMPTS = 2
+_JIMENG_CHUNK_BYTES = 64 * 1024
+_JIMENG_PUBLIC_PREFIX_BYTES = 4096
+
+
+def _jimeng_phase(callback, deadline: float | None, name: str) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise _transfer_error(name, 'JIMENG_TRANSFER_DEADLINE_EXCEEDED')
+    if callback is not None:
+        try:
+            accepted = callback(name)
+        except Exception:
+            raise _transfer_error(name, 'JIMENG_TRANSFER_INTERRUPTED') from None
+        if accepted is False:
+            raise _transfer_error(name, 'JIMENG_TRANSFER_INTERRUPTED')
+    if deadline is not None and time.monotonic() >= deadline:
+        raise _transfer_error(name, 'JIMENG_TRANSFER_DEADLINE_EXCEEDED')
+
+
+def _jimeng_https_host(value: object, *, official: bool) -> str:
+    try:
+        if (not isinstance(value, str) or not value or len(value) > 65536 or '\\' in value
+                or any(ord(char) <= 32 or ord(char) == 127 for char in value)):
+            raise ValueError()
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        if (parsed.scheme != 'https' or not host or parsed.username is not None
+                or parsed.password is not None or parsed.port not in (None, 443) or parsed.fragment
+                or len(host) > 253 or not all(re.fullmatch(
+                    r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label) for label in host.split('.'))):
+            raise ValueError()
+        is_official = any(host == domain or host.endswith('.' + domain) for domain in _JIMENG_MEDIA_DOMAINS)
+        if official != is_official or not official and (host == 'localhost' or host.endswith('.localhost')):
+            raise ValueError()
+        if not official:
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                address = None
+            if (address is not None and not address.is_global
+                    or '.' not in host or host.endswith(('.local', '.internal'))):
+                raise ValueError()
+        return host
+    except (ValueError, TypeError):
+        stage = 'jimeng_download' if official else 's3_public_verify'
+        raise _transfer_error(stage, 'JIMENG_DOWNLOAD_URL_INVALID' if official else 'S3_PUBLIC_URL_INVALID') from None
+
+
+def _jimeng_timeout(deadline: float | None) -> tuple[float, float]:
+    remaining = 30.0 if deadline is None else max(0.001, deadline - time.monotonic())
+    return min(10.0, remaining), min(30.0, remaining)
+
+
+def _jimeng_proxy(value: str) -> str:
+    if not value:
+        return ''
+    try:
+        parsed = urlsplit(value)
+        if (parsed.scheme not in {'http', 'https', 'socks5', 'socks5h'} or not parsed.hostname
+                or not parsed.port or parsed.path not in ('', '/') or parsed.query or parsed.fragment):
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise _transfer_error('jimeng_download', 'JIMENG_PROXY_INVALID') from None
+    return value.replace('socks5://', 'socks5h://', 1)
+
+
+def _jimeng_length(response, stage: str) -> int:
+    value = response.headers.get('Content-Length', '')
+    if not isinstance(value, str) or not value.isdecimal() or not 0 < int(value) <= MAX_SINGLE_UPLOAD_BYTES:
+        raise _transfer_error(stage, 'JIMENG_MEDIA_LENGTH_INVALID')
+    if str(response.headers.get('Content-Encoding', '')).lower() not in ('', 'identity'):
+        raise _transfer_error(stage, 'JIMENG_MEDIA_ENCODING_INVALID')
+    return int(value)
+
+
+def _jimeng_get(http, url: str, *, official: bool, headers: dict, proxies: dict,
+                 deadline: float | None, on_phase, stage: str):
+    # Handle redirects ourselves so an anonymous request cannot gain a cookie,
+    # a Referer, credentials, or an unvalidated destination through a redirect.
+    current = url
+    for redirect in range(4):
+        _jimeng_https_host(current, official=official)
+        _jimeng_phase(on_phase, deadline, stage)
+        http.cookies.clear()
+        response = http.get(current, headers=headers, proxies=proxies, stream=True,
+                            timeout=_jimeng_timeout(deadline), allow_redirects=False)
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            return response
+        location = response.headers.get('Location')
+        response.close()
+        if redirect == 3 or not isinstance(location, str) or not location:
+            raise _transfer_error(stage, 'JIMENG_REDIRECT_INVALID')
+        current = urljoin(current, location)
+    raise AssertionError('unreachable')
+
+
+def _download_jimeng_original(url: str, target: Path, *, proxy_url: str,
+                              deadline: float | None, on_phase) -> dict:
+    proxy = _jimeng_proxy(proxy_url)
+    for attempt in range(_JIMENG_DOWNLOAD_ATTEMPTS):
+        _jimeng_phase(on_phase, deadline, 'jimeng_download')
+        route = proxy if attempt and proxy else ''
+        proxies = {'http': route, 'https': route} if route else {}
+        try:
+            with requests.Session() as http:
+                http.trust_env = False
+                response = _jimeng_get(http, url, official=True,
+                    headers={'Accept-Encoding': 'identity'}, proxies=proxies,
+                    deadline=deadline, on_phase=on_phase, stage='jimeng_download')
+                with response:
+                    status = response.status_code
+                    if status != 200:
+                        retryable = status in _RETRY_HTTP or status in {401, 403} and not route and bool(proxy)
+                        raise _transfer_error('jimeng_download', 'JIMENG_MEDIA_HTTP_ERROR',
+                                              http_status=status, retryable=retryable)
+                    size = _jimeng_length(response, 'jimeng_download')
+                    media_type = str(response.headers.get('Content-Type', '')).split(';', 1)[0].strip().lower()
+                    if media_type not in {'video/mp4', 'application/mp4', 'application/octet-stream', 'binary/octet-stream'}:
+                        raise _transfer_error('jimeng_download', 'JIMENG_MEDIA_TYPE_INVALID')
+                    # Restart on every retry; never splice unvalidated CDN bytes.
+                    total, digest = 0, hashlib.sha256()
+                    with target.open('wb') as output:
+                        for chunk in response.iter_content(_JIMENG_CHUNK_BYTES):
+                            _jimeng_phase(on_phase, deadline, 'jimeng_download')
+                            if not chunk:
+                                continue
+                            total += len(chunk)
+                            if total > size or total > MAX_SINGLE_UPLOAD_BYTES:
+                                raise _transfer_error('jimeng_download', 'JIMENG_MEDIA_SIZE_MISMATCH')
+                            digest.update(chunk)
+                            output.write(chunk)
+                    if total != size:
+                        raise _transfer_error('jimeng_download', 'JIMENG_MEDIA_TRUNCATED', retryable=True)
+                    return {'size_bytes': size, 'sha256': digest.hexdigest(),
+                            'source_route': 'account_proxy' if route else 'direct'}
+        except requests.RequestException:
+            error = _transfer_error('jimeng_download', 'JIMENG_MEDIA_TRANSPORT_ERROR', retryable=True)
+        except ResultTransferError as exc:
+            error = exc
+        except OSError:
+            raise _transfer_error('jimeng_download', 'JIMENG_MEDIA_FILE_ERROR') from None
+        if not error.retryable or attempt == _JIMENG_DOWNLOAD_ATTEMPTS - 1:
+            raise error from None
+        _jimeng_phase(on_phase, deadline, 'jimeng_download')
+        delay = float(attempt + 1)
+        if deadline is not None:
+            delay = min(delay, max(0.0, deadline - time.monotonic()))
+        if delay:
+            time.sleep(delay)
+    raise AssertionError('unreachable')
+
+
+def _probe_jimeng_original(path: Path, *, deadline: float | None, on_phase) -> tuple[int, int, float]:
+    _jimeng_phase(on_phase, deadline, 'jimeng_probe')
+    try:
+        with path.open('rb') as contents:
+            prefix = contents.read(16)
+        if len(prefix) < 16 or prefix[4:8] != b'ftyp':
+            raise _transfer_error('jimeng_probe', 'JIMENG_MP4_INVALID')
+        timeout = 30 if deadline is None else max(0.001, min(30, deadline - time.monotonic()))
+        result = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height:format=duration', '-of', 'json', str(path)],
+            capture_output=True, text=True, timeout=timeout)
+        value = json.loads(result.stdout) if not result.returncode else {}
+        stream = (value.get('streams') or [{}])[0]
+        width, height = stream.get('width'), stream.get('height')
+        duration = float((value.get('format') or {}).get('duration') or 0)
+        if (type(width) is not int or width <= 0 or type(height) is not int or height <= 0
+                or not math.isfinite(duration) or duration <= 0):
+            raise _transfer_error('jimeng_probe', 'JIMENG_MP4_INVALID')
+    except ResultTransferError:
+        raise
+    except (OSError, ValueError, TypeError, IndexError, AttributeError, subprocess.TimeoutExpired):
+        raise _transfer_error('jimeng_probe', 'JIMENG_MP4_INVALID') from None
+    _jimeng_phase(on_phase, deadline, 'jimeng_probe')
+    return width, height, duration
+
+
+def _verify_jimeng_public(url: str, path: Path, downloaded: dict, *,
+                           deadline: float | None, on_phase) -> dict:
+    size, digest = downloaded['size_bytes'], downloaded['sha256']
+    with path.open('rb') as contents:
+        prefix = contents.read(min(size, _JIMENG_PUBLIC_PREFIX_BYTES))
+    for attempt in range(_JIMENG_PUBLIC_ATTEMPTS):
+        try:
+            with requests.Session() as http:
+                http.trust_env = False
+                response = _jimeng_get(http, url, official=False,
+                    headers={'Accept-Encoding': 'identity', 'Range': f'bytes=0-{len(prefix) - 1}'},
+                    proxies={}, deadline=deadline, on_phase=on_phase, stage='s3_public_verify')
+                with response:
+                    status = response.status_code
+                    if status not in {200, 206}:
+                        raise _transfer_error('s3_public_verify', 'S3_PUBLIC_HTTP_ERROR',
+                            http_status=status, retryable=status in _RETRY_HTTP)
+                    media_type = str(response.headers.get('Content-Type', '')).split(';', 1)[0].strip().lower()
+                    if media_type not in {'video/mp4', 'application/mp4', 'application/octet-stream', 'binary/octet-stream'}:
+                        raise _transfer_error('s3_public_verify', 'S3_PUBLIC_MEDIA_TYPE_INVALID')
+                    declared = _jimeng_length(response, 's3_public_verify')
+                    if status == 206:
+                        match = _CONTENT_RANGE.fullmatch(response.headers.get('Content-Range', ''))
+                        if (not match or tuple(map(int, match.groups())) != (0, len(prefix) - 1, size)
+                                or declared != len(prefix)):
+                            raise _transfer_error('s3_public_verify', 'S3_PUBLIC_RANGE_MISMATCH')
+                        expected = len(prefix)
+                    else:
+                        if declared != size:
+                            raise _transfer_error('s3_public_verify', 'S3_PUBLIC_SIZE_MISMATCH')
+                        expected = size
+                    total, public_digest, head = 0, hashlib.sha256(), bytearray()
+                    for chunk in response.iter_content(_JIMENG_CHUNK_BYTES):
+                        _jimeng_phase(on_phase, deadline, 's3_public_verify')
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > expected:
+                            raise _transfer_error('s3_public_verify', 'S3_PUBLIC_SIZE_MISMATCH')
+                        public_digest.update(chunk)
+                        if len(head) < len(prefix):
+                            head.extend(chunk[:len(prefix) - len(head)])
+                    if total != expected:
+                        raise _transfer_error('s3_public_verify', 'S3_PUBLIC_TRUNCATED', retryable=True)
+                    if bytes(head) != prefix or head[4:8] != b'ftyp' or status == 200 and public_digest.hexdigest() != digest:
+                        raise _transfer_error('s3_public_verify', 'S3_PUBLIC_BYTES_MISMATCH')
+                    _jimeng_phase(on_phase, deadline, 's3_public_verify')
+                    return {'status': status, 'range_bytes': expected if status == 206 else 0,
+                            'verified_size_bytes': size, 'mode': 'range' if status == 206 else 'full_get'}
+        except requests.RequestException:
+            error = _transfer_error('s3_public_verify', 'S3_PUBLIC_TRANSPORT_ERROR', retryable=True)
+        except ResultTransferError as exc:
+            error = exc
+        if not error.retryable or attempt == _JIMENG_PUBLIC_ATTEMPTS - 1:
+            raise error from None
+        _jimeng_phase(on_phase, deadline, 's3_public_verify')
+        if deadline is None or deadline - time.monotonic() > 1:
+            time.sleep(1)
+    raise AssertionError('unreachable')
+
+
+def transfer_jimeng_original(url: str, task_id: str, storage: dict | None = None, *,
+                             index: int = 0, proxy_url: str = '', deadline: float | None = None,
+                             checkpoint: dict | None = None, persist_checkpoint=None,
+                             on_phase=None) -> tuple[str, dict]:
+    """Publish original Jimeng bytes only after anonymous S3 read verification."""
+    _jimeng_https_host(url, official=True)
+    if (not isinstance(task_id, str) or re.fullmatch(r'[A-Za-z0-9_-]{1,120}', task_id) is None
+            or type(index) is not int or not 0 <= index < 10000
+            or deadline is not None and (isinstance(deadline, bool)
+                or not isinstance(deadline, (int, float)) or not math.isfinite(deadline))):
+        raise _transfer_error('jimeng_download', 'JIMENG_TRANSFER_BINDING_INVALID')
+    _jimeng_phase(on_phase, deadline, 'jimeng_download')
+    try:
+        _, _, bucket, prefix = _config(storage)
+    except (ResultTransferError, TypeError, ValueError):
+        raise _transfer_error('s3_checkpoint', 'S3_CONFIG_INVALID') from None
+    try:
+        with tempfile.TemporaryDirectory(prefix='ijm-jimeng-original-') as directory:
+            source = Path(directory) / 'original.mp4'
+            downloaded = _download_jimeng_original(url, source, proxy_url=proxy_url,
+                                                  deadline=deadline, on_phase=on_phase)
+            width, height, duration = _probe_jimeng_original(source, deadline=deadline, on_phase=on_phase)
+            public, metadata = store_original(source, task_id, storage, index=index,
+                content_type='video/mp4', checkpoint=checkpoint, persist_checkpoint=persist_checkpoint,
+                on_phase=lambda name: _jimeng_phase(on_phase, deadline, name))
+            if (not isinstance(metadata, dict) or metadata.get('bucket') != bucket
+                    or metadata.get('key') != f'{prefix}/{task_id}/original-{index}.mp4'
+                    or type(metadata.get('size_bytes')) is not int
+                    or metadata['size_bytes'] != downloaded['size_bytes']
+                    or metadata.get('sha256') != downloaded['sha256']
+                    or metadata.get('content_type') != 'video/mp4' or metadata.get('original_bytes') is not True):
+                raise _transfer_error('s3_public_verify', 'S3_ORIGINAL_RECEIPT_MISMATCH')
+            public_verification = _verify_jimeng_public(public, source, downloaded,
+                                                        deadline=deadline, on_phase=on_phase)
+            result = {**metadata, 'source_url_sha256': hashlib.sha256(url.encode()).hexdigest(),
+                'width': width, 'height': height, 'duration_seconds': duration,
+                'source_route': downloaded['source_route'], 'public_download_verified': True,
+                'public_download_verified_at': time.time(), 'public_verification': public_verification}
+            return public, result
+    except ResultTransferError:
+        raise
+    except Exception:
+        raise _transfer_error('s3_transfer', 'JIMENG_ORIGINAL_TRANSFER_FAILED') from None

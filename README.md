@@ -34,7 +34,11 @@ Mainland video results use the website's separate Download request after
 generation completes. Delivery requires a watermark-free download receipt
 bound to the original account, submission and video; a history preview alone
 cannot complete delivery. Temporary download-detail failures retry the original
-result at most three times, without creating another generation.
+result at most three times, without creating another generation. Verified video
+bytes are then stored unchanged through the configured S3-center and checked
+with an anonymous download before success. The official CDN address is retained
+as upstream evidence; public results use S3-center links. Storage retries resume
+the same upload and never regenerate or fall back to the preview/CDN address.
 
 The account region is an admission setting independent of its execution
 backend. In the running settings, enable the mainland, US, or other-region

@@ -26,6 +26,12 @@ order. The service verifies this download provenance before success and does
 not opt into a separate `rwm` commercial operation or fall back to a preview.
 Reported media size is upstream metadata, not a hash or exact byte-length
 promise: the observed CDN byte length differed from the upstream metadata.
+The official CDN address is not the public delivery URL. The service downloads
+and validates the original MP4, stores its unchanged bytes through S3-center,
+and verifies an anonymous range read (or a full hash match when Range is ignored)
+before returning success. Upload checkpoints and completed objects remain bound
+to the original account, submission, history, item and video. Transfer failures
+retry the same output with a bounded budget and never submit another generation.
 
 Observed upstream keys: 2.0 Mini `dreamina_seedance_40_mini`;
 2.0 Standard `dreamina_seedance_40_pro`;

@@ -81,6 +81,15 @@ def context(tmp_path, monkeypatch):
     monkeypatch.setattr('app.service.DreaminaClient', international)
     monkeypatch.setattr('app.service.DreaminaImageClient', image)
     monkeypatch.setattr(service.canvas_cli, 'run', Mock(side_effect=AssertionError('Jimeng cannot invoke CLI')))
+    def stored_output(url, task_id, storage, *, index=0, **kwargs):
+        return 'https://storage.example.test/original.mp4', {
+            'bucket': 'assets', 'key': f'jimeng/{task_id}/original-{index}.mp4',
+            'size_bytes': 123814, 'sha256': '1' * 64, 'content_type': 'video/mp4',
+            'original_bytes': True, 'upload_id': 'synthetic-upload', 'expires_at': time.time() + 3600,
+            'source_url_sha256': hashlib.sha256(url.encode()).hexdigest(),
+            'public_download_verified': True, 'public_download_verified_at': time.time(),
+        }
+    monkeypatch.setattr('app.jimeng_service._transfer_jimeng_original', Mock(side_effect=stored_output))
     yield SimpleNamespace(store=store, service=service, account=account, client=client, prepared=prepared,
                           international=international, image=image, policies=policies)
     service.stop()

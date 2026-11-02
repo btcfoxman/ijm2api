@@ -12,6 +12,7 @@ import pytest
 
 from app.browser import BrowserError
 from app.jimeng_client import JimengResultDownloadError
+from app.result_transfer import ResultTransferError
 from app.region_policy import DEFAULT_REGION_GENERATION_POLICY
 from app.service import Service
 from app.store import Store
@@ -20,10 +21,24 @@ from app.store import Store
 DOWNLOAD_URL = 'https://v3-dreamnia.jimeng.com/original-video.mp4?signature=synthetic'
 PREVIEW_URL = 'https://v26-artist.vlabvod.com/preview-video.mp4?signature=synthetic'
 HISTORY_ID = '12345678901234'
+STORED_URL = 'https://storage.example.test/original.mp4?signature=synthetic'
 
 
 def sha(value):
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def stored_output(url, task_id, storage, *, index=0, on_phase=None,
+                  persist_checkpoint=None, **kwargs):
+    assert on_phase('download') is True
+    assert persist_checkpoint({'version': 1, 'task_id': task_id, 'index': index}) is True
+    return STORED_URL + f'&index={index}', {
+        'bucket': 'assets', 'key': f'jimeng/{task_id}/original-{index}.mp4',
+        'size_bytes': 123814, 'sha256': '1' * 64, 'content_type': 'video/mp4',
+        'original_bytes': True, 'upload_id': 'synthetic-upload', 'expires_at': time.time() + 3600,
+        'source_url_sha256': sha(url), 'public_download_verified': True,
+        'public_download_verified_at': time.time(), 'width': 720, 'height': 1280, 'duration_seconds': 4.0,
+    }
 
 
 def output_state(context, *, credits=None):
@@ -79,9 +94,11 @@ def context(tmp_path, monkeypatch):
     client = Mock(account=account)
     client.account_state.return_value = {'available_balance': 88}
     client.submit_prepared.side_effect = AssertionError('Result reads must not generate')
+    transfer = Mock(side_effect=stored_output)
+    monkeypatch.setattr('app.jimeng_service._transfer_jimeng_original', transfer)
     monkeypatch.setattr(service, '_reserve_account', Mock(side_effect=AssertionError('Result reads cannot change accounts')))
     result = SimpleNamespace(service=service, store=store, account=account, task_id=task_id,
-                             submit_id=submit_id, client=client)
+                             submit_id=submit_id, client=client, transfer=transfer)
     yield result
     client.submit_prepared.assert_not_called()
     service._reserve_account.assert_not_called()
@@ -128,7 +145,8 @@ def test_transient_download_error_retries_only_original_poll_and_persists_receip
         return False
     context.service._stop.wait.side_effect = during_retry
     task = run_poll(context)
-    assert task['status'] == 'succeeded' and task['result_urls'] == [DOWNLOAD_URL]
+    assert task['status'] == 'succeeded' and task['result_urls'] == [STORED_URL + '&index=0']
+    assert task['upstream_result_urls'] == [DOWNLOAD_URL]
     assert context.client.poll.call_count == 2
     context.service._stop.wait.assert_called_once_with(1)
     download = task['upstream_context']['result_download']
@@ -300,3 +318,232 @@ def test_download_retry_reaching_deadline_remains_a_result_error(context, monkey
     download = task['upstream_context']['result_download']
     assert download['phase'] == 'failed' and download['deadline_exhausted'] is True
     assert_original_binding(context, task)
+
+
+def test_original_cdn_is_private_evidence_and_only_verified_s3_is_published(context):
+    context.client.poll.return_value = output_state(context, credits=0)
+    task = run_poll(context)
+    assert task['status'] == 'succeeded' and task['actual_cost'] == 0
+    assert task['result_urls'] == [STORED_URL + '&index=0']
+    assert task['upstream_result_urls'] == [DOWNLOAD_URL]
+    transfer = task['result_transfer']
+    assert transfer['original_bytes'] is True and transfer['source'] == 'jimeng_web_download'
+    stored = transfer['items'][0]
+    assert stored['public_download_verified'] is True and stored['content_type'] == 'video/mp4'
+    # CDN metadata is not an actual-byte promise: use the downloaded size/hash.
+    assert stored['size_bytes'] == 123814 and stored['sha256'] == '1' * 64
+    assert task['upstream_context']['result_download']['receipts'][0]['size_bytes'] == 123456
+    assert task['upstream_context']['result_storage']['phase'] == 'verified'
+    assert DOWNLOAD_URL not in json.dumps(task['upstream_context'])
+    assert_original_binding(context, task)
+
+
+def test_storage_failure_has_small_budget_and_never_falls_back_to_cdn(context):
+    context.client.poll.return_value = output_state(context, credits=12)
+    context.transfer.side_effect = ResultTransferError('secret signed URL ' + DOWNLOAD_URL,
+        code='S3_TRANSPORT_FAILED', stage='upload', retryable=True)
+    task = run_poll(context)
+    assert task['status'] == 'failed' and task['error_code'] == 'RESULT_TRANSFER_FAILED'
+    assert task['result_urls'] == [] and task['upstream_result_urls'] == [DOWNLOAD_URL]
+    assert task['actual_cost'] == 12
+    assert task['upstream_context']['result_storage']['attempts'] == 3
+    assert task['upstream_context']['result_download']['phase'] == 'verified'
+    assert DOWNLOAD_URL not in task['error_message']
+    assert DOWNLOAD_URL not in json.dumps(task['upstream_context'])
+    assert context.transfer.call_count == 3 and context.client.poll.call_count == 1
+    assert [call.args for call in context.service._stop.wait.call_args_list] == [(1,), (2,)]
+    assert_original_binding(context, task)
+
+
+def test_storage_retries_resume_the_original_upload_checkpoint(context):
+    context.client.poll.return_value = output_state(context)
+    checkpoint = {'version': 1, 'task_id': context.task_id, 'index': 0,
+                  'upload_id': 'synthetic-persisted-session'}
+    attempts = []
+    def interrupted_upload(*args, **kwargs):
+        attempts.append(kwargs['checkpoint'])
+        if len(attempts) == 1:
+            assert kwargs['persist_checkpoint'](checkpoint) is True
+            raise ResultTransferError('synthetic disconnect', code='S3_TRANSPORT_FAILED', retryable=True)
+        return stored_output(*args, **kwargs)
+    context.transfer.side_effect = interrupted_upload
+    task = run_poll(context)
+    assert task['status'] == 'succeeded'
+    assert attempts == [None, checkpoint]
+    assert task['upstream_context']['result_storage']['attempts'] == 1
+    context.client.poll.assert_called_once()
+
+
+@pytest.mark.parametrize('field,value', [
+    ('public_download_verified', False), ('content_type', 'text/html'),
+    ('sha256', ''), ('source_url_sha256', '0' * 64), ('original_bytes', False),
+    ('public_download_verified_at', None), ('size_bytes', 0),
+])
+def test_storage_requires_actual_original_file_and_public_download_evidence(context, field, value):
+    context.client.poll.return_value = output_state(context)
+    def invalid(*args, **kwargs):
+        url, metadata = stored_output(*args, **kwargs)
+        metadata[field] = value
+        return url, metadata
+    context.transfer.side_effect = invalid
+    task = run_poll(context)
+    assert task['status'] == 'failed' and task['result_urls'] == []
+    assert task['error_code'] == 'RESULT_TRANSFER_FAILED'
+    assert task['upstream_context']['result_storage']['reason_code'] == 'JIMENG_STORAGE_RECEIPT_INVALID'
+    context.transfer.assert_called_once()
+
+
+def test_partial_storage_resumes_without_reupload_and_retains_source_binding(context):
+    first = output_state(context, credits=12)
+    second_url = DOWNLOAD_URL.replace('original-video', 'second-video')
+    second = deepcopy(first['result_download_receipts'][0])
+    second.update(item_id='22345678901235', video_id='v03055synthetic2', source_url_sha256=sha(second_url))
+    first['result_urls'].append(second_url)
+    first['result_download_receipts'].append(second)
+    context.client.poll.return_value = first
+    calls = []
+    def stop_second(*args, **kwargs):
+        calls.append(kwargs['index'])
+        if kwargs['index'] == 1:
+            context.service._stop.set()
+            raise ResultTransferError('stopped', code='S3_INTERRUPTED', retryable=False)
+        return stored_output(*args, **kwargs)
+    context.transfer.side_effect = stop_second
+    pending = run_poll(context)
+    assert pending['status'] == 'running' and pending['result_urls'] == []
+    assert pending['actual_cost'] == 12
+    assert list(pending['upstream_context']['result_storage']['completed']) == ['22345678901234']
+    context.service._stop.clear()
+    refreshed = deepcopy(first)
+    refreshed['result_urls'][0] = DOWNLOAD_URL + '&renewed=1'
+    refreshed['result_download_receipts'][0]['source_url_sha256'] = sha(refreshed['result_urls'][0])
+    context.client.poll.return_value = refreshed
+    context.transfer.side_effect = stored_output
+    task = run_poll(context)
+    assert task['status'] == 'succeeded'
+    assert task['result_urls'] == [STORED_URL + '&index=0', STORED_URL + '&index=1']
+    assert task['upstream_result_urls'] == [DOWNLOAD_URL, second_url]
+    assert task['upstream_context']['result_download']['receipts'][0]['source_url_sha256'] == sha(DOWNLOAD_URL)
+    assert [call.kwargs['index'] for call in context.transfer.call_args_list] == [0, 1, 1]
+    assert task['actual_cost'] == 12
+    assert_original_binding(context, task)
+
+
+def test_storage_cancellation_between_chunks_prevents_late_success(context):
+    context.client.poll.return_value = output_state(context, credits=12)
+    def cancel(*args, **kwargs):
+        assert kwargs['on_phase']('download') is True
+        current = context.store.task(context.task_id)
+        context.store.update_task(context.task_id, {'status': 'failed', 'error_code': 'MANUAL_TASK_TERMINATED',
+            'upstream_context': {**current['upstream_context'], 'manual_termination': {'operator': True}}})
+        assert kwargs['on_phase']('download') is False
+        assert kwargs['persist_checkpoint']({'upload_id': 'must-not-save'}) is False
+        raise ResultTransferError('interrupted', retryable=False)
+    context.transfer.side_effect = cancel
+    task = run_poll(context)
+    assert task['status'] == 'failed' and task['error_code'] == 'MANUAL_TASK_TERMINATED'
+    assert task['result_urls'] == [] and task['actual_cost'] == 12
+    assert task['upstream_context']['result_storage']['checkpoints'] == {}
+    context.transfer.assert_called_once()
+
+
+def test_storage_retry_budget_survives_restart(context):
+    context.client.poll.return_value = output_state(context)
+    context.service._jimeng_update(context.task_id, context={'result_storage': {
+        'phase': 'retrying', 'attempts': 2, 'generation_completed': True}})
+    context.transfer.side_effect = ResultTransferError('synthetic outage', code='S3_TRANSPORT_FAILED', retryable=True)
+    task = run_poll(context)
+    assert task['status'] == 'failed' and task['upstream_context']['result_storage']['attempts'] == 3
+    context.transfer.assert_called_once()
+    context.service._stop.wait.assert_not_called()
+
+
+def test_expired_s3_link_refreshes_without_repolling_or_regenerating(context, monkeypatch):
+    context.client.poll.return_value = output_state(context)
+    task = run_poll(context)
+    metadata = deepcopy(task['result_transfer'])
+    metadata['items'][0]['expires_at'] = time.time() - 1
+    context.store.update_task(context.task_id, {'result_transfer': metadata})
+    renewed = STORED_URL + '&renewed=1'
+    presign = Mock(return_value=(renewed, {'expires_at': time.time() + 3600}))
+    monkeypatch.setattr('app.result_transfer.presign', presign)
+    public = context.service.public_task(context.store.task(context.task_id))
+    assert public['data'] == [{'url': renewed}]
+    assert context.store.task(context.task_id)['upstream_result_urls'] == [DOWNLOAD_URL]
+    context.client.poll.assert_called_once()
+    context.transfer.assert_called_once()
+
+
+def test_deadline_exhausted_during_balance_read_is_a_delivery_failure(context, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr('app.jimeng_service.time.monotonic', lambda: clock[0])
+    context.client.poll.return_value = output_state(context, credits=12)
+    def balance(**_):
+        clock[0] = 102.0
+        return {'available_balance': 88}
+    context.client.account_state.side_effect = balance
+    context.service._poll_jimeng(context.task_id, context.client, 101.0)
+    task = context.store.task(context.task_id)
+    assert task['status'] == 'failed' and task['error_code'] == 'RESULT_TRANSFER_FAILED'
+    assert task['result_urls'] == [] and task['actual_cost'] == 12
+    assert task['upstream_context']['result_storage']['deadline_exhausted'] is True
+    context.transfer.assert_not_called()
+
+
+@pytest.mark.parametrize('url', ['http://storage.example.test/file.mp4',
+                               'https://user:password@storage.example.test/file.mp4'])
+def test_storage_cannot_publish_unsafe_external_url(context, url):
+    context.client.poll.return_value = output_state(context)
+    def invalid(*args, **kwargs):
+        _, metadata = stored_output(*args, **kwargs)
+        return url, metadata
+    context.transfer.side_effect = invalid
+    task = run_poll(context)
+    assert task['status'] == 'failed' and task['result_urls'] == []
+    assert task['error_code'] == 'RESULT_TRANSFER_FAILED'
+    context.transfer.assert_called_once()
+
+
+def test_persisted_storage_binding_cannot_change_to_another_video(context):
+    state = output_state(context)
+    context.client.poll.return_value = state
+    receipt = state['result_download_receipts'][0]
+    binding = {key: receipt[key] for key in ('account_id', 'submit_id', 'history_id', 'item_id', 'video_id')}
+    binding.update(index=0, video_id='v03055foreign')
+    context.service._jimeng_update(context.task_id, context={'result_storage': {
+        'bindings': {receipt['item_id']: binding}, 'phase': 'transferring', 'attempts': 0}})
+    task = run_poll(context)
+    assert task['status'] == 'failed' and task['result_urls'] == []
+    assert task['upstream_context']['result_storage']['reason_code'] == 'JIMENG_STORAGE_BINDING_INVALID'
+    context.transfer.assert_not_called()
+
+
+def test_download_chunks_check_cancellation_without_repeating_sqlite_writes(context, monkeypatch):
+    context.client.poll.return_value = output_state(context)
+    updates = Mock(wraps=context.store.update_task)
+    monkeypatch.setattr(context.store, 'update_task', updates)
+    def chunks(*args, **kwargs):
+        assert kwargs['on_phase']('jimeng_download') is True
+        first = updates.call_count
+        for _ in range(50):
+            assert kwargs['on_phase']('jimeng_download') is True
+        assert updates.call_count == first
+        assert kwargs['on_phase']('s3_put') is True
+        assert updates.call_count == first + 1
+        return stored_output(*args, **kwargs)
+    context.transfer.side_effect = chunks
+    task = run_poll(context)
+    assert task['status'] == 'succeeded'
+
+
+def test_expired_resumed_storage_stays_a_result_failure_without_new_query(context):
+    context.service._jimeng_update(context.task_id, {'status': 'running', 'actual_cost': 12},
+        {'result_download': {'phase': 'verified', 'generation_completed': True},
+         'result_storage': {'phase': 'transferring', 'generation_completed': True, 'attempts': 1}})
+    context.service._poll_jimeng(context.task_id, context.client, time.monotonic() - 1)
+    task = context.store.task(context.task_id)
+    assert task['status'] == 'failed' and task['error_code'] == 'RESULT_TRANSFER_FAILED'
+    assert task['actual_cost'] == 12 and task['result_urls'] == []
+    assert task['upstream_context']['result_storage']['deadline_exhausted'] is True
+    context.client.poll.assert_not_called()
+    context.transfer.assert_not_called()

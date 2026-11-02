@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 import math
 import re
+import hashlib
+from urllib.parse import urlsplit
 
 from .auto_login import verified_login_user_id
 from .browser import BrowserError, BrowserRejected
@@ -15,6 +17,7 @@ from .jimeng_client import (JimengPageNotReady, JimengProtocolUnavailable,
 from .image_model_routing import plan_image_execution
 from .media import MediaError, media_error_diagnostic
 from .upload import UploadError
+from .result_transfer import ResultTransferError
 
 
 _JIMENG_DOWNLOAD_ATTEMPTS = 3
@@ -25,6 +28,39 @@ _JIMENG_DOWNLOAD_RECEIPT_FIELDS = (
     'size_bytes', 'size_source', 'history_watermark_type', 'history_logo_type',
 )
 _JIMENG_DOWNLOAD_MESSAGE = 'Jimeng original output download could not be verified'
+_JIMENG_STORAGE_ATTEMPTS = 3
+_JIMENG_STORAGE_MESSAGE = 'Jimeng original output could not be saved and verified'
+_JIMENG_STORAGE_FIELDS = ('bucket', 'key', 'size_bytes', 'sha256', 'content_type',
+    'original_bytes', 'upload_id', 'expires_at', 'source_url_sha256',
+    'public_download_verified', 'public_download_verified_at', 'width', 'height',
+    'duration_seconds', 'source_route', 'public_verification')
+
+
+def _transfer_jimeng_original(*args, **kwargs):
+    from .result_transfer import transfer_jimeng_original
+    return transfer_jimeng_original(*args, **kwargs)
+
+
+def _jimeng_stored_output_valid(url, metadata, source_hash):
+    try:
+        parsed = urlsplit(url)
+        valid_url = (parsed.scheme == 'https' and parsed.hostname and not parsed.username
+            and not parsed.password and not parsed.fragment and parsed.port in (None, 443))
+    except (TypeError, ValueError):
+        return False
+    return bool(valid_url and isinstance(metadata, dict)
+        and metadata.get('original_bytes') is True
+        and metadata.get('public_download_verified') is True
+        and type(metadata.get('public_download_verified_at')) in (int, float)
+        and math.isfinite(metadata['public_download_verified_at'])
+        and metadata['public_download_verified_at'] > 0
+        and metadata.get('content_type') == 'video/mp4'
+        and type(metadata.get('size_bytes')) is int and metadata['size_bytes'] > 0
+        and isinstance(metadata.get('sha256'), str)
+        and re.fullmatch(r'[0-9a-f]{64}', metadata['sha256'])
+        and metadata.get('source_url_sha256') == source_hash
+        and isinstance(metadata.get('bucket'), str) and metadata['bucket']
+        and isinstance(metadata.get('key'), str) and metadata['key'])
 
 
 class JimengServiceMixin:
@@ -395,6 +431,162 @@ class JimengServiceMixin:
         self._stop.wait(min(attempts, max(0, deadline - time.monotonic())))
         return True
 
+    def _jimeng_store_outputs(self, task_id: str, client, state: dict, deadline: float):
+        """Publish only original bytes verified through the configured S3-center.
+
+        Storage retries keep the same generated assets, account and upload sessions.
+        The official CDN address remains private upstream evidence, never a fallback.
+        """
+        task = self.store.task(task_id) or {}
+        account_id, submit_id = task.get('account_id'), task.get('run_id')
+        receipts = [{key: receipt[key] for key in _JIMENG_DOWNLOAD_RECEIPT_FIELDS if key in receipt}
+                    for receipt in state['result_download_receipts']]
+        sources = list(state['result_urls'])
+        prior = (task.get('upstream_context') or {}).get('result_storage') or {}
+        storage = dict(prior) if isinstance(prior, dict) else {}
+        for key in ('bindings', 'checkpoints', 'completed'):
+            storage[key] = dict(storage.get(key) or {}) if isinstance(storage.get(key), dict) else {}
+        attempts = storage.get('attempts', 0)
+        attempts = attempts if type(attempts) is int and attempts >= 0 else 0
+        bindings = {receipt['item_id']: {key: receipt[key] for key in (
+            'account_id', 'submit_id', 'history_id', 'item_id', 'video_id')}
+            | {'index': index} for index, receipt in enumerate(receipts)}
+
+        if storage['bindings'] and storage['bindings'] != bindings:
+            self._jimeng_update(task_id, context={'result_storage': {
+                **storage, 'phase': 'failed', 'reason_code': 'JIMENG_STORAGE_BINDING_INVALID'}})
+            self._fail(task_id, 'RESULT_TRANSFER_FAILED', _JIMENG_STORAGE_MESSAGE)
+            return None
+
+        def current_open():
+            current = self.store.task(task_id) or {}
+            return (not self._stop.is_set() and time.monotonic() < deadline
+                and self._jimeng_open(current) and current.get('account_id') == account_id
+                and current.get('run_id') == submit_id)
+
+        def persist(phase, *, values=None):
+            with self._lock:
+                if not current_open():
+                    current = self.store.task(task_id) or {}
+                    if (not self._stop.is_set() and self._jimeng_open(current)
+                            and current.get('account_id') == account_id and current.get('run_id') == submit_id
+                            and time.monotonic() >= deadline):
+                        storage.update(phase='failed', deadline_exhausted=True,
+                            generation_completed=True, automatic_resubmission=False)
+                        self._jimeng_update(task_id, {'status': 'failed', 'progress': 100,
+                            'error_code': 'RESULT_TRANSFER_FAILED', 'error_message': _JIMENG_STORAGE_MESSAGE,
+                            'completed_at': time.time()}, {'result_storage': storage})
+                    return False
+                storage.update(phase=phase, generation_completed=True, automatic_resubmission=False)
+                self._jimeng_update(task_id, values, {'result_storage': storage})
+                return True
+
+        # A resumed transfer may use a renewed CDN signature, but completed S3
+        # objects must retain their own original receipt and asset binding.
+        previous_sources = task.get('upstream_result_urls') or []
+        for index, receipt in enumerate(receipts):
+            item_id, binding = receipt['item_id'], bindings[receipt['item_id']]
+            old_binding = storage['bindings'].get(item_id)
+            if old_binding is not None and old_binding != binding:
+                self._jimeng_update(task_id, context={'result_storage': {
+                    **storage, 'phase': 'failed', 'reason_code': 'JIMENG_STORAGE_BINDING_INVALID'}})
+                self._fail(task_id, 'RESULT_TRANSFER_FAILED', _JIMENG_STORAGE_MESSAGE)
+                return None
+            saved = storage['completed'].get(item_id)
+            if saved:
+                old_receipt = saved.get('receipt') if isinstance(saved, dict) else None
+                old_source = previous_sources[index] if index < len(previous_sources) else ''
+                old_hash = hashlib.sha256(old_source.encode()).hexdigest() if isinstance(old_source, str) else ''
+                if (not isinstance(old_receipt, dict) or saved.get('binding') != binding
+                        or any(old_receipt.get(key) != value for key, value in binding.items() if key != 'index')
+                        or old_receipt.get('source_url_sha256') != old_hash
+                        or not verified_result_download_receipts({'result_urls': [old_source],
+                            'result_download_receipts': [old_receipt]}, account_id=account_id,
+                            submit_id=submit_id, history_id=binding['history_id'])
+                        or not _jimeng_stored_output_valid(saved.get('url'), saved.get('metadata'), old_hash)):
+                    self._jimeng_update(task_id, context={'result_storage': {
+                        **storage, 'phase': 'failed', 'reason_code': 'JIMENG_STORAGE_CACHE_INVALID'}})
+                    self._fail(task_id, 'RESULT_TRANSFER_FAILED', _JIMENG_STORAGE_MESSAGE)
+                    return None
+                sources[index], receipts[index] = old_source, {
+                    key: old_receipt[key] for key in _JIMENG_DOWNLOAD_RECEIPT_FIELDS if key in old_receipt}
+        storage['bindings'] = bindings
+        download = (task.get('upstream_context') or {}).get('result_download') or {}
+        download = {'phase': 'verified', 'attempts': download.get('attempts', 0),
+            'generation_completed': True, 'automatic_resubmission': False, 'receipts': receipts}
+        if not current_open():
+            persist('transferring')
+            return None
+        self._jimeng_update(task_id, {'status': 'running', 'progress': max(95, task.get('progress') or 0),
+            'upstream_result_urls': sources}, {'submission_phase': 'accepted', 'result_download': download})
+
+        while current_open() and attempts < _JIMENG_STORAGE_ATTEMPTS:
+            try:
+                for index, receipt in enumerate(receipts):
+                    item_id, binding = receipt['item_id'], bindings[receipt['item_id']]
+                    if item_id in storage['completed']:
+                        continue
+                    if not persist('transferring'):
+                        return None
+
+                    def checkpoint(value, rid=item_id):
+                        storage['checkpoints'][rid] = value
+                        return persist('transferring')
+
+                    def phase(value):
+                        # Only the local phase enum is persisted, never URLs or
+                        # remote error prose which might include signed links.
+                        stage = value if isinstance(value, str) and re.fullmatch(
+                            r'[a-z_]{1,40}', value) else 'transfer'
+                        if storage.get('stage') == stage and current_open():
+                            return True  # Download chunks still check cancellation; no repeated SQLite writes.
+                        storage['stage'] = stage
+                        return persist('downloading' if stage in {'download', 'jimeng_download', 'jimeng_probe'}
+                                       else 'transferring')
+
+                    signed, metadata = _transfer_jimeng_original(sources[index], task_id,
+                        self.settings(), index=index,
+                        proxy_url=str(getattr(client, 'account', {}).get('proxy_url') or ''),
+                        deadline=deadline, checkpoint=storage['checkpoints'].get(item_id),
+                        persist_checkpoint=checkpoint, on_phase=phase)
+                    if not current_open():
+                        persist('transferring')
+                        return None
+                    source_hash = hashlib.sha256(sources[index].encode()).hexdigest()
+                    if not _jimeng_stored_output_valid(signed, metadata, source_hash):
+                        raise ResultTransferError('Original storage receipt is invalid',
+                            code='JIMENG_STORAGE_RECEIPT_INVALID', retryable=False)
+                    storage['completed'][item_id] = {'url': signed, 'binding': binding, 'receipt': receipt,
+                        'metadata': {key: metadata[key] for key in _JIMENG_STORAGE_FIELDS if key in metadata}}
+                    if not persist('transferring'):
+                        return None
+                items = [storage['completed'][receipt['item_id']] for receipt in receipts]
+                if not persist('verified'):
+                    return None
+                return ([item['url'] for item in items],
+                    {'items': [item['metadata'] for item in items], 'original_bytes': True,
+                     'source': 'jimeng_web_download'}, sources, download)
+            except Exception as exc:
+                if not current_open():
+                    break
+                attempts += 1
+                code = getattr(exc, 'code', None)
+                code = code if isinstance(code, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,79}', code) else 'JIMENG_STORAGE_FAILED'
+                retryable = getattr(exc, 'retryable', None) is True or isinstance(exc, OSError)
+                retry = retryable and attempts < _JIMENG_STORAGE_ATTEMPTS
+                storage.update(attempts=attempts, reason_code=code, retryable=retryable)
+                if not persist('retrying' if retry else 'failed'):
+                    return None
+                if not retry:
+                    self._fail(task_id, 'RESULT_TRANSFER_FAILED', _JIMENG_STORAGE_MESSAGE)
+                    return None
+                self._stop.wait(min(attempts, max(0, deadline - time.monotonic())))
+        if not self._stop.is_set() and self._jimeng_open(self.store.task(task_id)):
+            storage.update(deadline_exhausted=time.monotonic() >= deadline, phase='failed')
+            self._jimeng_update(task_id, context={'result_storage': storage})
+            self._fail(task_id, 'RESULT_TRANSFER_FAILED', _JIMENG_STORAGE_MESSAGE)
+        return None
+
     def _poll_jimeng(self, task_id: str, client, deadline: float) -> None:
         errors = 0
         while not self._stop.is_set() and time.monotonic() < deadline:
@@ -430,7 +622,8 @@ class JimengServiceMixin:
                 # share the small result-read budget instead of the 8-query backoff.
                 current = self.store.task(task_id) or {}
                 download = (current.get('upstream_context') or {}).get('result_download') or {}
-                if isinstance(download, dict) and download.get('phase') == 'retrying':
+                if isinstance(download, dict) and (download.get('phase') == 'retrying'
+                        or download.get('generation_completed') is True):
                     transient = JimengResultDownloadError('JIMENG_DOWNLOAD_UNAVAILABLE')
                     if not self._jimeng_download_failure(task_id, transient, deadline):
                         return
@@ -456,14 +649,27 @@ class JimengServiceMixin:
                         self.store.update_account(int(task['account_id']), {'balance': after})
                 except Exception:
                     pass  # A credit read never invalidates a verified output.
+                if self._stop.is_set() or not self._jimeng_open(self.store.task(task_id)):
+                    return
                 receipts = state.get('result_download_receipts') or []
                 download = (task.get('upstream_context') or {}).get('result_download') or {}
                 download = {'phase': 'verified', 'attempts': download.get('attempts', 0),
                     'generation_completed': True, 'automatic_resubmission': False,
                     'receipts': [{key: receipt[key] for key in _JIMENG_DOWNLOAD_RECEIPT_FIELDS if key in receipt}
                                  for receipt in receipts]}
+                upstream_urls, transfer = urls, {}
+                if task.get('normalized', {}).get('kind') != 'image':
+                    task = self._jimeng_update(task_id, {
+                        'actual_cost': amount if proven else task.get('actual_cost')})
+                    stored = self._jimeng_store_outputs(task_id, client, state, deadline)
+                    if stored is None:
+                        return
+                    urls, transfer, upstream_urls, download = stored
+                if self._stop.is_set():
+                    return
                 self._jimeng_update(task_id, {'status': 'succeeded', 'progress': 100,
-                    'result_urls': urls, 'upstream_result_urls': urls, 'balance_after': after,
+                    'result_urls': urls, 'upstream_result_urls': upstream_urls, 'result_transfer': transfer,
+                    'balance_after': after,
                     'actual_cost': amount if proven else task.get('actual_cost'), 'completed_at': time.time(),
                     'error_code': '', 'error_message': ''},
                     {'submission_phase': 'accepted', 'result_download': download})
@@ -487,6 +693,12 @@ class JimengServiceMixin:
         if not self._stop.is_set():
             current = self.store.task(task_id) or {}
             download = (current.get('upstream_context') or {}).get('result_download') or {}
+            storage = (current.get('upstream_context') or {}).get('result_storage') or {}
+            if isinstance(storage, dict) and storage.get('generation_completed') is True:
+                self._jimeng_update(task_id, context={'result_storage': {
+                    **storage, 'phase': 'failed', 'deadline_exhausted': True}})
+                self._fail(task_id, 'RESULT_TRANSFER_FAILED', _JIMENG_STORAGE_MESSAGE)
+                return
             if isinstance(download, dict) and download.get('phase') == 'retrying':
                 self._jimeng_update(task_id, context={'result_download': {
                     **download, 'phase': 'failed', 'deadline_exhausted': True}})
