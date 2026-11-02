@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from .browser import (BrowserError, BrowserRejected, CDPBrowser, account_browser_options,
+from .browser import (BrowserError, BrowserRejected, CDPBrowser, CDPTransportError, account_browser_options,
     account_proxy_url, browser_alive)
 from .account_automation import AccountAutomation, AutomationError
 from .browser_runtime import BrowserRuntime
@@ -985,11 +985,30 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                 return self.store.update_account(account_id, {'status': 'cli_auth_required',
                     'last_error': 'CLI authorization is required before accepting tasks'})
             return self._check_cli_account(account)
-        account, owned = self.browser_runtime.acquire(account, force_managed=start_browser)
+        try:
+            account, owned = self.browser_runtime.acquire(account, force_managed=start_browser)
+        except CDPTransportError as exc:
+            checked = self._account_cdp_transport_failure(account, exc)
+            if checked is None:
+                raise AccountMaintenanceBusy('Account binding changed during its browser check') from exc
+            return checked
         try:
             return self._check_account_live(account)
         finally:
             self.browser_runtime.release(account, owned)
+
+    def _account_cdp_transport_failure(self, account: dict, exc: CDPTransportError):
+        """A broken CDP transport does not establish that authentication expired."""
+        with self._lock:
+            current = self.store.account(int(account['id']), private=True)
+            if (not current or current.get('status') == 'logging_in'
+                    or any(current.get(key) != account.get(key) for key in (
+                        'execution_mode', 'cdp_port', 'login_user_id', 'setup_checked_at'))):
+                return None
+            if current.get('status') in {'disabled', 'disabled_low_balance'}:
+                return current
+            return self.store.update_account(int(account['id']),
+                {'status': 'network_error', 'last_error': str(exc)[:300]})
 
     def _check_account_live(self, account: dict[str, Any]) -> dict[str, Any]:
         account_id = int(account["id"])
@@ -1031,7 +1050,9 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
         if jimeng:
             assert_login_binding(self.store.account(account_id, private=True) or {})
         port = int(account["cdp_port"] or 0)
-        if not browser_alive(port, **account_browser_options(account)):
+        # Jimeng's live identity read preserves typed CDP discovery failures;
+        # the boolean probe would mistake a transient socket fault for logout.
+        if not jimeng and not browser_alive(port, **account_browser_options(account)):
             label = 'Jimeng' if execution_mode(account) == 'jimeng_web' else 'Dreamina'
             return update_check({"status": "login_required",
                                                          "last_error": f"{label} account browser is unavailable"})
@@ -1039,13 +1060,20 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
         # loading. After a service restart, one early fetch failure should not
         # put an otherwise valid account into login_required for an entire
         # maintenance interval. Complete HTTP rejections still fail promptly.
+        verification_budget = [30.0]
         for attempt in range(3):
             try:
                 client = self._web_client(account)
                 if execution_mode(account) == 'jimeng_web':
-                    verified = self._jimeng_identity(client, str(account.get('login_user_id') or ''))
-                state = client.account_state()
+                    with self._jimeng_verification_reads(client, verification_budget):
+                        verified = self._jimeng_identity(client, str(account.get('login_user_id') or ''))
+                        state = client.account_state(max_attempts=2, timeout_seconds=6)
+                        project_id = client.browser.project_id()
+                else:
+                    state = client.account_state()
                 break
+            except CDPTransportError as exc:
+                return update_check({'status': 'network_error', 'last_error': str(exc)[:300]})
             except JimengPageNotReady as exc:
                 return update_check({"status": "network_error", "last_error": str(exc)[:300]})
             except BrowserRejected as exc:
@@ -1055,7 +1083,8 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                     return update_check({"status": "login_required", "last_error": str(exc)[:300]})
                 time.sleep(1)
         balance = state["available_balance"]
-        project_id = client.browser.project_id()
+        if not jimeng:
+            project_id = client.browser.project_id()
         threshold = float(self.settings()["low_balance_disable_threshold"] or 0)
         values: dict[str, Any] = {"balance": balance, "balance_details": state["buckets"],
                                   "status": "active", "last_error": ""}

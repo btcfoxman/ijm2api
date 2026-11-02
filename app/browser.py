@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -81,7 +82,9 @@ def site_start_url(site: str) -> str:
     return site_origin(site) + ("/ai-tool/home" if site == "jimeng" else "/ai-tool/generate")
 
 
-def _site_page(port: int, site: str) -> dict[str, Any]:
+def _site_page(port: int, site: str, *, deadline: float | None = None) -> dict[str, Any]:
+    if deadline is not None:
+        return _page(port, site=site, deadline=deadline)
     return _page(port, site=site) if site != "dreamina" else _page(port)
 
 
@@ -93,8 +96,28 @@ class BrowserError(Exception):
     pass
 
 
+class CDPTransportError(BrowserError):
+    """A CDP transport failure, not proof of login expiry or upstream dispatch.
+
+    command_sent conservatively means send was attempted, including a partially
+    written frame. It never establishes that a JavaScript business call ran.
+    """
+    code = "CDP_TRANSPORT_FAILED"
+
+    def __init__(self, method: str, phase: str, command_sent: bool, exception_type: str,
+                 *, retryable: bool = True) -> None:
+        self.method, self.phase = method, phase
+        self.command_sent, self.exception_type = command_sent, exception_type
+        self.retryable = retryable
+        super().__init__(f"CDP {method} failed: {exception_type}")
+
+
 class BrowserRejected(BrowserError):
     """A complete HTTP response established that the upstream rejected a call."""
+
+
+class BrowserTargetUnavailable(BrowserError):
+    """CDP discovery cannot find the original site's page; no login verdict."""
 
 
 class _ResourceTimingContextPending(BrowserError):
@@ -164,25 +187,27 @@ def account_proxy_url(account: dict[str, Any]) -> str:
     return value
 
 
-def _targets(port: int) -> list[dict[str, Any]]:
+def _targets(port: int, *, timeout: float = 4) -> list[dict[str, Any]]:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(f"http://127.0.0.1:{port}/json", timeout=4) as response:
+        with opener.open(f"http://127.0.0.1:{port}/json", timeout=timeout) as response:
             return json.load(response)
     except Exception as exc:
         raise BrowserError(f"Dreamina CDP port {port} is unavailable: {type(exc).__name__}") from exc
 
 
-def _page(port: int, *, site: str = "dreamina") -> dict[str, Any]:
+def _page(port: int, *, site: str = "dreamina", deadline: float | None = None) -> dict[str, Any]:
     origin = urllib.parse.urlsplit(site_origin(site))
-    pages = [target for target in _targets(port) if target.get("type") == "page" and
+    targets = (_targets(port) if deadline is None else
+               _targets(port, timeout=max(.001, min(4, deadline - time.monotonic()))))
+    pages = [target for target in targets if target.get("type") == "page" and
              (parsed := urllib.parse.urlsplit(target.get("url") or "")).scheme == "https"
              and parsed.netloc == origin.netloc]
     pages.sort(key=lambda target: int("projectId=" in str(target.get("url") or "")), reverse=True)
     if pages:
         return pages[0]
     label = "Jimeng" if site == "jimeng" else "Dreamina"
-    raise BrowserError(f"open and log in to {label} in the account browser")
+    raise BrowserTargetUnavailable(f"open and log in to {label} in the account browser")
 
 
 def browser_alive(port: int, *, site: str = "dreamina") -> bool:
@@ -383,6 +408,24 @@ class CDPBrowser:
         self.timeout = timeout
         self.site = site
         self.base_url = site_origin(site)
+        self._command_local = threading.local()
+
+    @contextmanager
+    def command_budget(self, deadline: float, *, timeout: float = 10) -> Iterator[None]:
+        """Bound this thread's commands without changing shared timeout state."""
+        if (type(deadline) not in (int, float) or not math.isfinite(deadline)
+                or type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0):
+            raise ValueError("CDP command budget must have a deadline and positive timeout")
+        previous = getattr(self._command_local, "budget", None)
+        bounded = (min(deadline, previous[0]), min(timeout, previous[1])) if previous else (deadline, timeout)
+        self._command_local.budget = bounded
+        try:
+            yield
+        finally:
+            if previous is None:
+                del self._command_local.budget
+            else:
+                self._command_local.budget = previous
 
     @contextmanager
     def resource_timing_capture(self, *, _target: dict[str, Any] | None = None,
@@ -476,22 +519,58 @@ class CDPBrowser:
                         pass
 
     def command(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        target = _site_page(self.port, self.site)
-        ws = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=self.timeout,
-                                         suppress_origin=True)
+        budget = getattr(self._command_local, "budget", None)
+        timeout = min(self.timeout, budget[1]) if budget else self.timeout
+        deadline = min(time.monotonic() + timeout, budget[0]) if budget else time.monotonic() + timeout
+        ws, phase, command_sent = None, "target_lookup", False
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise CDPTransportError(method, phase, command_sent, "WebSocketTimeoutException")
+            return value
+
         try:
+            remaining()
+            try:
+                target = (_site_page(self.port, self.site, deadline=deadline) if budget else
+                          _site_page(self.port, self.site))
+            except BrowserError as exc:
+                if isinstance(exc, BrowserTargetUnavailable):
+                    raise CDPTransportError(method, phase, False, "TargetUnavailable") from exc
+                if isinstance(exc.__cause__, (OSError, websocket.WebSocketException)):
+                    raise CDPTransportError(method, phase, False, type(exc.__cause__).__name__) from exc
+                raise
+            phase = "connect"
+            ws = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=remaining(),
+                                             suppress_origin=True)
+            phase = "send"
+            ws.settimeout(remaining())
+            command_sent = True
             ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
+            phase = "receive"
             while True:
+                ws.settimeout(remaining())
                 result = json.loads(ws.recv())
+                if not isinstance(result, dict):
+                    raise BrowserError(f"CDP {method} returned an invalid response")
                 if result.get("id") != 1:
                     continue
                 if "error" in result:
                     raise BrowserError(f"CDP {method}: {result['error'].get('message', 'unknown error')}")
                 return result.get("result") or {}
         except (OSError, websocket.WebSocketException) as exc:
-            raise BrowserError(f"CDP {method} failed: {type(exc).__name__}") from exc
+            retryable = (isinstance(exc, (OSError, websocket.WebSocketTimeoutException,
+                                         websocket.WebSocketConnectionClosedException))
+                         and not isinstance(exc, websocket.WebSocketBadStatusException))
+            raise CDPTransportError(method, phase, command_sent, type(exc).__name__,
+                                    retryable=retryable) from exc
         finally:
-            ws.close()
+            if ws is not None:
+                try:
+                    ws.close()
+                except (OSError, websocket.WebSocketException):
+                    pass
 
     def evaluate(self, expression: str, *, await_promise: bool = False) -> Any:
         result = self.command("Runtime.evaluate", {"expression": expression,

@@ -20,7 +20,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
-from .browser import BrowserError, BrowserRejected, CDPBrowser
+from .browser import BrowserError, BrowserRejected, CDPBrowser, CDPTransportError
 
 
 JIMENG_ORIGIN = "https://jimeng.jianying.com"
@@ -978,12 +978,11 @@ class JimengWebClient:
         expression = _ready_expression(str(self.account.get("login_user_id") or ""),
                                        require_web_id=require_web_id)
         last_pending = JimengPageNotReady("runtime", "runtime-pending")
-        try:
+        with self.browser.command_budget(deadline, timeout=original_timeout):
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise last_pending
-                self.browser.timeout = min(original_timeout, remaining)
                 raw = self.browser.evaluate(expression)
                 try:
                     response = json.loads(raw)
@@ -1001,21 +1000,32 @@ class JimengWebClient:
                     time.sleep(min(poll_interval_seconds, remaining))
                     continue
                 raise BrowserError("Jimeng returned an invalid readiness result")
-        finally:
-            self.browser.timeout = original_timeout
 
     def login_identity(self) -> dict[str, Any]:
-        config = self._post("/mweb/v1/get_common_config", {})
-        sec_uid = config.get("sec_uid")
-        if not isinstance(sec_uid, str) or not sec_uid.strip():
-            raise BrowserError("Jimeng authenticated identity could not be verified")
-        info = self._post("/mweb/v1/get_user_info", {"sec_uid": sec_uid})
-        identity = parse_login_identity(config, info)
-        current = self.browser.evaluate(_CURRENT_IDENTITY)
-        if not isinstance(current, dict) or current.get("user_id") != identity["user_id"]:
-            raise JimengReceiptMismatch("Jimeng account changed while its identity was being verified")
-        self.account["login_user_id"] = identity["user_id"]
-        return identity
+        """Retry only complete live identity reads after a temporary CDP fault.
+
+        The browser already opens a new socket for each command. Never reuse a
+        partial profile, cached UID, or this retry policy for a generation call.
+        """
+        deadline = time.monotonic() + 30
+        with self.browser.command_budget(deadline, timeout=10):
+            for attempt in range(2):
+                try:
+                    config = self._post("/mweb/v1/get_common_config", {})
+                    sec_uid = config.get("sec_uid")
+                    if not isinstance(sec_uid, str) or not sec_uid.strip():
+                        raise BrowserError("Jimeng authenticated identity could not be verified")
+                    info = self._post("/mweb/v1/get_user_info", {"sec_uid": sec_uid})
+                    identity = parse_login_identity(config, info)
+                    current = self.browser.evaluate(_CURRENT_IDENTITY)
+                    if not isinstance(current, dict) or current.get("user_id") != identity["user_id"]:
+                        raise JimengReceiptMismatch("Jimeng account changed while its identity was being verified")
+                    self.account["login_user_id"] = identity["user_id"]
+                    return identity
+                except CDPTransportError as exc:
+                    if not exc.retryable or attempt == 1 or time.monotonic() + .5 >= deadline:
+                        raise
+                    time.sleep(.5)
 
     def _post(self, path: str, body: dict[str, Any], *,
               query: dict[str, str] | None = None, one_shot: bool = False) -> dict[str, Any]:

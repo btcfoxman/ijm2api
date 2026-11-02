@@ -6,10 +6,11 @@ import time
 import math
 import re
 import hashlib
+from contextlib import contextmanager, nullcontext
 from urllib.parse import urlsplit
 
 from .auto_login import verified_login_user_id
-from .browser import BrowserError, BrowserRejected
+from .browser import BrowserError, BrowserRejected, CDPTransportError
 from .cost_adapter import input_evidence, number
 from .errors import RegionGenerationDenied, upstream_review_error
 from .jimeng_client import (JimengPageNotReady, JimengProtocolUnavailable,
@@ -64,6 +65,65 @@ def _jimeng_stored_output_valid(url, metadata, source_hash):
 
 
 class JimengServiceMixin:
+    @staticmethod
+    @contextmanager
+    def _jimeng_verification_reads(client, budget):
+        """Share thirty seconds of live verification across preparation phases.
+
+        Uploading or preparing a quote does not consume this read-only budget.
+        Nested client retries can only shorten the browser's outer deadline.
+        """
+        started = time.monotonic()
+        remaining = budget[0]
+        if remaining <= 0:
+            raise CDPTransportError('Runtime.evaluate', 'target_lookup', False, 'TimeoutError')
+        browser = getattr(client, 'browser', None)
+        factory = getattr(type(browser), 'command_budget', None)
+        scope = factory(browser, started + remaining, timeout=10) if factory else nullcontext()
+        try:
+            with scope:
+                yield
+        finally:
+            budget[0] = max(0, remaining - max(0, time.monotonic() - started))
+
+    @staticmethod
+    def _jimeng_cdp_diagnostic(exc):
+        diagnostic = {'code': 'CDP_TRANSPORT_FAILED', 'retryable': exc.retryable is True,
+                      'command_sent': exc.command_sent is True}
+        for key in ('method', 'phase', 'exception_type'):
+            value = getattr(exc, key, '')
+            if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', value):
+                diagnostic[key] = value
+        return diagnostic
+
+    def _jimeng_cdp_pre_dispatch_failure(self, task_id, account, exc, *, stage='account_verification'):
+        """The service has not entered its only generation call for this task."""
+        with self._lock:
+            task = self.store.task(task_id) or {}
+            context = dict(task.get('upstream_context') or {})
+            if (not self._jimeng_open(task) or task.get('status') in {'succeeded', 'failed', 'expired', 'cancelled'}
+                    or task.get('execution_backend') != 'jimeng_web'
+                    or task.get('account_id') != int(account['id'])
+                    or task.get('run_id') or task.get('thread_id')
+                    or task.get('result_urls') or task.get('upstream_result_urls')
+                    or task.get('actual_cost') is not None or context.get('upstream_task_id')
+                    or context.get('submission_phase') in {'dispatching', 'accepted', 'submitted', 'unknown'}
+                    or (context.get('submit_error') or {}).get('outcome_unknown') is True):
+                return False
+            facts = {'generation_request_sent': False, 'financial_outcome': 'not_charged_this_invocation',
+                     'automatic_resubmission': False, 'stage': stage,
+                     'reason': 'cdp_transport_failed'}
+            context.update(submission_phase='not_dispatched', pre_dispatch_failure=facts,
+                           cdp_transport_failure=self._jimeng_cdp_diagnostic(exc))
+            saved = self.store.update_task(task_id, {'status': 'failed', 'progress': 100,
+                'error_code': 'JIMENG_PROTOCOL_UNAVAILABLE', 'error_message': str(exc)[:600],
+                'completed_at': time.time(), 'upstream_context': context}, preserve_terminal=True,
+                expected_updated_at=task['updated_at'])
+            if not self._jimeng_public_pre_dispatch_facts(saved):
+                return False
+            self._account_cdp_transport_failure(account, exc)
+            return True
+
     @staticmethod
     def _jimeng_public_pre_dispatch_facts(task: dict) -> dict:
         context = task.get('upstream_context') or {}
@@ -186,17 +246,20 @@ class JimengServiceMixin:
             return True
         owned = False
         dispatched = False
+        verification_budget = [30.0]
+        preparation_stage = 'account_verification'
         try:
             account = self._submission_account(task_id, account, normalized)
             account, owned = self.browser_runtime.acquire(account)
             account = self._submission_account(task_id, account, normalized)
             client = self._web_client(account, with_store=True)
-            identity = self._jimeng_identity(client, str(account.get('login_user_id') or ''))
-            if not account.get('login_user_id'):
-                self.store.update_account(int(account['id']), {'login_user_id': identity})
-            client.account['login_user_id'] = identity
-            account = self._submission_account(task_id, account, normalized)
-            state = client.account_state(max_attempts=2, timeout_seconds=6)
+            with self._jimeng_verification_reads(client, verification_budget):
+                identity = self._jimeng_identity(client, str(account.get('login_user_id') or ''))
+                if not account.get('login_user_id'):
+                    self.store.update_account(int(account['id']), {'login_user_id': identity})
+                client.account['login_user_id'] = identity
+                account = self._submission_account(task_id, account, normalized)
+                state = client.account_state(max_attempts=2, timeout_seconds=6)
             before = number(state.get('available_balance'))
             if before is None or before < 0:
                 raise BrowserError('Jimeng available balance could not be verified')
@@ -210,11 +273,13 @@ class JimengServiceMixin:
             client.preflight_model(normalized)
             self._jimeng_update(task_id, {'balance_before': before, 'progress': 12})
             account = self._submission_account(task_id, account, normalized)
+            preparation_stage = 'media_upload'
             assets = client.upload_inputs(normalized)
             task = self._jimeng_update(task_id, {'cost_evidence': input_evidence(assets)})
             task = self._update_cost_estimate(task)
             account = self._submission_account(task_id, account, normalized)
             client.preflight_model(normalized)
+            preparation_stage = 'quote_preparation'
             prepared = client.prepare_submit(normalized, assets)
             if prepared.kind != ('image' if normalized.get('kind') == 'image' else 'video'):
                 raise BrowserError('Jimeng prepared submission kind does not match the task')
@@ -226,8 +291,10 @@ class JimengServiceMixin:
             # Preparation may upload media and refresh commercial state. Read
             # credits again; historical estimates and commerce amount are not
             # the price of this account's newly prepared request.
-            self._jimeng_identity(client, identity)
-            latest_state = client.account_state(max_attempts=2, timeout_seconds=6)
+            preparation_stage = 'account_verification'
+            with self._jimeng_verification_reads(client, verification_budget):
+                self._jimeng_identity(client, identity)
+                latest_state = client.account_state(max_attempts=2, timeout_seconds=6)
             latest_balance = number(latest_state.get('available_balance'))
             if latest_balance is None:
                 raise BrowserError('Jimeng final available balance could not be verified')
@@ -316,6 +383,14 @@ class JimengServiceMixin:
             return True
         except JimengProtocolUnavailable as exc:
             self._fail(task_id, 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN' if dispatched else 'JIMENG_PROTOCOL_UNAVAILABLE', str(exc))
+            return True
+        except CDPTransportError as exc:
+            if not dispatched:
+                # A concurrent terminal state or accepted binding is authoritative;
+                # a rejected CAS must not relabel that operation as unsubmitted.
+                self._jimeng_cdp_pre_dispatch_failure(task_id, account, exc, stage=preparation_stage)
+                return True
+            self._fail(task_id, 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN', str(exc))
             return True
         except (BrowserError, ValueError, KeyError, TypeError) as exc:
             self._fail(task_id, 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN' if dispatched else 'ACCOUNT_VERIFICATION_FAILED', str(exc))
