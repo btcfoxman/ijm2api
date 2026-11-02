@@ -16,7 +16,7 @@ UNKNOWN = '提交结果未确认，请核对上游任务，暂勿重复提交~'
 
 @pytest.mark.parametrize('code,expected', [
     ('MEDIA_UPLOAD_FAILED', '素材上传失败，请检查素材后重试~'),
-    ('MEDIA_UPLOAD_PENDING', '素材仍在处理中，请稍后重试~'),
+    ('MEDIA_UPLOAD_PENDING', '视频生成提交失败，请稍后重试~'),
     ('RESULT_TRANSFER_FAILED', '生成结果保存暂未完成，请稍后查询~'),
     ('ACCOUNT_POOL_UNAVAILABLE', '当前可用生成资源不足，请稍后重试~'),
     ('ACCOUNT_MISSING', '任务执行资源不可用，请联系管理员核查~'),

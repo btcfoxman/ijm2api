@@ -296,13 +296,55 @@ class CanvasServiceMixin:
                 'stage': 'confirming' if submission_started else 'preparation'}
 
     @staticmethod
+    def _canvas_pending_reference_retry(task: dict, exc: CanvasCLIError) -> bool:
+        """Only an original input checkpoint may resume before paid dispatch."""
+        if (task.get('status') not in {'queued', 'preparing'}
+                or exc.code != 'MEDIA_UPLOAD_PENDING' or exc.outcome_unknown
+                or CanvasServiceMixin._canvas_dispatch_evidence(task)):
+            return False
+        error = exc.details if isinstance(exc.details, dict) else {}
+        if any(value.get('phase') in ('run_dispatching', 'submitting', 'submitted', 'accepted',
+                                     'running', 'succeeded', 'completed')
+                or CanvasServiceMixin._canvas_dispatch_evidence({'upstream_context': value})
+                for value in (error, error.get('error')) if isinstance(value, dict)):
+            return False
+        context = task.get('upstream_context') or {}
+        checkpoint = context.get('upload_checkpoint')
+        if (context.get('phase') != 'uploading' or not isinstance(checkpoint, dict)
+                or type(checkpoint.get('version')) is not int or checkpoint['version'] != 1
+                or checkpoint.get('backend') != 'canvas_cli'):
+            return False
+        binding = checkpoint.get('binding')
+        pending = checkpoint.get('pending_refs')
+        if (not isinstance(binding, dict) or binding.get('task_id') != task.get('id')
+                or type(binding.get('account_id')) is not int
+                or binding['account_id'] != task.get('account_id')
+                or not isinstance(binding.get('project_id'), str) or not binding['project_id']
+                or binding['project_id'] != context.get('project_id')
+                or not isinstance(pending, list) or not pending):
+            return False
+        resources = context.get('resources') or {}
+        if not isinstance(resources, dict):
+            return False
+        return all(isinstance(ref, dict) and ref.get('observe_only') is True
+            and isinstance(ref.get('registration'), str)
+            and ref['registration'] in {'acknowledged', 'unknown', 'unacknowledged'}
+            and isinstance(ref.get('group'), str) and ref['group'] in {'images', 'videos', 'audios'}
+            and type(ref.get('index')) is int and ref['index'] >= 0
+            and isinstance(ref.get('resource_id'), str) and bool(ref['resource_id'])
+            and isinstance(resources.get(ref['group']), list)
+            and ref['index'] < len(resources[ref['group']])
+            and resources[ref['group']][ref['index']] == ref['resource_id']
+            for ref in pending)
+
+    @staticmethod
     def _canvas_public_pre_dispatch_facts(task: dict) -> dict:
         """Expose only the new bounded proof; preserve all stored financial data."""
         context = task.get('upstream_context') or {}
         facts = context.get('pre_dispatch_failure')
         if (task.get('status') not in {'failed', 'expired'}
                 or task.get('error_code') not in {'CLI_PREPARATION_TRANSIENT_FAILED', 'CLI_PREPARATION_RETRY_EXHAUSTED',
-                                                'CLI_PREPARATION_TIMEOUT',
+                                                'CLI_PREPARATION_TIMEOUT', 'MEDIA_UPLOAD_PENDING',
                                                 'INSUFFICIENT_CREDITS'}
                 or not isinstance(facts, dict) or facts.get('generation_request_sent') is not False
                 or facts.get('financial_outcome') != 'not_charged_this_invocation'
@@ -315,7 +357,8 @@ class CanvasServiceMixin:
             return {}
         result = {key: facts[key] for key in ('generation_request_sent', 'financial_outcome',
                                              'automatic_resubmission')}
-        if facts.get('fallback_allowed') is True or task.get('error_code') == 'CLI_PREPARATION_TIMEOUT':
+        if facts.get('fallback_allowed') is True or task.get('error_code') in {
+                'CLI_PREPARATION_TIMEOUT', 'MEDIA_UPLOAD_PENDING'}:
             result['fallback_allowed'] = True
         return result
 
@@ -1276,9 +1319,14 @@ class CanvasServiceMixin:
                 if expired_preparation:
                     fail_preparation('CLI_PREPARATION_TIMEOUT', '', cause=exc)
                     return True
-                facts = (self._canvas_pre_dispatch_facts(self.store.task(task_id) or {}, exc, submission_started)
-                         if preparation_retryable_failure(exc) and not prior_dispatch_evidence else {})
+                failed_task = self.store.task(task_id) or {}
+                pending_reference = self._canvas_pending_reference_retry(failed_task, exc)
+                retryable_preparation = preparation_retryable_failure(exc) or pending_reference
+                facts = (self._canvas_pre_dispatch_facts(failed_task, exc, submission_started)
+                         if retryable_preparation and not prior_dispatch_evidence else {})
                 if facts:
+                    if pending_reference:
+                        facts['fallback_allowed'] = True
                     self._canvas_context(task_id, {'pre_dispatch_failure': facts})
                     return self._canvas_retry_preparation(task_id, account, exc, generation_deadline, facts)
                 self._fail_canvas_task(task_id, exc.code, str(exc))

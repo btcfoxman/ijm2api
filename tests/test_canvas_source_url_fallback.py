@@ -140,14 +140,14 @@ def test_only_exact_not_found_not_wrong_identity_or_failure_allows_file(clock, r
     assert sum(args[:2] == ['resource', 'upload'] for args, _ in runner.calls) == 1
 
 
-def test_failed_read_is_not_absence_and_durably_restricts_to_observation(clock):
+def test_failed_read_is_unacknowledged_and_cannot_rewrite_without_positive_absence(clock):
     failure = unavailable()
     callback = Mock()
     runner = Runner([failure], [unavailable()])
     registered = []
     with pytest.raises(CanvasCLIError) as caught:
         invoke(runner, callback, registered=registered.append)
-    assert caught.value is failure and callback.call_count == 0 and registered == ['unknown']
+    assert caught.value is failure and callback.call_count == 0 and registered == ['unacknowledged']
     assert sum(args[:2] == ['resource', 'upload'] for args, _ in runner.calls) == 1
 
 

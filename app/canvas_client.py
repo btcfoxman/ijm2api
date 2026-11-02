@@ -748,6 +748,57 @@ class CanvasClient:
                 raise CanvasCLIError("MEDIA_UPLOAD_PENDING", "Canvas reference upload is not ready; retained original resource ID") from exc
             raise
 
+    def _reference_fallback_file(self, fallback_file: Callable[[], Path], deadline: float | None) -> Path:
+        self._remaining(deadline)
+        closed = getattr(self.runner, '_closed', None)
+        if isinstance(closed, Event) and closed.is_set():
+            raise CanvasCLIError('CLI_STOPPING', 'Canvas reference preparation stopped')
+        # Preserve the service's structured MediaError and bounded download policy.
+        path = fallback_file()
+        self._remaining(deadline)
+        if isinstance(closed, Event) and closed.is_set():
+            raise CanvasCLIError('CLI_STOPPING', 'Canvas reference preparation stopped')
+        if not isinstance(path, Path) or not path.is_file():
+            raise CanvasCLIError('MEDIA_INPUT_MISSING', 'Canvas image fallback file is unavailable')
+        return path
+
+    def _resume_unacknowledged_upload(self, resource_id: str, project_id: str, media_type: str, *,
+                                     fallback_file: Callable[[], Path], deadline: float | None,
+                                     on_registered: Callable[[str], Any]) -> None:
+        """Recheck a locally unacknowledged URL write; never send its URL again."""
+        if media_type != 'image' or not callable(fallback_file):
+            raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID', 'Canvas unacknowledged upload is not a bound URL image')
+        self._remaining(deadline)
+        probe_deadline = time.monotonic() + 15
+        if deadline is not None:
+            probe_deadline = min(probe_deadline, deadline)
+        try:
+            existing = self._call(['resource', 'get', resource_id, '--project-id', project_id],
+                timeout=15, read_only=True, deadline=probe_deadline)
+        except CanvasCLIError as check:
+            if _planned_resource_not_found(check, resource_id):
+                path = self._reference_fallback_file(fallback_file, deadline)
+                self._upload_resource(path, media_type, resource_id, project_id,
+                    deadline=deadline, on_registered=on_registered)
+                return
+            retryable_read = (not check.outcome_unknown and (
+                preparation_retryable_failure(check) or identity_network_error(check)
+                or check.code in {'CLI_COMMAND_TIMEOUT', 'CLI_INVALID_RESPONSE', 'CLI_TASK_DEADLINE_EXCEEDED'}))
+            if not retryable_read or _resource_read_intervention(check):
+                raise
+            self._remaining(deadline)
+            raise CanvasCLIError('MEDIA_UPLOAD_PENDING',
+                'Canvas original reference registration is temporarily unavailable; retained original resource ID') from check
+        if existing.get('projectId') not in (None, '', project_id):
+            raise CanvasCLIError('CLI_RESOURCE_MISMATCH', 'Canvas returned another reference project')
+        state = self._reference_state(existing, resource_id, media_type)
+        if state in {'success', 'succeeded', 'completed'}:
+            return
+        # A positive registered/pending resource is now observe-only, even if a
+        # later resource read fails or temporarily reports registration absence.
+        on_registered('acknowledged')
+        self._resource_ready(resource_id, project_id, deadline=deadline, media_type=media_type)
+
     def _upload_resource(self, path: Path | None, media_type: str, resource_id: str, project_id: str, *,
                          deadline: float | None = None, source_url: str | None = None,
                           on_registered: Callable[[str], Any] | None = None,
@@ -812,22 +863,14 @@ class CanvasClient:
                             if not retryable_read or _resource_read_intervention(check):
                                 raise
                             if on_registered is not None:
-                                on_registered('unknown')
+                                # This is our failed read after a known retryable,
+                                # unacknowledged URL write, not the vendor's
+                                # cli.upload_state_unknown no-replay contract.
+                                on_registered('unacknowledged')
                             raise exc from check
                         if attempt == 2:
                             raise exc from check  # The three-write cap is shared by both transports.
-                        self._remaining(deadline)
-                        closed = getattr(self.runner, '_closed', None)
-                        if isinstance(closed, Event) and closed.is_set():
-                            raise CanvasCLIError('CLI_STOPPING', 'Canvas reference preparation stopped')
-                        # The service owns validated download diagnostics and
-                        # normalization, including its structured MediaError.
-                        fallback_path = fallback_file()
-                        self._remaining(deadline)
-                        if isinstance(closed, Event) and closed.is_set():
-                            raise CanvasCLIError('CLI_STOPPING', 'Canvas reference preparation stopped')
-                        if not isinstance(fallback_path, Path) or not fallback_path.is_file():
-                            raise CanvasCLIError('MEDIA_INPUT_MISSING', 'Canvas image fallback file is unavailable')
+                        fallback_path = self._reference_fallback_file(fallback_file, deadline)
                         source = ['--file', str(fallback_path.resolve())]
                         self._sleep(0.5 * 2 ** attempt, deadline)
                         continue
@@ -980,10 +1023,16 @@ class CanvasClient:
                 base = ({key: value for key, value in expected[resource_id].items() if key != 'verified'}
                         if isinstance(resource_id, str) and resource_id in expected else None)
                 if (base is None or type(ref.get('index')) is not int or ref.get('observe_only') is not True
-                        or not isinstance(disposition, str) or disposition not in {'acknowledged', 'unknown'}
+                        or not isinstance(disposition, str) or disposition not in {'acknowledged', 'unknown', 'unacknowledged'}
                         or ref != {**base, 'observe_only': True, 'registration': disposition}
                         or resource_id in pending_refs or resource_id in verified):
                     raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID', 'Canvas pending upload checkpoint is invalid')
+                if disposition == 'unacknowledged':
+                    job = next(job for job in jobs if job['resource_id'] == resource_id)
+                    if (job['source_kind'] != 'url' or job['media_type'] != 'image'
+                            or not callable(job['fallback_file'])):
+                        raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID',
+                            'Canvas unacknowledged upload requires its original URL image fallback')
                 pending_refs[resource_id] = disposition
         context['resources'] = {group: [job['resource_id'] for job in jobs if job['group'] == group]
                                 for group in ('images', 'videos', 'audios')}
@@ -1030,7 +1079,11 @@ class CanvasClient:
                                 self._resource_ready(job['resource_id'], context['project_id'],
                                     deadline=deadline, media_type=job['media_type'])
                             elif job['resource_id'] in pending_refs:
-                                if pending_refs[job['resource_id']] == 'unknown':
+                                if pending_refs[job['resource_id']] == 'unacknowledged':
+                                    self._resume_unacknowledged_upload(job['resource_id'], context['project_id'],
+                                        job['media_type'], deadline=deadline, fallback_file=job['fallback_file'],
+                                        on_registered=registered)
+                                elif pending_refs[job['resource_id']] == 'unknown':
                                     self._observe_unknown_upload(job['resource_id'], context['project_id'],
                                         deadline=deadline, media_type=job['media_type'])
                                 else:

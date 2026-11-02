@@ -49,7 +49,7 @@ def public_error(code: str, message: str) -> dict[str, str]:
     if kind in {'JIMENG_QUERY_FAILED', 'JIMENG_RESULT_MISSING'}:
         return {'code': kind, 'message': UNCERTAIN_SUBMISSION_MESSAGE}
     if kind in {'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED', 'CLI_PREPARATION_RETRY_EXHAUSTED',
-                'CLI_PREPARATION_TIMEOUT'}:
+                'CLI_PREPARATION_TIMEOUT', 'MEDIA_UPLOAD_PENDING'}:
         return {'code': kind, 'message': BOUNDED_RETRY_FAILURE_MESSAGE}
     if kind in {'CLI_PREPARATION_TRANSIENT_FAILED', 'CLI_SUBMISSION_RETRYABLE'}:
         # Call-stage classification is authoritative. Raw diagnostics can quote
@@ -116,7 +116,6 @@ def public_error(code: str, message: str) -> dict[str, str]:
     if "web upload failed" in raw or kind == "MEDIA_UPLOAD_FAILED":
         return {"code": "MEDIA_UPLOAD_FAILED", "message": "素材上传失败，请检查素材后重试~"}
     messages = {
-        "MEDIA_UPLOAD_PENDING": "素材仍在处理中，请稍后重试~",
         "RESULT_TRANSFER_FAILED": "生成结果保存暂未完成，请稍后查询~",
         "ACCOUNT_POOL_UNAVAILABLE": "当前可用生成资源不足，请稍后重试~",
         "ACCOUNT_MISSING": "任务执行资源不可用，请联系管理员核查~",
