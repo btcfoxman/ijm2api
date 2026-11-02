@@ -309,6 +309,28 @@ class JimengReceiptMismatch(BrowserError):
     """A response does not belong to the originally dispatched submission."""
 
 
+class JimengResultDownloadError(BrowserError):
+    """Generation succeeded, but its ordinary official download is unverified."""
+
+    _MESSAGES = {
+        "JIMENG_DOWNLOAD_UNAVAILABLE": "Jimeng original download details are temporarily unavailable",
+        "JIMENG_DOWNLOAD_BINDING_MISMATCH": "Jimeng download does not match its original task and account",
+        "JIMENG_DOWNLOAD_WATERMARK_UNCONFIRMED": "Jimeng download has no verified watermark-free result",
+        "JIMENG_DOWNLOAD_URL_INVALID": "Jimeng returned an invalid official download address",
+        "JIMENG_DOWNLOAD_PREVIEW_ONLY": "Jimeng returned the existing preview instead of a verified download",
+        "JIMENG_DOWNLOAD_METADATA_INVALID": "Jimeng official download media details are incomplete",
+        "JIMENG_DOWNLOAD_BENEFIT_UNCONFIRMED": "Jimeng download returned unverified commercial deductions",
+        "JIMENG_DOWNLOAD_RECEIPT_INVALID": "Jimeng official download provenance could not be verified",
+    }
+
+    def __init__(self, code: str = "JIMENG_DOWNLOAD_UNAVAILABLE", *, retryable: bool = True):
+        self.code = code if code in self._MESSAGES else "JIMENG_DOWNLOAD_UNAVAILABLE"
+        self.retryable = retryable is True
+        self.generation_state: dict[str, Any] = {}
+        # Never retain a provider message or signed media URL in this error.
+        super().__init__(self._MESSAGES[self.code])
+
+
 class JimengPageNotReady(BrowserError):
     """The pure bootstrap gate proved that no business POST was invoked."""
 
@@ -443,6 +465,221 @@ def parse_history_response(data: dict[str, Any], submit_id: str, *,
         if evidence is not None:
             result["task_credit_evidence"] = evidence
     return result
+
+
+_DOWNLOAD_PATH = "/mweb/v1/get_local_item_list"
+_DOWNLOAD_SOURCE = "get_local_item_list_download"
+_DOWNLOAD_HOST_SUFFIXES = ("jimeng.com", "vlabvod.com")
+
+
+def _download_url_host(url: Any) -> str:
+    """Validate only observed official media domains; never repair signed URLs."""
+    if (not isinstance(url, str) or not url or len(url) > 65536 or "\\" in url
+            or any(ord(char) <= 32 or ord(char) == 127 for char in url)):
+        raise JimengResultDownloadError("JIMENG_DOWNLOAD_URL_INVALID", retryable=False)
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host, port = parsed.hostname, parsed.port
+        valid = (parsed.scheme == "https" and host and parsed.username is None
+                 and parsed.password is None and port in (None, 443) and not parsed.fragment
+                 and len(host) <= 253 and all(re.fullmatch(
+                     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in host.split("."))
+                 and any(host == suffix or host.endswith("." + suffix)
+                         for suffix in _DOWNLOAD_HOST_SUFFIXES))
+    except ValueError:
+        valid, host = False, None
+    if not valid:
+        raise JimengResultDownloadError("JIMENG_DOWNLOAD_URL_INVALID", retryable=False)
+    return host
+
+
+def _url_digest(url: str) -> str:
+    return hashlib.sha256(url.encode()).hexdigest()
+
+
+def _download_video_choice(video: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """The current website's Xt.R selector: original, origin rendition, tallest."""
+    original = video.get("origin_video")
+    if isinstance(original, dict):
+        return "origin_video", original
+    transcoded = video.get("transcoded_video")
+    if not isinstance(transcoded, dict):
+        return None
+    if isinstance(transcoded.get("origin"), dict):
+        return "transcoded_video.origin", transcoded["origin"]
+    variants = [(name, value) for name, value in transcoded.items()
+                if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,40}", name)
+                and isinstance(value, dict) and type(value.get("height")) is int and value["height"] > 0]
+    if not variants:
+        return None
+    name, selected = max(variants, key=lambda entry: entry[1]["height"])
+    return "transcoded_video." + name, selected
+
+
+def verified_result_download_receipts(state: Any, *, account_id: int, submit_id: str,
+                                      history_id: str = "") -> bool:
+    """Check durable delivery provenance before a service publishes success."""
+    if not isinstance(state, dict) or type(account_id) is not int or account_id <= 0:
+        return False
+    urls, receipts = state.get("result_urls"), state.get("result_download_receipts")
+    if (not isinstance(urls, list) or not isinstance(receipts, list) or not urls
+            or len(urls) != len(receipts) or len(set(url for url in urls if isinstance(url, str))) != len(urls)):
+        return False
+    expected_history = history_id or state.get("history_id") or ""
+    observed_history, seen_items = None, set()
+    try:
+        _submit_id(submit_id)
+        for url, receipt in zip(urls, receipts):
+            if not isinstance(receipt, dict):
+                return False
+            rid = receipt.get("history_id")
+            if (not isinstance(rid, str) or not _record_identifier(rid) or expected_history and rid != expected_history
+                    or observed_history is not None and rid != observed_history):
+                return False
+            observed_history = rid
+            if state.get("history_id") and rid != state["history_id"]:
+                return False
+            item_id, video_id = receipt.get("item_id"), receipt.get("video_id")
+            if (not isinstance(item_id, str) or not isinstance(video_id, str)
+                    or not _record_identifier(item_id) or not _record_identifier(video_id) or item_id in seen_items
+                    or type(receipt.get("version")) is not int or receipt["version"] != 1
+                    or receipt.get("kind") != "jimeng_web_video_download"
+                    or type(receipt.get("account_id")) is not int or receipt["account_id"] != account_id
+                    or receipt.get("submit_id") != submit_id or receipt.get("source") != _DOWNLOAD_SOURCE
+                    or type(receipt.get("request_scene")) is not int or receipt["request_scene"] != 1
+                    or receipt.get("is_for_video_download") is not True
+                    or type(receipt.get("watermark_type")) is not int or receipt["watermark_type"] != 1
+                    or receipt.get("logo_type") != ""
+                    or receipt.get("selection") != "origin_video" and not re.fullmatch(
+                        r"transcoded_video\.[A-Za-z0-9_-]{1,40}", str(receipt.get("selection") or ""))):
+                return False
+            seen_items.add(item_id)
+            if receipt.get("url_host") != _download_url_host(url) or receipt.get("source_url_sha256") != _url_digest(url):
+                return False
+            previous = receipt.get("preview_url_sha256")
+            if previous != "" and (not isinstance(previous, str) or re.fullmatch(r"[0-9a-f]{64}", previous) is None):
+                return False
+            if previous == receipt["source_url_sha256"] and not (
+                    type(receipt.get("history_watermark_type")) is int and receipt["history_watermark_type"] == 1
+                    and receipt.get("history_logo_type") == ""):
+                return False
+            if any(type(receipt.get(key)) is not int or not 0 < receipt[key] <= 2 ** 53 - 1
+                   for key in ("width", "height", "size_bytes")):
+                return False
+    except (TypeError, ValueError, JimengResultDownloadError):
+        return False
+    return True
+
+
+def _bound_download_items(record: dict[str, Any], state: dict[str, Any], *, account_id: int,
+                           expected_user_id: str) -> dict[str, dict]:
+    """Verify the original targets before requesting any download metadata."""
+    history_id = state.get("history_id")
+    if (type(account_id) is not int or account_id <= 0 or not expected_user_id
+            or not _record_identifier(history_id) or str(record.get("uid") or "") != expected_user_id):
+        raise JimengResultDownloadError("JIMENG_DOWNLOAD_BINDING_MISMATCH", retryable=False)
+    originals: dict[str, dict] = {}
+    for item in record.get("item_list") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("video"), dict):
+            continue
+        common, video = item.get("common_attr"), item["video"]
+        if not isinstance(common, dict):
+            raise JimengResultDownloadError("JIMENG_DOWNLOAD_BINDING_MISMATCH", retryable=False)
+        item_id, local_id, vid = (_record_identifier(common.get("id")),
+                                  _record_identifier(common.get("local_item_id")),
+                                  _record_identifier(video.get("video_id")))
+        if not item_id or not vid or local_id and local_id != item_id or item_id in originals:
+            raise JimengResultDownloadError("JIMENG_DOWNLOAD_BINDING_MISMATCH", retryable=False)
+        originals[item_id] = item
+    if not originals:
+        raise JimengResultDownloadError("JIMENG_DOWNLOAD_BINDING_MISMATCH", retryable=False)
+    return originals
+
+
+def _verified_download_results(detail: Any, record: dict[str, Any], state: dict[str, Any], *,
+                               account_id: int, submit_id: str, expected_user_id: str) -> tuple[list[str], list[dict]]:
+    """Bind the captured Download-scene response, without a preview fallback."""
+    history_id = state.get("history_id")
+    originals = _bound_download_items(record, state, account_id=account_id, expected_user_id=expected_user_id)
+    items = detail.get("item_list") if isinstance(detail, dict) else None
+    if not isinstance(items, list) or not items:
+        raise JimengResultDownloadError()
+    if detail.get("deduct_list") not in (None, []):
+        # Only the observed ordinary download is supported; never silently opt
+        # into or settle a different commercial watermark-removal operation.
+        raise JimengResultDownloadError("JIMENG_DOWNLOAD_BENEFIT_UNCONFIRMED", retryable=False)
+    if len(items) != len(originals):
+        raise JimengResultDownloadError("JIMENG_DOWNLOAD_BINDING_MISMATCH", retryable=False)
+    by_id = {}
+    for item in items:
+        common = item.get("common_attr") if isinstance(item, dict) else None
+        item_id = _record_identifier(common.get("id")) if isinstance(common, dict) else ""
+        if not item_id or item_id not in originals or item_id in by_id:
+            raise JimengResultDownloadError("JIMENG_DOWNLOAD_BINDING_MISMATCH", retryable=False)
+        by_id[item_id] = item
+    urls, receipts = [], []
+    for item_id, original in originals.items():
+        item = by_id[item_id]
+        common, video = item["common_attr"], item.get("video")
+        prior = original["video"]
+        video_id = _record_identifier(prior.get("video_id"))
+        if (not isinstance(video, dict) or _record_identifier(video.get("video_id")) != video_id
+                or common.get("local_item_id") and _record_identifier(common["local_item_id"]) != item_id):
+            raise JimengResultDownloadError("JIMENG_DOWNLOAD_BINDING_MISMATCH", retryable=False)
+        for owner in (common, item.get("author") or {}):
+            if not isinstance(owner, dict) or any(owner.get(key) not in (None, "")
+                    and str(owner[key]) != expected_user_id for key in ("uid", "user_id")):
+                raise JimengResultDownloadError("JIMENG_DOWNLOAD_BINDING_MISMATCH", retryable=False)
+        author, old_author = item.get("author") or {}, original.get("author") or {}
+        for key in ("sec_uid", "user_unique_id"):
+            if author.get(key) not in (None, "") and (not isinstance(old_author, dict)
+                    or not old_author.get(key) or author[key] != old_author[key]):
+                raise JimengResultDownloadError("JIMENG_DOWNLOAD_BINDING_MISMATCH", retryable=False)
+        chosen = _download_video_choice(video)
+        if chosen is None:
+            raise JimengResultDownloadError()
+        selection, media = chosen
+        if type(video.get("watermark_type")) is not int or video["watermark_type"] != 1 or media.get("logo_type") != "":
+            raise JimengResultDownloadError("JIMENG_DOWNLOAD_WATERMARK_UNCONFIRMED", retryable=False)
+        if any(media.get(key) not in (None, "") and str(media[key]) != video_id for key in ("video_id", "vid")):
+            raise JimengResultDownloadError("JIMENG_DOWNLOAD_BINDING_MISMATCH", retryable=False)
+        if any(type(media.get(key)) is not int or not 0 < media[key] <= 2 ** 53 - 1
+               for key in ("width", "height", "size")) or media.get("format") != "mp4" or media.get("encryption_key") not in (None, ""):
+            raise JimengResultDownloadError("JIMENG_DOWNLOAD_METADATA_INVALID", retryable=False)
+        url = media.get("video_url")
+        if url in (None, ""):
+            raise JimengResultDownloadError()
+        host = _download_url_host(url)
+        digest = _url_digest(url)
+        old_choice = _download_video_choice(prior)
+        old_media = old_choice[1] if old_choice else {}
+        old_url = old_media.get("video_url")
+        old_digest = _url_digest(old_url) if isinstance(old_url, str) and old_url else ""
+        old_variants = [prior.get("origin_video")]
+        if isinstance(prior.get("transcoded_video"), dict):
+            old_variants += list(prior["transcoded_video"].values())
+        reused = next((entry for entry in old_variants if isinstance(entry, dict)
+                       and entry.get("video_url") == url), None)
+        if reused is not None:
+            old_digest = digest
+            old_media = reused
+            if type(prior.get("watermark_type")) is not int or prior["watermark_type"] != 1 or reused.get("logo_type") != "":
+                raise JimengResultDownloadError("JIMENG_DOWNLOAD_PREVIEW_ONLY")
+        receipt = {"version": 1, "kind": "jimeng_web_video_download", "account_id": account_id,
+                   "submit_id": submit_id, "history_id": history_id, "item_id": item_id, "video_id": video_id,
+                   "source": _DOWNLOAD_SOURCE, "request_scene": 1, "is_for_video_download": True,
+                   "watermark_type": 1, "logo_type": "", "url_host": host, "selection": selection,
+                   "source_url_sha256": digest, "preview_url_sha256": old_digest,
+                   "history_watermark_type": prior.get("watermark_type") if type(prior.get("watermark_type")) is int else None,
+                   "history_logo_type": "" if old_media.get("logo_type") == "" else "unconfirmed",
+                   "width": media["width"], "height": media["height"], "size_bytes": media["size"],
+                   "size_source": "upstream_metadata"}
+        urls.append(url)
+        receipts.append(receipt)
+    if not verified_result_download_receipts({**state, "result_urls": urls, "result_download_receipts": receipts},
+            account_id=account_id, submit_id=submit_id, history_id=history_id):
+        raise JimengResultDownloadError("JIMENG_DOWNLOAD_METADATA_INVALID", retryable=False)
+    return urls, receipts
 
 
 def _submit_id(value: str | None = None) -> str:
@@ -942,5 +1179,36 @@ class JimengWebClient:
         data = self._post("/mweb/v1/get_history_by_ids", {"submit_ids": [submit_id]},
                           query={"region": "cn", "da_version": "3.3.36",
                                  "web_version": "7.5.0", "aigc_features": "app_lip_sync"})
-        return parse_history_response(data, submit_id, history_id=history_id,
-                                      expected_user_id=str(self.account.get("login_user_id") or ""))
+        user_id = str(self.account.get("login_user_id") or "")
+        state = parse_history_response(data, submit_id, history_id=history_id, expected_user_id=user_id)
+        if state.get("state") != 50 or state["status"] == "failed":
+            return state
+        from .client import history_task_credits
+        credit = history_task_credits(data[submit_id], submit_id, "succeeded")
+        if credit is not None:
+            state["task_credit_evidence"] = credit
+        try:
+            original = data[submit_id]
+            bound = _bound_download_items(original, state, account_id=self.account.get("id"),
+                                           expected_user_id=user_id)
+            # Captured ordinary website Download scene; no rwm entitlement is
+            # invented or requested. Never substitute a history/preview URL.
+            detail = self._post(_DOWNLOAD_PATH, {"item_id_list": list(bound),
+                "pack_item_opt": {"scene": 1, "need_data_integrity": True},
+                "is_for_video_download": True})
+            urls, receipts = _verified_download_results(detail, original, state,
+                account_id=self.account.get("id"), submit_id=submit_id, expected_user_id=user_id)
+        except Exception as exc:
+            if isinstance(exc, JimengResultDownloadError):
+                error = exc
+            elif isinstance(exc, JimengReceiptMismatch):
+                error = JimengResultDownloadError("JIMENG_DOWNLOAD_BINDING_MISMATCH", retryable=False)
+            else:
+                error = JimengResultDownloadError()
+            # Carry only already-validated identity/settlement facts through a
+            # delivery failure; error logs must never expose signed addresses.
+            error.generation_state = {key: state[key] for key in (
+                "state", "record_found", "upstream_task_id", "history_id", "task_credit_evidence") if key in state}
+            error.generation_state["status"] = "succeeded"
+            raise error from None
+        return {**state, "status": "succeeded", "result_urls": urls, "result_download_receipts": receipts}

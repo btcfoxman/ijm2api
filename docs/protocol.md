@@ -14,6 +14,19 @@ shapes without cookies, tokens, prompt text or media contents.
 | Poll | `POST mweb-api-sg.capcut.com/mweb/v1/get_history_by_ids` | Query by `submit_ids`; successful `item_list[].video.transcoded_video.origin.video_url`. |
 | Detail | `POST mweb-api-sg.capcut.com/mweb/v1/get_local_item_list` | Result detail and video download data. |
 
+Mainland Jimeng video download was separately verified on 2026-11-02 using
+the authenticated `jimeng.jianying.com` page. The ordinary website download
+reads `/mweb/v1/get_local_item_list` with `item_id_list`,
+`pack_item_opt: {scene: 1, need_data_integrity: true}` and
+`is_for_video_download: true`. Its response must match the original history's
+item and video IDs. The captured download returned `watermark_type=1` and an
+explicitly empty selected `logo_type`; the history preview had type 3.
+Selection follows the website's original-video, origin-rendition, highest-height
+order. The service verifies this download provenance before success and does
+not opt into a separate `rwm` commercial operation or fall back to a preview.
+Reported media size is upstream metadata, not a hash or exact byte-length
+promise: the observed CDN byte length differed from the upstream metadata.
+
 Observed upstream keys: 2.0 Mini `dreamina_seedance_40_mini`;
 2.0 Standard `dreamina_seedance_40_pro`;
 2.5 Standard `dreamina_seedance_45_pro`;

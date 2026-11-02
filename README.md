@@ -30,6 +30,12 @@ automatic login. A mainland web account can leave its proxy blank for a direct
 connection; an explicitly configured proxy remains in use. Existing `browser`
 and `canvas_cli` accounts keep their international execution paths.
 
+Mainland video results use the website's separate Download request after
+generation completes. Delivery requires a watermark-free download receipt
+bound to the original account, submission and video; a history preview alone
+cannot complete delivery. Temporary download-detail failures retry the original
+result at most three times, without creating another generation.
+
 The account region is an admission setting independent of its execution
 backend. In the running settings, enable the mainland, US, or other-region
 restriction and list the allowed public model aliases and inclusive duration

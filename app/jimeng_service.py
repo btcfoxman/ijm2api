@@ -4,15 +4,27 @@ from __future__ import annotations
 
 import time
 import math
+import re
 
 from .auto_login import verified_login_user_id
 from .browser import BrowserError, BrowserRejected
 from .cost_adapter import input_evidence, number
 from .errors import RegionGenerationDenied, upstream_review_error
-from .jimeng_client import JimengPageNotReady, JimengProtocolUnavailable
+from .jimeng_client import (JimengPageNotReady, JimengProtocolUnavailable,
+                            JimengResultDownloadError, verified_result_download_receipts)
 from .image_model_routing import plan_image_execution
 from .media import MediaError, media_error_diagnostic
 from .upload import UploadError
+
+
+_JIMENG_DOWNLOAD_ATTEMPTS = 3
+_JIMENG_DOWNLOAD_RECEIPT_FIELDS = (
+    'version', 'kind', 'account_id', 'submit_id', 'history_id', 'item_id', 'video_id',
+    'source', 'request_scene', 'is_for_video_download', 'watermark_type', 'logo_type',
+    'source_url_sha256', 'preview_url_sha256', 'url_host', 'selection', 'width', 'height',
+    'size_bytes', 'size_source', 'history_watermark_type', 'history_logo_type',
+)
+_JIMENG_DOWNLOAD_MESSAGE = 'Jimeng original output download could not be verified'
 
 
 class JimengServiceMixin:
@@ -317,6 +329,72 @@ class JimengServiceMixin:
             self._release_account(account_id, task_id)
             self._worker_slots.release()
 
+    def _jimeng_poll_evidence(self, task_id: str, state: dict) -> tuple[dict, float | None, bool]:
+        """Keep accepted identity and task charges even if result retrieval fails."""
+        with self._lock:
+            task = self.store.task(task_id) or {}
+            if not self._jimeng_open(task):
+                return task, None, False
+            if state.get('record_found') is True:
+                context, values = {}, {}
+                upstream_task_id = state.get('upstream_task_id')
+                if (isinstance(upstream_task_id, str) and upstream_task_id.strip()
+                        and not (task.get('upstream_context') or {}).get('upstream_task_id')):
+                    context['upstream_task_id'] = upstream_task_id
+                history_id = state.get('history_id')
+                if isinstance(history_id, str) and history_id.strip() and not task.get('thread_id'):
+                    values['thread_id'] = history_id
+                if context or values:
+                    task = self._jimeng_update(task_id, values, context)
+            credit = state.get('task_credit_evidence')
+            amount = number(credit.get('amount')) if isinstance(credit, dict) else None
+            proven = (amount is not None and amount >= 0
+                and credit.get('submit_id') == task.get('run_id') and credit.get('phase') == state.get('status')
+                and credit.get('field') == 'item_list[].extra.credits_consume')
+            if proven:
+                task = self._jimeng_update(task_id, {'cost_evidence': {'upstream_task_credits': credit},
+                    'estimated_cost': amount if amount > 0 or state['status'] == 'succeeded' else task['estimated_cost']})
+            return task, amount, bool(proven)
+
+    def _jimeng_download_failure(self, task_id: str, exc: JimengResultDownloadError,
+                                 deadline: float) -> bool:
+        """Retry only the bound result read; never dispatch or select an account."""
+        evidence = getattr(exc, 'generation_state', None)
+        if isinstance(evidence, dict) and evidence.get('status') == 'succeeded':
+            task, amount, proven = self._jimeng_poll_evidence(task_id, evidence)
+        else:
+            task, amount, proven = self.store.task(task_id) or {}, None, False
+        if not self._jimeng_open(task) or self._stop.is_set():
+            return False
+        previous = (task.get('upstream_context') or {}).get('result_download') or {}
+        previous = previous if isinstance(previous, dict) else {}
+        attempts = previous.get('attempts', 0)
+        attempts = attempts if type(attempts) is int and attempts >= 0 else 0
+        attempts += 1
+        reason = getattr(exc, 'code', '')
+        if not isinstance(reason, str) or not re.fullmatch(r'JIMENG_DOWNLOAD_[A-Z_]{1,64}', reason):
+            reason = 'JIMENG_DOWNLOAD_UNAVAILABLE'
+        retryable = getattr(exc, 'retryable', False) is True
+        retry = retryable and attempts < _JIMENG_DOWNLOAD_ATTEMPTS and time.monotonic() < deadline
+        facts = {'phase': 'retrying' if retry else 'failed', 'attempts': attempts,
+                 'reason_code': reason, 'retryable': retryable, 'automatic_resubmission': False,
+                 'generation_completed': (isinstance(evidence, dict) and evidence.get('status') == 'succeeded')
+                     or previous.get('generation_completed') is True}
+        values = {'status': 'running' if retry else 'failed',
+                  'progress': max(95, task.get('progress') or 0) if retry else 100,
+                  'error_code': '' if retry else 'RESULT_TRANSFER_FAILED',
+                  'error_message': '' if retry else _JIMENG_DOWNLOAD_MESSAGE}
+        if not retry:
+            values['completed_at'] = time.time()
+        if proven:
+            values['actual_cost'] = amount
+        saved = self._jimeng_update(task_id, values,
+            {'submission_phase': 'accepted', 'result_download': facts})
+        if not retry or not self._jimeng_open(saved):
+            return False
+        self._stop.wait(min(attempts, max(0, deadline - time.monotonic())))
+        return True
+
     def _poll_jimeng(self, task_id: str, client, deadline: float) -> None:
         errors = 0
         while not self._stop.is_set() and time.monotonic() < deadline:
@@ -327,35 +405,45 @@ class JimengServiceMixin:
                 state = client.poll(task['run_id'], task.get('thread_id') or '')
                 if not isinstance(state, dict) or state.get('status') not in {'running', 'succeeded', 'failed'}:
                     raise BrowserError('Jimeng returned an invalid task state')
+                download = (task.get('upstream_context') or {}).get('result_download') or {}
+                if (state['status'] == 'running' and isinstance(download, dict)
+                        and (download.get('generation_completed') is True or download.get('phase') == 'retrying')):
+                    # A missing/stale history record cannot undo confirmed
+                    # completion or return result retrieval to generation polling.
+                    raise JimengResultDownloadError('JIMENG_DOWNLOAD_UNAVAILABLE')
+                if (state['status'] == 'succeeded' and task.get('normalized', {}).get('kind') != 'image'
+                        and not verified_result_download_receipts(state,
+                            account_id=task['account_id'], submit_id=task['run_id'],
+                            history_id=task.get('thread_id') or '')):
+                    missing = JimengResultDownloadError('JIMENG_DOWNLOAD_METADATA_INVALID', retryable=False)
+                    missing.generation_state = {key: state[key] for key in (
+                        'status', 'state', 'record_found', 'upstream_task_id', 'history_id', 'task_credit_evidence')
+                        if key in state}
+                    raise missing
                 errors = 0
+            except JimengResultDownloadError as exc:
+                if not self._jimeng_download_failure(task_id, exc, deadline):
+                    return
+                continue
             except Exception as exc:
+                # Once generation has completed, later history/transport errors
+                # share the small result-read budget instead of the 8-query backoff.
+                current = self.store.task(task_id) or {}
+                download = (current.get('upstream_context') or {}).get('result_download') or {}
+                if isinstance(download, dict) and download.get('phase') == 'retrying':
+                    transient = JimengResultDownloadError('JIMENG_DOWNLOAD_UNAVAILABLE')
+                    if not self._jimeng_download_failure(task_id, transient, deadline):
+                        return
+                    continue
                 errors += 1
                 self._jimeng_update(task_id, context={'last_query_error': {'code': type(exc).__name__}})
                 if errors >= 8:
                     break
                 self._stop.wait(min(2 ** errors, max(0, deadline - time.monotonic())))
                 continue
-            if state.get('record_found') is True:
-                with self._lock:
-                    current = self.store.task(task_id) or {}
-                    context, values = {}, {}
-                    upstream_task_id = state.get('upstream_task_id')
-                    if (isinstance(upstream_task_id, str) and upstream_task_id.strip()
-                            and not (current.get('upstream_context') or {}).get('upstream_task_id')):
-                        context['upstream_task_id'] = upstream_task_id
-                    history_id = state.get('history_id')
-                    if isinstance(history_id, str) and history_id.strip() and not current.get('thread_id'):
-                        values['thread_id'] = history_id
-                    if context or values:
-                        task = self._jimeng_update(task_id, values, context)
-            credit = state.get('task_credit_evidence')
-            amount = number(credit.get('amount')) if isinstance(credit, dict) else None
-            proven = (amount is not None and amount >= 0
-                and credit.get('submit_id') == task['run_id'] and credit.get('phase') == state['status']
-                and credit.get('field') == 'item_list[].extra.credits_consume')
-            if proven:
-                task = self._jimeng_update(task_id, {'cost_evidence': {'upstream_task_credits': credit},
-                    'estimated_cost': amount if amount > 0 or state['status'] == 'succeeded' else task['estimated_cost']})
+            task, amount, proven = self._jimeng_poll_evidence(task_id, state)
+            if not self._jimeng_open(task):
+                return
             if state['status'] == 'succeeded':
                 urls = state.get('result_urls')
                 if not isinstance(urls, list) or not urls or any(not isinstance(url, str) or not url for url in urls):
@@ -368,10 +456,17 @@ class JimengServiceMixin:
                         self.store.update_account(int(task['account_id']), {'balance': after})
                 except Exception:
                     pass  # A credit read never invalidates a verified output.
+                receipts = state.get('result_download_receipts') or []
+                download = (task.get('upstream_context') or {}).get('result_download') or {}
+                download = {'phase': 'verified', 'attempts': download.get('attempts', 0),
+                    'generation_completed': True, 'automatic_resubmission': False,
+                    'receipts': [{key: receipt[key] for key in _JIMENG_DOWNLOAD_RECEIPT_FIELDS if key in receipt}
+                                 for receipt in receipts]}
                 self._jimeng_update(task_id, {'status': 'succeeded', 'progress': 100,
                     'result_urls': urls, 'upstream_result_urls': urls, 'balance_after': after,
-                    'actual_cost': amount if proven else None, 'completed_at': time.time(),
-                    'error_code': '', 'error_message': ''}, {'submission_phase': 'accepted'})
+                    'actual_cost': amount if proven else task.get('actual_cost'), 'completed_at': time.time(),
+                    'error_code': '', 'error_message': ''},
+                    {'submission_phase': 'accepted', 'result_download': download})
                 return
             if state['status'] == 'failed':
                 upstream_code = str(state.get('error_code') or '')
@@ -390,5 +485,12 @@ class JimengServiceMixin:
             self._stop.wait(min(max(2, int(self.settings()['poll_interval_seconds'])),
                                 max(0, deadline - time.monotonic())))
         if not self._stop.is_set():
+            current = self.store.task(task_id) or {}
+            download = (current.get('upstream_context') or {}).get('result_download') or {}
+            if isinstance(download, dict) and download.get('phase') == 'retrying':
+                self._jimeng_update(task_id, context={'result_download': {
+                    **download, 'phase': 'failed', 'deadline_exhausted': True}})
+                self._fail(task_id, 'RESULT_TRANSFER_FAILED', _JIMENG_DOWNLOAD_MESSAGE)
+                return
             self._fail(task_id, 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN',
                 'Jimeng original submission query window ended; automatic resubmission is disabled')

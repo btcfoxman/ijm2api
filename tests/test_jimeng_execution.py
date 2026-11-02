@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from dataclasses import replace
+import hashlib
 import json
 import time
 from types import SimpleNamespace
@@ -17,6 +18,25 @@ from app.upload import UploadError
 from app.region_policy import DEFAULT_REGION_GENERATION_POLICY
 from app.service import AccountMaintenanceBusy, Service
 from app.store import Store
+
+
+def with_download_receipt(state, *, account_id, submit_id, history_id=''):
+    """Match the native client contract without changing each test's scenario."""
+    url = state['result_urls'][0]
+    preview = 'https://preview.example.test/watermarked.mp4'
+    history_id = history_id or state.get('history_id') or '12345678901234'
+    state['result_download_receipts'] = [{
+        'version': 1, 'kind': 'jimeng_web_video_download', 'account_id': account_id,
+        'submit_id': submit_id, 'history_id': history_id, 'item_id': '22345678901234',
+        'video_id': 'v03055synthetic', 'source': 'get_local_item_list_download',
+        'request_scene': 1, 'is_for_video_download': True, 'watermark_type': 1, 'logo_type': '',
+        'source_url_sha256': hashlib.sha256(url.encode()).hexdigest(),
+        'preview_url_sha256': hashlib.sha256(preview.encode()).hexdigest(),
+        'history_watermark_type': 3, 'history_logo_type': 'synthetic-logo',
+        'url_host': 'v3-dreamnia.jimeng.com', 'selection': 'origin_video',
+        'width': 1280, 'height': 720, 'size_bytes': 123456,
+    }]
+    return state
 
 
 @pytest.fixture
@@ -52,8 +72,9 @@ def context(tmp_path, monkeypatch):
     client.upload_inputs.return_value = {'images': [], 'videos': [], 'audios': []}
     client.prepare_submit.return_value = prepared
     client.submit_prepared.return_value = {'run_id': submit_id, 'thread_id': '', 'upstream_task_id': 'upstream-task'}
-    client.poll.return_value = {'status': 'succeeded', 'result_urls': ['https://results.example.test/original.mp4'],
-                              'error': '', 'error_code': ''}
+    client.poll.return_value = with_download_receipt(
+        {'status': 'succeeded', 'result_urls': ['https://v3-dreamnia.jimeng.com/original.mp4'],
+         'error': '', 'error_code': ''}, account_id=account['id'], submit_id=submit_id)
     monkeypatch.setattr('app.service.JimengWebClient', Mock(return_value=client))
     international = Mock(side_effect=AssertionError('Jimeng cannot use Dreamina transport'))
     image = Mock(side_effect=AssertionError('Jimeng cannot use Dreamina image transport'))
@@ -118,6 +139,8 @@ def test_lost_or_foreign_receipt_only_queries_the_original_id(context, failure):
         context.client.submit_prepared.return_value = {'run_id': str(uuid.uuid4()), 'thread_id': 'foreign-history'}
     context.client.poll.return_value.update(record_found=True,
         upstream_task_id='12345678901234567890', history_id='98765432109876543210')
+    with_download_receipt(context.client.poll.return_value,
+        account_id=context.account['id'], submit_id=context.prepared.submit_id)
     context.service._run(identifier)
     result = context.store.task(identifier)
     assert result['status'] == 'succeeded' and result['error_code'] == ''
@@ -264,6 +287,8 @@ def test_page_not_ready_proof_cannot_clear_later_acceptance_evidence(context):
     def accepted_then_pending(prepared):
         context.service._jimeng_update(identifier, {'thread_id': 'own-history'},
             {'submission_phase': 'accepted', 'upstream_task_id': 'own-provider-task'})
+        with_download_receipt(context.client.poll.return_value,
+            account_id=context.account['id'], submit_id=context.prepared.submit_id, history_id='own-history')
         raise JimengPageNotReady('modules', 'factories-pending')
 
     context.client.submit_prepared.side_effect = accepted_then_pending
@@ -806,8 +831,9 @@ def test_only_verified_history_receipts_bind_actual_ids_and_later_queries_reuse_
         'upstream_task_id': upstream if first_record_found else 'unverified-task',
         'result_urls': [], 'error': '', 'error_code': ''}
     done = {'status': 'succeeded', 'record_found': True, 'history_id': history,
-        'upstream_task_id': upstream, 'result_urls': ['https://results.example.test/original.mp4'],
+        'upstream_task_id': upstream, 'result_urls': ['https://v3-dreamnia.jimeng.com/original.mp4'],
         'error': '', 'error_code': ''}
+    with_download_receipt(done, account_id=context.account['id'], submit_id=context.prepared.submit_id)
     context.client.poll.side_effect = [first, done]
     monkeypatch.setattr(context.service._stop, 'wait', Mock(return_value=False))
     context.service._run(identifier)
