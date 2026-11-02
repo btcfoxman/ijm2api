@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -139,6 +140,24 @@ def receipt_quota(result):
     return value
 
 
+def daily_failure_info(error):
+    """Keep numeric provider diagnostics without persisting raw response text."""
+    code, http = '', None
+    if isinstance(error, BrowserRejected):
+        ret = re.match(r'^Dreamina ret=(-?[0-9]{1,12}):', str(error))
+        status = re.match(r'^Dreamina HTTP ([1-5][0-9]{2})(?:\b|$)', str(error))
+        if ret:
+            code = ret.group(1)
+        elif status:
+            http = int(status.group(1))
+    restricted = getattr(error, 'status', '') in {
+        'challenge_required', 'verification_required', 'login_required', 'setup_required', 'agreement_required'}
+    transient_rejection = isinstance(error, BrowserRejected) and (code == '34010100' or http is not None and 500 <= http <= 599)
+    restricted = restricted or isinstance(error, BrowserRejected) and not transient_rejection
+    return {'last_error_code': code, 'last_http_status': http,
+            'retry_class': 'rejected' if restricted else 'upstream_transient' if transient_rejection else 'transport'}
+
+
 def automatic_eligible(account, settings):
     return bool(settings.get('daily_checkin_enabled') and account.get('enabled')
         and account.get('execution_mode', 'canvas_cli') != 'jimeng_web'
@@ -244,7 +263,9 @@ class DailyClaimScheduler:
             pass  # Busy is not an auth/network failure and has no failure backoff.
         except Exception as exc:
             self.failures[identifier] = type(exc).__name__
-            logger.warning('Daily credit maintenance failed account_id=%s error_type=%s', identifier, type(exc).__name__)
+            info = daily_failure_info(exc)
+            logger.warning('Daily credit maintenance failed account_id=%s error_type=%s error_code=%s http_status=%s retry_class=%s',
+                identifier, type(exc).__name__, info['last_error_code'], info['last_http_status'], info['retry_class'])
         finally:
             with self._guard:
                 self._inflight.discard(identifier)
@@ -316,11 +337,14 @@ def run_checkin(service, identifier, client_factory, *, automatic=False, refresh
             if not account or int(account.get('id') or 0) != identifier or identity_binding(account) != binding:
                 raise AccountMaintenanceBusy('Browser lease does not match the daily credit account binding')
             service._wait_checkin_identity(account)
+            client = client_factory(account)
+            if not confirmed and not refresh_only:
+                client.browser.wait_daily_credit_sdk()
+                service._verify_checkin_identity(account)
             current = service.store.account(identifier, private=True)
             if not current or identity_binding(current) != binding:
                 raise AccountMaintenanceBusy('Account identity changed during daily credit readiness')
             roll_day(current)
-            client = client_factory(account)
             if not confirmed and not refresh_only:
                 if state.get('total_attempts', state['attempts']) > 1:
                     try:
@@ -369,12 +393,12 @@ def run_checkin(service, identifier, client_factory, *, automatic=False, refresh
                     'quota_refreshed': refreshed}
         except Exception as exc:
             if not confirmed:
-                restricted = isinstance(exc, BrowserRejected) or getattr(exc, 'status', '') in {
-                    'challenge_required', 'verification_required', 'login_required', 'setup_required', 'agreement_required'}
+                info = daily_failure_info(exc)
+                restricted = info['retry_class'] == 'rejected'
                 delay = BURST_COOLDOWN if restricted or state.get('attempts', 0) >= MAX_CLAIM_ATTEMPTS else (60, 300)[
                     min(1, max(0, state.get('attempts', 1)-1))]
                 state.update(state='retry', last_error_type=type(exc).__name__,
-                    retry_class='rejected' if restricted else 'transport', next_retry_at=time.time() + delay)
+                    **info, next_retry_at=time.time() + delay)
                 service.store.save_checkin_state(identifier, state, binding=binding)
             else:
                 state.update(state='confirmed', quota_status='failed', last_error_type=type(exc).__name__)

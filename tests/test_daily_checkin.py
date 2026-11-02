@@ -42,10 +42,10 @@ def test_cold_sdk_reads_retry_before_one_daily_claim_and_release_browser(context
     store, service, account, automation, client, ready = context
     automation.read_identity.side_effect = [
         AutomationError('login_required', 'Dreamina identity read could not complete'),
-        AutomationError('login_required', 'Dreamina identity read could not complete'), ready, ready]
+        AutomationError('login_required', 'Dreamina identity read could not complete'), ready, ready, ready]
     service._stop.wait = Mock(return_value=False)
     assert service.checkin_account(account['id'])['received'] == 10
-    assert automation.read_identity.call_count == 4  # Warmup plus post-receipt identity binding.
+    assert automation.read_identity.call_count == 5  # Warmup, SDK readiness, post-receipt binding.
     client.daily_checkin.assert_called_once_with()
     assert store.account(account['id'])['last_checkin_date']
     service.browser_runtime.release.assert_called_once()
@@ -80,6 +80,7 @@ def test_login_challenge_mismatch_and_business_errors_never_retry_or_claim(conte
     with pytest.raises(type(error)):
         service.checkin_account(account['id'])
     automation.read_identity.assert_called_once()
+    client.browser.wait_daily_credit_sdk.assert_not_called()
     client.daily_checkin.assert_not_called()
     assert not store.account(account['id'])['last_checkin_date']
     service.browser_runtime.release.assert_called_once()
@@ -118,7 +119,7 @@ def test_one_failed_claim_is_not_replayed_and_not_marked_success(context, error)
     client.daily_checkin.side_effect = error
     with pytest.raises(BrowserError):
         service.checkin_account(account['id'])
-    automation.read_identity.assert_called_once()
+    assert automation.read_identity.call_count == 2  # Recheck after SDK readiness, before the single POST.
     client.daily_checkin.assert_called_once()
     assert not store.account(account['id'])['last_checkin_date']
     service.browser_runtime.release.assert_called_once()

@@ -30,7 +30,7 @@ def test_confirmed_receipt_immediately_refreshes_authoritative_web_quota(context
     assert row['balance_details']['_meta']['source'] == 'dreamina_web'
     client.daily_checkin.assert_called_once()
     client.account_state.assert_called_once_with(max_attempts=2, timeout_seconds=6)
-    assert automation.read_identity.call_count == 3  # Before claim, after receipt, after quota.
+    assert automation.read_identity.call_count == 4  # Before/after SDK readiness, receipt, quota.
     assert 'checkin_state_json' not in row
 
 
@@ -167,11 +167,71 @@ def test_reject_34070104_has_bounded_independent_retry_and_no_false_confirmation
         service.checkin_account(account['id'], _automatic=True)
     state = json.loads(store.account(account['id'], private=True)['checkin_state_json'])
     assert state['retry_class'] == 'rejected' and state['next_retry_at'] == clock[0] + 3600
+    assert state['last_error_code'] == '34070104' and state['last_http_status'] is None
     with pytest.raises(AccountMaintenanceBusy):
         service.checkin_account(account['id'], _automatic=True)
     assert client.daily_checkin.call_count == 1
     assert store.account(account['id'])['last_checkin_date'] == ''
     assert not service._maintenance_failures
+
+
+@pytest.mark.parametrize('error,code,http', [
+    (BrowserRejected('Dreamina ret=34010100: param error'), '34010100', None),
+    (BrowserRejected('Dreamina HTTP 503'), '', 503),
+])
+def test_known_temporary_rejections_use_a_bounded_burst_without_faking_confirmation(context, monkeypatch, caplog, error, code, http):
+    store, service, account, _, client, _ = context
+    store.update_settings({'daily_checkin_enabled': True})
+    clock = [1000]
+    monkeypatch.setattr('app.daily_checkin.time', SimpleNamespace(time=lambda: clock[0]))
+    client.daily_checkin.side_effect = error
+    client.account_state.return_value = fresh_quota()
+    for delay in (60, 300, 3600):
+        service._daily_claims._run_one(account['id'])
+        state = json.loads(store.account(account['id'], private=True)['checkin_state_json'])
+        assert state['retry_class'] == 'upstream_transient'
+        assert state['last_error_code'] == code and state['last_http_status'] == http
+        assert state['next_retry_at'] == clock[0] + delay
+        assert store.account(account['id'])['last_checkin_date'] == ''
+        clock[0] = state['next_retry_at'] + 1
+    assert client.daily_checkin.call_count == 3
+    assert f'error_code={code}' in caplog.text and f'http_status={http}' in caplog.text
+    client.daily_checkin.side_effect = None
+    client.daily_checkin.return_value = {'receive_quota': 10}
+    service.checkin_account(account['id'], _automatic=True)
+    assert store.account(account['id'])['checkin']['confirmed_today']
+    assert client.daily_checkin.call_count == 4
+
+
+def test_sdk_timeout_never_claims_and_does_not_reclassify_existing_long_backoff(context, monkeypatch):
+    store, service, account, _, client, _ = context
+    store.update_settings({'daily_checkin_enabled': True})
+    client.browser.wait_daily_credit_sdk.side_effect = BrowserError('SDK readiness timed out before request')
+    with pytest.raises(BrowserError):
+        service.checkin_account(account['id'], _automatic=True)
+    client.daily_checkin.assert_not_called()
+    state = json.loads(store.account(account['id'], private=True)['checkin_state_json'])
+    assert state['retry_class'] == 'transport'
+    assert state['attempts'] == 1 and state['last_error_code'] == ''
+    before = store.account(account['id'], private=True)['checkin_state_json']
+    service._daily_claims.dispatch()
+    assert store.account(account['id'], private=True)['checkin_state_json'] == before
+
+
+@pytest.mark.parametrize('change', ['uid', 'global', 'disabled', 'binding'])
+def test_account_changes_while_waiting_for_sdk_prevent_any_claim(context, change):
+    store, service, account, automation, client, ready = context
+    store.update_settings({'daily_checkin_enabled': True})
+    def changed():
+        if change == 'uid':automation.read_identity.return_value = {'user_id':'different-user'}
+        elif change == 'global':store.update_settings({'daily_checkin_enabled':False})
+        elif change == 'disabled':store.update_account(account['id'], {'enabled':False})
+        else:store.update_account(account['id'], {'login_user_id':'different-user'})
+    client.browser.wait_daily_credit_sdk.side_effect = changed
+    with pytest.raises(BrowserError):
+        service.checkin_account(account['id'], _automatic=True)
+    client.daily_checkin.assert_not_called()
+    assert store.account(account['id'])['last_checkin_date'] == ''
 
 
 def test_transport_burst_cools_down_then_recovers_on_the_same_day(context, monkeypatch):
@@ -437,7 +497,7 @@ def test_implicit_managed_startup_port_does_not_invalidate_the_same_profile(cont
 
 def test_post_receipt_page_identity_mismatch_never_confirms_the_day(context):
     store, service, account, automation, client, ready = context
-    automation.read_identity.side_effect = [ready, {'user_id': 'other-page-user'}]
+    automation.read_identity.side_effect = [ready, ready, {'user_id': 'other-page-user'}]
     with pytest.raises(BrowserError, match='identity changed'):
         service.checkin_account(account['id'])
     assert store.account(account['id'])['last_checkin_date'] == ''
@@ -448,7 +508,7 @@ def test_post_receipt_page_identity_mismatch_never_confirms_the_day(context):
 
 def test_post_quota_page_switch_preserves_receipt_but_does_not_apply_foreign_balance(context):
     store, service, account, automation, client, ready = context
-    automation.read_identity.side_effect = [ready, ready, {'user_id': 'other-page-user'}]
+    automation.read_identity.side_effect = [ready, ready, ready, {'user_id': 'other-page-user'}]
     client.account_state.return_value = fresh_quota()
     result = service.checkin_account(account['id'])
     assert result['quota_refreshed'] is False

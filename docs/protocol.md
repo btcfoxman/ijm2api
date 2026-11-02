@@ -32,6 +32,11 @@ Dreamina page: ordinary `XMLHttpRequest` to
 The website's installed SDK supplies its normal request context. Bare `fetch`
 was rejected with `34070104`; legacy webpack module IDs were unavailable.
 No signatures or credential values are copied or constructed by the service.
+Before claiming, a bounded 20-second read-only gate waits for the current
+document's naturally completed benefit metadata request on the selected
+verified commerce origin. It checks only signature query-key presence,
+then rechecks identity and account policy. Timeout sends no claim request;
+the final XHR evaluation checks readiness again without replaying a request.
 The receipt must have HTTP success, `ret=0`, a finite nonnegative
 `receive_quota`, and matching account identity. Request and response must stay
 on the selected verified SG/US commerce origin and exact endpoint path.
@@ -41,7 +46,10 @@ naturally idle accounts. Queued maintenance does not block new generation;
 only the actual claim holds the account, and existing tasks are never interrupted.
 Transport failures use a three-attempt short retry burst, then a persisted
 one-hour cooldown before another bounded burst on the same day. Explicit
-rejections and verification failures use the long cooldown immediately.
+`34070104`, unclassified rejections and verification failures use the long
+cooldown immediately. Explicit `34010100` and HTTP 5xx responses use the
+bounded short burst. Private state and logs retain numeric error codes,
+without raw provider messages or request context.
 Confirmed same-day receipts permit only bounded quota refresh, never another
 claim. Receipt day and request timezone both use `IJM_TIME_ZONE`.
 

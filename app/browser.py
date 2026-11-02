@@ -41,6 +41,23 @@ _RESOURCE_TIMING_BUFFER_SCRIPT = """(() => {
  performance.setResourceTimingBufferSize(5000);return true;
 })()"""
 
+# A boolean check over the current document's naturally completed requests.
+# Signature values stay inside the website; only fixed query-key presence is
+# checked. start_up and our own credit_receive never establish SDK readiness.
+_DAILY_CREDIT_SDK_READY = r"""(origin=>{
+ if(location.origin!=='https://dreamina.capcut.com'||
+    !['interactive','complete'].includes(document.readyState))return false;
+ if(typeof performance?.getEntriesByType!=='function')return false;
+ return performance.getEntriesByType('resource').some(entry=>{
+  if(!Number.isFinite(entry.responseEnd)||entry.responseEnd<=0)return false;
+  try{const url=new URL(entry.name);
+   return url.origin===origin&&!url.username&&!url.password&&!url.hash&&
+    ['/commerce/v3/resource/benefit_metadata','/commerce/v3/benefits/batch_get_user_benefit'].includes(url.pathname)&&
+    url.searchParams.has('X-Bogus')&&url.searchParams.has('X-Gnarly')&&url.searchParams.has('msToken');
+  }catch(_){return false;}
+ });
+})"""
+
 
 def account_browser_site(account: dict[str, Any]) -> str:
     """Select a site from the explicit transport, independently of region."""
@@ -487,6 +504,30 @@ class CDPBrowser:
             raise BrowserError("Dreamina browser JavaScript request returned an error")
         return value.get("value")
 
+    def wait_daily_credit_sdk(self, timeout_seconds: float = 20) -> None:
+        """Wait only for normal page bootstrap; never make or repeat a request."""
+        original_timeout = self.timeout
+        deadline = time.monotonic() + min(20, timeout_seconds, original_timeout)
+        expression = ("(()=>{let origin=" + json.dumps(COMMERCE_API) + ";"
+            "try{const info=globalThis.__locationInfo,domain=info?.domain?.commerce_domain;"
+            "if(info?.code==='US'&&" + json.dumps(COMMERCE_US_ORIGINS) + ".includes(domain))origin=domain;"
+            "}catch(_){}return " + _DAILY_CREDIT_SDK_READY + "(origin)})()")
+        try:
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                self.timeout = min(2, original_timeout, remaining)
+                try:
+                    if self.evaluate(expression) is True:
+                        return
+                except BrowserError:
+                    pass  # A replacing document is not proof of lost login.
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(.2, remaining))
+        finally:
+            self.timeout = original_timeout
+        raise BrowserError('Dreamina daily credit page SDK readiness timed out before request')
+
     def post(self, path: str, body: dict[str, Any], *, query: dict[str, str] | None = None,
              allow_empty_ret: bool = False, native_client: bool = False) -> dict[str, Any]:
         if self.site != "dreamina":
@@ -552,7 +593,7 @@ class CDPBrowser:
                 regional_url = "url=commerceOrigin+" + json.dumps(url[len(COMMERCE_API):]) + ";"
             request = ("r=await fetch(url,{method:'POST',credentials:'include',headers,"
                        "body:JSON.stringify(" + payload + ")})")
-            origin_guard = response_guard = ''
+            origin_guard = response_guard = ready_guard = ''
             if path == '/commerce/v1/benefits/credit_receive':
                 # The current website SDK intercepts normal page XHR, not bare
                 # fetch. Verified 2026-11-02: one ordinary XHR received ret=0;
@@ -560,6 +601,8 @@ class CDPBrowser:
                 timeout_ms = max(1, min(15000, int(self.timeout * 1000)))
                 origin_guard = ("if(globalThis.location?.origin!=='https://dreamina.capcut.com')"
                     "return JSON.stringify({transport_error:'daily-page-context'});")
+                ready_guard = ("if(!" + _DAILY_CREDIT_SDK_READY + "(new URL(url).origin))"
+                    "return JSON.stringify({transport_error:'daily-sdk-not-ready'});")
                 response_guard = (
                     "if(r.contextError)return JSON.stringify({transport_error:'daily-response-context'});"
                     "if(!Number.isInteger(r.status)||r.status<200||r.status>=300)"
@@ -583,6 +626,7 @@ class CDPBrowser:
                 "if(globalThis.location?.hostname==='dreamina.capcut.com'&&"
                 "info?.code==='US'&&" + us_commerce_context + "){"
                 + regional_url + "headers.appid='513641'}}catch(_){}"
+                + ready_guard +
                 "try{" + request + "}"
                 "catch(e){return JSON.stringify({transport_error:'fetch'})}"
                 + response_guard +
@@ -611,6 +655,8 @@ class CDPBrowser:
             raise BrowserError("Dreamina browser fetch failed")
         if response.get('transport_error') in {'daily-page-context', 'daily-response-context'}:
             raise BrowserError('Dreamina daily credit request context could not be verified')
+        if response.get('transport_error') == 'daily-sdk-not-ready':
+            raise BrowserError('Dreamina daily credit page SDK is not ready before request')
         if response.get('transport_error') == 'daily-http':
             status = response.get('http')
             if isinstance(status, int) and status >= 400:

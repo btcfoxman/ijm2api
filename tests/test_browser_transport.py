@@ -210,7 +210,8 @@ process.stdin.on('data', (part) => { input += part; });
 process.stdin.on('end', async () => {
   const {expressions, contexts} = JSON.parse(input);
   const calls = [], values = [], reads = [];
-  const sandbox = {URL, location: {hostname: 'dreamina.capcut.com'}};
+  const sandbox = {URL, location: {hostname: 'dreamina.capcut.com'}, document:{readyState:'complete'}};
+  sandbox.performance={getEntriesByType:()=>sandbox.resources};
   sandbox.fetch = async (url, options) => {
     calls.push({url, options});
     if (sandbox.throwFetch) throw new Error('synthetic network failure');
@@ -247,6 +248,11 @@ process.stdin.on('end', async () => {
     }
     sandbox.location.hostname = item.hostname || 'dreamina.capcut.com';
     sandbox.location.origin = 'https://' + sandbox.location.hostname;
+    sandbox.document.readyState=item.readyState||'complete';
+    // Key names only: these fixtures contain no signature values.
+    sandbox.resources=item.resources??['https://commerce-api-sg.capcut.com',
+      'https://commerce-us-ttp2.us.capcut.com','https://commerce.us.capcut.com'].map(origin=>({
+        name:origin+'/commerce/v3/resource/benefit_metadata?X-Bogus&X-Gnarly&msToken',responseEnd:1}));
     sandbox.throwFetch = !!item.throwFetch;
     sandbox.throwXhrTimeout = !!item.throwXhrTimeout;
     sandbox.xhrResponseURL = item.xhrResponseURL;
@@ -532,6 +538,63 @@ process.stdin.on('end', async () => {
             self.assertEqual(client.daily_checkin(), {'receive_quota': 0})
         result = self.execute_contexts([evaluate.call_args.args[0]], [{}])
         self.assertEqual(json.loads(result['calls'][0]['options']['body']), {'time_zone': 'UTC'})
+
+    def test_daily_sdk_readiness_requires_completed_natural_benefit_in_the_exact_selected_region(self):
+        browser = CDPBrowser(19301)
+        with patch.object(browser, 'evaluate', return_value=True) as evaluate:
+            browser.wait_daily_credit_sdk()
+        probe = evaluate.call_args.args[0]
+        sg, us = 'https://commerce-api-sg.capcut.com', 'https://commerce.us.capcut.com'
+        def entry(origin=sg, path='/commerce/v3/resource/benefit_metadata', keys='X-Bogus&X-Gnarly&msToken', end=1):
+            return {'name': origin+path+'?'+keys, 'responseEnd': end}
+        contexts = [
+            {'resources':[entry()]},
+            {'resources':[entry(path='/commerce/v3/benefits/batch_get_user_benefit')]},
+            {'resources':[entry(end=0)]},
+            {'resources':[entry(keys='X-Bogus&msToken')]},
+            {'resources':[entry(path='/commerce/v1/common/start_up')]},
+            {'resources':[entry(path='/commerce/v1/benefits/credit_receive')]},
+            {'resources':[entry(origin='https://unrelated.example')]},
+            {'resources':[entry()], 'readyState':'loading'},
+            {'resources':[entry()], 'hostname':'unrelated.example'},
+            {'resources':[entry()], 'sdk':{'code':'US','domain':{'commerce_domain':us}}},
+            {'resources':[entry(origin=us)], 'sdk':{'code':'US','domain':{'commerce_domain':us}}},
+            {'resources':[entry(origin=us)]},
+        ]
+        result = self.execute_contexts([probe], contexts)
+        self.assertEqual(result['values'], [True, True, False, False, False, False, False, False, False, False, True, False])
+        self.assertEqual(result['calls'], [])
+        self.assertNotIn('searchParams.get(', probe)
+        self.assertNotIn('fetch(', probe)
+        self.assertNotIn('XMLHttpRequest', probe)
+        # The last guard runs in the same evaluate as send, including after
+        # a previous successful poll if the document was replaced meanwhile.
+        result = self.execute_contexts([self.expression('/commerce/v1/benefits/credit_receive')], [{'resources':[]}])
+        self.assertEqual(result['calls'], [])
+        self.assertEqual(json.loads(result['values'][0]), {'transport_error':'daily-sdk-not-ready'})
+
+    def test_daily_sdk_wait_is_bounded_restores_timeout_and_only_evaluates_a_boolean(self):
+        browser, clock = CDPBrowser(19301, timeout=.4), [0.0]
+        timeouts = []
+        def evaluate(*_, **__):
+            timeouts.append(browser.timeout)
+            return False
+        with patch.object(browser, 'evaluate', side_effect=evaluate), \
+                patch('app.browser.time.monotonic', side_effect=lambda:clock[0]), \
+                patch('app.browser.time.sleep', side_effect=lambda delay:clock.__setitem__(0,clock[0]+delay)):
+            with self.assertRaisesRegex(BrowserError, 'before request'):
+                browser.wait_daily_credit_sdk()
+        self.assertEqual(clock[0], .4)
+        self.assertEqual(browser.timeout, .4)
+        self.assertTrue(timeouts and all(0 < value <= 2 for value in timeouts))
+        browser, clock = CDPBrowser(19301), [0.0]
+        with patch.object(browser, 'evaluate', side_effect=[False, BrowserError('replacing document'), True]) as evaluate, \
+                patch('app.browser.time.monotonic', side_effect=lambda:clock[0]), \
+                patch('app.browser.time.sleep', side_effect=lambda delay:clock.__setitem__(0,clock[0]+delay)):
+            browser.wait_daily_credit_sdk()
+        self.assertEqual(evaluate.call_count, 3)
+        self.assertEqual(browser.timeout, 90)
+        self.assertAlmostEqual(clock[0], .4)
 
     def test_unrelated_commerce_write_and_native_paths_keep_existing_transport(self):
         us = {"sdk": {"code": "US", "domain": {
