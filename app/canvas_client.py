@@ -587,7 +587,7 @@ class CanvasClient:
         credits = data.get("credits") if isinstance(data.get("credits"), dict) else {}
         return {"user_id": user_id, "id": user_id, "name": str(data.get("displayName") or ""),
                 "available_balance": balance, "credits": balance,
-                "buckets": {"details": credits.get("details", [])},
+                "buckets": ({"details": credits['details']} if isinstance(credits.get('details'), list) else {}),
                 "membership": {k: data[k] for k in ("isVip", "vipLevel", "vipLevelStartsAt", "vipLevelExpiresAt") if k in data},
                 "raw": data}
 

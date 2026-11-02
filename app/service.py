@@ -46,6 +46,8 @@ from .result_transfer import ResultTransferError, transfer, presign, expires_soo
 from .upload import UploadError
 from .store import Store, accepted_canvas_result
 from .result_delivery import result_delivery_projection
+from .daily_checkin import (AccountMaintenanceBusy, DailyClaimScheduler, run_checkin,
+                            credit_read_is_stale, identity_binding)
 
 
 TERMINAL = {"succeeded", "failed", "expired"}
@@ -53,10 +55,6 @@ MAX_CREDIT_ACCOUNT_ATTEMPTS = 2
 HISTORY_COST_WINDOW_SECONDS = 7 * 24 * 60 * 60
 HISTORY_COST_SAMPLES = 5
 logger = logging.getLogger(__name__)
-
-
-class AccountMaintenanceBusy(BrowserError):
-    """A daily credit claim must wait until all generation accounting is idle."""
 
 
 def _credential_setup_ready(account: dict[str, Any]) -> bool:
@@ -119,6 +117,7 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
         self._maintenance_failures: dict[int, tuple[int, float]] = {}
         self._browser_views: dict[int, tuple[dict[str, Any], bool, float]] = {}
         self._browser_views_lock = threading.RLock()
+        self._daily_claims = DailyClaimScheduler(self)
 
     def settings(self) -> dict[str, Any]:
         return {**DEFAULT_SETTINGS, **self.store.get_settings()}
@@ -161,6 +160,7 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
             except ResultTransferError as exc:
                 raise ValueError(str(exc)) from exc
         self.store.update_settings(filtered)
+        self._daily_claims.wake()
         return self.public_settings()
 
     def start(self) -> None:
@@ -199,6 +199,7 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
         self._maintenance = threading.Thread(target=self._maintain_accounts, daemon=True,
                                              name="ijm-account-maintenance")
         self._maintenance.start()
+        self._daily_claims.start()
         for task in reversed(self.store.tasks(1000)):
             if accepted_canvas_result(task, allow_closed=True) and (task['status'] in {'failed', 'expired'}
                     or (task.get('upstream_context') or {}).get('result_observation')):
@@ -249,6 +250,7 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
 
     def stop(self) -> None:
         self._stop.set()
+        self._daily_claims.close()
         if self._canvas_result_maintenance and self._canvas_result_maintenance.is_alive():
             self._canvas_result_maintenance.join(timeout=5)
         self._canvas_result_pool.shutdown(wait=False, cancel_futures=True)
@@ -286,8 +288,19 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
             entry = self._browser_views.pop(account_id, None)
         if entry:
             self.browser_runtime.release(entry[0], entry[1])
+            self._daily_claims.wake()
 
     def _maintain_accounts(self) -> None:
+        # Unexpected provider/driver shapes must not permanently kill routine
+        # account maintenance. Daily claims have their own worker/backoff.
+        while not self._stop.is_set():
+            try:
+                self._maintain_accounts_loop()
+            except Exception as exc:
+                logger.warning('IJM account maintenance recovered error_type=%s', type(exc).__name__)
+                self._stop.wait(5)
+
+    def _maintain_accounts_loop(self) -> None:
         while not self._stop.is_set():
             with self._browser_views_lock:
                 expired = [account_id for account_id, (_, _, touched) in self._browser_views.items()
@@ -319,17 +332,13 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                         checked = self.check_account(account_id)
                     if checked["status"] == "login_required":
                         needs_rapid_recheck = True
-                    if (settings["daily_checkin_enabled"] and execution_mode(account) != 'jimeng_web'
-                            and checked['status'] in {'active', 'cli_auth_required'}):
-                        stage = 'daily_checkin'
-                        with self._browser_aux_slots:
-                            self.checkin_account(account_id)
+                    self._daily_claims.wake()
                     self._maintenance_failures.pop(account_id, None)
                 except AccountMaintenanceBusy:
                     # Occupancy is temporary and does not mean the account or
                     # its proxy failed. Revisit it during the next normal pass.
                     continue
-                except (BrowserError, CanvasCLIError, ValueError, KeyError) as exc:
+                except Exception as exc:
                     failed += 1
                     retry_seconds = min(1800, 60 * 2 ** min(failed - 1, 5))
                     self._maintenance_failures[account_id] = (failed,
@@ -345,28 +354,21 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
             # leaving a valid account unavailable for the full interval.
             self._stop.wait(interval)
 
-    def checkin_account(self, account_id: int) -> dict[str, Any]:
-        account = self.store.account(account_id, private=True)
-        if not account:
-            raise KeyError(account_id)
-        if execution_mode(account) == 'jimeng_web':
-            raise JimengProtocolUnavailable('Jimeng daily credit claim contract is unavailable')
-        today = datetime.now(ZoneInfo(os.getenv("IJM_TIME_ZONE", "Asia/Taipei"))).date().isoformat()
-        if account.get("last_checkin_date") == today:
-            return {"already_checked_in": True, "date": today}
-        with self._exclusive_aux_account(account_id):
-            account = self.store.account(account_id, private=True)
-            if account.get('last_checkin_date') == today:
-                return {"already_checked_in": True, "date": today}
-            account, owned = self.browser_runtime.acquire(account)
-            try:
-                self._wait_checkin_identity(account)
-                result = DreaminaClient(account).daily_checkin()
-            finally:
-                self.browser_runtime.release(account, owned)
-            self.store.update_account(account_id, {"last_checkin_date": today})
-        return {"already_checked_in": False, "date": today,
-                "received": result.get("receive_quota", 0)}
+    def checkin_account(self, account_id: int, *, _automatic: bool = False,
+                        _refresh_only: bool = False) -> dict[str, Any]:
+        return run_checkin(self, account_id, DreaminaClient,
+                           automatic=_automatic, refresh_only=_refresh_only)
+
+    def _daily_receipt(self, account: dict[str, Any], client: Any, day: str) -> dict[str, Any]:
+        """Transport seam for the original account's verified official receipt."""
+        return client.daily_checkin()
+
+    def _verify_checkin_identity(self, account: dict[str, Any]) -> None:
+        browser = CDPBrowser(int(account.get('cdp_port') or 0), timeout=6)
+        identity = AccountAutomation(account, self.settings(), browser=browser).read_identity()
+        if (not isinstance(identity, dict)
+                or str(identity.get('user_id') or '') != str(account.get('login_user_id') or '')):
+            raise AutomationError('login_required', 'Dreamina check-in identity changed during credit maintenance')
 
     @contextmanager
     def _exclusive_aux_account(self, account_id: int):
@@ -383,7 +385,9 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
             if not current:
                 raise KeyError(account_id)
             if (current.get('status') == 'logging_in' or self._active.get(account_id, 0) or self.store.active_account_count(account_id)
-                    or account_id in self._aux_account_owners):
+                    or account_id in self._aux_account_owners
+                    or getattr(self, 'auto_login_busy', lambda _: False)(account_id)
+                    or getattr(self, 'canvas_auth', None) and self.canvas_auth.busy(account_id)):
                 raise AccountMaintenanceBusy('Account is busy; daily check-in is deferred until its tasks finish')
             self._aux_account_owners[account_id] = owner
         try:
@@ -801,6 +805,7 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
             key = task_id or next((key for key, (owner, _) in self._credit_reservations.items() if owner == account_id), None)
             if key:
                 self._credit_reservations.pop(key, None)
+        self._daily_claims.wake()
 
     def _handle_credit_rejection(self, task_id: str, account_id: int, reason: str) -> bool:
         """One admission-rejection policy for browser, Canvas, image and video."""
@@ -971,6 +976,8 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
         account = self.store.account(account_id, private=True)
         if not account:
             raise KeyError(account_id)
+        if account_id in self._aux_account_owners or self._daily_claims.reserved(account_id):
+            raise AccountMaintenanceBusy('Daily credit maintenance owns this account; health check is deferred')
         if execution_mode(account) == 'jimeng_web' and account.get('status') == 'logging_in':
             raise AccountMaintenanceBusy('Account is in online browser login; account check is deferred')
         if not start_browser and execution_mode(account) == 'canvas_cli':
@@ -987,6 +994,9 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
     def _check_account_live(self, account: dict[str, Any]) -> dict[str, Any]:
         account_id = int(account["id"])
         jimeng = execution_mode(account) == 'jimeng_web'
+        started = time.time()
+        if account_id in self._aux_account_owners or self._daily_claims.reserved(account_id):
+            raise AccountMaintenanceBusy('Daily credit maintenance owns this account; health check is deferred')
 
         def assert_login_binding(current: dict[str, Any]) -> None:
             if current.get('status') == 'logging_in':
@@ -996,11 +1006,20 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                 raise AccountMaintenanceBusy('Account login binding changed; account check is deferred')
 
         def update_check(values: dict[str, Any]) -> dict[str, Any]:
-            if not jimeng:
-                return self.store.update_account(account_id, values)
             with self._lock:
                 current = self.store.account(account_id, private=True) or {}
-                assert_login_binding(current)
+                if jimeng:
+                    assert_login_binding(current)
+                elif identity_binding(current) != identity_binding(account) or current.get('status') == 'logging_in':
+                    raise AccountMaintenanceBusy('Account binding changed during its browser credit check')
+                if account_id in self._aux_account_owners or self._daily_claims.reserved(account_id):
+                    raise AccountMaintenanceBusy('Daily credit maintenance superseded the browser health check')
+                if not jimeng and credit_read_is_stale(current, started):
+                    for key in ('balance', 'balance_details', 'enabled', 'status', 'last_error'):
+                        values.pop(key, None)
+                if not current.get('enabled'):
+                    for key in ('enabled', 'status', 'last_error'):
+                        values.pop(key, None)
                 return self.store.update_account(account_id, values)
 
         if jimeng:

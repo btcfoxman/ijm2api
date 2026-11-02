@@ -136,7 +136,8 @@ class CanvasAuthManager:
             if (getattr(self.service, 'auto_login_busy', lambda _: False)(account_id)
                     or account['status'] == 'logging_in'):
                 raise ValueError('account is in browser login')
-            if self.service._active.get(account_id, 0) or self.store.active_account_count(account_id):
+            if (self.service._active.get(account_id, 0) or self.store.active_account_count(account_id)
+                    or account_id in getattr(self.service, '_aux_account_owners', {})):
                 raise ValueError('account has active tasks')
             if not account.get('proxy_url'):
                 raise ValueError('Canvas authorization requires the account proxy')

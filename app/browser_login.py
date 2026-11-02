@@ -314,7 +314,8 @@ class BrowserLoginManager:
                     raise LoginError('account is in automatic login')
                 if cli_auth and cli_auth.busy(account_id):
                     raise LoginError('account is in Canvas CLI authorization')
-                if self.service._active.get(account_id, 0) or self.store.active_account_count(account_id):
+                if (self.service._active.get(account_id, 0) or self.store.active_account_count(account_id)
+                        or account_id in getattr(self.service, '_aux_account_owners', {})):
                     raise LoginError("account has active tasks")
                 try:
                     if desktop:
@@ -497,7 +498,8 @@ class BrowserLoginManager:
             with self.service._lock:
                 if getattr(self.service, 'auto_login_busy', lambda _: False)(account_id):
                     raise LoginError('account is in automatic login')
-                if self.service._active.get(account_id, 0) or self.store.active_account_count(account_id):
+                if (self.service._active.get(account_id, 0) or self.store.active_account_count(account_id)
+                        or account_id in getattr(self.service, '_aux_account_owners', {})):
                     raise LoginError("account has active tasks")
                 try:
                     self.service.browser_runtime.assert_idle(account_id)

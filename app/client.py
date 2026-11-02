@@ -15,6 +15,7 @@ from .catalog import ALIASES, MODELS, media_alias_kind
 from .media import _download
 from .store import Store
 from .upload import UploadError, upload_media_bytes
+from .daily_checkin import claim_timezone
 
 
 class DreaminaError(Exception):
@@ -292,7 +293,7 @@ class DreaminaClient:
 
     def daily_checkin(self) -> dict[str, Any]:
         return self.browser.post("/commerce/v1/benefits/credit_receive",
-                                 {"time_zone": "Asia/Taipei"})
+                                 {"time_zone": claim_timezone()})
 
     def upload_inputs(self, normalized: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         account_id = int(self.account["id"])

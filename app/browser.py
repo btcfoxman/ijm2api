@@ -550,16 +550,42 @@ class CDPBrowser:
                 )
             else:
                 regional_url = "url=commerceOrigin+" + json.dumps(url[len(COMMERCE_API):]) + ";"
+            request = ("r=await fetch(url,{method:'POST',credentials:'include',headers,"
+                       "body:JSON.stringify(" + payload + ")})")
+            origin_guard = response_guard = ''
+            if path == '/commerce/v1/benefits/credit_receive':
+                # The current website SDK intercepts normal page XHR, not bare
+                # fetch. Verified 2026-11-02: one ordinary XHR received ret=0;
+                # signatures remain entirely inside that installed website SDK.
+                timeout_ms = max(1, min(15000, int(self.timeout * 1000)))
+                origin_guard = ("if(globalThis.location?.origin!=='https://dreamina.capcut.com')"
+                    "return JSON.stringify({transport_error:'daily-page-context'});")
+                response_guard = (
+                    "if(r.contextError)return JSON.stringify({transport_error:'daily-response-context'});"
+                    "if(!Number.isInteger(r.status)||r.status<200||r.status>=300)"
+                    "return JSON.stringify({transport_error:'daily-http',http:r.status});")
+                request = (
+                    "r=await new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();"
+                    "xhr.open('POST',url,true);xhr.withCredentials=true;"
+                    "xhr.timeout=" + str(timeout_ms) + ";"
+                    "for(const [key,value]of Object.entries(headers))xhr.setRequestHeader(key,value);"
+                    "xhr.onload=()=>{try{const actual=new URL(xhr.responseURL),expected=new URL(url);"
+                    "if(actual.origin!==expected.origin||actual.pathname!==expected.pathname||"
+                    "actual.username||actual.password||actual.hash){resolve({contextError:true});return;}"
+                    "resolve({status:xhr.status,json:async()=>JSON.parse(xhr.responseText)});"
+                    "}catch(_){resolve({contextError:true});}};"
+                    "xhr.onerror=xhr.ontimeout=xhr.onabort=()=>reject(new Error('daily-xhr-failed'));"
+                    "xhr.send(JSON.stringify(" + payload + "))})")
             expression = (
-                "(async()=>{let r;let url=" + json.dumps(url) + ";"
+                "(async()=>{" + origin_guard + "let r;let url=" + json.dumps(url) + ";"
                 "const headers={'content-type':'application/json'};"
                 "try{const info=globalThis.__locationInfo;" + commerce_origin_setup +
                 "if(globalThis.location?.hostname==='dreamina.capcut.com'&&"
                 "info?.code==='US'&&" + us_commerce_context + "){"
                 + regional_url + "headers.appid='513641'}}catch(_){}"
-                "try{r=await fetch(url,{method:'POST',credentials:'include',headers,"
-                "body:JSON.stringify(" + payload + ")})}"
+                "try{" + request + "}"
                 "catch(e){return JSON.stringify({transport_error:'fetch'})}"
+                + response_guard +
                 "let body;try{body=await r.json()}"
                 "catch(e){return JSON.stringify({transport_error:'json',http:r.status})}"
                 "return JSON.stringify({http:r.status,body})})()"
@@ -583,6 +609,13 @@ class CDPBrowser:
             raise BrowserError("Dreamina returned an invalid response envelope")
         if response.get("transport_error") == "fetch":
             raise BrowserError("Dreamina browser fetch failed")
+        if response.get('transport_error') in {'daily-page-context', 'daily-response-context'}:
+            raise BrowserError('Dreamina daily credit request context could not be verified')
+        if response.get('transport_error') == 'daily-http':
+            status = response.get('http')
+            if isinstance(status, int) and status >= 400:
+                raise BrowserRejected(f'Dreamina HTTP {status}')
+            raise BrowserError('Dreamina daily credit request returned an unexpected HTTP status')
         if response.get("transport_error") == "native-client-unavailable":
             raise BrowserError("Dreamina page request client is unavailable")
         if response.get("transport_error") == "native-container-unavailable":

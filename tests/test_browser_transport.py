@@ -216,6 +216,22 @@ process.stdin.on('end', async () => {
     if (sandbox.throwFetch) throw new Error('synthetic network failure');
     return {status: 200, json: async () => ({ret: '0', data: {credit: {gift_credit: 7}}})};
   };
+  sandbox.XMLHttpRequest = class {
+    constructor(){this.headers={};}
+    open(method,url,async){this.method=method;this.url=url;this.async=async;}
+    setRequestHeader(key,value){this.headers[key]=value;}
+    send(body){
+      calls.push({url:this.url,transport:'xhr',timeout:this.timeout,options:{method:this.method,
+        credentials:this.withCredentials?'include':'omit',headers:this.headers,body}});
+      Promise.resolve().then(()=>{
+        if(sandbox.throwFetch){this.onerror();return;}
+        if(sandbox.throwXhrTimeout){this.ontimeout();return;}
+        this.status=sandbox.xhrStatus??200;
+        this.responseURL=sandbox.xhrResponseURL===undefined?this.url:sandbox.xhrResponseURL;
+        this.responseText=JSON.stringify({ret:'0',data:{receive_quota:5}});this.onload();
+      });
+    }
+  };
   vm.createContext(sandbox);
   for (let i = 0; i < contexts.length; i++) {
     const item = contexts[i];
@@ -230,7 +246,11 @@ process.stdin.on('end', async () => {
       Object.defineProperty(sandbox.__locationInfo, 'domain', {get: () => {domainReads++; return domain;}});
     }
     sandbox.location.hostname = item.hostname || 'dreamina.capcut.com';
+    sandbox.location.origin = 'https://' + sandbox.location.hostname;
     sandbox.throwFetch = !!item.throwFetch;
+    sandbox.throwXhrTimeout = !!item.throwXhrTimeout;
+    sandbox.xhrResponseURL = item.xhrResponseURL;
+    sandbox.xhrStatus = item.xhrStatus;
     values.push(await vm.runInContext(expressions[i % expressions.length], sandbox));
     reads.push({domain: domainReads, origin: originReads});
   }
@@ -311,7 +331,9 @@ process.stdin.on('end', async () => {
                          "commerce_domain": 'https://commerce.us.capcut.com'}}}]
         for path in ["/commerce/v1/benefits/user_credit", "/commerce/v1/benefits/credit_receive", "/mweb/v1/get_settings"]:
             result = self.execute_contexts([self.expression(path)], contexts)
-            self.assertEqual(len(result['calls']), len(contexts))
+            self.assertEqual(len(result['calls']), len(contexts) - (1 if path.endswith('/credit_receive') else 0))
+            if path.endswith('/credit_receive'):
+                self.assertEqual(json.loads(result['values'][-1]), {'transport_error': 'daily-page-context'})
             for call in result['calls']:
                 origin = 'https://mweb-api-sg.capcut.com' if path.startswith('/mweb/') else 'https://commerce-api-sg.capcut.com'
                 self.assertEqual(call['url'], origin + path)
@@ -469,6 +491,47 @@ process.stdin.on('end', async () => {
         self.assertEqual(result['calls'][0]['options']['headers']['appid'], '513641')
         self.assertNotIn('appid', result['calls'][1]['options']['headers'])
         self.assertEqual(json.loads(result['values'][-1]), {'transport_error': 'fetch'})
+
+    def test_daily_claim_uses_one_bounded_page_xhr_without_fetch_or_module_fallback(self):
+        expression = self.expression('/commerce/v1/benefits/credit_receive', body={'time_zone': 'Asia/Taipei'})
+        self.assertIn('new XMLHttpRequest()', expression)
+        self.assertNotIn('fetch(', expression)
+        self.assertNotIn('chunks.push', expression)
+        result = self.execute_contexts([expression], [{}, {'throwXhrTimeout': True}])
+        self.assertEqual(len(result['calls']), 2)
+        self.assertTrue(all(call['transport'] == 'xhr' and call['timeout'] == 15000 for call in result['calls']))
+        self.assertEqual(json.loads(result['values'][0])['body']['data']['receive_quota'], 5)
+        self.assertEqual(json.loads(result['values'][1]), {'transport_error': 'fetch'})
+        ordinary = self.expression('/commerce/v1/benefits/user_credit')
+        self.assertIn('fetch(', ordinary)
+        self.assertNotIn('new XMLHttpRequest', ordinary)
+
+    def test_daily_xhr_response_must_match_the_selected_origin_and_path(self):
+        path = '/commerce/v1/benefits/credit_receive'
+        us = {'code': 'US', 'domain': {'commerce_domain': 'https://commerce.us.capcut.com'}}
+        contexts = [
+            {'xhrResponseURL': 'https://commerce-api-sg.capcut.com' + path + '?sdk=synthetic'},
+            {'xhrResponseURL': 'https://unrelated.example' + path},
+            {'xhrResponseURL': 'https://commerce-api-sg.capcut.com/different-path'},
+            {'sdk': us, 'xhrResponseURL': 'https://commerce-api-sg.capcut.com' + path},
+            {'xhrResponseURL': ''}, {'xhrStatus': 0}, {'xhrStatus': 302},
+        ]
+        result = self.execute_contexts([self.expression(path)], contexts)
+        self.assertEqual(len(result['calls']), len(contexts))
+        self.assertEqual(json.loads(result['values'][0])['http'], 200)
+        for value in result['values'][1:5]:
+            self.assertEqual(json.loads(value), {'transport_error': 'daily-response-context'})
+        for value in result['values'][5:]:
+            self.assertEqual(json.loads(value)['transport_error'], 'daily-http')
+
+    def test_daily_body_uses_the_same_configured_timezone_as_the_receipt_day(self):
+        import os
+        client = DreaminaClient({'id': 1, 'cdp_port': 19301, 'proxy_url': 'socks5://proxy.test:20001'})
+        with patch.dict(os.environ, {'IJM_TIME_ZONE': 'UTC'}), patch.object(client.browser, 'evaluate',
+                return_value=json.dumps({'http': 200, 'body': {'ret': '0', 'data': {'receive_quota': 0}}})) as evaluate:
+            self.assertEqual(client.daily_checkin(), {'receive_quota': 0})
+        result = self.execute_contexts([evaluate.call_args.args[0]], [{}])
+        self.assertEqual(json.loads(result['calls'][0]['options']['body']), {'time_zone': 'UTC'})
 
     def test_unrelated_commerce_write_and_native_paths_keep_existing_transport(self):
         us = {"sdk": {"code": "US", "domain": {

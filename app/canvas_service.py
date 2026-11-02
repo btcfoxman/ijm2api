@@ -20,6 +20,7 @@ from .canvas_quote_hints import new_hint
 from .canvas_retry_budget import (new_retry_budget, budget_token, claim_attempt,
                                  seed_from_verified_preparations, RetryBudgetError)
 from .account_policy import credit_rejected
+from .daily_checkin import AccountMaintenanceBusy, cli_credit_details, decode_details, identity_binding, read_state
 from .image_model_routing import plan_image_execution, recorded_image_route
 from .errors import RegionGenerationDenied
 from .cost_adapter import input_evidence, number
@@ -544,6 +545,9 @@ class CanvasServiceMixin:
 
     def _check_cli_account(self, account: dict) -> dict:
         account_id = int(account["id"])
+        started = time.time()
+        if account_id in self._aux_account_owners or self._daily_claims.reserved(account_id):
+            raise AccountMaintenanceBusy('Daily credit maintenance owns this account; credit check is deferred')
         try:
             state = self.canvas_client(account).identity()
             identity = str(state.get("user_id") or "")
@@ -554,20 +558,48 @@ class CanvasServiceMixin:
             balance = number(state.get("available_balance"))
             if balance is not None:
                 values["balance"] = balance
-                values["balance_details"] = state.get("buckets") or {}
+                values["balance_details"] = cli_credit_details(account, state.get('buckets'))
             if account.get("enabled") and account.get("watermark_ready") and account.get("agreement_ready"):
                 values.update(status="active", last_error="")
             threshold = float(self.settings().get("low_balance_disable_threshold") or 0)
             if balance is not None and threshold > 0 and balance < threshold:
                 values.update(enabled=False, status="disabled_low_balance", last_error="credit balance below threshold")
-            return self.store.update_account(account_id, values)
+            with self._lock:
+                current = self.store.account(account_id, private=True) or {}
+                if (identity_binding(current) != identity_binding(account)
+                        or current.get('status') == 'logging_in'
+                        or account_id in self._aux_account_owners or self._daily_claims.reserved(account_id)
+                        or current.get('cli_auth_status') in {'queued', 'authorizing', 'manual_required'}):
+                    raise AccountMaintenanceBusy('Account binding changed during its CLI credit check')
+                meta = decode_details(current).get('_meta', {})
+                daily = read_state(current)
+                timestamps = (meta.get('observed_at'), meta.get('missing_at'),
+                              daily.get('confirmed_at'), daily.get('last_attempt_at'))
+                newer = max([0, *(value for value in timestamps if isinstance(value, (int, float))
+                                  and not isinstance(value, bool) and math.isfinite(value))])
+                if newer > started:
+                    values.pop('balance', None)
+                    values.pop('balance_details', None)
+                    for key in ('enabled', 'status', 'last_error'):
+                        values.pop(key, None)
+                if not current.get('enabled'):
+                    for key in ('enabled', 'status', 'last_error'):
+                        values.pop(key, None)
+                return self.store.update_account(account_id, values)
         except CanvasCLIError as exc:
             # A transport failure is not proof that authorization was revoked.
             auth_error = any(word in exc.code.upper() for word in ("AUTH", "IDENTITY", "CREDENTIAL", "ACCOUNT_MISMATCH"))
-            return self.store.update_account(account_id, {
-                "status": "cli_auth_required" if auth_error else "network_error",
-                "cli_auth_status": "expired" if auth_error else account.get("cli_auth_status", "pending"),
-                "cli_auth_error": str(exc)[:300], "last_error": str(exc)[:300]})
+            with self._lock:
+                current = self.store.account(account_id, private=True) or {}
+                if (identity_binding(current) != identity_binding(account)
+                        or current.get('status') == 'logging_in'
+                        or account_id in self._aux_account_owners or self._daily_claims.reserved(account_id)
+                        or current.get('cli_auth_status') in {'queued', 'authorizing', 'manual_required'}):
+                    raise AccountMaintenanceBusy('Account binding changed during its CLI credit check')
+                return self.store.update_account(account_id, {
+                    "status": "cli_auth_required" if auth_error else "network_error",
+                    "cli_auth_status": "expired" if auth_error else account.get("cli_auth_status", "pending"),
+                    "cli_auth_error": str(exc)[:300], "last_error": str(exc)[:300]})
 
     @staticmethod
     def _canvas_direct_media_allowed(source: str) -> bool:

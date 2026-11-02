@@ -119,6 +119,43 @@ function account(id, values = {}) {
     max_concurrency: 1, priority: 0, ...values };
 }
 
+test('confirmed daily receipt and stale quota history are shown separately from fresh balance', () => {
+  const ui = harness();
+  loadAccountRenderer(ui, [account(1, {last_balance: 7,
+    balance_details: {gift_credit: 100, vip_credit: 20, purchase_credit: 0,
+      _meta: {source: 'dreamina_web', stale: true}},
+    checkin: {confirmed_today: true, day: '2026-11-02'}, last_checkin_date: '2026-11-02'})],
+    {canvas_cli_enabled: true, canvas_cli_runtime: {available: true}});
+  const html = ui.element('#accountsBody').innerHTML;
+  assert.match(html, /明细待补查/);
+  assert.match(html, /上次额度明细/);
+  assert.match(html, /今日领取已确认 2026-11-02/);
+  assert.match(html, />7</);
+  assert.doesNotMatch(html, /未签到/);
+  assert.equal(ui.requests.length, 0);
+});
+
+test('one quota item does not imply an unclaimed daily benefit', () => {
+  const ui = harness();
+  loadAccountRenderer(ui, [account(1, {last_balance: 99,
+    balance_details: {details: [{available: 99}]}})],
+    {canvas_cli_enabled: true, canvas_cli_runtime: {available: true}});
+  const html = ui.element('#accountsBody').innerHTML;
+  assert.match(html, /1项额度/);
+  assert.doesNotMatch(html, /未签到|未领取/);
+  assert.equal(ui.requests.length, 0);
+});
+
+test('spent gift quota retains the confirmed daily receipt date', () => {
+  const ui = harness();
+  loadAccountRenderer(ui, [account(1, {last_balance: 0,
+    balance_details: {gift_credit: 0, vip_credit: 0, purchase_credit: 0},
+    checkin: {confirmed_today: true, day: '2026-11-02'}})],
+    {canvas_cli_enabled: true, canvas_cli_runtime: {available: true}});
+  assert.match(ui.element('#accountsBody').innerHTML, /今日领取已确认 2026-11-02/);
+  assert.equal(ui.requests.length, 0);
+});
+
 test('migrated enabled accounts waiting for authorization are not reported as available', () => {
   const ui = harness();
   const accounts = Array.from({ length: 19 }, (_, i) => account(i + 1, {

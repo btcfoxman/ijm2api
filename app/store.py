@@ -206,7 +206,8 @@ class Store:
                     ("region", "TEXT NOT NULL DEFAULT 'other'"),
                     ("cli_auth_status", "TEXT NOT NULL DEFAULT 'pending'"),
                     ("cli_auth_error", "TEXT NOT NULL DEFAULT ''"),
-                    ("cli_user_id", "TEXT NOT NULL DEFAULT ''")):
+                    ("cli_user_id", "TEXT NOT NULL DEFAULT ''"),
+                    ("checkin_state_json", "TEXT NOT NULL DEFAULT '{}'")):
                 if name not in account_columns:
                     db.execute(f"ALTER TABLE accounts ADD COLUMN {name} {declaration}")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS accounts_login_email ON accounts(LOWER(login_email)) WHERE login_email<>''")
@@ -238,6 +239,9 @@ class Store:
     @staticmethod
     def _account(row: sqlite3.Row) -> dict[str, Any]:
         value = dict(row)
+        from .daily_checkin import public_state
+        value['checkin'] = public_state(value)
+        value.pop('checkin_state_json', None)
         email = str(value.get("login_email") or "")
         value["email_configured"] = bool(email)
         value["password_configured"] = bool(value.get("login_password"))
@@ -347,6 +351,9 @@ class Store:
                     login_enable_after=:login_enable_after,updated_at=:updated_at WHERE id=:id""",
                     {"login_enable_after": old['login_enable_after'], **values,
                      "updated_at": now, "id": old["id"]})
+                from .daily_checkin import identity_binding
+                if identity_binding({**dict(old), **values}) != identity_binding(dict(old)):
+                    db.execute("UPDATE accounts SET last_checkin_date='',checkin_state_json='{}' WHERE id=?", (old['id'],))
                 account_id = int(old["id"])
             else:
                 cursor = db.execute("""INSERT INTO accounts(name,cdp_port,proxy_url,project_id,
@@ -365,7 +372,8 @@ class Store:
                 if old and any(old[key] != value for key, value in credentials.items()):
                     status = "disabled" if not old["enabled"] and old["status"] == "disabled" else "pending"
                     db.execute("UPDATE accounts SET enabled=0,status=?,managed_profile=1,login_stage='',"
-                               "watermark_ready=0,agreement_ready=0,setup_checked_at=0,login_enable_after=NULL,login_user_id='' WHERE id=?", (status, account_id))
+                               "watermark_ready=0,agreement_ready=0,setup_checked_at=0,login_enable_after=NULL,login_user_id='',"
+                               "last_checkin_date='',checkin_state_json='{}' WHERE id=?", (status, account_id))
         return self.account(account_id) or {}
 
     @staticmethod
@@ -586,12 +594,37 @@ class Store:
             if any(old[key] != value for key, value in credentials.items()):
                 status = "disabled" if not old["enabled"] and old["status"] == "disabled" else "pending"
                 data.update(enabled=0, managed_profile=1, status=status, login_stage="",
-                            watermark_ready=0, agreement_ready=0, setup_checked_at=0, login_enable_after=None, login_user_id="")
+                            watermark_ready=0, agreement_ready=0, setup_checked_at=0, login_enable_after=None, login_user_id="",
+                            last_checkin_date='', checkin_state_json='{}')
+            from .daily_checkin import identity_binding
+            if identity_binding({**dict(old), **data}) != identity_binding(dict(old)):
+                data.update(last_checkin_date='', checkin_state_json='{}')
             cursor = db.execute("UPDATE accounts SET " + ",".join(f"{key}=?" for key in data) + " WHERE id=?",
                                 (*data.values(), account_id))
             if not cursor.rowcount:
                 raise KeyError(account_id)
         return self.account(account_id) or {}
+
+    def save_checkin_state(self, account_id: int, state: dict, *, binding: str,
+                           values: dict | None = None) -> bool:
+        """Write daily receipt/quota only while its verified identity epoch matches."""
+        from .daily_checkin import identity_binding
+        if not isinstance(state, dict) or state.get('binding') != binding:
+            return False
+        changes = {key: value for key, value in (values or {}).items()
+                   if key in {'last_checkin_date', 'balance'}}
+        if values and 'balance_details' in values:
+            changes['balance_details_json'] = _json(values['balance_details'])
+        changes['checkin_state_json'] = _json(state)
+        changes['updated_at'] = time.time()
+        with self._lock, self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM accounts WHERE id=?', (account_id,)).fetchone()
+            if row is None or identity_binding(dict(row)) != binding:
+                return False
+            db.execute('UPDATE accounts SET ' + ','.join(key+'=?' for key in changes) + ' WHERE id=?',
+                       (*changes.values(), account_id))
+        return True
 
     def delete_account(self, account_id: int) -> bool:
         with self._lock, self._connect() as db:

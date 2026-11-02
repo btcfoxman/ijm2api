@@ -73,7 +73,8 @@ class AutoLoginManager:
                 raise ValueError('account has no stored email/password for automatic login')
             if not account.get('managed_profile'):
                 raise ValueError('automatic login requires a service-managed account profile')
-            if self.service._active.get(account_id, 0) or self.store.active_account_count(account_id):
+            if (self.service._active.get(account_id, 0) or self.store.active_account_count(account_id)
+                    or account_id in getattr(self.service, '_aux_account_owners', {})):
                 raise ValueError('account has active tasks')
             self.service.browser_runtime.assert_idle(account_id)
             previous_intent = account.get('login_enable_after')

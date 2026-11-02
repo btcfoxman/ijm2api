@@ -42,10 +42,10 @@ def test_cold_sdk_reads_retry_before_one_daily_claim_and_release_browser(context
     store, service, account, automation, client, ready = context
     automation.read_identity.side_effect = [
         AutomationError('login_required', 'Dreamina identity read could not complete'),
-        AutomationError('login_required', 'Dreamina identity read could not complete'), ready]
+        AutomationError('login_required', 'Dreamina identity read could not complete'), ready, ready]
     service._stop.wait = Mock(return_value=False)
     assert service.checkin_account(account['id'])['received'] == 10
-    assert automation.read_identity.call_count == 3
+    assert automation.read_identity.call_count == 4  # Warmup plus post-receipt identity binding.
     client.daily_checkin.assert_called_once_with()
     assert store.account(account['id'])['last_checkin_date']
     service.browser_runtime.release.assert_called_once()
@@ -161,21 +161,16 @@ def test_already_checked_in_does_not_open_browser(context, monkeypatch):
     client.daily_checkin.assert_not_called()
 
 
-def test_maintenance_failure_reports_only_safe_stage_and_error_type(context, caplog):
+def test_daily_failure_has_independent_safe_error_reporting_and_backoff(context, caplog):
     store, service, account, automation, client, _ = context
     store.update_settings({'daily_checkin_enabled': True})
-    service.check_account = Mock(return_value={'status': 'active'})
     service.checkin_account = Mock(side_effect=BrowserError('private cookie=secret-value prompt=private-text'))
-    def finish(_):
-        service._stop.set()
-        return True
-    service._stop.wait = finish
-    service._maintain_accounts()
-    record = next(r for r in caplog.records if r.message.startswith('IJM account maintenance failed'))
-    assert record.account_id == account['id'] and record.stage == 'daily_checkin'
-    assert record.error_type == 'BrowserError'
+    service._daily_claims._run_one(account['id'])
+    record = next(r for r in caplog.records if r.message.startswith('Daily credit maintenance failed'))
+    assert f"account_id={account['id']}" in record.message and 'BrowserError' in record.message
     assert 'secret-value' not in caplog.text and 'private-text' not in caplog.text
-    assert account['id'] in service._maintenance_failures
+    assert service._daily_claims.failures[account['id']] == 'BrowserError'
+    assert account['id'] not in service._maintenance_failures
 
 
 def queued_task(store, identifier='waiting'):
@@ -234,13 +229,8 @@ def test_automatic_busy_checkin_is_deferred_without_failure_backoff(context, cap
     store, service, account, automation, client, _ = context
     store.update_settings({'daily_checkin_enabled': True})
     service._active[account['id']] = 1
-    service.check_account = Mock(return_value={'status': 'active'})
     service._maintenance_failures[account['id']] = (2, 0)
-    def finish(_):
-        service._stop.set()
-        return True
-    service._stop.wait = finish
-    service._maintain_accounts()
+    service._daily_claims._run_one(account['id'])
     assert service._maintenance_failures[account['id']] == (2, 0)
     assert not caplog.records
     client.daily_checkin.assert_not_called()

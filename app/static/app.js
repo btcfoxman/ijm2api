@@ -109,22 +109,31 @@ function renderAccounts() {
     const quota = account.balance_details || {};
     const amount = (value) => value === null || value === undefined || value === "" || !Number.isFinite(Number(value))
       ? "-" : Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
-    const detail = Array.isArray(quota.details)
+    let detail = Array.isArray(quota.details)
       ? quota.details.map((item) => `${amount(item.available)}${item.expiresAt ? ` · 到期 ${fmtTime(item.expiresAt)}` : ""}`).join(" / ") || "上游未提供额度明细"
       : [["套餐", quota.vip_credit], ["赠送", quota.gift_credit], ["加购", quota.purchase_credit]]
         .filter(([, value]) => value !== undefined && value !== null).map(([label, value]) => `${label} ${amount(value)}`).join(" · ") || "上游未提供额度明细";
-    const quotaSummary = Array.isArray(quota.details)
+    let quotaSummary = Array.isArray(quota.details)
       ? quota.details.length ? `${quota.details.length}项额度` : "明细未提供"
       : [["套餐", quota.vip_credit], ["赠送", quota.gift_credit], ["加购", quota.purchase_credit]]
         .filter(([, value]) => Number(value) > 0).map(([label]) => label).join(" / ")
           || (["vip_credit", "gift_credit", "purchase_credit"].some((key) => quota[key] !== undefined && quota[key] !== null) ? "无可用额度" : "明细未提供");
+    const quotaStale = quota._meta?.stale === true;
+    if (quotaStale) {
+      quotaSummary = "明细待补查";
+      detail = `上次额度明细，待补查 · ${detail}`;
+    }
+    const checkin = account.checkin || {};
+    const checkinText = checkin.confirmed_today ? `今日领取已确认 ${checkin.day}`
+      : account.last_checkin_date ? `上次确认领取 ${account.last_checkin_date}`
+      : checkin.state === "retry" ? "每日领取待重试" : "";
     const progress = loginProgress(account);
     const availability = accountAvailability(account);
-    const statusDetail = [availability.notice, progress, account.last_error].filter(Boolean).join(" · ");
+    const statusDetail = [availability.notice, progress, checkinText, account.last_error].filter(Boolean).join(" · ");
     const identity = account.login_identifier || account.email || account.user_id || "";
     return `<tr><td><span class="cell-title"><span class="account-id mono">#${account.id}</span>${escapeHtml(account.name)}</span><span class="cell-sub" title="${escapeHtml(identity)}">${escapeHtml(identity)}</span><select class="execution-select" data-account-region="${account.id}" aria-label="账号 #${account.id} 区域"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}><option value="cn"${account.region === "cn" ? " selected" : ""}>中国大陆</option><option value="us"${account.region === "us" ? " selected" : ""}>美国</option><option value="other"${!["cn", "us"].includes(account.region) ? " selected" : ""}>其他区域</option></select></td>
       <td title="${escapeHtml(statusDetail)}">${accountAvailabilityBadge(availability)}</td>
-      <td title="${escapeHtml(detail)}"><span class="cell-title mono">${escapeHtml(amount(account.last_balance))}</span><span class="cell-sub">${escapeHtml(quotaSummary)}</span></td>
+      <td title="${escapeHtml(detail)}"><span class="cell-title mono">${escapeHtml(amount(account.last_balance))}</span><span class="cell-sub">${escapeHtml(quotaSummary)}</span>${checkinText ? `<span class="cell-sub">${escapeHtml(checkinText)}</span>` : ""}</td>
       <td><input class="priority-input mono" data-account-priority="${account.id}" type="number" min="0" max="2147483647" step="1" value="${account.priority ?? 0}" title="优先级越高越先执行；相同优先级按余额和账号编号排序" aria-label="账号 #${account.id} 执行优先级"></td>
       <td><span class="slots ${account.active_tasks ? "busy" : ""}"><i></i><b class="mono">${account.active_tasks || 0} /</b><input class="concurrency-input mono" data-account-concurrency="${account.id}" type="number" min="1" value="${account.max_concurrency}" title="修改账号并发"></span></td><td class="mono">${account.total_uses || 0}</td>
       <td><span class="cell-title mono proxy" title="${escapeHtml(proxyLabel(account.proxy_url))}">${escapeHtml(proxyLabel(account.proxy_url))}</span></td><td title="${escapeHtml([availability.summary, account.cli_auth_error].filter(Boolean).join(" · "))}"><div class="execution-controls"><select class="execution-select" data-account-mode="${account.id}" aria-label="账号 #${account.id} 提交模式"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}><option value="canvas_cli"${!["browser", "jimeng_web"].includes(account.execution_mode) ? " selected" : ""}>Canvas CLI</option><option value="browser"${account.execution_mode === "browser" ? " selected" : ""}>Dreamina 网页</option><option value="jimeng_web"${account.execution_mode === "jimeng_web" ? " selected" : ""}>即梦网页</option></select>${account.execution_mode !== "jimeng_web" ? `<button class="link-button" data-action="cli-auth" data-id="${account.id}"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}>CLI 授权</button>` : ""}</div>${["browser", "jimeng_web"].includes(account.execution_mode) ? `<span class="cell-sub">CDP ${account.cdp_port || "按需启动"}</span>` : ""}</td><td>${fmtTime(account.updated_at)}</td>
