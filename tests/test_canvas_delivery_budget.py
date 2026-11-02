@@ -99,15 +99,21 @@ def test_full_download_over_95_seconds_and_all_outputs_share_fresh_delivery_budg
     assert all(tuple(args[:2]) != ('node', 'run') for args, _ in native.calls)
 
 
-def test_same_attempt_reentry_restart_and_changed_config_do_not_renew_deadline(delivery, clock):
+@pytest.mark.parametrize('monotonic_start', [None, 46.716775862])
+def test_same_attempt_reentry_restart_and_changed_config_do_not_renew_deadline(delivery, clock, monotonic_start):
     service = delivery['service']; now, advance = clock
+    if monotonic_start is not None:
+        now['mono'] = monotonic_start
     claim, binding = claim_bound(service)
     deadline = service._canvas_result_delivery_deadline(TASK_ID, claim, binding)
     first = service.store.task(TASK_ID)['upstream_context']['result_delivery_attempt']
     advance(300)
     service.store.update_settings({'canvas_result_delivery_timeout_seconds': 3600})
     restarted, _ = delivery['restart']()
-    assert restarted._canvas_result_delivery_deadline(TASK_ID, claim, binding) == deadline
+    # Reconstructing the same cutoff after advancing the monotonic clock can
+    # differ by one float ULP. The persisted cutoff below must remain exact.
+    assert restarted._canvas_result_delivery_deadline(TASK_ID, claim, binding) == pytest.approx(
+        deadline, rel=0, abs=1e-9)
     assert restarted.store.task(TASK_ID)['upstream_context']['result_delivery_attempt'] == first
     advance(601)
     with pytest.raises(CanvasCLIError, match='delivery attempt deadline passed'):
