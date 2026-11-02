@@ -117,6 +117,8 @@ test('unknown stages, prototype keys, non-Canvas and pre-submit tasks retain leg
 test('HTML cache keys load both updated task state and renderer; CSS is unchanged', () => {
   const html = fs.readFileSync(path.join(__dirname, '../app/static/index.html'), 'utf8');
   assert.match(html, /canvas-task-state\.js\?v=20261101-result-delivery/);
-  assert.match(html, /app\.js\?v=20261101-result-delivery/);
+  const rendererRelease = html.match(/src="\/static\/app\.js\?v=(\d{8})-[^"\s]+"/)?.[1];
+  assert.ok(rendererRelease && rendererRelease >= '20261101',
+    'renderer cache key must include result delivery or a newer release');
   assert.match(html, /styles\.css\?v=20261030-upstream-ids/);
 });
