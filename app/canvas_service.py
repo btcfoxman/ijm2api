@@ -115,6 +115,25 @@ class CanvasServiceMixin:
             return self.store.bind_canvas_outputs(task_id, binding,
                 expected_updated_at=task['updated_at'], expected_account=account)
 
+    def _canvas_result_delivery_deadline(self, task_id: str, observer_claim_id: str | None,
+                                         expected_binding: dict) -> float:
+        """Start only after verified output binding; the claim never renews."""
+        with self._lock:
+            task = self.store.task(task_id) or {}
+            if self._stop.is_set() or self._canvas_task_terminated(task):
+                raise CanvasCLIError('CLI_STOPPING', 'Canvas original result delivery was stopped')
+            claimed = self.store.claim_canvas_result_delivery(task_id, task['updated_at'],
+                expected_binding=expected_binding, observer_claim_id=observer_claim_id,
+                duration_seconds=int(self.settings()['canvas_result_delivery_timeout_seconds']))
+            if not claimed:
+                raise CanvasCLIError('CLI_OUTPUT_BINDING_PERSIST_FAILED',
+                    'Canvas original result delivery claim changed before download')
+            attempt = claimed['upstream_context']['result_delivery_attempt']
+            remaining = attempt['deadline'] - time.time()
+            if remaining <= 0:
+                raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas original result delivery attempt deadline passed')
+            return time.monotonic() + remaining
+
     def _canvas_delivery_progress(self, task_id: str, *, phase: str | None = None,
                                   stage: str | None = None, retrying: bool = False,
                                   error: dict | None = None, download: dict | None = None,
@@ -1255,7 +1274,8 @@ class CanvasServiceMixin:
                 if (not account or account.get('login_user_id') != expected
                         or account.get('cli_user_id') != expected or execution_mode(account) != 'canvas_cli'):
                     continue
-                claimed = self.store.queue_canvas_result_observation(task['id'], task['updated_at'], claim=True)
+                claimed = self.store.queue_canvas_result_observation(task['id'], task['updated_at'], claim=True,
+                    delivery_timeout_seconds=int(self.settings()['canvas_result_delivery_timeout_seconds']))
                 if not claimed:
                     continue
                 self._canvas_result_inflight.add(task['id'])
@@ -1268,20 +1288,28 @@ class CanvasServiceMixin:
     def _run_canvas_result_observer(self, claimed: dict, account: dict) -> None:
         task_id, account_id = claimed['id'], account['id']
         attempt = claimed['upstream_context']['result_observation']['attempts']
+        claim_id = claimed['upstream_context']['result_observation'].get('claim_id')
         blocked = None
         timing = None
+        owns_claim = False
         try:
             if self._stop.is_set():
                 return
             current = self.store.task(task_id) or {}
             if not accepted_canvas_result(current):
                 return
+            recovery = current['upstream_context'].get('result_observation') or {}
+            if (not claim_id or recovery.get('claim_id') != claim_id or recovery.get('attempts') != attempt
+                    or recovery.get('last_finished_at') is not None):
+                return  # A delayed worker cannot borrow a later observer's owner.
+            owns_claim = True
             if not self._canvas_delivery_progress(task_id, phase='querying', stage='query'):
                 return
             client = self.canvas_client(account)
             if isinstance(client, CanvasClient):
                 timing = client.preparation_timing = PreparationTiming(task_id)
-            deadline = time.monotonic() + 120
+            deadline = time.monotonic() + max(0, min(120,
+                recovery['last_started_at'] + 120 - time.time()))
             with self.canvas_cli.account_guard(account, deadline=deadline):
                 if isinstance(client, CanvasClient):
                     client._check_context(current['upstream_context'], deadline=deadline)
@@ -1289,7 +1317,8 @@ class CanvasServiceMixin:
                 if identity.get('user_id') != current['upstream_context']['expected_user_id']:
                     raise CanvasCLIError('CLI_ACCOUNT_MISMATCH', 'Canvas result observer account identity changed')
                 if not self._stop.is_set():
-                    self._poll_canvas(task_id, client, deadline, one_shot=True, result_observer=True)
+                    self._poll_canvas(task_id, client, deadline, one_shot=True, result_observer=True,
+                                      observer_claim_id=claim_id)
         except CanvasCLIError as exc:
             if exc.code in {'CLI_ACCOUNT_MISMATCH', 'CLI_RESOURCE_MISMATCH', 'CLI_RESULT_INVALID',
                             'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'}:
@@ -1312,10 +1341,10 @@ class CanvasServiceMixin:
         finally:
             try:
                 current = self.store.task(task_id) or {}
-                if not self._stop.is_set() and accepted_canvas_result(current):
+                if owns_claim and not self._stop.is_set() and accepted_canvas_result(current):
                     context = dict(current['upstream_context'])
                     recovery = dict(context.get('result_observation') or {})
-                    if recovery.get('attempts') == attempt:
+                    if recovery.get('attempts') == attempt and recovery.get('claim_id') == claim_id:
                         recovery.update(last_finished_at=time.time(),
                             next_poll_at=time.time() + min(300, 30 * 2 ** min(max(0, attempt - 1), 4)))
                         if blocked:
@@ -1383,7 +1412,8 @@ class CanvasServiceMixin:
             return value
 
     def _poll_canvas(self, task_id: str, client, deadline: float, *,
-                     one_shot: bool = False, result_observer: bool = False) -> None:
+                     one_shot: bool = False, result_observer: bool = False,
+                     observer_claim_id: str | None = None) -> None:
         errors = 0
         transfer_errors = 0
         result_storage_pending = False
@@ -1391,6 +1421,12 @@ class CanvasServiceMixin:
         if self._canvas_task_terminated(task):
             return
         prior = task.get('upstream_context') or {}
+        current_claim_id = (prior.get('result_observation') or {}).get('claim_id')
+        if observer_claim_id is not None and observer_claim_id != current_claim_id:
+            return
+        observer_claim_id = observer_claim_id or current_claim_id
+        delivery_deadline = None
+        delivery_binding = None
         if prior.get('reconciliation_paused') and not one_shot:
             if prior.get('reconciliation_pause_reason') in {'result_pending', 'result_transfer_failed'}:
                 return
@@ -1417,6 +1453,19 @@ class CanvasServiceMixin:
             stage = value.removeprefix('s3_')
             return self._canvas_delivery_progress(task_id, phase='transferring',
                                                   stage='upload' if stage == 'put' else stage)
+
+        def get_delivery_deadline():
+            nonlocal delivery_deadline
+            if delivery_deadline is None:
+                delivery_deadline = self._canvas_result_delivery_deadline(task_id, observer_claim_id, delivery_binding)
+            return delivery_deadline
+
+        def persist_output_binding(binding):
+            nonlocal delivery_binding
+            if not self._canvas_persist_output_binding(task_id, binding):
+                return False
+            delivery_binding = dict(binding)
+            return True
 
         queried = False
         while not self._stop.is_set() and (one_shot and not queried or not one_shot
@@ -1457,8 +1506,8 @@ class CanvasServiceMixin:
                     if query_timing is None or query_timing.snapshot()['finished']:
                         query_timing = client.preparation_timing = PreparationTiming(task_id)
                     kwargs.update(persist_download=lambda receipt: self._canvas_delivery_progress(task_id, download=receipt),
-                                  persist_output_binding=lambda receipt: self._canvas_persist_output_binding(task_id, receipt),
-                                  on_phase=client_phase)
+                                  persist_output_binding=persist_output_binding,
+                                  on_phase=client_phase, get_delivery_deadline=get_delivery_deadline)
                 try:
                     state = client.poll(context, **kwargs)
                 finally:
@@ -1619,7 +1668,8 @@ class CanvasServiceMixin:
                                     or mimetypes.guess_type(path.name)[0] or 'application/octet-stream',
                                 checkpoint=checkpoint,
                                 persist_checkpoint=lambda value, rid=resource_id: self._canvas_delivery_progress(
-                                    task_id, resource_id=rid, upload=value), on_phase=storage_phase)
+                                    task_id, resource_id=rid, upload=value), on_phase=storage_phase,
+                                **({'deadline': delivery_deadline} if delivery_deadline is not None else {}))
                             urls.append(url)
                             receipts.append(receipt)
                         metadata = {'items': receipts, 'original_bytes': True}
@@ -1669,7 +1719,8 @@ class CanvasServiceMixin:
                     return
                 values = {"status": "succeeded", "progress": 100, "error_code": "", "error_message": "",
                           "result_urls": urls, 'result_transfer': metadata,
-                          "completed_at": time.time(), **self._canvas_settlement(task, client, deadline=query_deadline)}
+                          "completed_at": time.time(), **self._canvas_settlement(task, client,
+                              deadline=delivery_deadline if delivery_deadline is not None else query_deadline)}
                 if task["model"] == "sd-2-5-480p-x":
                     from .result_transfer import transfer
                     signed, metadata = transfer(urls[0], str(client.account["proxy_url"]), task_id,

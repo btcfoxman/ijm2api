@@ -1283,17 +1283,27 @@ class CanvasClient:
     def _download_retryable(exc: CanvasCLIError) -> bool:
         error = exc.details.get("error")
         error = error if isinstance(error, dict) else {}
-        # This documented native read failure is specific to resource download.
-        # It never authorizes another generation command or a new deadline.
-        read_failed = (exc.code == "cli.download_read_failed"
-            and error.get("code") in (None, "cli.download_read_failed")
-            and error.get("class") == "retryable_failure"
-            and error.get("retryable") is True and error.get("requiredAction") == "retry"
-            and error.get("serviceCode") in (None, "")
-            and error.get("reason") in (None, "", "network_timeout", "dns_resolution_failed",
-                                        "network_error", "transport_error"))
-        return (read_failed or exc.code in {"CLI_COMMAND_TIMEOUT", "CLI_INVALID_RESPONSE", "cli.invalid_service_response"}
-                or bool(error.get("retryable")) and error.get("reason") in _TRANSIENT)
+        # These native errors describe reading the bound original resource, not
+        # admission or generation. Their explicit contract outranks a generic
+        # network reason; auth/input/action failures must never fall through.
+        if exc.code in {"cli.download_read_failed", "cli.transport_failed"}:
+            expected_codes = (None, exc.code) if exc.code == "cli.download_read_failed" else (exc.code,)
+            return (error.get("code") in expected_codes
+                and error.get("class") == "retryable_failure"
+                and error.get("retryable") is True and error.get("requiredAction") == "retry"
+                and error.get("serviceCode") in (None, "")
+                and error.get("reason") in (None, "", *_TRANSIENT))
+        classification = " ".join(str(value or "").lower() for value in
+            (exc.code, error.get("code"), error.get("class"), error.get("reason")))
+        if (error.get("retryable") is not None and error.get("retryable") is not True
+                or error.get("serviceCode") not in (None, "")
+                or error.get("requiredAction") not in (None, "", "retry")
+                or any(word in classification for word in
+                    ("auth", "credential", "identity", "permission", "invalid_input",
+                     "invalid_argument", "conflict", "mismatch", "human_intervention"))):
+            return False
+        return (exc.code in {"CLI_COMMAND_TIMEOUT", "CLI_INVALID_RESPONSE", "cli.invalid_service_response"}
+                or error.get("retryable") is True and error.get("reason") in _TRANSIENT)
 
     @staticmethod
     def _download_safe_path(path: Path) -> None:
@@ -1372,6 +1382,10 @@ class CanvasClient:
         if (not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", str(context["task_id"]))
                 or not re.fullmatch(r"[a-f0-9-]{36}", resource_id)):
             raise CanvasCLIError("CLI_RESULT_INVALID", "Canvas result identifiers are invalid")
+        # A direct original-result read is bounded even without a service
+        # delivery claim. Service callers pass the one durable attempt deadline.
+        if deadline is None:
+            deadline = time.monotonic() + 900
         self._remaining(deadline)
         base = self.runner.account_directory(self.account).absolute() / "results" / context["task_id"]
         self._download_safe_path(base)
@@ -1409,7 +1423,7 @@ class CanvasClient:
             try:
                 data = self._call(["resource", "download", resource_id,
                     "--project-id", context["project_id"], "--output", str(partial)],
-                    timeout=180, read_only=False, deadline=deadline)
+                    timeout=self._remaining(deadline), read_only=False, deadline=deadline)
                 returned = Path(str(data.get("path") or "")).absolute()
                 size, expected_hash = data.get("size"), data.get("sha256")
                 if (data.get("resourceId") != resource_id or returned != partial or not partial.is_file()
@@ -1493,18 +1507,21 @@ class CanvasClient:
     def poll(self, context: dict[str, Any], *, deadline: float | None = None,
              persist_download: Callable[[dict[str, Any]], Any] | None = None,
               persist_output_binding: Callable[[dict[str, Any]], Any] | None = None,
+             get_delivery_deadline: Callable[[], float] | None = None,
              on_phase: Callable[[str], Any] | None = None) -> dict[str, Any]:
         with self.runner.account_guard(self.account, deadline=deadline):
             self._check_context(context, deadline=deadline)
             return self._poll(context, deadline=deadline, persist_download=persist_download,
-                              persist_output_binding=persist_output_binding, on_phase=on_phase)
+                              persist_output_binding=persist_output_binding,
+                              get_delivery_deadline=get_delivery_deadline, on_phase=on_phase)
 
     def _poll(self, context: dict[str, Any], *, deadline: float | None = None,
               persist_download: Callable[[dict[str, Any]], Any] | None = None,
                persist_output_binding: Callable[[dict[str, Any]], Any] | None = None,
+              get_delivery_deadline: Callable[[], float] | None = None,
               on_phase: Callable[[str], Any] | None = None) -> dict[str, Any]:
-        def phase(name: str) -> None:
-            self._remaining(deadline)
+        def phase(name: str, *, phase_deadline: float | None = None) -> None:
+            self._remaining(deadline if phase_deadline is None else phase_deadline)
             if on_phase is not None and on_phase(name) is False:
                 raise CanvasCLIError("CLI_STOPPING", "Canvas result observation was stopped before delivery")
         phase("querying")
@@ -1618,9 +1635,19 @@ class CanvasClient:
         if persist_output_binding is not None:
             context["output_binding"] = copy.deepcopy(receipt)
         result["resource_ids"] = list(outputs)
+        # Query/authentication keeps its short budget. Only a complete verified
+        # original output may claim a separate, durably bounded delivery attempt.
+        # Claim once for all files and retries, never once per command or output.
+        delivery_deadline = deadline if deadline is not None else time.monotonic() + 900
+        if get_delivery_deadline is not None:
+            delivery_deadline = get_delivery_deadline()
+            if (isinstance(delivery_deadline, bool) or not isinstance(delivery_deadline, (int, float))
+                    or not math.isfinite(delivery_deadline)):
+                raise CanvasCLIError("CLI_RESULT_INVALID", "Canvas original-result delivery deadline is invalid")
+            self._remaining(delivery_deadline)
         for resource_id, facts in checked_resources:
-            phase("downloading")
-            download_kwargs = {"deadline": deadline}
+            phase("downloading", phase_deadline=delivery_deadline)
+            download_kwargs = {"deadline": delivery_deadline}
             if persist_download is not None:
                 download_kwargs["persist_download"] = persist_download
             downloaded = self.download_result(context, resource_id, str(facts.get("type") or context["kind"]), **download_kwargs)

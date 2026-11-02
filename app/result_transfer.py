@@ -36,6 +36,49 @@ def _transfer_error(stage: str, code: str, *, http_status: int | None = None,
                                http_status=http_status, retryable=retryable)
 
 
+def _transfer_remaining(deadline: float | None, stage: str) -> float | None:
+    if deadline is None:
+        return None
+    if type(deadline) not in (int, float) or not math.isfinite(deadline):
+        raise _transfer_error(stage, 'S3_DEADLINE_INVALID')
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _transfer_error(stage, 'S3_TRANSFER_DEADLINE_EXCEEDED', retryable=True)
+    return remaining
+
+
+def _transfer_timeout(deadline, ordinary, stage):
+    remaining = _transfer_remaining(deadline, stage)
+    if remaining is None:
+        return ordinary
+    # Reserve time for both connect and read; neither may consume a fresh
+    # whole delivery allowance. Phase checks also guard completed effects.
+    allowance = max(0.001, remaining / 2)
+    if isinstance(ordinary, tuple):
+        return tuple(min(value, allowance) for value in ordinary)
+    return min(ordinary, allowance)
+
+
+def _transfer_sleep(delay, deadline, stage):
+    remaining = _transfer_remaining(deadline, stage)
+    time.sleep(delay if remaining is None else min(delay, remaining))
+    _transfer_remaining(deadline, stage)
+
+
+class _DeadlineReader:
+    def __init__(self, source, deadline, stage):
+        self.source, self.deadline, self.stage = source, deadline, stage
+
+    def read(self, size=-1):
+        _transfer_remaining(self.deadline, self.stage)
+        value = self.source.read(size)
+        _transfer_remaining(self.deadline, self.stage)
+        return value
+
+    def __getattr__(self, name):
+        return getattr(self.source, name)
+
+
 def _http_error(label: str, status: int, stage: str | None) -> ResultTransferError:
     code = {401: 'S3_AUTH_FAILED', 403: 'S3_AUTH_FAILED', 404: 'S3_NOT_FOUND',
             409: 'S3_SESSION_CONFLICT', 410: 'S3_SESSION_EXPIRED',
@@ -97,14 +140,16 @@ def _json_response(response: requests.Response, label: str, *, stage: str | None
 
 
 def _post(http: requests.Session, url: str, token: str, body: dict | None, label: str,
-          headers: dict | None = None, *, stage: str | None = None) -> dict:
+          headers: dict | None = None, *, stage: str | None = None,
+          deadline: float | None = None) -> dict:
     for attempt in range(3):
         try:
             options = {'allow_redirects': False} if stage else {}
             response = http.post(url, headers={"Authorization": f"Bearer {token}", **(headers or {})},
-                                 json=body, timeout=60, **options)
+                                 json=body, timeout=_transfer_timeout(deadline, 60, stage or 's3_request'), **options)
+            _transfer_remaining(deadline, stage or 's3_request')
             if response.status_code in {408, 425, 429, 500, 502, 503, 504} and attempt < 2:
-                time.sleep(2 ** attempt)
+                _transfer_sleep(2 ** attempt, deadline, stage or 's3_request')
                 continue
             return _json_response(response, label, stage=stage)
         except requests.RequestException as exc:
@@ -112,7 +157,7 @@ def _post(http: requests.Session, url: str, token: str, body: dict | None, label
                 raise ResultTransferError(f"{label} transport failure: {type(exc).__name__}",
                     stage=stage, code='S3_TRANSPORT_ERROR' if stage else None,
                     retryable=True if stage else None) from None
-            time.sleep(2 ** attempt)
+            _transfer_sleep(2 ** attempt, deadline, stage or 's3_request')
     raise ResultTransferError(f"{label} failed")
 
 
@@ -252,7 +297,8 @@ def _upload_headers(value: object) -> dict[str, str]:
 
 
 def presign(bucket: str, key: str, expected_size: int | None = None,
-            storage: dict | None = None) -> tuple[str, dict]:
+            storage: dict | None = None, *, deadline: float | None = None) -> tuple[str, dict]:
+    _transfer_remaining(deadline, 's3_presign')
     base, token, configured_bucket, _ = _config(storage)
     if bucket != configured_bucket:
         raise ResultTransferError("s3-center bucket mismatch")
@@ -260,7 +306,8 @@ def presign(bucket: str, key: str, expected_size: int | None = None,
         http.trust_env = False
         grant = _post(http, f"{base}/v1/objects/presign", token,
                       {"bucket": bucket, "key": key, "method": "GET", "expires_seconds": 0},
-                      "s3-center presign", stage='s3_presign')
+                      "s3-center presign", stage='s3_presign',
+                      **({'deadline': deadline} if deadline is not None else {}))
     request = grant.get("request") or {}
     if not isinstance(request, dict):
         raise _transfer_error('s3_presign', 'S3_RESPONSE_INVALID')
@@ -342,31 +389,35 @@ _CHECKPOINT_STATES = frozenset({'creating', 'url_issued', 'uploaded', 'committed
 _RETRY_HTTP = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
-def _get_upload(http, base, token, upload_id):
+def _get_upload(http, base, token, upload_id, *, deadline=None):
     for attempt in range(3):
         try:
             response = http.get(f'{base}/v1/uploads/{quote(upload_id, safe="")}',
-                headers={'Authorization': f'Bearer {token}'}, timeout=60, allow_redirects=False)
+                headers={'Authorization': f'Bearer {token}'},
+                timeout=_transfer_timeout(deadline, 60, 's3_resume'), allow_redirects=False)
+            _transfer_remaining(deadline, 's3_resume')
             if response.status_code in _RETRY_HTTP and attempt < 2:
-                time.sleep(2 ** attempt)
+                _transfer_sleep(2 ** attempt, deadline, 's3_resume')
                 continue
             return _json_response(response, 's3-center resume', stage='s3_resume')
         except requests.RequestException:
             if attempt == 2:
                 raise _transfer_error('s3_resume', 'S3_TRANSPORT_ERROR', retryable=True) from None
-            time.sleep(2 ** attempt)
+            _transfer_sleep(2 ** attempt, deadline, 's3_resume')
     raise AssertionError('unreachable')
 
 
 def store_original(path: Path, task_id: str, storage: dict | None = None, *,
                    index: int = 0, content_type: str = 'video/mp4',
                    checkpoint: dict | None = None, persist_checkpoint=None,
-                   on_phase=None) -> tuple[str, dict]:
+                   on_phase=None, deadline: float | None = None) -> tuple[str, dict]:
     """Publish original bytes, resuming a bound session when its checkpoint exists.
 
     The persistence callback must acknowledge each boundary before its next HTTP
     effect. Callers without callbacks retain the original stateless API.
     """
+    _transfer_remaining(deadline, 's3_checkpoint')
+    bounded = {'deadline': deadline} if deadline is not None else {}
     try:
         base, token, bucket, prefix = _config(storage)
     except (ResultTransferError, ValueError, TypeError):
@@ -385,6 +436,7 @@ def store_original(path: Path, task_id: str, storage: dict | None = None, *,
         hasher = hashlib.sha256()
         with path.open('rb') as contents:
             for chunk in iter(lambda: contents.read(1024 * 1024), b''):
+                _transfer_remaining(deadline, 's3_checkpoint')
                 hasher.update(chunk)
     except OSError:
         raise _transfer_error('s3_checkpoint', 'S3_FILE_INVALID') from None
@@ -409,6 +461,7 @@ def store_original(path: Path, task_id: str, storage: dict | None = None, *,
         current = dict(checkpoint)
 
     def phase(name):
+        _transfer_remaining(deadline, name)
         if on_phase is not None:
             try:
                 acknowledged = on_phase(name)
@@ -416,6 +469,7 @@ def store_original(path: Path, task_id: str, storage: dict | None = None, *,
                 raise _transfer_error(name, 'S3_TRANSFER_INTERRUPTED') from None
             if acknowledged is False:
                 raise _transfer_error(name, 'S3_TRANSFER_INTERRUPTED')
+        _transfer_remaining(deadline, name)
 
     def save(**changes):
         nonlocal current
@@ -444,7 +498,7 @@ def store_original(path: Path, task_id: str, storage: dict | None = None, *,
         need_upload = True
         if current['upload_id']:
             phase('s3_resume')
-            session = _get_upload(http, base, token, current['upload_id'])
+            session = _get_upload(http, base, token, current['upload_id'], **bounded)
             state = validate_session(session, 's3_resume')
             if state == 'committed':
                 save(state='committed')
@@ -466,7 +520,7 @@ def store_original(path: Path, task_id: str, storage: dict | None = None, *,
             phase('s3_create')
             created = _post(http, f'{base}/v1/uploads', token,
                 {'bucket': bucket, 'key': key, 'size': size, 'content_type': content_type},
-                's3-center create', {'Idempotency-Key': current['idempotency_key']}, stage='s3_create')
+                's3-center create', {'Idempotency-Key': current['idempotency_key']}, stage='s3_create', **bounded)
             upload_id = created.get('id')
             if (not isinstance(upload_id, str) or re.fullmatch(r'du_[a-f0-9]{32}', upload_id) is None
                     or type(created.get('declared_bytes')) is not int or created['declared_bytes'] != size
@@ -498,8 +552,10 @@ def store_original(path: Path, task_id: str, storage: dict | None = None, *,
                             if (actual.st_dev, actual.st_ino, actual.st_size, actual.st_mtime_ns) != (
                                     initial.st_dev, initial.st_ino, size, initial.st_mtime_ns):
                                 raise _transfer_error('s3_put', 'S3_FILE_CHANGED')
-                            response = http.put(upload['url'], headers=headers, data=contents,
-                                                timeout=(30, 300), allow_redirects=False)
+                            payload = _DeadlineReader(contents, deadline, 's3_put') if deadline is not None else contents
+                            response = http.put(upload['url'], headers=headers, data=payload,
+                                timeout=_transfer_timeout(deadline, (30, 300), 's3_put'), allow_redirects=False)
+                            _transfer_remaining(deadline, 's3_put')
                         if 200 <= response.status_code < 300:
                             break
                         if response.status_code not in _RETRY_HTTP or attempt == 2:
@@ -509,18 +565,18 @@ def store_original(path: Path, task_id: str, storage: dict | None = None, *,
                             raise _transfer_error('s3_put', 'S3_TRANSPORT_ERROR', retryable=True) from None
                     except OSError:
                         raise _transfer_error('s3_put', 'S3_FILE_INVALID') from None
-                    time.sleep(2 ** attempt)
+                    _transfer_sleep(2 ** attempt, deadline, 's3_put')
                 save(state='uploaded')
         if current['state'] != 'committed':
             phase('s3_complete')
             committed = _post(http, f'{base}/v1/uploads/{quote(current["upload_id"], safe="")}/complete',
-                              token, None, 's3-center complete', stage='s3_complete')
+                              token, None, 's3-center complete', stage='s3_complete', **bounded)
             if validate_session(committed, 's3_complete') != 'committed':
                 raise _transfer_error('s3_complete', 'S3_RESPONSE_INVALID')
             save(state='committed')
     phase('s3_presign')
     try:
-        url, metadata = presign(bucket, key, size, storage)
+        url, metadata = presign(bucket, key, size, storage, **bounded)
     except ResultTransferError as exc:
         if exc.stage:
             raise

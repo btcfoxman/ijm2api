@@ -75,6 +75,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "task_timeout_seconds": 1800,
     "canvas_missing_resource_query_attempts": 3,
     "canvas_missing_resource_timeout_seconds": 60,
+    "canvas_result_delivery_timeout_seconds": 900,
     "account_maintenance_interval_seconds": 300,
     "daily_checkin_enabled": False,
     "chrome_executable": os.getenv("IJM_CHROME_EXECUTABLE", "/usr/bin/chromium" if os.name != "nt" else "chrome.exe"),
@@ -148,6 +149,7 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                 raise ValueError(f"invalid {key}")
         for key, upper in (("canvas_missing_resource_query_attempts", 10),
                            ("canvas_missing_resource_timeout_seconds", 300),
+                           ("canvas_result_delivery_timeout_seconds", 3600),
                            ("canvas_upload_concurrency", 8),
                            ("canvas_account_upload_concurrency", 16),
                            ("canvas_total_upload_concurrency", 32)):

@@ -730,8 +730,10 @@ class Store:
         return [self._task(row) for row in rows]
 
     def queue_canvas_result_observation(self, task_id: str, expected_updated_at: float,
-                                        *, claim: bool = False) -> dict[str, Any]:
+                                        *, claim: bool = False, delivery_timeout_seconds: int = 900) -> dict[str, Any]:
         """CAS only an affirmative original output into automatic result reads."""
+        if type(delivery_timeout_seconds) is not int or not 1 <= delivery_timeout_seconds <= 3600:
+            raise ValueError('invalid canvas_result_delivery_timeout_seconds')
         with self._lock, self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
             raw = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
@@ -767,7 +769,9 @@ class Store:
                         or not math.isfinite(due) or due > now):
                     return {}
                 recovery.update(attempts=attempts + 1, last_started_at=now,
-                    next_poll_at=now + 120 + min(300, 30 * 2 ** min(attempts, 4)))
+                    claim_id=uuid.uuid4().hex, delivery_timeout_seconds=delivery_timeout_seconds,
+                    next_poll_at=now + 120 + delivery_timeout_seconds + min(300, 30 * 2 ** min(attempts, 4)))
+                recovery.pop('last_finished_at', None)
             context['result_observation'] = recovery
             context['reconciliation_paused'] = False
             context['reconciliation_closed'] = False
@@ -775,6 +779,84 @@ class Store:
                 progress=MAX(45,MIN(95,progress)),upstream_context_json=?,updated_at=?
                 WHERE id=? AND updated_at=?""",
                 (_upstream_context(context), time.time(), task_id, expected_updated_at))
+        return self.task(task_id) or {}
+
+    def claim_canvas_result_delivery(self, task_id: str, expected_updated_at: float, *,
+                                     expected_binding: dict[str, Any],
+                                     observer_claim_id: str | None = None,
+                                     duration_seconds: int = 900) -> dict[str, Any]:
+        """CAS a verified original output into one non-renewable delivery attempt.
+
+        The original worker has one stable owner. Each subsequent observer CAS
+        gets a new owner; re-entry with that same owner keeps its old cutoff.
+        Query time and the generation observation window are independent.
+        """
+        if type(duration_seconds) is not int or not 1 <= duration_seconds <= 3600:
+            raise ValueError('invalid canvas_result_delivery_timeout_seconds')
+        with self._lock, self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            raw = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if raw is None or raw['updated_at'] != expected_updated_at:
+                return {}
+            task = self._task(raw)
+            if not accepted_canvas_result(task):
+                return {}
+            context = dict(task['upstream_context'])
+            binding = context.get('output_binding')
+            fields = ('account_id', 'task_id', 'profile', 'project_id', 'node_id', 'submit_id',
+                      'expected_user_id', 'kind', 'resource_ids')
+            if (not isinstance(binding, dict) or binding.get('durable') is not True
+                    or not isinstance(expected_binding, dict)
+                    or binding != {**expected_binding, 'durable': True}
+                    or any(binding.get(key) != context.get(key) for key in fields)):
+                return {}
+            account = db.execute('SELECT * FROM accounts WHERE id=?', (task['account_id'],)).fetchone()
+            if (account is None or account['execution_mode'] != 'canvas_cli'
+                    or account['login_user_id'] != context['expected_user_id']
+                    or account['cli_user_id'] != context['expected_user_id']):
+                return {}
+            recovery = context.get('result_observation') or {}
+            if not isinstance(recovery, dict):
+                return {}
+            now = time.time()
+            observation_attempt = 0
+            if observer_claim_id is not None:
+                if (not isinstance(observer_claim_id, str) or re.fullmatch(r'[a-f0-9]{32}', observer_claim_id) is None
+                        or recovery.get('claim_id') != observer_claim_id
+                        or recovery.get('last_finished_at') is not None
+                        or type(recovery.get('attempts')) is not int or recovery['attempts'] < 1
+                        or type(recovery.get('next_poll_at')) not in (int, float)
+                        or not math.isfinite(recovery['next_poll_at'])
+                        or recovery['next_poll_at'] <= now):
+                    return {}
+                duration_seconds = recovery.get('delivery_timeout_seconds')
+                if type(duration_seconds) is not int or not 1 <= duration_seconds <= 3600:
+                    return {}
+                owner = 'observer:' + observer_claim_id
+                observation_attempt = recovery['attempts']
+            else:
+                if recovery.get('claim_id'):
+                    return {}  # A stale original worker cannot steal an observer's claim.
+                owner = 'generation:' + context['submit_id']
+            old = context.get('result_delivery_attempt')
+            if old is not None:
+                if (not isinstance(old, dict) or type(old.get('version')) is not int or old['version'] != 1
+                        or type(old.get('ordinal')) is not int or old['ordinal'] < 1
+                        or not isinstance(old.get('owner'), str)
+                        or old.get('binding') != {key: context[key] for key in fields}
+                        or any(type(old.get(key)) not in (int, float) or not math.isfinite(old[key])
+                               for key in ('started_at', 'deadline'))
+                        or not 0 < old['started_at'] < old['deadline'] <= old['started_at'] + 3600):
+                    return {}
+                if old['owner'] == owner:
+                    return task  # This claim never receives a refreshed deadline.
+                if observer_claim_id is None:
+                    return {}
+            context['result_delivery_attempt'] = {'version': 1, 'ordinal': old['ordinal'] + 1 if old else 1,
+                'owner': owner, 'observation_attempt': observation_attempt, 'started_at': now,
+                'deadline': now + duration_seconds, 'binding': {key: context[key] for key in fields}}
+            db.execute('UPDATE tasks SET upstream_context_json=?,updated_at=? WHERE id=? AND updated_at=?',
+                (_upstream_context(context), now, task_id, expected_updated_at))
         return self.task(task_id) or {}
 
     def update_task(self, task_id: str, values: dict[str, Any], *,
