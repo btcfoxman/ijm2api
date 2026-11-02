@@ -8,7 +8,7 @@ import pytest
 from app.image_client import resolve_image_model
 from app.image_request import normalize_image_request
 from app.region_policy import DEFAULT_REGION_GENERATION_POLICY
-from test_canvas_execution import context, owner, task
+from test_canvas_execution import context, fake_client, owner, task
 from test_mixed_execution_admission import mixed
 
 
@@ -130,3 +130,35 @@ def test_low_balance_effective_image_alias_cannot_escape_the_region_allowlist(co
     assert service._region_denial(account, normalized) is None
     response = service.create_image(request)
     assert store.task(response["id"])["status"] == "queued"
+
+
+@pytest.mark.parametrize('region_restriction_enabled', [False, True])
+def test_incompatible_low_balance_target_keeps_execution_preflight_rejection_with_region_policy_on_or_off(
+        context, monkeypatch, region_restriction_enabled):
+    store, service, _ = context
+    account = owner(store, balance=20)
+    policy = deepcopy(DEFAULT_REGION_GENERATION_POLICY)
+    policy['other'] = {'enabled': region_restriction_enabled, 'models': {'seedream-5.0-pro': {}}}
+    service.update_settings({'low_balance_seedream_target_model': 'seedream-5.0-lite',
+                             'region_generation_policy': policy})
+    request = {'model': 'seedream-5.0-pro', 'prompt': 'Synthetic', 'resolution': '1.5k'}
+    normalized = normalize_image_request(request, resolve_image_model(request['model']))
+    assert service._region_denial(account, normalized) is None
+    response = service.create_image(request)
+    assert store.task(response['id'])['status'] == 'queued'
+
+    client = fake_client(store, service, account, kind='image')
+    monkeypatch.setattr(service, 'canvas_client', lambda _: client)
+    assets = Mock(side_effect=AssertionError('incompatible target must fail before media preparation'))
+    monkeypatch.setattr(service, '_canvas_local_assets', assets)
+    service._run_image(response['id'])
+
+    row = store.task(response['id'])
+    assert row['status'] == 'failed' and row['error_code'] == 'CLI_CAPABILITY_UNAVAILABLE'
+    assert row['actual_cost'] is None and row['run_id'] == ''
+    assert row['attempted_account_ids'] == []
+    client.identity.assert_called_once()
+    client.preflight_model.assert_not_called()
+    assets.assert_not_called()
+    client.prepare.assert_not_called()
+    client.submit.assert_not_called()

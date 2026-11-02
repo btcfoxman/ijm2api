@@ -429,8 +429,10 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
             return reason
         try:
             effective, _ = plan_image_execution({'normalized': normalized}, account, settings)
-        except ValueError as exc:
-            return str(exc)
+        except ValueError:
+            # Target capability errors retain the existing execution preflight
+            # boundary; they are not regional admission rejections.
+            return None
         return region_denial_detail(account, effective, settings)
 
     def _assert_region_pool_allows(self, normalized: dict) -> None:
