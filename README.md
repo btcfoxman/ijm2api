@@ -108,8 +108,8 @@ remote authorization view. Cancelling a pending flow does not log out an
 existing upstream session. `execution_mode` is writable on an idle account;
 authorization state is service-managed.
 
-Generation uses the same account priorities, smallest sufficient balance at
-equal priority, concurrency limits, reservations and maximum two-account
+Generation uses the same account priorities, credit reservations, concurrency
+limits and maximum two-account
 credit-rejection policy as the browser backend. Canvas saves the requested
 node, obtains the complete quote and runs within that credit ceiling. Upload
 and query retries reuse original identities; a lost submission receipt only
@@ -147,6 +147,38 @@ Known service and invalid-response failures before generation use bounded
 retries within the original deadline. Draft writes reuse their project, node
 and update IDs; retries do not call `node run`. Exhausted preparation failures
 return a normalized retry message so the caller can select its next route.
+
+Reference uploads have separate, configurable concurrency limits:
+
+| Setting | Default | Range |
+| --- | ---: | ---: |
+| `canvas_upload_concurrency` (per task) | 3 | 1–8 |
+| `canvas_account_upload_concurrency` (per account) | 4 | 1–16 |
+| `canvas_total_upload_concurrency` (service total) | 8 | 1–32 |
+
+These limits include each upload's resource-readiness checks. Completed files
+keep their original reference order even when transfers finish out of order.
+Limits are captured for each preparation; changes apply to new preparations
+and do not interrupt transfers that are already running.
+Verified checkpoints retain successful same-account uploads across preparation
+retries; the original resources are checked again before they are referenced.
+Account identity, profile, proxy and input bindings must still match. No draft
+is submitted until every required reference is ready.
+
+For new preparation failures, the durable retry window starts at the first
+proven transient failure, allowing up to 180 additional seconds within the
+original task deadline. Initial useful preparation time does not consume this
+retry window. The maximum remains three preparations, two accounts and two
+preparations per account; earlier verified credit-rejected preparations count
+toward these limits. Existing saved budgets retain their original deadlines,
+including after restarts. Accepted or uncertain generation requests are never
+replayed by this preparation retry mechanism.
+
+For Canvas videos with multiple references, accounts without an exact matching
+quote prefer a larger available balance at equal priority. Valid account-bound
+quote hints can still guide best-fit selection. A historical quote is only a
+scheduling hint: the fresh complete quote and confirmation ceiling remain
+mandatory before generation.
 
 
 CLI result downloads preserve original media bytes and are published through

@@ -9,7 +9,7 @@
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
   <script src="/api/cost-reference/assets/task-cost.js"></script>
 <script src="/static/canvas-task-state.js?v=20261101-result-delivery" defer></script>
-<script src="/static/app.js?v=20261102-region-policy" defer></script>
+<script src="/static/app.js?v=20261102-canvas-upload" defer></script>
   <script src="/static/browser-assist.js?v=ijm-canvas-20261029-1" defer></script>
   <script src="/static/account-login.js?v=20261102-region-policy" defer></script>
 </head>
@@ -145,7 +145,7 @@
   <dialog id="settingsDialog" class="settings-dialog"><form class="dialog-form" id="settingsForm">
     <header class="settings-dialog-header"><div><p class="eyebrow">RUNTIME CONTROL PLANE</p><h2>运行设置</h2><p class="settings-subtitle">任务执行、会话恢复、代理分配与请求归一化实时配置</p></div><button class="icon-button close" type="button"><i data-lucide="x"></i></button></header>
     <div class="settings-sections">
-      <fieldset class="settings-card"><legend>Canvas CLI</legend><div class="form-grid settings-form-grid"><label class="check"><input name="canvas_cli_enabled" type="checkbox">Canvas CLI 接单</label></div><p class="settings-card-note">完成账号授权及代理隔离验收后启用。关闭时 CLI 模式账号不接单；可按账号选择网页提交。</p></fieldset>
+      <fieldset class="settings-card"><legend>Canvas CLI</legend><div class="form-grid settings-form-grid"><label class="check"><input name="canvas_cli_enabled" type="checkbox">Canvas CLI 接单</label><label>每任务素材上传并发<input name="canvas_upload_concurrency" type="number" min="1" max="8" step="1" value="3" required></label><label>每账号素材上传并发<input name="canvas_account_upload_concurrency" type="number" min="1" max="16" step="1" value="4" required></label><label>全部账号素材上传并发<input name="canvas_total_upload_concurrency" type="number" min="1" max="32" step="1" value="8" required></label></div><p class="settings-card-note">完成账号授权及代理隔离验收后启用。关闭时 CLI 模式账号不接单；可按账号选择网页提交。上传并发分别限制同一任务、同一账号及全部账号同时上传的参考素材数量。</p></fieldset>
       <fieldset class="settings-card routing-settings-card"><legend>区域模型与时长限制</legend>
         <p class="settings-card-note">启用后只允许该区域列出的模型。每行填写模型别名和秒数范围，例如 sd-2-0 4-15；图片模型只填别名。启用且留空表示拒绝该区域所有新任务。中国大陆默认启用且为空，配置后才可接单。</p>
         <div class="form-grid settings-form-grid">

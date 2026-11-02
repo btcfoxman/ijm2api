@@ -6,7 +6,8 @@ import threading
 
 import pytest
 
-from app.canvas_retry_budget import RetryBudgetError, budget_token, claim_attempt, new_budget
+from app.canvas_retry_budget import (RetryBudgetError, budget_token, claim_attempt, new_budget,
+                                     new_retry_budget, preparation_deadline, seed_from_verified_preparations)
 
 
 TASK = "ijm_budget_fixture"
@@ -187,3 +188,106 @@ def test_task_scoped_cas_cannot_copy_a_ticket_to_another_task_or_reset_state():
                       expected_token=token, proof=PROOF)
     with pytest.raises(RetryBudgetError, match="BUDGET_CONFLICT"):
         claim(new_budget(TASK, admitted_at=101), now=102, expected_token=token)
+
+
+def test_retry_window_starts_after_useful_initial_work_but_preserves_admission_and_task_cutoff():
+    budget = new_retry_budget(TASK, admitted_at=100, retry_started_at=500, task_deadline=1000)
+    assert budget['version'] == 2 and budget['admitted_at'] == 100
+    assert budget['started_at'] == 500 and preparation_deadline(budget, task_id=TASK) == 680
+    assert budget['task_deadline'] == 1000
+    first = claim(budget, 3, 500)
+    second = claim(first, 3, 501)
+    third = claim(second, 7, 502)
+    assert len(third['attempts']) == 3
+    with pytest.raises(RetryBudgetError, match='ATTEMPTS_EXHAUSTED'):
+        claim(third, 7, 503)
+
+
+def test_retry_window_restart_never_renews_and_original_task_cutoff_can_shorten_it():
+    budget = claim(new_retry_budget(TASK, admitted_at=100, retry_started_at=500, task_deadline=540), 3, 500)
+    restored = json.loads(json.dumps(budget))
+    assert preparation_deadline(restored, task_id=TASK) == 540
+    assert budget_token(restored, task_id=TASK) == budget_token(budget, task_id=TASK)
+    with pytest.raises(RetryBudgetError, match='BUDGET_EXPIRED'):
+        claim(restored, 3, 540)
+    assert restored == budget
+
+
+def test_version_one_deadline_and_claim_digest_remain_unchanged():
+    legacy = claim(new_budget(TASK, admitted_at=100), 3, 101)
+    snapshot = deepcopy(legacy)
+    assert preparation_deadline(legacy, task_id=TASK) == 280
+    assert claim(legacy, 3, 279)['deadline'] == 280
+    with pytest.raises(RetryBudgetError, match='BUDGET_EXPIRED'):
+        claim(legacy, 3, 500)
+    assert legacy == snapshot and set(legacy) == {'version', 'task_id', 'started_at', 'deadline', 'attempts'}
+
+
+@pytest.mark.parametrize('changes', [
+    {'admitted_at': 501}, {'task_deadline': 600}, {'started_at': 501},
+    {'deadline': 681}, {'version': 1}, {'admitted_at': None},
+])
+def test_retry_budget_snapshot_or_deadline_tampering_is_rejected(changes):
+    budget = claim(new_retry_budget(TASK, admitted_at=100, retry_started_at=500, task_deadline=1000), 3, 500)
+    budget.update(changes)
+    with pytest.raises(RetryBudgetError):
+        budget_token(budget, task_id=TASK)
+
+
+def test_expired_task_cannot_open_a_new_retry_window():
+    with pytest.raises(RetryBudgetError, match='BUDGET_INVALID'):
+        new_retry_budget(TASK, admitted_at=100, retry_started_at=500, task_deadline=500)
+
+
+def archived_preparation(owner, ordinal, reason):
+    return {'ordinal': ordinal, 'account_id': owner, 'reason': reason,
+        'timing': {'task_id': TASK, 'finished': True, 'current_command': None,
+            'dropped_command_samples': 0, 'command_count': 1,
+            'commands': {'node quote': {'count': 1, 'failed': 0}}}}
+
+
+def test_verified_prior_funding_skip_consumes_its_ticket_before_current_account_retry():
+    budget = new_retry_budget(TASK, admitted_at=100, retry_started_at=500, task_deadline=1000)
+    history = [archived_preparation(7, 1, 'insufficient_credits'), archived_preparation(19, 2, 'command_failed')]
+    original = deepcopy(history)
+    seeded = seed_from_verified_preparations(budget, task_id=TASK, preparations=history,
+        preparation_attempt_count=2, account_id=19, now=500, proof=PROOF)
+    assert [entry['account_id'] for entry in seeded['attempts']] == [7, 19]
+    assert [entry['at'] for entry in seeded['attempts']] == [500, 500]
+    assert history == original and budget['attempts'] == []
+    assert len(claim(seeded, 19, 501)['attempts']) == 3
+    with pytest.raises(RetryBudgetError, match='ACCOUNT_RETURN_BLOCKED'):
+        claim(seeded, 7, 501)
+
+
+@pytest.mark.parametrize('change', ['run', 'confirm', 'unfinished', 'trimmed', 'ordinal', 'reason', 'wrong_task', 'count'])
+def test_ambiguous_or_dispatched_preparation_history_cannot_seed_retry_tickets(change):
+    budget = new_retry_budget(TASK, admitted_at=100, retry_started_at=500, task_deadline=1000)
+    history = [archived_preparation(7, 1, 'insufficient_credits'), archived_preparation(19, 2, 'command_failed')]
+    first = history[0]
+    count = 2
+    if change in {'run', 'confirm'}:
+        first['timing']['commands']['node ' + change] = {'count': 1, 'failed': 0}
+        first['timing']['command_count'] += 1
+    elif change == 'unfinished': first['timing']['finished'] = False
+    elif change == 'trimmed': count = 9
+    elif change == 'ordinal': first['ordinal'] = 2
+    elif change == 'reason': first['reason'] = 'accepted'
+    elif change == 'wrong_task': first['timing']['task_id'] = 'another_task'
+    elif change == 'count': first['timing']['command_count'] = 2
+    with pytest.raises(RetryBudgetError):
+        seed_from_verified_preparations(budget, task_id=TASK, preparations=history,
+            preparation_attempt_count=count, account_id=19, now=500, proof=PROOF)
+
+
+def test_seeded_preparations_cannot_hide_a_third_account_or_fourth_attempt():
+    budget = new_retry_budget(TASK, admitted_at=100, retry_started_at=500, task_deadline=1000)
+    history = [archived_preparation(7, 1, 'insufficient_credits'),
+        archived_preparation(11, 2, 'insufficient_credits'), archived_preparation(19, 3, 'command_failed')]
+    with pytest.raises(RetryBudgetError, match='ACCOUNT_LIMIT'):
+        seed_from_verified_preparations(budget, task_id=TASK, preparations=history,
+            preparation_attempt_count=3, account_id=19, now=500, proof=PROOF)
+    history.append(archived_preparation(19, 4, 'command_failed'))
+    with pytest.raises(RetryBudgetError):
+        seed_from_verified_preparations(budget, task_id=TASK, preparations=history,
+            preparation_attempt_count=4, account_id=19, now=500, proof=PROOF)

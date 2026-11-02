@@ -68,6 +68,9 @@ def _credential_setup_ready(account: dict[str, Any]) -> bool:
 DEFAULT_SETTINGS: dict[str, Any] = {
     "region_generation_policy": DEFAULT_REGION_GENERATION_POLICY,
     "canvas_cli_enabled": False,
+    "canvas_upload_concurrency": 3,
+    "canvas_account_upload_concurrency": 4,
+    "canvas_total_upload_concurrency": 8,
     "task_workers": 10,
     "task_queue_capacity": 100,
     "poll_interval_seconds": 8,
@@ -145,7 +148,10 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
             if key in filtered and not 1 <= int(filtered[key]) <= (3600 if key != "task_queue_capacity" else 10000):
                 raise ValueError(f"invalid {key}")
         for key, upper in (("canvas_missing_resource_query_attempts", 10),
-                           ("canvas_missing_resource_timeout_seconds", 300)):
+                           ("canvas_missing_resource_timeout_seconds", 300),
+                           ("canvas_upload_concurrency", 8),
+                           ("canvas_account_upload_concurrency", 16),
+                           ("canvas_total_upload_concurrency", 32)):
             if key in filtered and (type(filtered[key]) is not int or not 1 <= filtered[key] <= upper):
                 raise ValueError(f"invalid {key}")
         candidate = {**self.settings(), **filtered}
@@ -661,6 +667,9 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                          backend: str | None = None, *, include_aux_busy: bool = False,
                          task: dict | None = None) -> list[dict]:
         accounts, legacy, all_quotes = [], [], []
+        normalized = (task or {}).get('normalized') or {}
+        multi_reference_video = (normalized.get('kind') != 'image'
+            and sum(len(normalized.get(kind) or []) for kind in ('images', 'videos', 'audios')) > 1)
         threshold = number(self.settings().get('low_balance_disable_threshold')) or 0
         image_rescue = rescue_threshold(self.settings())
         if task and (task.get('normalized') or {}).get('kind') != 'image':
@@ -707,10 +716,21 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                 # This is a temporary hold, never a price or actual debit.
                 accounts.append({**candidate, '_credit_reservation_amount': available})
                 continue
-            if available is None or available >= estimated_cost:
+            canvas_reference_probe = multi_reference_video and execution_mode(item) == 'canvas_cli'
+            if canvas_reference_probe:
+                # Keep a live-quote fallback if all cached predictions are
+                # underfunded or busy; no account is disabled by a hint.
+                legacy.append({**candidate, '_scheduling_quote_unknown': True})
+            elif available is None or available >= estimated_cost:
                 legacy.append(candidate)
             hint = next((row for row in all_quotes if row['account_id'] == int(item['id'])
                 and matching_hint(row, item, self.canvas_cli.data_dir, task['normalized'])), None)
+            if canvas_reference_probe and hint is None:
+                # Another identity's estimate is not this account's price.
+                # Prefer a well-funded probe before uploading many references;
+                # its own fresh quote remains the final submission gate.
+                accounts.append({**candidate, '_scheduling_quote_unknown': True})
+                continue
             required = hint['amount'] if hint is not None else estimated_cost
             if available is None or available >= required:
                 accounts.append({**candidate, '_scheduling_quote_amount': hint['amount']} if hint else candidate)
@@ -752,8 +772,9 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
             # Unknown cost is not a free task: probe a larger balance until a
             # measured budget exists. Explicit priority always remains first.
             accounts.sort(key=lambda item: (-int(item['priority']), item['_available_credits'] is None,
-                (item['_available_credits'] or 0) * (1 if estimated_cost > 0
-                    or int(item['priority']) in hinted_priorities else -1), item['id']))
+                bool(item.get('_scheduling_quote_unknown')),
+                (item['_available_credits'] or 0) * (-1 if item.get('_scheduling_quote_unknown') else
+                    1 if estimated_cost > 0 or int(item['priority']) in hinted_priorities else -1), item['id']))
             for account in accounts:
                 account_id = int(account["id"])
                 active = self._active.get(account_id, 0)
@@ -856,6 +877,13 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
         task = self.store.task(task_id) or {}
         previous = [value for entry in self._admission_history(task)
                     if isinstance(entry, dict) and (value := number(entry.get('task_deadline'))) is not None]
+        budget = (task.get('upstream_context') or {}).get('preparation_retry_budget')
+        if budget is not None:
+            from .canvas_retry_budget import preparation_deadline, RetryBudgetError
+            try:
+                previous.append(preparation_deadline(budget, task_id=task_id))
+            except RetryBudgetError:
+                return min(deadline, time.monotonic())
         if previous:
             return min(deadline, time.monotonic() + max(0, min(previous) - time.time()))
         return deadline
@@ -1084,6 +1112,8 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                         break
                     self._stop.wait(1)
                 if not account:
+                    if self._admission_expired(task_id, deadline):
+                        return
                     rejected = attempted or self._model_excluded_accounts(self.store.task(task_id) or {})
                     code = admission_code if rejected else "ACCOUNT_POOL_UNAVAILABLE"
                     message = credit_reason if rejected else "no available Dreamina account before timeout"
@@ -1212,6 +1242,8 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                     self.browser_runtime.release(account, owned)
                     self._release_account(account_id, task_id)
             if not self._stop.is_set():
+                if self._admission_expired(task_id, deadline):
+                    return
                 rejected = attempted or self._model_excluded_accounts(self.store.task(task_id) or {})
                 self._fail(task_id, admission_code if rejected else "ACCOUNT_POOL_UNAVAILABLE",
                            credit_reason if rejected else "no available Dreamina account before timeout")
@@ -1363,6 +1395,8 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                     self.browser_runtime.release(account, owned)
                     self._release_account(account_id, task_id)
             if not self._stop.is_set():
+                if self._admission_expired(task_id, deadline):
+                    return
                 self._fail(task_id, *(preflight_failure or ("UPSTREAM_TIMEOUT", "Dreamina image task timed out")))
         finally:
             self._worker_slots.release()

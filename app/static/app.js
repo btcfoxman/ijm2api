@@ -376,6 +376,19 @@ function lowBalanceSettingsPayload(form, settings) {
   if (!lowBalanceModelOptions(settings).includes(target)) throw new Error("实际生成模型不可用，请刷新设置后重新选择");
   return { low_balance_image_rescue_threshold: threshold, low_balance_seedream_target_model: target };
 }
+const canvasUploadLimits = [["canvas_upload_concurrency", 3, 8], ["canvas_account_upload_concurrency", 4, 16], ["canvas_total_upload_concurrency", 8, 32]];
+function renderCanvasUploadSettings(form, settings) {
+  for (const [name, fallback] of canvasUploadLimits) form.elements.namedItem(name).value = String(settings[name] ?? fallback);
+}
+function canvasUploadSettingsPayload(form) {
+  const values = {};
+  for (const [name, , maximum] of canvasUploadLimits) {
+    const raw = form.elements.namedItem(name).value.trim(), value = Number(raw);
+    if (!raw || !Number.isInteger(value) || value < 1 || value > maximum) throw new Error(`素材上传并发须为 1–${maximum} 的整数`);
+    values[name] = value;
+  }
+  return values;
+}
 function renderRegionGenerationSettings(form, settings) {
   const policy = settings.region_generation_policy || {};
   for (const region of ["cn", "us", "other"]) {
@@ -415,6 +428,7 @@ $("#settingsButton").addEventListener("click", () => {
     else input.value = value ?? "";
   });
   renderLowBalanceSettings(form, state.settings);
+  renderCanvasUploadSettings(form, state.settings);
   renderRegionGenerationSettings(form, state.settings);
   form.elements.namedItem("result_s3_center_token").value = "";
   $("#s3TokenHint").textContent = state.settings.result_s3_center_token_configured
@@ -441,12 +455,13 @@ $("#settingsForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
   const field = (name) => form.elements.namedItem(name);
-  let lowBalance, regionPolicy;
-  try { lowBalance = lowBalanceSettingsPayload(form, state.settings); regionPolicy = regionGenerationSettingsPayload(form); }
+  let lowBalance, regionPolicy, canvasUploads;
+  try { lowBalance = lowBalanceSettingsPayload(form, state.settings); regionPolicy = regionGenerationSettingsPayload(form); canvasUploads = canvasUploadSettingsPayload(form); }
   catch (error) { toast(error.message, true); return; }
   const payload = {
     ...lowBalance,
     ...regionPolicy,
+    ...canvasUploads,
     canvas_cli_enabled: field("canvas_cli_enabled").checked,
     task_workers: Number(field("task_workers").value),
     task_queue_capacity: Number(field("task_queue_capacity").value),

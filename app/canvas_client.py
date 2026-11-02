@@ -5,13 +5,17 @@ from __future__ import annotations
 import copy
 import hashlib
 import ipaddress
+import json
 import math
 import os
 import re
 import stat
+import threading
 import time
 import uuid
-from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Event
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -20,6 +24,7 @@ from urllib.parse import urlsplit
 from .canvas_cli import CanvasCLI, CanvasCLIError, _has_accepted, account_profile, admission_verdict, sanitize
 from .catalog import ALIASES, media_alias_kind
 from .errors import public_error, upstream_review_error
+from .canvas_upload_limiter import UPLOAD_LIMITER, runner_namespace
 
 
 _NAMESPACE = uuid.UUID("b867f326-c52e-491e-b971-3937d0c731c1")
@@ -49,6 +54,19 @@ def submission_evidence_blocks_fallback(value: dict[str, Any]) -> bool:
             or any(type(evidence.get(key)) is not bool for key in _SUBMISSION_EVIDENCE_FLAGS)):
         return True  # An incompatible evidence format cannot grant failover.
     return any(evidence[key] for key in _SUBMISSION_EVIDENCE_FLAGS if key != 'ambiguous_partial')
+
+
+def _upload_dispatch_evidence(value):
+    if not isinstance(value, dict):
+        return False
+    error = value.get('submit_error')
+    evidence = value.get('submission_evidence')
+    return (value.get('submission_phase') in {'submitting', 'confirming', 'run_dispatching', 'submitted', 'accepted', 'unknown'}
+        or value.get('phase') in {'accepted', 'unknown', 'submitted', 'running', 'succeeded'}
+        or any(value.get(key) for key in ('run_id', 'thread_id', 'resource_ids', 'accepted',
+            'submission_receipt_evidence', 'dispatch_started'))
+        or isinstance(error, dict) and error.get('outcome_unknown') is True
+        or evidence is not None)
 
 
 def _remember_submission_evidence(context: dict[str, Any], envelope: dict[str, Any]) -> None:
@@ -452,11 +470,28 @@ def prompt_with_resources(prompt: str, resources: dict[str, list[str]]) -> str:
 
 class CanvasClient:
     def __init__(self, runner: CanvasCLI, account: dict[str, Any], *,
-                 capabilities: dict[str, list[dict[str, Any]]] | None = None) -> None:
+                 capabilities: dict[str, list[dict[str, Any]]] | None = None,
+                 upload_concurrency: int = 1, account_upload_concurrency: int = 4,
+                 total_upload_concurrency: int = 8) -> None:
+        for value, maximum in ((upload_concurrency, 8), (account_upload_concurrency, 16),
+                               (total_upload_concurrency, 32)):
+            if type(value) is not int or not 1 <= value <= maximum:
+                raise ValueError('Canvas upload concurrency is out of range')
         self.runner = runner
         self.account = dict(account)
         self._capabilities = capabilities or {}
         self.preparation_timing = None
+        self.upload_concurrency = upload_concurrency
+        self.account_upload_concurrency = account_upload_concurrency
+        self.total_upload_concurrency = total_upload_concurrency
+
+    def _parallel_uploads(self):
+        return self.upload_concurrency > 1 and (not isinstance(self.runner, CanvasCLI)
+            or self.runner._parallel_verified)
+
+    def _account_guard(self, deadline):
+        return (self.runner.account_guard(self.account, deadline=deadline)
+                if isinstance(self.runner, CanvasCLI) else nullcontext())
 
     def _phase(self, name, **metadata):
         return self.preparation_timing.phase(name, **metadata) if self.preparation_timing is not None else nullcontext()
@@ -653,7 +688,8 @@ class CanvasClient:
             raise
 
     def _upload_resource(self, path: Path | None, media_type: str, resource_id: str, project_id: str, *,
-                         deadline: float | None = None, source_url: str | None = None) -> None:
+                         deadline: float | None = None, source_url: str | None = None,
+                         on_registered: Callable[[str], Any] | None = None) -> None:
         """Retries keep the same documented registration idempotency key."""
         if source_url is not None:
             if media_type != 'image' or path is not None:
@@ -670,6 +706,8 @@ class CanvasClient:
                             "--type", media_type, "--project-id", project_id,
                             "--resource-id", resource_id], timeout=180, deadline=deadline)
                 upload_acknowledged = True
+                if on_registered is not None:
+                    on_registered('acknowledged')
                 self._resource_ready(resource_id, project_id, deadline=deadline, media_type=media_type)
                 return
             except CanvasCLIError as exc:
@@ -681,6 +719,8 @@ class CanvasClient:
                     # The CLI explicitly forbids replaying an unknown upload.
                     # Only observe its original registration ID; this is not a
                     # node.run recovery and must never allocate another ID.
+                    if on_registered is not None:
+                        on_registered('unknown')
                     try:
                         self._observe_unknown_upload(resource_id, project_id, deadline=deadline, media_type=media_type)
                     except CanvasCLIError as observed:
@@ -731,13 +771,268 @@ class CanvasClient:
                 raise CanvasCLIError("MEDIA_UPLOAD_PENDING", "Canvas reference upload remains unconfirmed") from exc
             raise
 
+    @contextmanager
+    def _upload_binding_guard(self, context, epoch, deadline):
+        with self._account_guard(deadline):
+            self._check_context(context, deadline=deadline)
+            getter = getattr(self.runner, 'credential_epoch', None)
+            if epoch is not None and callable(getter) and getter(self.account) != epoch:
+                raise CanvasCLIError('CLI_ACCOUNT_MISMATCH', 'Canvas credentials changed during reference preparation')
+            self._remaining(deadline)
+            yield
+
+    def _upload_plan(self, normalized, task_id, assets, context, checkpoint, deadline):
+        """Bind verified checkpoints to inputs, never to temporary file paths."""
+        def digest(value):
+            return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=True,
+                separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+
+        jobs = []
+        for group, media_type in (('images', 'image'), ('videos', 'video'), ('audios', 'audio')):
+            for index, asset in enumerate(assets.get(group, [])):
+                self._remaining(deadline)
+                source_url = asset.get('source_url') if isinstance(asset, dict) else None
+                path = asset.get('path') if isinstance(asset, dict) else asset
+                if source_url is not None:
+                    if media_type != 'image' or path is not None:
+                        raise CanvasCLIError('MEDIA_INPUT_MISSING', 'Canvas remote references require an image URL only')
+                    source_url = public_image_source_url(source_url)
+                    source_kind, source_hash = 'url', hashlib.sha256(source_url.encode()).hexdigest()
+                    path = None
+                else:
+                    if not isinstance(path, (str, Path)) or not Path(path).is_file():
+                        raise CanvasCLIError('MEDIA_INPUT_MISSING', 'Canvas reference file is missing')
+                    path = Path(path)
+                    hasher = hashlib.sha256()
+                    with path.open('rb') as stream:
+                        for block in iter(lambda: stream.read(1024 * 1024), b''):
+                            self._remaining(deadline)
+                            hasher.update(block)
+                    source_kind, source_hash = 'file', hasher.hexdigest()
+                jobs.append({'group': group, 'index': index, 'media_type': media_type,
+                    'source_kind': source_kind, 'source_sha256': source_hash,
+                    'path': path, 'source_url': source_url})
+        binding = {'task_id': task_id, 'account_id': int(self.account['id']),
+            'profile_sha256': digest(context['profile']),
+            'user_id_sha256': digest(str(self.account.get('login_user_id') or self.account.get('cli_user_id') or '')),
+            'proxy_sha256': digest(str(self.account.get('proxy_url') or '')),
+            'project_id': context['project_id'],
+            'request_sha256': digest({key: value for key, value in normalized.items() if not key.startswith('_')}),
+            'media_sha256': digest([{key: job[key] for key in ('group', 'index', 'source_kind', 'source_sha256')}
+                                   for job in jobs])}
+        binding_hash = digest(binding)
+        if isinstance(checkpoint, dict):
+            if _upload_dispatch_evidence(checkpoint):
+                raise CanvasCLIError('UPSTREAM_SUBMIT_OUTCOME_UNKNOWN',
+                    'Canvas checkpoint has prior dispatch evidence; query its original operation', outcome_unknown=True)
+            previous_binding = checkpoint.get('binding')
+            if isinstance(previous_binding, dict) and any(key in previous_binding and previous_binding[key] != binding[key]
+                    for key in ('task_id', 'account_id', 'profile_sha256', 'user_id_sha256', 'proxy_sha256', 'project_id')):
+                raise CanvasCLIError('CLI_ACCOUNT_MISMATCH', 'Canvas upload checkpoint identity binding changed')
+        refs = []
+        for job in jobs:
+            job['resource_id'] = _stable(self.account['id'], task_id, job['group'], job['index'], binding_hash)
+            refs.append({key: job[key] for key in ('group', 'index', 'resource_id', 'source_kind', 'source_sha256')})
+        expected = {ref['resource_id']: {**ref, 'verified': True} for ref in refs}
+        verified = set()
+        pending_refs = {}
+        has_pending = isinstance(checkpoint, dict) and bool(checkpoint.get('pending_refs'))
+        if (isinstance(checkpoint, dict) and 'pending_refs' in checkpoint
+                and not isinstance(checkpoint['pending_refs'], list)):
+            raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID', 'Canvas pending upload checkpoint is invalid')
+        candidate_valid = (isinstance(checkpoint, dict) and type(checkpoint.get('version')) is int
+            and checkpoint['version'] == 1 and checkpoint.get('backend') == 'canvas_cli'
+            and checkpoint.get('binding') == binding and isinstance(checkpoint.get('refs'), list)
+            and len(checkpoint['refs']) <= len(refs))
+        if has_pending and not candidate_valid:
+            raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID',
+                'Canvas pending uploads must retain their original input binding')
+        if candidate_valid:
+            valid = True
+            for ref in checkpoint['refs']:
+                resource_id = ref.get('resource_id') if isinstance(ref, dict) else None
+                if (not isinstance(resource_id, str) or resource_id not in expected
+                        or type(ref.get('index')) is not int or ref.get('verified') is not True
+                        or ref != expected[resource_id] or resource_id in verified):
+                    valid = False
+                    break
+                verified.add(resource_id)
+            if not valid:
+                if has_pending:
+                    raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID', 'Canvas pending upload checkpoint is invalid')
+                verified.clear()
+            for ref in checkpoint.get('pending_refs', []):
+                resource_id = ref.get('resource_id') if isinstance(ref, dict) else None
+                disposition = ref.get('registration') if isinstance(ref, dict) else None
+                base = ({key: value for key, value in expected[resource_id].items() if key != 'verified'}
+                        if isinstance(resource_id, str) and resource_id in expected else None)
+                if (base is None or type(ref.get('index')) is not int or ref.get('observe_only') is not True
+                        or not isinstance(disposition, str) or disposition not in {'acknowledged', 'unknown'}
+                        or ref != {**base, 'observe_only': True, 'registration': disposition}
+                        or resource_id in pending_refs or resource_id in verified):
+                    raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID', 'Canvas pending upload checkpoint is invalid')
+                pending_refs[resource_id] = disposition
+        context['resources'] = {group: [job['resource_id'] for job in jobs if job['group'] == group]
+                                for group in ('images', 'videos', 'audios')}
+        context['uploaded_resources'] = [ref['resource_id'] for ref in refs if ref['resource_id'] in verified]
+        context['upload_checkpoint'] = {'version': 1, 'backend': 'canvas_cli', 'binding': binding,
+            'refs': [expected[ref['resource_id']] for ref in refs if ref['resource_id'] in verified],
+            'pending_refs': [{**ref, 'observe_only': True, 'registration': pending_refs[ref['resource_id']]}
+                for ref in refs if ref['resource_id'] in pending_refs]}
+        return jobs, refs, expected, verified, pending_refs
+
+    def _upload_references(self, jobs, refs, expected, verified, pending_refs, context, save, state_lock,
+                           epoch, deadline):
+        stopped = Event()
+        failure_lock = threading.Lock()
+        first_failure = []
+        fatal_failures = []
+        namespace = runner_namespace(self.runner)
+
+        def cancelled():
+            closed = getattr(self.runner, '_closed', None)
+            return stopped.is_set() or isinstance(closed, threading.Event) and closed.is_set()
+
+        def upload(job):
+            admitted = False
+
+            def registered(disposition):
+                with state_lock:
+                    pending_refs[job['resource_id']] = disposition
+                    context['upload_checkpoint']['pending_refs'] = [
+                        {**ref, 'observe_only': True, 'registration': pending_refs[ref['resource_id']]}
+                        for ref in refs if ref['resource_id'] in pending_refs]
+                    # Commit the observe-only restriction before any readiness
+                    # call can fail or another sibling can select a retry.
+                    save('uploading')
+
+            try:
+                with UPLOAD_LIMITER.slot(namespace, int(self.account['id']),
+                        account_limit=self.account_upload_concurrency, total_limit=self.total_upload_concurrency,
+                        deadline=deadline, stopped=cancelled, clock=time.monotonic):
+                    admitted = True
+                    with self._upload_binding_guard(context, epoch, deadline):
+                        with self._phase('reference_upload', index=job['index'] + 1, media_type=job['media_type']):
+                            if job['resource_id'] in verified:
+                                self._resource_ready(job['resource_id'], context['project_id'],
+                                    deadline=deadline, media_type=job['media_type'])
+                            elif job['resource_id'] in pending_refs:
+                                if pending_refs[job['resource_id']] == 'unknown':
+                                    self._observe_unknown_upload(job['resource_id'], context['project_id'],
+                                        deadline=deadline, media_type=job['media_type'])
+                                else:
+                                    self._resource_ready(job['resource_id'], context['project_id'],
+                                        deadline=deadline, media_type=job['media_type'])
+                            else:
+                                self._upload_resource(job['path'], job['media_type'], job['resource_id'],
+                                    context['project_id'], deadline=deadline, source_url=job['source_url'],
+                                    on_registered=registered)
+                        self._remaining(deadline)
+                        # Successful siblings remain useful after another worker fails.
+                        with state_lock:
+                            verified.add(job['resource_id'])
+                            pending_refs.pop(job['resource_id'], None)
+                            context['uploaded_resources'] = [ref['resource_id'] for ref in refs
+                                if ref['resource_id'] in verified]
+                            context['upload_checkpoint']['refs'] = [expected[ref['resource_id']] for ref in refs
+                                if ref['resource_id'] in verified]
+                            context['upload_checkpoint']['pending_refs'] = [
+                                {**ref, 'observe_only': True, 'registration': pending_refs[ref['resource_id']]}
+                                for ref in refs if ref['resource_id'] in pending_refs]
+                            save('uploading')
+            except BaseException as exc:
+                # Publish the real failure before waking cancelled siblings.
+                # A waiting sibling's termination can otherwise finish its
+                # Future first and mask a retryable upstream error.
+                with failure_lock:
+                    if not first_failure:
+                        first_failure.append(exc)
+                    cancellation = (not admitted and stopped.is_set()
+                        and isinstance(exc, CanvasCLIError) and exc.code == 'CLI_TASK_TERMINATED')
+                    transient = (isinstance(exc, CanvasCLIError) and not exc.outcome_unknown
+                        and not _resource_read_intervention(exc)
+                        and (preparation_retryable_failure(exc) or exc.code in {
+                            'CLI_COMMAND_TIMEOUT', 'CLI_INVALID_RESPONSE', 'cli.invalid_service_response',
+                            'cli.transport_failed', 'MEDIA_UPLOAD_PENDING'}))
+                    observing = (isinstance(exc, CanvasCLIError) and exc.code == 'cli.upload_state_unknown'
+                        and job['resource_id'] in pending_refs)
+                    if not cancellation and not transient and not observing:
+                        fatal_failures.append(exc)
+                    original = first_failure[0]
+                code = str(getattr(original, 'code', type(original).__name__))
+                safe_code = code if re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', code) else 'Error'
+                try:
+                    with state_lock:
+                        context['upload_checkpoint']['first_failure'] = {'code': safe_code}
+                        save('uploading')
+                except Exception:
+                    # A failed checkpoint cannot authorize a retry. Retain the
+                    # persistence failure as a fatal cause instead of replaying.
+                    with failure_lock:
+                        fatal_failures.append(CanvasCLIError('CLI_UPLOAD_CHECKPOINT_FAILED',
+                            'Canvas upload checkpoint could not be persisted'))
+                stopped.set()
+                with failure_lock:
+                    fatal = fatal_failures[0] if fatal_failures else None
+                if fatal is not None and fatal is not exc:
+                    if isinstance(fatal, CanvasCLIError):
+                        fatal.details = {**fatal.details, 'parallel_first_failure': {'code': safe_code}}
+                    raise fatal from exc
+                raise
+
+        images = [job for job in jobs if job['group'] == 'images']
+        if self._parallel_uploads() and len(images) > 1:
+            with ThreadPoolExecutor(max_workers=min(self.upload_concurrency, len(images)),
+                                    thread_name_prefix='canvas-upload') as executor:
+                futures = [executor.submit(upload, job) for job in images]
+                error = None
+                try:
+                    for future in as_completed(futures):
+                        try:
+                            future.result()
+                        except BaseException as exc:
+                            if error is None:
+                                error = exc
+                                stopped.set()
+                                for pending in futures:
+                                    pending.cancel()
+                    if error is not None:
+                        with failure_lock:
+                            cause = fatal_failures[0] if fatal_failures else first_failure[0] if first_failure else error
+                            original = first_failure[0] if first_failure else error
+                        if cause is not original and isinstance(cause, CanvasCLIError):
+                            original_code = str(getattr(original, 'code', type(original).__name__))
+                            cause.details = {**cause.details, 'parallel_first_failure': {
+                                'code': original_code if re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', original_code) else 'Error'}}
+                        raise cause
+                except BaseException:
+                    stopped.set()
+                    raise
+                finally:
+                    for pending in futures:
+                        pending.cancel()
+                    # Executor shutdown joins every running worker before returning.
+        else:
+            for job in images:
+                upload(job)
+        for job in jobs:
+            if job['group'] != 'images':
+                upload(job)
+
     def prepare(self, normalized: dict[str, Any], task_id: str,
                 assets: dict[str, list[Any]], *,
                 persist: Callable[[dict[str, Any]], Any] | None = None,
-                deadline: float | None = None) -> dict[str, Any]:
-        guard = self.runner.account_guard if isinstance(self.runner, CanvasCLI) else None
-        with guard(self.account, deadline=deadline) if callable(guard) else nullcontext():
-            return self._prepare(normalized, task_id, assets, persist=persist, deadline=deadline)
+                deadline: float | None = None, checkpoint: dict | None = None) -> dict[str, Any]:
+        with self._account_guard(deadline):
+            getter = getattr(self.runner, 'credential_epoch', None)
+            epoch = getter(self.account) if callable(getter) else None
+            segmented = isinstance(self.runner, CanvasCLI) and self.runner._parallel_verified
+            if not segmented and not self._parallel_uploads():
+                return self._prepare(normalized, task_id, assets, persist=persist, deadline=deadline,
+                                     checkpoint=checkpoint, credential_epoch=epoch)
+        # No parent reader remains while child readers wait behind an auth writer.
+        return self._prepare(normalized, task_id, assets, persist=persist, deadline=deadline,
+                             checkpoint=checkpoint, credential_epoch=epoch)
 
     def _project_guard(self, context, deadline):
         return (self.runner.project_guard(self.account, context['project_id'], deadline=deadline)
@@ -746,7 +1041,8 @@ class CanvasClient:
     def _prepare(self, normalized: dict[str, Any], task_id: str,
                  assets: dict[str, list[Any]], *,
                  persist: Callable[[dict[str, Any]], Any] | None = None,
-                 deadline: float | None = None) -> dict[str, Any]:
+                 deadline: float | None = None, checkpoint: dict | None = None,
+                 credential_epoch=None) -> dict[str, Any]:
         kind = "image" if normalized.get("kind") == "image" else "video"
         counts = {x: len(assets.get(x, [])) for x in ("images", "videos", "audios")}
         model = self.preflight_model(normalized, deadline=deadline)
@@ -758,6 +1054,8 @@ class CanvasClient:
             if context.get("account_id") != int(self.account["id"]):
                 raise CanvasCLIError("CLI_ACCOUNT_MISMATCH", "An existing Canvas task cannot move to another account")
             self._check_context(context, deadline=deadline)
+            if context.get('task_id') != task_id:
+                raise CanvasCLIError('CLI_ACCOUNT_MISMATCH', 'Canvas checkpoint belongs to another task')
         else:
             context = {"backend": "canvas_cli", "account_id": int(self.account["id"]),
                        "profile": self.runner.profile(self.account) if hasattr(self.runner, "profile") else account_profile(self.account),
@@ -770,33 +1068,23 @@ class CanvasClient:
                        "mode": str(mode["name"]), "resources": {
                            group: [_stable(self.account["id"], task_id, group, index) for index in range(counts[group])]
                            for group in counts}, "uploaded_resources": [], "resource_ids": [], "phase": "prepared"}
-        if context.get("submission_phase") in {"submitting", "run_dispatching", "submitted", "accepted", "unknown"}:
+        if _upload_dispatch_evidence(context):
             raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas submission must be resumed by its original submit ID", outcome_unknown=True)
+        jobs, refs, expected, verified, pending_refs = self._upload_plan(normalized, task_id, assets, context,
+            checkpoint if checkpoint is not None else context.get('upload_checkpoint'), deadline)
+        state_lock = threading.RLock()
         def save(phase: str) -> None:
-            context["phase"] = phase
-            if persist:
-                persist(copy.deepcopy(context))
+            with state_lock:
+                context["phase"] = phase
+                if persist:
+                    if persist(copy.deepcopy(context)) is False:
+                        raise CanvasCLIError('CLI_TASK_TERMINATED', 'Canvas preparation persistence was not acknowledged')
         save("preparing")
-        with self._phase('project'):
-            self._ensure_project(context, deadline=deadline)
-        for group, media_type in (("images", "image"), ("videos", "video"), ("audios", "audio")):
-            for index, asset in enumerate(assets.get(group, [])):
-                resource_id = context["resources"][group][index]
-                if resource_id not in context["uploaded_resources"]:
-                    source_url = asset.get('source_url') if isinstance(asset, dict) else None
-                    path = asset.get("path") if isinstance(asset, dict) else asset
-                    with self._phase('reference_upload', index=index + 1, media_type=media_type):
-                        if source_url is not None:
-                            if media_type != 'image' or path is not None:
-                                raise CanvasCLIError('MEDIA_INPUT_MISSING', 'Canvas remote references require an image URL only')
-                            self._upload_resource(None, media_type, resource_id, context['project_id'],
-                                                  deadline=deadline, source_url=source_url)
-                        else:
-                            if not isinstance(path, (str, Path)) or not Path(path).is_file():
-                                raise CanvasCLIError("MEDIA_INPUT_MISSING", "Canvas reference file is missing")
-                            self._upload_resource(Path(path), media_type, resource_id, context["project_id"], deadline=deadline)
-                    context["uploaded_resources"].append(resource_id)
-                    save("uploading")
+        with self._upload_binding_guard(context, credential_epoch, deadline):
+            with self._phase('project'):
+                self._ensure_project(context, deadline=deadline)
+        self._upload_references(jobs, refs, expected, verified, pending_refs, context, save, state_lock,
+                                credential_epoch, deadline)
         args = ["node", "create", kind, "--project-id", context["project_id"],
                 "--node-id", context["node_id"], "--update-id", context["update_id"],
                 "--title", "IJM " + task_id, "--mode", context["mode"],
@@ -805,7 +1093,7 @@ class CanvasClient:
         for group in ("images", "videos", "audios"):
             for resource_id in context["resources"][group]:
                 args.extend(["--ref", "res:" + resource_id])
-        with self._project_guard(context, deadline):
+        with self._upload_binding_guard(context, credential_epoch, deadline), self._project_guard(context, deadline):
             save("saving")
             with self._phase('draft_save'):
                 self._preparation_write(args, deadline=deadline)

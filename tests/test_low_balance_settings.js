@@ -10,7 +10,8 @@ const options = ['seedream-5.0-pro', 'seedream-5.0-lite', 'gpt-image-2.5-flare',
 
 function harness(settings = {}) {
   const fields = Object.fromEntries([
-    'canvas_cli_enabled', 'task_workers', 'task_queue_capacity', 'poll_interval_seconds',
+    'canvas_cli_enabled', 'canvas_upload_concurrency', 'canvas_account_upload_concurrency',
+    'canvas_total_upload_concurrency', 'task_workers', 'task_queue_capacity', 'poll_interval_seconds',
     'task_timeout_seconds', 'daily_checkin_enabled', 'low_balance_disable_threshold',
     'chrome_executable', 'chrome_user_data_root', 'allow_video_reference_inputs',
     'prompt_media_reference_cleanup_enabled', 'strict_prompt_media_references',
@@ -62,6 +63,9 @@ test('zero round-trips and PATCH contains editable settings, never readonly opti
   assert.equal(h.requests[0].method, 'PATCH');
   assert.equal(h.requests[0].body.low_balance_image_rescue_threshold, 0);
   assert.equal(h.requests[0].body.low_balance_seedream_target_model, 'seedream-5.0-lite');
+  assert.equal(h.requests[0].body.canvas_upload_concurrency, 3);
+  assert.equal(h.requests[0].body.canvas_account_upload_concurrency, 4);
+  assert.equal(h.requests[0].body.canvas_total_upload_concurrency, 8);
   assert.ok(!('low_balance_seedream_target_options' in h.requests[0].body));
   assert.ok(!h.dialog.open);
 });
@@ -75,6 +79,22 @@ test('decimal threshold and chosen Flare persist without changing global disable
   assert.equal(h.requests[0].body.low_balance_image_rescue_threshold, 12.5);
   assert.equal(h.requests[0].body.low_balance_seedream_target_model, 'gpt-image-2.5-flare');
   assert.equal(h.requests[0].body.low_balance_disable_threshold, 0);
+});
+
+test('upload concurrency validation prevents a partial settings PATCH', async () => {
+  const h = harness({canvas_upload_concurrency: 2, canvas_account_upload_concurrency: 5, canvas_total_upload_concurrency: 12});
+  h.open();
+  h.fields.canvas_total_upload_concurrency.value = '1.5';
+  await h.submit();
+  assert.equal(h.requests.length, 0);
+  assert.ok(h.notifications.at(-1)[1]);
+  assert.ok(h.dialog.open);
+  h.fields.canvas_total_upload_concurrency.value = '16';
+  await h.submit();
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.requests[0].body.canvas_upload_concurrency, 2);
+  assert.equal(h.requests[0].body.canvas_account_upload_concurrency, 5);
+  assert.equal(h.requests[0].body.canvas_total_upload_concurrency, 16);
 });
 
 test('invalid thresholds never issue PATCH or close the dialog', async () => {

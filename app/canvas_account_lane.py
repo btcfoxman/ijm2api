@@ -20,6 +20,13 @@ class AccountLane:
         self._writer: int | None = None
         self._writer_depth = 0
         self._waiting_writers = 0
+        self._credential_epoch = 0
+
+    @property
+    def credential_epoch(self) -> int:
+        """Detect an intervening writer between bounded parallel read groups."""
+        with self._condition:
+            return self._credential_epoch
 
     def acquire(self, *, exclusive: bool, deadline: float | None, stopped) -> None:
         owner = threading.get_ident()
@@ -42,6 +49,8 @@ class AccountLane:
                             not self._waiting_writers or owner in self._readers or self._writer == owner)
                     if ready:
                         if exclusive:
+                            if self._writer != owner:
+                                self._credential_epoch += 1
                             self._writer = owner
                             self._writer_depth += 1
                         else:

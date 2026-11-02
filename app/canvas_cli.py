@@ -392,6 +392,14 @@ class CanvasCLI:
                 self._lanes = {}
             return self._lanes.setdefault(account_id, AccountLane(clock=lambda: time.monotonic()))
 
+    def credential_epoch(self, account: dict[str, Any]) -> int:
+        """Read this process's writer generation without touching credentials.
+
+        This is a gap detector for parallel workers, not a persistent identity
+        proof. Durable task checks must still bind the saved profile and user.
+        """
+        return self._lane(_account_id(account)).credential_epoch
+
     @contextmanager
     def account_guard(self, account: dict[str, Any], *, deadline: float | None = None,
                       exclusive: bool = False):

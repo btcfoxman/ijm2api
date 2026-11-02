@@ -73,12 +73,19 @@ def _claim_id(previous, account_id, at, proof) -> str:
 
 def _validate(budget, task_id: str) -> None:
     _task_id(task_id)
-    _require(type(budget) is dict and set(budget) == {"version", "task_id", "started_at", "deadline", "attempts"},
-             "BUDGET_INVALID")
-    _require(type(budget["version"]) is int and budget["version"] == 1 and budget["task_id"] == task_id,
+    _require(type(budget) is dict, "BUDGET_INVALID")
+    version = budget.get("version")
+    fields = {"version", "task_id", "started_at", "deadline", "attempts"}
+    if type(version) is int and version == 2:
+        fields |= {"admitted_at", "task_deadline"}
+    _require(set(budget) == fields, "BUDGET_INVALID")
+    _require(type(version) is int and version in {1, 2} and budget["task_id"] == task_id,
              "BUDGET_INVALID")
     started, deadline = _timestamp(budget["started_at"]), _timestamp(budget["deadline"])
     _require(started < deadline <= started + MAX_SECONDS, "BUDGET_INVALID")
+    if version == 2:
+        admitted, task_deadline = _timestamp(budget["admitted_at"]), _timestamp(budget["task_deadline"])
+        _require(admitted <= started < task_deadline and deadline <= task_deadline, "BUDGET_INVALID")
     attempts = budget["attempts"]
     _require(type(attempts) is list and len(attempts) <= MAX_ATTEMPTS, "BUDGET_INVALID")
     previous = {key: copy.deepcopy(value) for key, value in budget.items() if key != "attempts"}
@@ -104,12 +111,85 @@ def _validate(budget, task_id: str) -> None:
 
 
 def new_budget(task_id: str, *, admitted_at, task_deadline=None) -> dict:
-    """Create once at the first real admission, never at retry or restart."""
+    """Retain the original version-1 admission-window contract for old callers."""
     _task_id(task_id)
     started = _timestamp(admitted_at)
     deadline = min(started + MAX_SECONDS, _timestamp(task_deadline)) if task_deadline is not None else started + MAX_SECONDS
     result = {"version": 1, "task_id": task_id, "started_at": started, "deadline": deadline, "attempts": []}
     _validate(result, task_id)
+    return result
+
+
+def new_retry_budget(task_id: str, *, admitted_at, retry_started_at, task_deadline) -> dict:
+    """Open once at the first proven transient failure, within the task window.
+
+    Useful initial preparation does not spend the retry allowance. Persist this
+    version-2 state before retrying; existing state must never be recreated.
+    The failed initial preparation still consumes the first attempt ticket.
+    """
+    _task_id(task_id)
+    started = _timestamp(retry_started_at)
+    overall = _timestamp(task_deadline)
+    result = {"version": 2, "task_id": task_id, "admitted_at": _timestamp(admitted_at),
+              "started_at": started, "task_deadline": overall,
+              "deadline": min(started + MAX_SECONDS, overall), "attempts": []}
+    _validate(result, task_id)
+    return result
+
+
+def preparation_deadline(budget: dict, *, task_id: str) -> float:
+    """Return a validated durable cutoff without renewing either budget version."""
+    _validate(budget, task_id)
+    return float(budget["deadline"])
+
+
+def seed_from_verified_preparations(budget: dict, *, task_id: str, preparations: list,
+                                    preparation_attempt_count: int, account_id: int, now,
+                                    proof: dict, excluded_account_ids=()) -> dict:
+    """Count complete pre-run funding skips before the first transient failure.
+
+    Historical attempts get tickets at this newly opened window's start; their
+    original timestamps remain in the immutable preparation audit. A trimmed,
+    unfinished or ambiguous audit never supplies a ticket or a fresh budget.
+    """
+    _validate(budget, task_id)
+    _proof(proof)
+    _account_id(account_id)
+    _require(budget['version'] == 2 and not budget['attempts'], 'BUDGET_INVALID')
+    _require(type(preparations) is list and type(preparation_attempt_count) is int
+             and preparation_attempt_count == len(preparations)
+             and 2 <= len(preparations) <= MAX_ATTEMPTS, 'BUDGET_INVALID')
+    result = copy.deepcopy(budget)
+    for index, entry in enumerate(preparations):
+        _require(type(entry) is dict and set(entry) == {'ordinal', 'account_id', 'reason', 'timing'}
+                 and type(entry['ordinal']) is int and entry['ordinal'] == index + 1, 'BUDGET_INVALID')
+        owner = entry['account_id']
+        _account_id(owner)
+        current = index == len(preparations) - 1
+        _require(entry['reason'] == ('command_failed' if current else 'insufficient_credits')
+                 and (not current or owner == account_id), 'DISPATCH_EVIDENCE')
+        timing = entry['timing']
+        _require(type(timing) is dict and timing.get('task_id') == task_id
+                 and timing.get('finished') is True and timing.get('current_command') is None
+                 and timing.get('dropped_command_samples') == 0, 'DISPATCH_EVIDENCE')
+        commands = timing.get('commands')
+        _require(type(commands) is dict and type(timing.get('command_count')) is int, 'DISPATCH_EVIDENCE')
+        total = 0
+        for name, command in commands.items():
+            _require(type(name) is str and type(command) is dict and type(command.get('count')) is int
+                     and command['count'] >= 0, 'DISPATCH_EVIDENCE')
+            total += command['count']
+        _require(total == timing['command_count'], 'DISPATCH_EVIDENCE')
+        for name in ('node run', 'node confirm'):
+            command = commands.get(name)
+            _require(command is None or command['count'] == 0, 'DISPATCH_EVIDENCE')
+        if not current:
+            quoted = commands.get('node quote')
+            _require(type(quoted) is dict and type(quoted.get('failed')) is int
+                     and 0 <= quoted['failed'] < quoted['count'], 'DISPATCH_EVIDENCE')
+        result = claim_attempt(result, task_id=task_id, account_id=owner, now=now,
+            expected_token=budget_token(result, task_id=task_id), proof=proof,
+            excluded_account_ids=excluded_account_ids if current else ())
     return result
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import math
 import re
+import threading
 import time
 from collections import deque
 from contextlib import contextmanager, nullcontext
@@ -71,10 +72,14 @@ class PreparationTiming:
         self.first_admission_at = self.started_at if first_admission_at is INITIAL_ADMISSION_UNSET else first_admission_at
         self._ended = None
         self._listener = on_change
+        self._lock = threading.RLock()
+        self._notification_lock = threading.RLock()
         self._deferred = 0
         self._active = []
+        self._thread_phases = {}
         self._phase_started = {}
         self._command = None
+        self._active_commands = {}
         self._recent = deque(maxlen=64)
         self._phases = {}
         self._commands = {}
@@ -84,6 +89,10 @@ class PreparationTiming:
         return round(max(0, self._mono() - start) * 1000, 3)
 
     def snapshot(self):
+        with self._lock:
+            return self._snapshot()
+
+    def _snapshot(self):
         total = self._ms(self._started) if self._ended is None else self._ended
         queued = self.queued_at
         initial = self.first_admission_at
@@ -96,14 +105,22 @@ class PreparationTiming:
             'elapsed_before_attempt_ms': round(max(0, self.started_at - queued) * 1000, 3) if valid_queue else None,
             'phases': self._phases, 'commands': self._commands,
             'current_phase': self._active[-1] if self._active else None,
-            'current_command': self._command, 'command_count': self._count,
+            'current_command': next(reversed(self._active_commands.values()), None), 'command_count': self._count,
             'dropped_command_samples': max(0, self._count - len(self._recent)),
             'recent_commands': list(self._recent)})
 
     def _changed(self):
-        if self._listener is not None and not self._deferred:
+        # Serialize persistence callbacks without holding the timing-data lock.
+        # Service callbacks can themselves request a snapshot while holding a
+        # service lock; invoking them under _lock would invert those locks.
+        with self._notification_lock:
+            with self._lock:
+                listener = self._listener if not self._deferred else None
+                snapshot = self._snapshot() if listener is not None else None
+            if listener is None:
+                return
             try:
-                self._listener(self.snapshot())
+                listener(snapshot)
             except Exception:
                 # Telemetry must never erase an accepted receipt or alter retry policy.
                 pass
@@ -111,13 +128,14 @@ class PreparationTiming:
     @contextmanager
     def defer_notifications(self):
         """Piggyback on existing submit persistence, outside its critical section."""
-        self._deferred += 1
+        with self._lock:
+            self._deferred += 1
         try:
             yield
         finally:
-            self._deferred -= 1
-            if not self._deferred:
-                self._changed()
+            with self._lock:
+                self._deferred -= 1
+            self._changed()
 
     def begin_phase(self, name, *, index=None, media_type=None):
         if name not in _PHASES:
@@ -127,22 +145,32 @@ class PreparationTiming:
             marker['index'] = index
         if media_type in {'image', 'video', 'audio'}:
             marker['media_type'] = media_type
-        self._active.append(marker)
-        self._phase_started[id(marker)] = self._mono()
+        with self._lock:
+            owner = threading.get_ident()
+            self._active.append(marker)
+            self._thread_phases.setdefault(owner, []).append(marker)
+            self._phase_started[id(marker)] = (self._mono(), owner)
         self._changed()
         return marker
 
     def end_phase(self, marker, succeeded=True):
-        started = self._phase_started.pop(id(marker), None)
-        if started is None:
-            return
-        name = marker['name']
-        entry = self._phases.setdefault(name, {'count': 0, 'elapsed_ms': 0.0, 'failed': 0})
-        entry['count'] += 1
-        entry['elapsed_ms'] = round(entry['elapsed_ms'] + self._ms(started), 3)
-        entry['failed'] += int(not succeeded)
-        entry['last_completed_at'] = self._wall()
-        self._active = [item for item in self._active if item is not marker]
+        with self._lock:
+            bound = self._phase_started.pop(id(marker), None)
+            if bound is None:
+                return
+            started, owner = bound
+            name = marker['name']
+            entry = self._phases.setdefault(name, {'count': 0, 'elapsed_ms': 0.0, 'failed': 0})
+            entry['count'] += 1
+            entry['elapsed_ms'] = round(entry['elapsed_ms'] + self._ms(started), 3)
+            entry['failed'] += int(not succeeded)
+            entry['last_completed_at'] = self._wall()
+            self._active = [item for item in self._active if item is not marker]
+            phases = [item for item in self._thread_phases.get(owner, []) if item is not marker]
+            if phases:
+                self._thread_phases[owner] = phases
+            else:
+                self._thread_phases.pop(owner, None)
         self._changed()
 
     @contextmanager
@@ -156,19 +184,24 @@ class PreparationTiming:
             self.end_phase(marker, succeeded)
 
     def command(self, runner, account, args, kwargs, attempt, invoke):
-        if self._ended is not None:
+        with self._lock:
+            ended = self._ended is not None
+        if ended:
             return invoke()
         pair = tuple(args[:2])
         safe_pair = list(pair) if pair in TRANSPORT_DIAGNOSTIC_COMMANDS else ['unknown']
         started = self._mono()
         entry = {'command_pair': safe_pair, 'attempt': attempt,
                  'started_at': self._wall(), 'lock_wait_ms': None, 'execution_ms': None}
-        if self._active:
-            entry['phase'] = self._active[-1]['name']
-            for field in ('index', 'media_type'):
-                if field in self._active[-1]:
-                    entry[field] = self._active[-1][field]
-        self._command = entry
+        owner = threading.get_ident()
+        with self._lock:
+            phases = self._thread_phases.get(owner, [])
+            if phases:
+                entry['phase'] = phases[-1]['name']
+                for field in ('index', 'media_type'):
+                    if field in phases[-1]:
+                        entry[field] = phases[-1][field]
+            self._active_commands[owner] = entry
         self._changed()
         # Custom/test runners may expose a guard without actually taking that
         # lock in run(). Their lock wait is unknown, rather than an invented 0.
@@ -178,46 +211,55 @@ class PreparationTiming:
             manager = guard(account, args, deadline=kwargs.get('deadline')) if callable(guard) else nullcontext()
             with manager:
                 if callable(guard):
-                    entry['lock_wait_ms'] = self._ms(started)
+                    with self._lock:
+                        entry['lock_wait_ms'] = self._ms(started)
                 execution_started = self._mono()
                 result = invoke()
-            entry['outcome'] = 'success'
+            with self._lock:
+                entry['outcome'] = 'success'
             if pair == ('resource', 'get'):
                 try:
                     facts = _resource_observation(args, result)
                     if facts is not None:
-                        entry['resource_facts'] = facts
+                        with self._lock:
+                            entry['resource_facts'] = facts
                 except Exception:
                     pass  # Observation must not replace a successful command result.
             return result
         except BaseException as error:
-            entry['outcome'] = 'failed'
             code = str(getattr(error, 'code', type(error).__name__))
-            entry['error_code'] = code if _SAFE_CODE.fullmatch(code) else 'Error'
-            entry['failure'] = command_failure_facts(error)
+            with self._lock:
+                entry['outcome'] = 'failed'
+                entry['error_code'] = code if _SAFE_CODE.fullmatch(code) else 'Error'
+                entry['failure'] = command_failure_facts(error)
             raise
         finally:
-            if execution_started is not None:
-                entry['execution_ms'] = self._ms(execution_started)
-            entry['elapsed_ms'] = self._ms(started)
-            name = ' '.join(safe_pair)
-            aggregate = self._commands.setdefault(name, {'count': 0, 'elapsed_ms': 0.0,
-                'known_lock_wait_ms': 0.0, 'unknown_lock_wait_count': 0, 'failed': 0})
-            aggregate['count'] += 1
-            aggregate['elapsed_ms'] = round(aggregate['elapsed_ms'] + entry['elapsed_ms'], 3)
-            if entry['lock_wait_ms'] is None:
-                aggregate['unknown_lock_wait_count'] += 1
-            else:
-                aggregate['known_lock_wait_ms'] = round(aggregate['known_lock_wait_ms'] + entry['lock_wait_ms'], 3)
-            aggregate['failed'] += int(entry['outcome'] != 'success')
-            self._count += 1
-            self._recent.append(entry)
-            self._command = None
+            with self._lock:
+                if execution_started is not None:
+                    entry['execution_ms'] = self._ms(execution_started)
+                entry['elapsed_ms'] = self._ms(started)
+                name = ' '.join(safe_pair)
+                aggregate = self._commands.setdefault(name, {'count': 0, 'elapsed_ms': 0.0,
+                    'known_lock_wait_ms': 0.0, 'unknown_lock_wait_count': 0, 'failed': 0})
+                aggregate['count'] += 1
+                aggregate['elapsed_ms'] = round(aggregate['elapsed_ms'] + entry['elapsed_ms'], 3)
+                if entry['lock_wait_ms'] is None:
+                    aggregate['unknown_lock_wait_count'] += 1
+                else:
+                    aggregate['known_lock_wait_ms'] = round(aggregate['known_lock_wait_ms'] + entry['lock_wait_ms'], 3)
+                aggregate['failed'] += int(entry['outcome'] != 'success')
+                self._count += 1
+                self._recent.append(entry)
+                self._active_commands.pop(owner, None)
             self._changed()
 
     def finish(self):
-        if self._ended is None:
-            while self._active:
-                self.end_phase(self._active[-1], False)
+        with self._lock:
+            active = list(reversed(self._active)) if self._ended is None else []
+        for marker in active:
+            self.end_phase(marker, False)
+        with self._lock:
+            if self._ended is not None:
+                return
             self._ended = self._ms(self._started)
-            self._changed()
+        self._changed()

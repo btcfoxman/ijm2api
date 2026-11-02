@@ -17,7 +17,8 @@ from .canvas_client import (CanvasClient, identity_network_error, preparation_re
                             public_image_source_url, submission_evidence_blocks_fallback)
 from .canvas_timing import PreparationTiming, archived_attempts, INITIAL_ADMISSION_UNSET
 from .canvas_quote_hints import new_hint
-from .canvas_retry_budget import new_budget, budget_token, claim_attempt, RetryBudgetError
+from .canvas_retry_budget import (new_retry_budget, budget_token, claim_attempt,
+                                 seed_from_verified_preparations, RetryBudgetError)
 from .account_policy import credit_rejected
 from .image_model_routing import plan_image_execution, recorded_image_route
 from .errors import RegionGenerationDenied
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 ADMISSION_AUDIT_FIELDS = frozenset({'previous_submissions', 'recovery_resolution',
     'preflight_failures', 'model_eligibility_exclusions', 'preparation_admission_at',
     'preparation_attempts', 'preparation_attempt_count', 'preparation_retry_budget', 'pre_dispatch_failure',
-    'preparation_failures'})
+    'preparation_failures', 'upload_checkpoint'})
 
 
 def execution_mode(account: dict) -> str:
@@ -64,6 +65,16 @@ class CanvasServiceMixin:
         return ('manual_termination' in context or task.get('status') in {
             'failed', 'expired', 'succeeded', 'cancelled'}
             and task.get('error_code') != 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN')
+
+    @staticmethod
+    def _canvas_uploads_pending(task: dict | None) -> bool:
+        checkpoint = ((task or {}).get('upstream_context') or {}).get('upload_checkpoint')
+        if checkpoint is None:
+            return False
+        if not isinstance(checkpoint, dict):
+            return True
+        pending = checkpoint.get('pending_refs', [])
+        return not isinstance(pending, list) or bool(pending)
 
     def _update_canvas_task(self, task_id: str, values: dict) -> dict:
         return self.store.update_task(task_id, values, preserve_terminal=True)
@@ -515,7 +526,11 @@ class CanvasServiceMixin:
             return task
 
     def canvas_client(self, account: dict) -> CanvasClient:
-        return CanvasClient(self.canvas_cli, account)
+        settings = self.settings()
+        return CanvasClient(self.canvas_cli, account,
+            upload_concurrency=int(settings.get('canvas_upload_concurrency', 3)),
+            account_upload_concurrency=int(settings.get('canvas_account_upload_concurrency', 4)),
+            total_upload_concurrency=int(settings.get('canvas_total_upload_concurrency', 8)))
 
     def begin_cli_authorization(self, account_id: int, account=None):
         manager = getattr(self, "canvas_auth", None)
@@ -596,7 +611,8 @@ class CanvasServiceMixin:
     @staticmethod
     def _canvas_identity_network_retry(task: dict, exc: CanvasCLIError, deadline: float) -> bool:
         """Only a read-only identity failure can safely change this account."""
-        if time.monotonic() >= deadline or exc.outcome_unknown or task.get('run_id') or task.get('thread_id'):
+        if (time.monotonic() >= deadline or exc.outcome_unknown or task.get('run_id') or task.get('thread_id')
+                or CanvasServiceMixin._canvas_uploads_pending(task)):
             return False
         if (task.get('normalized') or {}).get('_execution'):
             return False
@@ -611,6 +627,7 @@ class CanvasServiceMixin:
         allowed = ADMISSION_AUDIT_FIELDS | ({'image_model_route'} if route else set())
         if (time.monotonic() >= deadline or exc.outcome_unknown
                 or exc.code != 'CLI_CAPABILITY_UNAVAILABLE'
+                or self._canvas_uploads_pending(task)
                 or not self._unaccepted_admission(task)
                 or any(key not in allowed for key in task.get('upstream_context') or {})):
             return False
@@ -629,21 +646,40 @@ class CanvasServiceMixin:
             context = dict(task.get('upstream_context') or {})
             budget = context.get('preparation_retry_budget')
             old_token = budget_token(budget, task_id=task_id) if budget is not None else None
+            initial_attempts = None
             if budget is None:
                 attempts = context.get('preparation_attempts') or []
                 if (not initial_failure or self._admission_history(task)
-                        or any(value != account_id for value in task.get('attempted_account_ids') or [])
-                        or len(attempts) > 1):
+                        or type(attempts) is not list or not attempts
+                        or type(context.get('preparation_attempt_count')) is not int
+                        or context['preparation_attempt_count'] != len(attempts)):
+                    raise RetryBudgetError('BUDGET_INVALID')
+                owners = {entry.get('account_id') for entry in attempts if isinstance(entry, dict)
+                          and type(entry.get('account_id')) is int}
+                if any(value not in owners for value in task.get('attempted_account_ids') or []):
+                    raise RetryBudgetError('BUDGET_INVALID')
+                if len(attempts) == 1 and (not isinstance(attempts[0], dict)
+                        or type(attempts[0].get('ordinal')) is not int or attempts[0].get('ordinal') != 1
+                        or type(attempts[0].get('account_id')) is not int
+                        or attempts[0].get('account_id') != account_id
+                        or attempts[0].get('reason') != 'command_failed'):
                     raise RetryBudgetError('BUDGET_INVALID')
                 admitted = context.get('preparation_admission_at', time.time())
-                budget = new_budget(task_id, admitted_at=admitted,
+                budget = new_retry_budget(task_id, admitted_at=admitted, retry_started_at=time.time(),
                     task_deadline=time.time() + max(0, deadline - time.monotonic()))
+                if len(attempts) > 1:
+                    initial_attempts = attempts
             token = budget_token(budget, task_id=task_id)
             proof = {'stage': 'preparation', 'node_run_count': 0,
                 'generation_request_sent': False, 'dispatch_started': False,
                 'outcome_unknown': False, 'prior_dispatch_evidence': False}
-            claimed = claim_attempt(budget, task_id=task_id, account_id=account_id, now=time.time(),
-                expected_token=token, excluded_account_ids=self._model_excluded_accounts(task), proof=proof)
+            if initial_attempts is not None:
+                claimed = seed_from_verified_preparations(budget, task_id=task_id, preparations=initial_attempts,
+                    preparation_attempt_count=context.get('preparation_attempt_count'), account_id=account_id,
+                    now=time.time(), excluded_account_ids=self._model_excluded_accounts(task), proof=proof)
+            else:
+                claimed = claim_attempt(budget, task_id=task_id, account_id=account_id, now=time.time(),
+                    expected_token=token, excluded_account_ids=self._model_excluded_accounts(task), proof=proof)
             if not self.store.claim_canvas_preparation_budget(task_id, claimed,
                     expected_updated_at=task['updated_at'], expected_token=old_token,
                     account_id=account_id, expected_context=context):
@@ -672,6 +708,10 @@ class CanvasServiceMixin:
                 return True
             account_id = int(account['id'])
             count = sum(entry['account_id'] == account_id for entry in budget['attempts'])
+            if count >= 2 and self._canvas_uploads_pending(task):
+                self._fail_canvas_task(task_id, 'CLI_PREPARATION_RETRY_EXHAUSTED',
+                    'Canvas pending uploads require their original account; preparation retry limit reached')
+                return True
             attempted = list(task.get('attempted_account_ids') or [])
             # Once this account used its two preparations, the scheduler will
             # reserve a different funded account using the durable quote.
@@ -697,7 +737,22 @@ class CanvasServiceMixin:
             return True
         prior_dispatch_evidence = self._canvas_dispatch_evidence(task)
         account_id = int(account["id"])
+        if self._canvas_uploads_pending(task):
+            # A pending material registration is not a generation receipt.
+            # Preserve paid recovery ownership, and never discard this upload
+            # binding to obtain fresh resource IDs on another account.
+            if prior_dispatch_evidence:
+                return True
+            checkpoint = (task.get('upstream_context') or {}).get('upload_checkpoint')
+            binding = checkpoint.get('binding') if isinstance(checkpoint, dict) else None
+            if (not isinstance(checkpoint, dict) or not isinstance(checkpoint.get('pending_refs'), list)
+                    or not isinstance(binding, dict) or binding.get('task_id') != task_id
+                    or type(binding.get('account_id')) is not int or binding['account_id'] != account_id):
+                self._fail_canvas_task(task_id, 'CLI_PREPARATION_RETRY_EXHAUSTED',
+                    'Canvas pending upload binding is invalid or belongs to another account')
+                return True
         generation_deadline = deadline
+        preparation_budget = None
         if (task.get('upstream_context') or {}).get('preparation_retry_budget') is not None:
             try:
                 preparation_budget = self._canvas_claim_preparation(task_id, account_id, deadline)
@@ -706,6 +761,12 @@ class CanvasServiceMixin:
                     'Canvas preparation retry budget unavailable: ' + exc.code)
                 return True
             deadline = min(deadline, time.monotonic() + max(0, preparation_budget['deadline'] - time.time()))
+            if preparation_budget['version'] == 2:
+                # The scheduler's admission cutoff is the retry window. The
+                # original task cutoff, durably bound before retrying, still
+                # owns query recovery after the sole paid generation request.
+                generation_deadline = time.monotonic() + max(0,
+                    preparation_budget['task_deadline'] - time.time())
             task = self.store.task(task_id) or task
         client = self.canvas_client(account)
         submission_started = False
@@ -713,15 +774,28 @@ class CanvasServiceMixin:
         model_pending = False
         context = {key: value for key, value in (task.get('upstream_context') or {}).items()
                    if key in ADMISSION_AUDIT_FIELDS}
+        # This is only a candidate for the client's independently validated
+        # upload-only binding. Never restore an execution/dispatch context.
+        checkpoint = context.get('upload_checkpoint')
+        binding = checkpoint.get('binding') if isinstance(checkpoint, dict) else None
+        if (prior_dispatch_evidence or not isinstance(binding, dict)
+                or binding.get('task_id') != task_id
+                or type(binding.get('account_id')) is not int or binding['account_id'] != account_id):
+            checkpoint = None
+            context.pop('upload_checkpoint', None)
         resolution = context.get('recovery_resolution') or {}
         attempt_started = number(resolution.get('attempt_started_at')) if isinstance(resolution, dict) else None
         if attempt_started is not None:
-            deadline = min(deadline, time.monotonic() + max(0,
-                attempt_started + int(self.settings()['task_timeout_seconds']) - time.time()))
+            recovery_deadline = time.monotonic() + max(0,
+                attempt_started + int(self.settings()['task_timeout_seconds']) - time.time())
+            deadline = min(deadline, recovery_deadline)
+            generation_deadline = min(generation_deadline, recovery_deadline)
         preflight_deadlines = [value for entry in self._admission_history(task)
             if isinstance(entry, dict) and (value := number(entry.get('task_deadline'))) is not None]
         if preflight_deadlines:
-            deadline = min(deadline, time.monotonic() + max(0, min(preflight_deadlines) - time.time()))
+            preflight_deadline = time.monotonic() + max(0, min(preflight_deadlines) - time.time())
+            deadline = min(deadline, preflight_deadline)
+            generation_deadline = min(generation_deadline, preflight_deadline)
 
         def timing_changed(snapshot):
             # Admission failures remain inside their existing audit entries.
@@ -841,7 +915,9 @@ class CanvasServiceMixin:
                     assets = self._canvas_local_assets(normalized, account, Path(directory), deadline=deadline)
                 self._update_canvas_task(task_id, {"cost_evidence": input_evidence(assets), "progress": 15})
                 account = self._submission_account(task_id, account, normalized)
-                prepared = client.prepare(normalized, task_id, assets, persist=persist, deadline=deadline)
+                prepare_options = {'checkpoint': checkpoint} if checkpoint is not None else {}
+                prepared = client.prepare(normalized, task_id, assets, persist=persist, deadline=deadline,
+                    **prepare_options)
                 persist(prepared)
             if time.monotonic() >= deadline:
                 fail_preparation('CLI_PREPARATION_TIMEOUT', 'Task deadline passed during Canvas preparation; no generation was submitted')
@@ -883,6 +959,10 @@ class CanvasServiceMixin:
                     raw_funded = bool(raw_balances) and min(raw_balances) >= quote
                     if not funded and (not temporary_hold or quote <= 0 or not raw_funded):
                         finish_attempt('insufficient_credits')
+                        if self._canvas_uploads_pending(self.store.task(task_id)):
+                            self._fail_canvas_task(task_id, 'CLI_PREPARATION_RETRY_EXHAUSTED',
+                                'Canvas pending uploads cannot move to a different funding account')
+                            return True
                         return False if self._requeue_unaccepted_task(task_id,
                             error_code='INSUFFICIENT_CREDITS',
                             error_message='Canvas quote exceeds available unreserved credits') else True
@@ -897,6 +977,9 @@ class CanvasServiceMixin:
                         # The durable record is committed before any paid run request.
                         began_at = time.time() if attempt_started is None else attempt_started
                         observation_deadline = began_at + int(self.settings()['task_timeout_seconds'])
+                        if preparation_budget is not None and preparation_budget['version'] == 2:
+                            observation_deadline = min(observation_deadline,
+                                time.time() + max(0, generation_deadline - time.monotonic()))
                         if preflight_deadlines:
                             observation_deadline = min(observation_deadline, min(preflight_deadlines))
                         persist({"submission_phase": "confirming", "expected_user_id": identity,
@@ -955,6 +1038,11 @@ class CanvasServiceMixin:
                 or str(error.get('serviceCode') or error.get('code')) == '1006'
                 or str(error.get('reason') or '').lower() in {'insufficient_credits', 'insufficient_balance'})
             if rejected_credit and not getattr(exc, 'outcome_unknown', False):
+                if (self._canvas_uploads_pending(current_task)
+                        and not self._canvas_dispatch_evidence(current_task)):
+                    self._fail_canvas_task(task_id, 'CLI_PREPARATION_RETRY_EXHAUSTED',
+                        'Canvas pending uploads cannot move to a different funding account')
+                    return True
                 return 'retry' if self._handle_credit_rejection(task_id, account_id, str(exc)) else True
             if submission_started and getattr(exc, "outcome_unknown", True):
                 # A lost receipt is reconciled by original operation identity.
