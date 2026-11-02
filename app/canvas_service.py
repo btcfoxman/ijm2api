@@ -20,6 +20,7 @@ from .canvas_quote_hints import new_hint
 from .canvas_retry_budget import new_budget, budget_token, claim_attempt, RetryBudgetError
 from .account_policy import credit_rejected
 from .image_model_routing import plan_image_execution, recorded_image_route
+from .errors import RegionGenerationDenied
 from .cost_adapter import input_evidence, number
 from .media import MediaError, _DIRECT_FIRST_MEDIA_HOSTS, _download, media_error_diagnostic
 from .upload import _probe_media
@@ -794,6 +795,7 @@ class CanvasServiceMixin:
                 fail_preparation('CLI_PREPARATION_TIMEOUT', 'Task deadline passed before Canvas preparation; no generation was submitted')
                 return True
             self._update_canvas_task(task_id, {"execution_backend": "canvas_cli"})
+            account = self._submission_account(task_id, account)
             with timing.phase('identity'):
                 state = client.identity(deadline=deadline)
             identity_pending = False
@@ -829,13 +831,16 @@ class CanvasServiceMixin:
             if task['model'] == 'sd-2-5-480p-x':
                 normalized['resolution'] = '720p'
             model_pending = True
+            account = self._submission_account(task_id, account, normalized)
             with timing.phase('model_preflight'):
                 client.preflight_model(normalized, deadline=deadline)
             model_pending = False
             with tempfile.TemporaryDirectory(prefix=f"ijm-canvas-{task_id}-") as directory:
+                account = self._submission_account(task_id, account, normalized)
                 with timing.phase('material_prepare'):
                     assets = self._canvas_local_assets(normalized, account, Path(directory), deadline=deadline)
                 self._update_canvas_task(task_id, {"cost_evidence": input_evidence(assets), "progress": 15})
+                account = self._submission_account(task_id, account, normalized)
                 prepared = client.prepare(normalized, task_id, assets, persist=persist, deadline=deadline)
                 persist(prepared)
             if time.monotonic() >= deadline:
@@ -906,6 +911,7 @@ class CanvasServiceMixin:
             else:
                 return True
             timing.end_phase(credit_wait)
+            account = self._submission_account(task_id, account, normalized)
             submission_started = True
             with timing.phase('confirmation_submit'), timing.defer_notifications():
                 submitted = client.submit(context, int(math.ceil(quote)), persist=persist, deadline=deadline)
@@ -913,6 +919,10 @@ class CanvasServiceMixin:
             persist({**submitted, "submission_phase": "submitted"})
             self._update_canvas_task(task_id, {"status": "submitted", "progress": 40})
             self._poll_canvas(task_id, client, generation_deadline)
+            return True
+        except RegionGenerationDenied as exc:
+            finish_attempt('region_denied')
+            self._fail_canvas_task(task_id, 'REGION_GENERATION_DENIED', str(exc))
             return True
         except CanvasCLIError as exc:
             finish_attempt('command_failed')

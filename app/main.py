@@ -8,6 +8,7 @@ import os
 import secrets
 import hashlib
 import hmac
+import logging
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,7 +18,7 @@ from fastapi import Body, Cookie, Depends, FastAPI, Header, HTTPException, Reque
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from .browser import BrowserError, CDPBrowser, browser_alive, clear_managed_profile, start_managed_browser, stop_managed_browser
+from .browser import BrowserError, CDPBrowser, account_browser_options, browser_alive, clear_managed_profile, start_managed_browser, stop_managed_browser
 from .browser_login import BrowserLoginManager, LoginError
 from .browser_login_api import register_browser_login
 from .account_import import AccountImporter
@@ -26,9 +27,11 @@ from .canvas_auth import CanvasAuthManager
 from .canvas_cli import CanvasCLIError
 from .catalog import public_models
 from .image_client import IMAGE_MODELS, image_model_requires_cli
+from .errors import GenerationCapabilityDenied, RegionGenerationDenied, public_error
 from .result_delivery import result_delivery_projection
 from .service import Service
-from .store import ACCOUNT_SECRET_FIELDS, ACCOUNT_SETUP_FIELDS, Store
+from .store import ACCOUNT_SECRET_FIELDS, ACCOUNT_SETUP_FIELDS, EXECUTION_MODES, Store
+from .region_policy import normalize_region
 
 
 API_KEY = os.getenv("IJM_API_KEY", "")
@@ -48,6 +51,7 @@ service.auto_login_busy = auto_login.busy
 canvas_auth = CanvasAuthManager(store, service, client_factory=service.canvas_client)
 service.canvas_auth = canvas_auth
 STATIC = Path(__file__).parent / "static"
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -191,6 +195,7 @@ def add_account(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     if (ACCOUNT_SECRET_FIELDS | ACCOUNT_SETUP_FIELDS | {'cli_auth_status', 'cli_auth_error', 'cli_user_id'}) & body.keys():
         raise HTTPException(status_code=422, detail='use batch import for login credentials; setup state is service-managed')
     try:
+        _validate_account_fields(body)
         with service._lock:
             existing = next((item for item in store.accounts(private=True)
                 if item['name'] == str(body.get('name') or '').strip()), None)
@@ -241,13 +246,23 @@ def account_login_results() -> dict[str, Any]:
         for account in store.accounts() if account.get('login_stage')]}
 
 
+def _validate_account_fields(body: dict[str, Any]) -> None:
+    if 'region' in body:
+        if not isinstance(body['region'], str):
+            raise ValueError('account region must be cn, us or other')
+        normalize_region(body['region'])
+    if 'execution_mode' in body and (not isinstance(body['execution_mode'], str)
+                                     or body['execution_mode'] not in EXECUTION_MODES):
+        raise ValueError('execution mode must be canvas_cli, browser or jimeng_web')
+
+
 def _assert_account_mutable(account: dict[str, Any], body: dict[str, Any]) -> None:
     """Call under service._lock to protect the browser identity during work."""
     account_id = int(account['id'])
     if (auto_login.busy(account_id) or canvas_auth.busy(account_id) or account['status'] == 'logging_in'
             or browser_login.active and browser_login.active['account_id'] == account_id):
         raise HTTPException(status_code=409, detail='account is in browser login')
-    identity = {'cdp_port', 'proxy_url', 'project_id', 'managed_profile', 'execution_mode'}
+    identity = {'cdp_port', 'proxy_url', 'project_id', 'managed_profile', 'execution_mode', 'region'}
     if any(key in body and body[key] != account.get(key) for key in identity):
         if service._active.get(account_id, 0) or store.active_account_count(account_id):
             raise HTTPException(status_code=409, detail='account has active tasks')
@@ -256,6 +271,7 @@ def _assert_account_mutable(account: dict[str, Any], body: dict[str, Any]) -> No
 @app.patch("/api/accounts/{account_id}", dependencies=[Depends(admin_auth)])
 async def patch_account(account_id: int, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     try:
+        _validate_account_fields(body)
         if auto_login.busy(account_id):
             raise HTTPException(status_code=409, detail='account is in automatic login')
         if (ACCOUNT_SECRET_FIELDS | ACCOUNT_SETUP_FIELDS | {'cli_auth_status', 'cli_auth_error', 'cli_user_id'}) & body.keys():
@@ -398,7 +414,7 @@ def _browser(account_id: int, *, start: bool = False) -> tuple[dict[str, Any], C
     port = int(account["cdp_port"] or 0)
     if not port:
         raise HTTPException(status_code=409, detail="account browser is not configured")
-    return account, CDPBrowser(port)
+    return account, CDPBrowser(port, **account_browser_options(account))
 
 
 def _frame(browser: CDPBrowser) -> dict[str, Any]:
@@ -541,9 +557,18 @@ def integration_docs() -> PlainTextResponse:
                              "image_urls, video_urls, audio_urls.\n")
 
 
+def _admission_rejection(exc: ValueError) -> HTTPException:
+    logger.info("Generation rejected before submission: %s", exc)
+    code = "REGION_GENERATION_DENIED" if isinstance(exc, RegionGenerationDenied) else "JIMENG_PROTOCOL_UNAVAILABLE"
+    return HTTPException(status_code=422, detail=public_error(code, str(exc))["message"],
+                         headers={"X-IJMAPI-Submit-Outcome": "not-accepted"})
+
+
 def _create(body: dict[str, Any]) -> dict[str, Any]:
     try:
         result = service.create(body)
+    except (RegionGenerationDenied, GenerationCapabilityDenied) as exc:
+        raise _admission_rejection(exc) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc),
                             headers={"X-IJMAPI-Submit-Outcome": "not-accepted"}) from exc
@@ -564,6 +589,8 @@ def _create(body: dict[str, Any]) -> dict[str, Any]:
 def create_image_response(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     try:
         return service.create_image(body)
+    except (RegionGenerationDenied, GenerationCapabilityDenied) as exc:
+        raise _admission_rejection(exc) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc),
                             headers={"X-IJMAPI-Submit-Outcome": "not-accepted"}) from exc

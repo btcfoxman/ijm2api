@@ -1,0 +1,239 @@
+{
+  "source": "Official Fo.DAGenVideoDraftBuilder and DADraft.toJSONString, 2026-11-02; pure synthetic objects, no generation.",
+  "cases": [
+    {
+      "model": "dreamina_seedance_40_mini",
+      "resolution": "720p",
+      "duration": 4,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_40_mini",
+      "resolution": "720p",
+      "duration": 8,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_40_mini",
+      "resolution": "720p",
+      "duration": 15,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_40_vision",
+      "resolution": "720p",
+      "duration": 4,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_40_vision",
+      "resolution": "720p",
+      "duration": 8,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_40_vision",
+      "resolution": "720p",
+      "duration": 15,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_40_pro_vision",
+      "resolution": "720p",
+      "duration": 4,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_40_pro_vision",
+      "resolution": "720p",
+      "duration": 8,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_40_pro_vision",
+      "resolution": "720p",
+      "duration": 15,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_40_pro_vision",
+      "resolution": "1080p",
+      "duration": 4,
+      "draft_min_version": "3.2.4",
+      "draft_version": "3.3.36",
+      "min_features": [],
+      "input_min_version": "3.2.4"
+    },
+    {
+      "model": "dreamina_seedance_40_pro_vision",
+      "resolution": "1080p",
+      "duration": 8,
+      "draft_min_version": "3.2.4",
+      "draft_version": "3.3.36",
+      "min_features": [],
+      "input_min_version": "3.2.4"
+    },
+    {
+      "model": "dreamina_seedance_40_pro_vision",
+      "resolution": "1080p",
+      "duration": 15,
+      "draft_min_version": "3.2.4",
+      "draft_version": "3.3.36",
+      "min_features": [],
+      "input_min_version": "3.2.4"
+    },
+    {
+      "model": "dreamina_seedance_40_pro_vision",
+      "resolution": "4k",
+      "duration": 4,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_40_pro_vision",
+      "resolution": "4k",
+      "duration": 8,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_40_pro_vision",
+      "resolution": "4k",
+      "duration": 15,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_45_pro",
+      "resolution": "480p",
+      "duration": 4,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [
+        "AIGC_Video_Seedance25ResultAction"
+      ],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_45_pro",
+      "resolution": "480p",
+      "duration": 8,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [
+        "AIGC_Video_Seedance25ResultAction"
+      ],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_45_pro",
+      "resolution": "480p",
+      "duration": 30,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [
+        "AIGC_Video_Seedance25ResultAction"
+      ],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_45_pro",
+      "resolution": "720p",
+      "duration": 4,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [
+        "AIGC_Video_Seedance25ResultAction"
+      ],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_45_pro",
+      "resolution": "720p",
+      "duration": 8,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [
+        "AIGC_Video_Seedance25ResultAction"
+      ],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_45_pro",
+      "resolution": "720p",
+      "duration": 30,
+      "draft_min_version": "3.0.5",
+      "draft_version": "3.3.36",
+      "min_features": [
+        "AIGC_Video_Seedance25ResultAction"
+      ],
+      "input_min_version": "3.0.5"
+    },
+    {
+      "model": "dreamina_seedance_45_pro",
+      "resolution": "1080p",
+      "duration": 4,
+      "draft_min_version": "3.2.4",
+      "draft_version": "3.3.36",
+      "min_features": [
+        "AIGC_Video_Seedance25ResultAction"
+      ],
+      "input_min_version": "3.2.4"
+    },
+    {
+      "model": "dreamina_seedance_45_pro",
+      "resolution": "1080p",
+      "duration": 8,
+      "draft_min_version": "3.2.4",
+      "draft_version": "3.3.36",
+      "min_features": [
+        "AIGC_Video_Seedance25ResultAction"
+      ],
+      "input_min_version": "3.2.4"
+    },
+    {
+      "model": "dreamina_seedance_45_pro",
+      "resolution": "1080p",
+      "duration": 30,
+      "draft_min_version": "3.2.4",
+      "draft_version": "3.3.36",
+      "min_features": [
+        "AIGC_Video_Seedance25ResultAction"
+      ],
+      "input_min_version": "3.2.4"
+    }
+  ]
+}

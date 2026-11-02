@@ -57,6 +57,8 @@ class AutoLoginManager:
             account = self.store.account(account_id, private=True)
             if not account:
                 raise KeyError(account_id)
+            if account.get('execution_mode') == 'jimeng_web':
+                raise ValueError('Jimeng web accounts require online browser login')
             if account_id in self._pending:
                 return self.store.account(account_id)
             cli_auth = getattr(self.service, 'canvas_auth', None)

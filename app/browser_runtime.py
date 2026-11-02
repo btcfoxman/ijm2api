@@ -7,7 +7,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
-from .browser import BrowserError, browser_alive, close_browser_port, ensure_resource_timing_capture, start_managed_browser, stop_managed_browser
+from .browser import (BrowserError, account_browser_options, browser_alive,
+    close_browser_port, ensure_resource_timing_capture, start_managed_browser, stop_managed_browser)
 
 
 class BrowserRuntime:
@@ -32,17 +33,19 @@ class BrowserRuntime:
         """Return an account with a live CDP port and whether we own its lease."""
         account_id = int(account["id"])
         if not force_managed and not self.managed(account):
-            if int(account.get("cdp_port") or 0) and browser_alive(int(account["cdp_port"])):
-                ensure_resource_timing_capture(int(account["cdp_port"]))
+            options = account_browser_options(account)
+            if int(account.get("cdp_port") or 0) and browser_alive(int(account["cdp_port"]), **options):
+                ensure_resource_timing_capture(int(account["cdp_port"]), **options)
             return account, False
         with self._lock(account_id):
             current = self.store.account(account_id, private=True)
             if not current or current["status"] == "logging_in":
                 raise BrowserError("account is in online browser login")
+            options = account_browser_options(current)
             current_port = int(current.get("cdp_port") or 0)
             if (current.get("managed_profile") and current_port != 19300 + account_id
-                    and current_port and browser_alive(current_port)):
-                ensure_resource_timing_capture(current_port)
+                    and current_port and browser_alive(current_port, **options)):
+                ensure_resource_timing_capture(current_port, **options)
                 self._leases[account_id] = self._leases.get(account_id, 0) + 1
                 return current, True
             settings = self.settings()

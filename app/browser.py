@@ -19,6 +19,7 @@ import websocket
 
 
 BASE = "https://dreamina.capcut.com"
+JIMENG_BASE = "https://jimeng.jianying.com"
 MWEB_API = "https://mweb-api-sg.capcut.com"
 MWEB_US_API = "https://dreamina-api-us-ttp2.us.capcut.com"
 COMMERCE_API = "https://commerce-api-sg.capcut.com"
@@ -39,6 +40,36 @@ _RESOURCE_TIMING_BUFFER_SCRIPT = """(() => {
  if(typeof performance.setResourceTimingBufferSize!=='function')return false;
  performance.setResourceTimingBufferSize(5000);return true;
 })()"""
+
+
+def account_browser_site(account: dict[str, Any]) -> str:
+    """Select a site from the explicit transport, independently of region."""
+    return "jimeng" if account.get("execution_mode") == "jimeng_web" else "dreamina"
+
+
+def account_browser_options(account: dict[str, Any]) -> dict[str, str]:
+    # Keep the default Dreamina calls compatible with existing CDP adapters.
+    return {"site": "jimeng"} if account_browser_site(account) == "jimeng" else {}
+
+
+def site_origin(site: str) -> str:
+    if site == "dreamina":
+        return BASE
+    if site == "jimeng":
+        return JIMENG_BASE
+    raise ValueError("browser site must be dreamina or jimeng")
+
+
+def site_start_url(site: str) -> str:
+    return site_origin(site) + ("/ai-tool/home" if site == "jimeng" else "/ai-tool/generate")
+
+
+def _site_page(port: int, site: str) -> dict[str, Any]:
+    return _page(port, site=site) if site != "dreamina" else _page(port)
+
+
+def _resource_timing_script(site: str) -> str:
+    return _RESOURCE_TIMING_BUFFER_SCRIPT.replace(BASE, site_origin(site))
 
 
 class BrowserError(Exception):
@@ -72,14 +103,16 @@ def close_resource_timing_capture(port: int) -> None:
 
 
 def ensure_resource_timing_capture(port: int, *, _target: dict[str, Any] | None = None,
-                                   _initial_navigation: bool = False) -> None:
+                                   _initial_navigation: bool = False,
+                                   site: str = "dreamina") -> None:
     """Keep each account's genuine SDK timing records across later documents."""
     with _timing_lock(port):
-        target = _target or _page(port)
+        origin = site_origin(site)
+        target = _target or _site_page(port, site)
         target_id = str(target.get("id") or "")
         url = str(target.get("url") or "")
         parsed = urllib.parse.urlsplit(url)
-        allowed = parsed.scheme == "https" and parsed.hostname == "dreamina.capcut.com"
+        allowed = parsed.scheme == "https" and parsed.netloc == urllib.parse.urlsplit(origin).netloc
         if (not target_id or target.get("type") != "page"
                 or (_initial_navigation and url != "about:blank")
                 or (not _initial_navigation and not allowed)):
@@ -93,7 +126,8 @@ def ensure_resource_timing_capture(port: int, *, _target: dict[str, Any] | None 
                 close_resource_timing_capture(port)
         elif current:
             close_resource_timing_capture(port)
-        context = CDPBrowser(port, timeout=15).resource_timing_capture(
+        options = {"site": site} if site != "dreamina" else {}
+        context = CDPBrowser(port, timeout=15, **options).resource_timing_capture(
             _target=target, _initial_navigation=_initial_navigation)
         handle = context.__enter__()
         _TIMING_CAPTURES[port] = (target_id, context, handle)
@@ -101,6 +135,8 @@ def ensure_resource_timing_capture(port: int, *, _target: dict[str, Any] | None 
 
 def account_proxy_url(account: dict[str, Any]) -> str:
     value = str(account.get("proxy_url") or "").strip()
+    if not value and account_browser_site(account) == "jimeng":
+        return ""
     parsed = urllib.parse.urlsplit(value)
     try:
         valid = parsed.scheme in {"socks5", "http", "https"} and bool(parsed.hostname) and bool(parsed.port)
@@ -120,18 +156,21 @@ def _targets(port: int) -> list[dict[str, Any]]:
         raise BrowserError(f"Dreamina CDP port {port} is unavailable: {type(exc).__name__}") from exc
 
 
-def _page(port: int) -> dict[str, Any]:
+def _page(port: int, *, site: str = "dreamina") -> dict[str, Any]:
+    origin = urllib.parse.urlsplit(site_origin(site))
     pages = [target for target in _targets(port) if target.get("type") == "page" and
-             (urllib.parse.urlsplit(target.get("url") or "").hostname or "") == "dreamina.capcut.com"]
+             (parsed := urllib.parse.urlsplit(target.get("url") or "")).scheme == "https"
+             and parsed.netloc == origin.netloc]
     pages.sort(key=lambda target: int("projectId=" in str(target.get("url") or "")), reverse=True)
     if pages:
         return pages[0]
-    raise BrowserError("open and log in to Dreamina in the account browser")
+    label = "Jimeng" if site == "jimeng" else "Dreamina"
+    raise BrowserError(f"open and log in to {label} in the account browser")
 
 
-def browser_alive(port: int) -> bool:
+def browser_alive(port: int, *, site: str = "dreamina") -> bool:
     try:
-        _page(port)
+        _site_page(port, site)
         return True
     except BrowserError:
         return False
@@ -190,13 +229,16 @@ def start_managed_browser(account: dict[str, Any], *, chrome: str, profiles: Pat
     if os.name != "nt":
         args += ["--no-sandbox", "--disable-dev-shm-usage"]
     proxy_url = account_proxy_url(account)
-    args.append("--proxy-server=" + proxy_url)
+    if proxy_url:
+        args.append("--proxy-server=" + proxy_url)
+    options = account_browser_options(account)
+    site = account_browser_site(account)
     # The new tab is ours and has not loaded account resources yet. Register
     # the persistent init script before its first normal website navigation.
     args.append("about:blank")
     with _PROCESS_LOCK:
-        if browser_alive(port):
-            ensure_resource_timing_capture(port)
+        if browser_alive(port, **options):
+            ensure_resource_timing_capture(port, **options)
             return port
         existing = _PROCESSES.get(account_id)
         if existing and existing.poll() is None:
@@ -232,7 +274,7 @@ def start_managed_browser(account: dict[str, Any], *, chrome: str, profiles: Pat
                               and str(target.get("id") or "") not in previous_targets), None)
                 if fresh:
                     stage = 'telemetry'
-                    ensure_resource_timing_capture(port, _target=fresh, _initial_navigation=True)
+                    ensure_resource_timing_capture(port, _target=fresh, _initial_navigation=True, **options)
                     ready = True
                     return port
                 time.sleep(.1)
@@ -240,9 +282,11 @@ def start_managed_browser(account: dict[str, Any], *, chrome: str, profiles: Pat
             try:
                 pages = [item for item in _targets(port) if item.get("type") == "page"]
                 hosts = {urllib.parse.urlsplit(str(item.get("url") or "")).hostname for item in pages}
-                redirected = sorted(host for host in hosts if host and host != "dreamina.capcut.com")
+                expected_host = urllib.parse.urlsplit(site_origin(site)).hostname
+                redirected = sorted(host for host in hosts if host and host != expected_host)
                 if redirected:
-                    raise BrowserError(f"Dreamina browser reached {redirected[0]}; configure an account proxy")
+                    label = "Jimeng" if site == "jimeng" else "Dreamina"
+                    raise BrowserError(f"{label} browser reached {redirected[0]}; configure an account proxy")
             except BrowserError as exc:
                 if "configure an account proxy" in str(exc):
                     raise
@@ -295,16 +339,17 @@ def clear_managed_profile(account: dict[str, Any], profiles: Path) -> None:
     """Delete only the service-owned profile for this numeric account ID."""
     account_id = int(account["id"])
     port = int(account.get("cdp_port") or 0)
-    if port == 19300 + account_id and browser_alive(port):
+    options = account_browser_options(account)
+    if port == 19300 + account_id and browser_alive(port, **options):
         try:
-            CDPBrowser(port).command("Browser.close")
+            CDPBrowser(port, **options).command("Browser.close")
         except BrowserError:
             pass
         for _ in range(30):
-            if not browser_alive(port):
+            if not browser_alive(port, **options):
                 break
             time.sleep(.1)
-        if browser_alive(port):
+        if browser_alive(port, **options):
             raise BrowserError("managed Chrome is still running; profile was not removed")
     stop_managed_browser(account_id)
     root = profiles.resolve()
@@ -316,15 +361,18 @@ def clear_managed_profile(account: dict[str, Any], profiles: Path) -> None:
 
 
 class CDPBrowser:
-    def __init__(self, port: int, timeout: float = 90) -> None:
+    def __init__(self, port: int, timeout: float = 90, *, site: str = "dreamina") -> None:
         self.port = int(port)
         self.timeout = timeout
+        self.site = site
+        self.base_url = site_origin(site)
 
     @contextmanager
     def resource_timing_capture(self, *, _target: dict[str, Any] | None = None,
                                 _initial_navigation: bool = False) -> Iterator[_ResourceTimingHandle]:
         """Keep timing-buffer injection attached across login navigations."""
-        target = _target or _page(self.port)
+        target = _target or _site_page(self.port, self.site)
+        timing_script = _resource_timing_script(self.site)
         ws = None
         identifier = None
         sequence = 0
@@ -360,7 +408,7 @@ class CDPBrowser:
                 ready_deadline = time.monotonic() + 30
                 while True:
                     try:
-                        current = command("Runtime.evaluate", {"expression": _RESOURCE_TIMING_BUFFER_SCRIPT,
+                        current = command("Runtime.evaluate", {"expression": timing_script,
                                                                 "returnByValue": True}, deadline=ready_deadline)
                     except _ResourceTimingContextPending:
                         current = {}
@@ -379,14 +427,14 @@ class CDPBrowser:
                 ws = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=self.timeout,
                                                  suppress_origin=True)
                 command("Page.enable")
-                registered = command("Page.addScriptToEvaluateOnNewDocument", {"source": _RESOURCE_TIMING_BUFFER_SCRIPT})
+                registered = command("Page.addScriptToEvaluateOnNewDocument", {"source": timing_script})
                 identifier = registered.get("identifier")
                 if not isinstance(identifier, str) or not identifier:
                     raise BrowserError("Dreamina login resource timing setup failed")
                 if _initial_navigation:
                     if target.get("url") != "about:blank":
                         raise BrowserError("Dreamina initial navigation requires an owned blank tab")
-                    navigation = command("Page.navigate", {"url": BASE + "/ai-tool/generate"})
+                    navigation = command("Page.navigate", {"url": site_start_url(self.site)})
                     if navigation.get("errorText"):
                         raise BrowserError("Dreamina initial page navigation failed")
                 # The target URL may already be Dreamina while its initial
@@ -411,7 +459,7 @@ class CDPBrowser:
                         pass
 
     def command(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        target = _page(self.port)
+        target = _site_page(self.port, self.site)
         ws = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=self.timeout,
                                          suppress_origin=True)
         try:
@@ -441,6 +489,8 @@ class CDPBrowser:
 
     def post(self, path: str, body: dict[str, Any], *, query: dict[str, str] | None = None,
              allow_empty_ret: bool = False, native_client: bool = False) -> dict[str, Any]:
+        if self.site != "dreamina":
+            raise BrowserError("Jimeng requests require the Jimeng web client")
         if not path.startswith("/") or path.startswith("//"):
             raise ValueError("Dreamina API path must be absolute")
         origin = COMMERCE_API if path.startswith("/commerce/") else MWEB_API
@@ -575,7 +625,7 @@ class CDPBrowser:
                                                   "deltaX": 0, "deltaY": delta_y})
 
     def cookies(self) -> list[dict[str, Any]]:
-        return self.command("Network.getCookies", {"urls": [BASE + "/"]}).get("cookies") or []
+        return self.command("Network.getCookies", {"urls": [self.base_url + "/"]}).get("cookies") or []
 
     def project_id(self) -> str:
         # Dreamina does not require a per-account project for generation.

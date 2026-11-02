@@ -67,28 +67,33 @@ function failureMessage(task) {
   return publicErrors[String(task.error_code || "").toUpperCase()] || "生成失败，积分已返还，请重试~";
 }
 
-function executionLabel(backend) { return backend === "canvas_cli" ? "Canvas CLI" : backend === "browser" ? "网页" : "待分配"; }
+function executionLabel(backend) { return backend === "canvas_cli" ? "Canvas CLI" : backend === "browser" ? "Dreamina 网页" : backend === "jimeng_web" ? "即梦网页" : "待分配"; }
 function cliAuthLabel(status) { return ({ pending: "待授权", required: "待授权", ready: "已授权", expired: "授权已过期", error: "授权异常", queued: "等待授权", authorizing: "授权中", manual_required: "等待确认授权", failed: "授权失败", cancelled: "已取消授权" })[status] || "待授权"; }
 
 function accountAvailability(account, settings = state.settings) {
-  const cli = account.execution_mode !== "browser";
+  const cli = !["browser", "jimeng_web"].includes(account.execution_mode);
   const runtime = settings.canvas_cli_runtime || {};
   const authorized = account.cli_auth_status === "ready";
   const gateOpen = settings.canvas_cli_enabled === true;
   const runtimeAvailable = runtime.available !== false;
   const enabledAndActive = Boolean(account.enabled) && account.status === "active";
+  const region = account.region || "other";
+  const regionRule = settings.region_generation_policy?.[region] || {enabled: region === "cn", models: {}};
+  const regionBlocked = regionRule.enabled && !Object.keys(regionRule.models || {}).length;
   let status = account.enabled || account.status === "cli_auth_required" || ["disabled_low_balance", "suspended", "logging_in", "login_pending", "login_required", "login_failed", "challenge_required", "verification_required", "setup_required", "agreement_required", "network_error"].includes(account.status) ? account.status : "disabled";
   if (cli && enabledAndActive) {
     status = !authorized ? "cli_auth_required" : !runtimeAvailable ? "cli_runtime_unavailable" : !gateOpen ? "cli_paused" : "active";
   }
-  const notice = cli && !runtimeAvailable
+  if (enabledAndActive && regionBlocked) status = "region_blocked";
+  const notice = regionBlocked ? "该区域尚未允许任何模型，请在运行设置中配置区域规则" : cli && !runtimeAvailable
     ? `CLI 运行环境不兼容，暂不能接单${runtime.message ? `：${runtime.message}` : ""}`
     : cli && !authorized ? "请完成 Canvas CLI 授权" : cli && !gateOpen ? "Canvas CLI 接单已关闭" : "";
   const summary = cli ? [cliAuthLabel(account.cli_auth_status), !gateOpen ? "接单已关闭" : "", !runtimeAvailable ? "CLI 环境不兼容" : ""].filter(Boolean).join(" · ") : "";
-  return { available: enabledAndActive && (!cli || authorized && gateOpen && runtimeAvailable), status, notice, summary };
+  return { available: enabledAndActive && !regionBlocked && (!cli || authorized && gateOpen && runtimeAvailable), status, notice, summary };
 }
 
 function accountAvailabilityBadge(value) {
+  if (value.status === "region_blocked") return '<span class="badge disabled">区域受限</span>';
   if (value.status === "cli_runtime_unavailable") return '<span class="badge network_error">环境异常</span>';
   if (value.status === "cli_paused") return '<span class="badge disabled">已暂停</span>';
   const compact = { cli_auth_required: "待授权", verification_required: "待验证", agreement_required: "待确认" };
@@ -117,12 +122,12 @@ function renderAccounts() {
     const availability = accountAvailability(account);
     const statusDetail = [availability.notice, progress, account.last_error].filter(Boolean).join(" · ");
     const identity = account.login_identifier || account.email || account.user_id || "";
-    return `<tr><td><span class="cell-title"><span class="account-id mono">#${account.id}</span>${escapeHtml(account.name)}</span><span class="cell-sub" title="${escapeHtml(identity)}">${escapeHtml(identity)}</span></td>
+    return `<tr><td><span class="cell-title"><span class="account-id mono">#${account.id}</span>${escapeHtml(account.name)}</span><span class="cell-sub" title="${escapeHtml(identity)}">${escapeHtml(identity)}</span><select class="execution-select" data-account-region="${account.id}" aria-label="账号 #${account.id} 区域"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}><option value="cn"${account.region === "cn" ? " selected" : ""}>中国大陆</option><option value="us"${account.region === "us" ? " selected" : ""}>美国</option><option value="other"${!["cn", "us"].includes(account.region) ? " selected" : ""}>其他区域</option></select></td>
       <td title="${escapeHtml(statusDetail)}">${accountAvailabilityBadge(availability)}</td>
       <td title="${escapeHtml(detail)}"><span class="cell-title mono">${escapeHtml(amount(account.last_balance))}</span><span class="cell-sub">${escapeHtml(quotaSummary)}</span></td>
       <td><input class="priority-input mono" data-account-priority="${account.id}" type="number" min="0" max="2147483647" step="1" value="${account.priority ?? 0}" title="优先级越高越先执行；相同优先级按余额和账号编号排序" aria-label="账号 #${account.id} 执行优先级"></td>
       <td><span class="slots ${account.active_tasks ? "busy" : ""}"><i></i><b class="mono">${account.active_tasks || 0} /</b><input class="concurrency-input mono" data-account-concurrency="${account.id}" type="number" min="1" value="${account.max_concurrency}" title="修改账号并发"></span></td><td class="mono">${account.total_uses || 0}</td>
-      <td><span class="cell-title mono proxy" title="${escapeHtml(proxyLabel(account.proxy_url))}">${escapeHtml(proxyLabel(account.proxy_url))}</span></td><td title="${escapeHtml([availability.summary, account.cli_auth_error].filter(Boolean).join(" · "))}"><div class="execution-controls"><select class="execution-select" data-account-mode="${account.id}" aria-label="账号 #${account.id} 提交模式"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}><option value="canvas_cli"${account.execution_mode !== "browser" ? " selected" : ""}>Canvas CLI</option><option value="browser"${account.execution_mode === "browser" ? " selected" : ""}>网页提交</option></select><button class="link-button" data-action="cli-auth" data-id="${account.id}"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}>CLI 授权</button></div>${account.execution_mode === "browser" ? `<span class="cell-sub">CDP ${account.cdp_port || "按需启动"}</span>` : ""}</td><td>${fmtTime(account.updated_at)}</td>
+      <td><span class="cell-title mono proxy" title="${escapeHtml(proxyLabel(account.proxy_url))}">${escapeHtml(proxyLabel(account.proxy_url))}</span></td><td title="${escapeHtml([availability.summary, account.cli_auth_error].filter(Boolean).join(" · "))}"><div class="execution-controls"><select class="execution-select" data-account-mode="${account.id}" aria-label="账号 #${account.id} 提交模式"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}><option value="canvas_cli"${!["browser", "jimeng_web"].includes(account.execution_mode) ? " selected" : ""}>Canvas CLI</option><option value="browser"${account.execution_mode === "browser" ? " selected" : ""}>Dreamina 网页</option><option value="jimeng_web"${account.execution_mode === "jimeng_web" ? " selected" : ""}>即梦网页</option></select>${account.execution_mode !== "jimeng_web" ? `<button class="link-button" data-action="cli-auth" data-id="${account.id}"${account.active_tasks || account.status === "logging_in" ? " disabled" : ""}>CLI 授权</button>` : ""}</div>${["browser", "jimeng_web"].includes(account.execution_mode) ? `<span class="cell-sub">CDP ${account.cdp_port || "按需启动"}</span>` : ""}</td><td>${fmtTime(account.updated_at)}</td>
       <td><div class="row-actions">${account.password_configured ? `<button class="icon-button" data-action="auto-login" data-id="${account.id}" title="自动登录并完成去水印 / AI 协议设置"${account.status === "logging_in" ? " disabled" : ""}><i data-lucide="log-in"></i></button>` : ""}<button class="icon-button" data-action="check" data-id="${account.id}" title="检测"><i data-lucide="activity"></i></button><button class="icon-button" data-action="login" data-id="${account.id}" title="CDP 登录"><i data-lucide="monitor-up"></i></button><button class="icon-button" data-action="web-login" data-id="${account.id}" title="网页登录 / 打开账号网页"><i data-lucide="monitor"></i></button><button class="icon-button${account.status === "challenge_required" ? " needs-verification" : ""}" data-action="browser-assist" data-id="${account.id}" title="人工验证"><i data-lucide="mouse-pointer-2"></i></button><button class="icon-button" data-action="reset-profile" data-id="${account.id}" title="重置 Profile"><i data-lucide="fingerprint"></i></button><button class="icon-button" data-action="toggle" data-id="${account.id}" data-enabled="${account.enabled}" title="${account.enabled ? "禁用" : "启用"}"><i data-lucide="${account.enabled ? "pause" : "play"}"></i></button>${account.enabled ? "" : `<button class="icon-button danger" data-action="delete" data-id="${account.id}" title="删除"><i data-lucide="trash-2"></i></button>`}</div></td></tr>`;
   }).join("");
   $("#accountsEmpty").classList.toggle("show", !items.length); $("#metricAccounts").textContent = `${state.accounts.filter((item) => accountAvailability(item).available).length} / ${state.accounts.length}`;
@@ -145,7 +150,7 @@ function upstreamIdentifierCell(task) {
   if (ids.task_id) rows.push(line('上游任务ID', ids.task_id));
   for (const value of ids.resource_ids || []) rows.push(line('上游资源ID', value));
   if (!rows.length) rows.push('<span class="cell-sub">上游任务ID：尚未取得</span>');
-  if (ids.submission_id) rows.push(line('提交ID', ids.submission_id, `本地预分配的 Canvas 提交标识，用于查询原提交；不是上游生成任务ID。${ids.submission_id}`));
+  if (ids.submission_id) rows.push(line('提交ID', ids.submission_id, `本地预分配的提交标识，用于查询原提交；不是上游生成任务ID。${ids.submission_id}`));
   return `<span class="upstream-identifiers">${rows.join('')}</span>`;
 }
 
@@ -293,6 +298,13 @@ document.addEventListener("click", async (event) => {
   if (!event.target.closest("#mediaPopover,[data-action='media'],[data-detail-media]")) $("#mediaPopover").hidden = true;
 });
 document.addEventListener("change", async (event) => {
+  const regionInput = event.target.closest("[data-account-region]");
+  if (regionInput) {
+    regionInput.disabled = true;
+    try { await api(`/api/accounts/${Number(regionInput.dataset.accountRegion)}`, { method: "PATCH", body: JSON.stringify({ region: regionInput.value }) }); toast("账号区域已更新"); }
+    catch (error) { toast(error.message, true); }
+    await refresh(); return;
+  }
   const modeInput = event.target.closest("[data-account-mode]");
   if (modeInput) {
     modeInput.disabled = true;
@@ -334,7 +346,13 @@ $("#taskLimit").addEventListener("change", () => {
   try { localStorage.setItem(TASK_LIMIT_STORAGE_KEY, String(limit)); } catch {}
   refresh();
 });
-$("#addAccountButton").addEventListener("click", () => { $("#accountForm").reset(); $("#accountForm").elements.namedItem("max_concurrency").value = 1; $("#accountDialog").showModal(); });
+function syncAccountTransportFields(form, useRegionDefault = false) {
+  const web = form.elements.namedItem("execution_mode").value === "jimeng_web";
+  form.elements.namedItem("proxy_url").required = !web;
+  if (useRegionDefault) form.elements.namedItem("region").value = web ? "cn" : "other";
+}
+$("#accountForm").addEventListener("change", (event) => { if (event.target.name === "execution_mode") syncAccountTransportFields(event.currentTarget, true); });
+$("#addAccountButton").addEventListener("click", () => { $("#accountForm").reset(); $("#accountForm").elements.namedItem("max_concurrency").value = 1; syncAccountTransportFields($("#accountForm")); $("#accountDialog").showModal(); });
 $("#batchButton").addEventListener("click", () => { renderBatchResult(); $("#batchDialog").showModal(); });
 $("#newTaskButton").addEventListener("click", () => { renderModels(); validateJson(); $("#taskDialog").showModal(); }); $("#requestJson").addEventListener("input", validateJson);
 function lowBalanceModelOptions(settings) {
@@ -358,6 +376,36 @@ function lowBalanceSettingsPayload(form, settings) {
   if (!lowBalanceModelOptions(settings).includes(target)) throw new Error("实际生成模型不可用，请刷新设置后重新选择");
   return { low_balance_image_rescue_threshold: threshold, low_balance_seedream_target_model: target };
 }
+function renderRegionGenerationSettings(form, settings) {
+  const policy = settings.region_generation_policy || {};
+  for (const region of ["cn", "us", "other"]) {
+    const entry = policy[region] || {enabled: region === "cn", models: {}};
+    form.elements.namedItem(`region_${region}_enabled`).checked = entry.enabled;
+    form.elements.namedItem(`region_${region}_models`).value = Object.entries(entry.models || {}).sort(([a], [b]) => a.localeCompare(b)).map(([model, rule]) => rule.min_duration === undefined ? model : `${model} ${rule.min_duration}-${rule.max_duration}`).join("\n");
+  }
+}
+function regionGenerationSettingsPayload(form) {
+  const policy = {};
+  for (const region of ["cn", "us", "other"]) {
+    const models = {};
+    const lines = form.elements.namedItem(`region_${region}_models`).value.split(/\r?\n/);
+    for (const [index, raw] of lines.entries()) {
+      const line = raw.trim();
+      if (!line) continue;
+      const match = /^([a-z0-9][a-z0-9._-]*)(?:\s+(\d+)\s*-\s*(\d+))?$/.exec(line);
+      if (!match || Object.hasOwn(models, match[1])) throw new Error(`${region} 第 ${index + 1} 行格式无效或模型重复；请填写模型别名和秒数范围`);
+      let rule = {};
+      if (match[2] !== undefined) {
+        const minimum = Number(match[2]), maximum = Number(match[3]);
+        if (!Number.isSafeInteger(minimum) || !Number.isSafeInteger(maximum) || minimum < 4 || maximum > 30 || minimum > maximum) throw new Error(`${region} 第 ${index + 1} 行秒数范围无效`);
+        rule = {min_duration: minimum, max_duration: maximum};
+      }
+      models[match[1]] = rule;
+    }
+    policy[region] = {enabled: form.elements.namedItem(`region_${region}_enabled`).checked, models};
+  }
+  return {region_generation_policy: policy};
+}
 $("#settingsButton").addEventListener("click", () => {
   const form = $("#settingsForm");
   Object.entries(state.settings).forEach(([key, value]) => {
@@ -367,6 +415,7 @@ $("#settingsButton").addEventListener("click", () => {
     else input.value = value ?? "";
   });
   renderLowBalanceSettings(form, state.settings);
+  renderRegionGenerationSettings(form, state.settings);
   form.elements.namedItem("result_s3_center_token").value = "";
   $("#s3TokenHint").textContent = state.settings.result_s3_center_token_configured
     ? "已配置；留空保留当前密钥" : "尚未配置";
@@ -392,11 +441,12 @@ $("#settingsForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
   const field = (name) => form.elements.namedItem(name);
-  let lowBalance;
-  try { lowBalance = lowBalanceSettingsPayload(form, state.settings); }
+  let lowBalance, regionPolicy;
+  try { lowBalance = lowBalanceSettingsPayload(form, state.settings); regionPolicy = regionGenerationSettingsPayload(form); }
   catch (error) { toast(error.message, true); return; }
   const payload = {
     ...lowBalance,
+    ...regionPolicy,
     canvas_cli_enabled: field("canvas_cli_enabled").checked,
     task_workers: Number(field("task_workers").value),
     task_queue_capacity: Number(field("task_queue_capacity").value),

@@ -66,3 +66,42 @@ def test_legacy_balance_cost_requires_isolation_evidence():
     assert build_observations(task(actual_cost=200))[0]["charged"] is None
     assert build_observations(task(actual_cost=200, _cost_balance_isolated=False))[0]["charged"] is None
     assert build_observations(task(actual_cost=0, _cost_balance_isolated=True))[0]["charged"] == 0
+
+
+def test_jimeng_quote_zero_is_evidence_not_a_charge_and_uses_the_real_provider_job():
+    value = task(execution_backend='jimeng_web', generation_id=None, account_id=7, run_id='original-submit',
+                 upstream_context={'submit_id': 'original-submit', 'upstream_task_id': '49769566645772'},
+                 normalized={'_cost_evidence': {'jimeng_quote': {'source': 'native_get_need_credits', 'amount': 0,
+                     'account_id': 7, 'submit_id': 'original-submit'}}})
+    result = build_observations(value)[0]
+    assert result['quoted'] == 0 and result['source'] == 'quote'
+    assert result['charged'] is None and result['refunded'] is None
+    assert result['upstream_task_id'] == '49769566645772'
+    assert result['attempt_id'] == 'original-submit'
+    value['run_id'] = None
+    prepared = build_observations(value)[0]
+    assert prepared['source'] == 'quote' and prepared['quoted'] == 0 and prepared['charged'] is None
+    value['run_id'] = 'original-submit'
+    value['normalized']['_cost_evidence']['jimeng_quote']['submit_id'] = 'another-submit'
+    assert build_observations(value)[0]['source'] == 'formula'
+    value['upstream_context']['submit_id'] = 'another-submit'
+    assert build_observations(value)[0]['source'] == 'formula'
+
+
+def test_jimeng_without_a_provider_job_does_not_export_its_local_uuid_as_one():
+    value = task(execution_backend='jimeng_web', generation_id=None, run_id='allocated-submit',
+                 upstream_context={'submit_id': 'allocated-submit'})
+    result = build_observations(value)[0]
+    assert result['upstream_task_id'] == ''
+    assert result['attempt_id'] == 'allocated-submit'
+
+
+def test_jimeng_model_comes_from_its_bound_native_quote_instead_of_international_alias():
+    value = task(execution_backend='jimeng_web', account_id=7, run_id='original-submit',
+                 upstream_context={'submit_id': 'original-submit'}, normalized={
+                     'upstream_model': 'dreamina_seedance_40', '_cost_evidence': {'jimeng_quote': {
+                         'source': 'native_get_need_credits', 'amount': 24, 'account_id': 7,
+                         'submit_id': 'original-submit', 'bound': {'model_req_key': 'dreamina_seedance_40_vision'}}}})
+    assert build_observations(value)[0]['upstream_model'] == 'dreamina_seedance_40_vision'
+    value['run_id'] = 'different-submit'
+    assert build_observations(value)[0]['upstream_model'] == 'dreamina_seedance_40'

@@ -5,9 +5,19 @@ from __future__ import annotations
 import re
 
 
+class RegionGenerationDenied(ValueError):
+    """A current account policy rejected an operation before submission."""
+
+
+class GenerationCapabilityDenied(ValueError):
+    """No configured compatible transport can submit this normalized request."""
+
+
 CONTENT_MODERATION_MESSAGE = "检测到内容可能违规，请修改提示词或参考素材后重试~"
 RETRYABLE_SUBMISSION_MESSAGE = "生成提交失败，请稍后重试~"
 BOUNDED_RETRY_FAILURE_MESSAGE = "视频生成提交失败，请稍后重试~"
+UNCERTAIN_SUBMISSION_MESSAGE = "提交结果未确认，请核对上游任务，暂勿重复提交~"
+PARAMETER_VALIDATION_MESSAGE = "请求参数未通过上游校验，请检查参数或参考素材后重试~"
 
 
 def upstream_review_error(code: str, message: str) -> str | None:
@@ -24,6 +34,15 @@ def upstream_review_error(code: str, message: str) -> str | None:
 def public_error(code: str, message: str) -> dict[str, str]:
     raw = (message or "").lower()
     kind = (code or "").upper()
+    # Typed phases win over arbitrary diagnostic prose. These codes retain
+    # routing detail while callers receive only the approved message set.
+    if kind in {'REGION_GENERATION_DENIED', 'JIMENG_PROTOCOL_UNAVAILABLE',
+                'JIMENG_CREDITS_INSUFFICIENT', 'JIMENG_UPSTREAM_FAILED'}:
+        return {'code': kind, 'message': BOUNDED_RETRY_FAILURE_MESSAGE}
+    if kind == 'JIMENG_UPSTREAM_REJECTED':
+        return {'code': kind, 'message': PARAMETER_VALIDATION_MESSAGE}
+    if kind in {'JIMENG_QUERY_FAILED', 'JIMENG_RESULT_MISSING'}:
+        return {'code': kind, 'message': UNCERTAIN_SUBMISSION_MESSAGE}
     if kind in {'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED', 'CLI_PREPARATION_RETRY_EXHAUSTED'}:
         return {'code': kind, 'message': BOUNDED_RETRY_FAILURE_MESSAGE}
     if kind in {'CLI_PREPARATION_TRANSIENT_FAILED', 'CLI_SUBMISSION_RETRYABLE'}:
@@ -81,12 +100,12 @@ def public_error(code: str, message: str) -> dict[str, str]:
     if kind == "VIDEO_EDIT_CONSTRAINT" or "video editing task" in raw:
         return {"code": "VIDEO_EDIT_CONSTRAINT", "message": "素材时长不支持，请修改后再试~"}
     if kind in {"UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "UPSTREAM_TIMEOUT", "CLI_SUBMISSION_UNCONFIRMED"}:
-        return {"code": kind, "message": "提交结果未确认，请核对上游任务，暂勿重复提交~"}
+        return {"code": kind, "message": UNCERTAIN_SUBMISSION_MESSAGE}
     if "media download failed" in raw or kind == "MEDIA_DOWNLOAD_FAILED":
         return {"code": "MEDIA_DOWNLOAD_FAILED", "message": "素材下载失败，请检查素材链接后重试~"}
-    if "reference media exceeds" in raw:
+    if kind == 'MEDIA_LIMIT_EXCEEDED' or "reference media exceeds" in raw:
         return {"code": "MEDIA_LIMIT_EXCEEDED", "message": "素材超限，请修改后再试~"}
-    if "wrong content type" in raw:
+    if kind == 'MEDIA_FORMAT_UNSUPPORTED' or "wrong content type" in raw:
         return {"code": "MEDIA_FORMAT_UNSUPPORTED", "message": "素材格式不支持，请修改后再试~"}
     if "web upload failed" in raw or kind == "MEDIA_UPLOAD_FAILED":
         return {"code": "MEDIA_UPLOAD_FAILED", "message": "素材上传失败，请检查素材后重试~"}

@@ -136,6 +136,27 @@ test('migrated enabled accounts waiting for authorization are not reported as av
   assert.equal(ui.requests.length, 0, 'rendering availability must not patch account configuration');
 });
 
+test('Jimeng web accounts show their own transport and region without requiring CLI authorization', () => {
+  const ui = harness();
+  loadAccountRenderer(ui, [account(1, {execution_mode: 'jimeng_web', region: 'cn',
+    cli_auth_status: 'pending', proxy_url: ''})],
+    {canvas_cli_enabled: false, canvas_cli_runtime: {available: false}, region_generation_policy:
+      {cn: {enabled: true, models: {'sd-2-0': {min_duration: 4, max_duration: 15}}}}});
+  assert.equal(ui.element('#metricAccounts').textContent, '1 / 1');
+  const row = ui.element('#accountsBody').innerHTML;
+  assert.match(row, /value="jimeng_web" selected/);
+  assert.match(row, /data-account-region="1"/);
+  assert.match(row, /value="cn" selected/);
+  assert.doesNotMatch(row, /data-action="cli-auth"/);
+});
+
+test('empty mainland allowlist shows regional restriction instead of reporting an available account', () => {
+  const ui = harness();
+  loadAccountRenderer(ui, [account(1, {execution_mode: 'jimeng_web', region: 'cn'})], {});
+  assert.equal(ui.element('#metricAccounts').textContent, '0 / 1');
+  assert.match(ui.element('#accountsBody').innerHTML, /区域受限/);
+});
+
 test('available metric requires effective CLI readiness and keeps browser mode independent', () => {
   const ui = harness();
   loadAccountRenderer(ui, [

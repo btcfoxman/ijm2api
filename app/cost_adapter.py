@@ -128,11 +128,21 @@ def build_observations(task: dict[str, Any]) -> list[dict[str, Any]]:
     quoted = number(task.get("estimated_cost"))
     quoted = quoted if quoted is not None and quoted > 0 else None
     source = "formula" if quoted is not None else "unknown"
+    verified_jimeng_quote = {}
     if SERVICE == 'ijm2api':
         context['execution_backend'] = str(task.get('execution_backend') or 'browser')
         quote = mapping(evidence.get('canvas_quote'))
         if quote.get('source') == 'node.quote' and number(quote.get('amount')) is not None:
             quoted, source = number(quote['amount']), 'quote'
+        quote = mapping(evidence.get('jimeng_quote'))
+        if (task.get('execution_backend') == 'jimeng_web'
+                and quote.get('source') == 'native_get_need_credits'
+                and quote.get('submit_id') == mapping(task.get('upstream_context')).get('submit_id')
+                and (not task.get('run_id') or quote.get('submit_id') == task.get('run_id'))
+                and quote.get('submit_id') and quote.get('account_id') == task.get('account_id')
+                and number(quote.get('amount')) is not None):
+            quoted, source = number(quote['amount']), 'quote'
+            verified_jimeng_quote = quote
     if SERVICE in {"ak2api", "mag2api"}:
         quotes = [number(mapping(item).get("fee")) for item in attempts if "calculate_fee" in mapping(item)]
         if quotes:
@@ -198,11 +208,19 @@ def build_observations(task: dict[str, Any]) -> list[dict[str, Any]]:
     model = caller.get("model") or task.get("model") or request.get("model") or ""
     execution = task.get("channel") or SERVICE
     attempt = task.get("generation_id") or task.get("run_id") or protocol.get("job_ref")
+    upstream_task_id = str(task.get("generation_id") or task.get("run_id") or "")
+    if SERVICE == 'ijm2api' and task.get('execution_backend') == 'jimeng_web':
+        from .task_identifiers import upstream_identifiers
+        upstream_task_id = upstream_identifiers(task)['task_id']
+    upstream_model = request.get("upstream_model") or submit.get("model") or model
+    native_model = mapping(verified_jimeng_quote.get('bound')).get('model_req_key')
+    if isinstance(native_model, str) and native_model:
+        upstream_model = native_model
     row = {"task_id": str(task.get("id") or task.get("task_id") or ""),
            "attempt_id": str(attempt or (str(task.get("id") or "") + ":pending")),
-           "upstream_task_id": str(task.get("generation_id") or task.get("run_id") or ""),
+           "upstream_task_id": upstream_task_id,
            "channel": SERVICE, "execution_source": str(execution), "model": str(model),
-           "upstream_model": str(request.get("upstream_model") or submit.get("model") or model),
+           "upstream_model": str(upstream_model),
            "duration": duration, "requested_duration": first_number(caller.get("duration"), duration),
            "reference_seconds": number(reference), "requested_reference_seconds": requested_reference,
            "billable_reference_seconds": first_number(evidence.get("billable_reference_seconds"), submit.get("billable_reference_seconds")),

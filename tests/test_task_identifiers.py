@@ -22,6 +22,17 @@ def test_browser_retains_its_existing_upstream_lookup_id():
         'task_id': 'upstream-task', 'submission_id': '', 'resource_ids': []}
 
 
+def test_jimeng_displays_the_accepted_provider_job_separately_from_allocated_uuid():
+    task = {'execution_backend': 'jimeng_web', 'run_id': 'allocated-local-uuid',
+            'upstream_context': {'submit_id': 'allocated-local-uuid', 'upstream_task_id': '49769566645772',
+                                 'trace_id': 'gen-diagnostic-only', 'resource_ids': ['input-reference']}}
+    assert upstream_identifiers(task) == {
+        'task_id': '49769566645772', 'submission_id': 'allocated-local-uuid', 'resource_ids': []}
+    del task['upstream_context']['upstream_task_id']
+    assert upstream_identifiers(task) == {
+        'task_id': '', 'submission_id': 'allocated-local-uuid', 'resource_ids': []}
+
+
 def test_identifier_projection_ignores_malformed_values_without_exposing_raw_context():
     assert upstream_identifiers({'execution_backend': 'canvas_cli', 'upstream_context': {
         'submit_id': 'https://secret.invalid?token=private',

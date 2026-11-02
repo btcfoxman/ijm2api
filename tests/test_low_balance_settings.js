@@ -17,6 +17,8 @@ function harness(settings = {}) {
     'enable_sd_2_5_480p_x', 'result_s3_center_api_base', 'result_s3_bucket',
     'result_s3_key_prefix', 'result_s3_center_token', 'low_balance_image_rescue_threshold',
     'low_balance_seedream_target_model',
+    'region_cn_enabled', 'region_cn_models', 'region_us_enabled', 'region_us_models',
+    'region_other_enabled', 'region_other_models',
   ].map((name) => [name, {value: '', checked: false, innerHTML: ''}]));
   const listeners = {};
   const form = {elements: {namedItem: (name) => fields[name]}, addEventListener: (name, fn) => { listeners[name] = fn; }};

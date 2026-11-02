@@ -105,3 +105,18 @@ test('cancelling an in-flight verification does not revive its viewer', async ()
   assert.equal(ui.element('onlineAccountFrame').src, 'about:blank');
   assert.equal(ui.element('onlineAccountDialog').open, false);
 });
+
+test('online Jimeng creation defaults mainland and permits a direct browser connection', async () => {
+  const ui = loginUI(defaultReply);
+  const fields = {execution_mode: {value: 'jimeng_web'}, region: {value: 'other'}, proxy_url: {required: true}};
+  const form = ui.element('onlineAccountForm');
+  form.elements = {namedItem: name => fields[name]};
+  await form.emit('change', {target: {name: 'execution_mode'}});
+  assert.equal(fields.region.value, 'cn');
+  assert.equal(fields.proxy_url.required, false);
+  fields.execution_mode.value = 'browser';
+  await form.emit('change', {target: {name: 'execution_mode'}});
+  assert.equal(fields.region.value, 'other');
+  assert.equal(fields.proxy_url.required, true);
+  assert.equal(ui.requests.length, 0);
+});

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import secrets
 import shutil
@@ -14,7 +15,8 @@ from urllib.parse import urlsplit
 
 import requests
 
-from .browser import BrowserError, BrowserRejected, browser_alive, close_resource_timing_capture, ensure_resource_timing_capture
+from .browser import (BrowserError, BrowserRejected, account_browser_options, account_browser_site,
+    browser_alive, close_resource_timing_capture, ensure_resource_timing_capture, site_start_url)
 from .client import DreaminaClient as UpstreamClient
 from .account_automation import AccountAutomation
 from .auto_login import verified_login_user_id
@@ -28,7 +30,7 @@ class LoginError(Exception):
         self.status = status
 
 
-def _verification_failure(exc: Exception, stage: str) -> str:
+def _verification_failure(exc: Exception, stage: str, *, site: str = "dreamina") -> str:
     """Explain a failed admin check without returning browser or response data."""
     known_browser_errors = {
         "account proxy must be a SOCKS5 or HTTP proxy with host and port":
@@ -49,7 +51,8 @@ def _verification_failure(exc: Exception, stage: str) -> str:
             "Dreamina credit service returned an unreadable response",
     }
     if isinstance(exc, BrowserRejected):
-        reason = "Dreamina credit service rejected verification; check the signed-in account"
+        label = "Jimeng" if site == "jimeng" else "Dreamina"
+        reason = f"{label} credit service rejected verification; check the signed-in account"
     elif isinstance(exc, BrowserError):
         reason = known_browser_errors.get(str(exc), "browser connection or page request failed")
     else:
@@ -73,9 +76,11 @@ def browser_proxy(value: str) -> str:
 
 
 class LoginDesktop:
-    def __init__(self, profile: Path, proxy: str) -> None:
+    def __init__(self, profile: Path, proxy: str, *, site: str = "dreamina") -> None:
         self.profile = profile
         self.proxy = proxy
+        self.site = site
+        self.start_url = site_start_url(site)
         self.folder: tempfile.TemporaryDirectory | None = None
         self.processes: list[asyncio.subprocess.Process] = []
         self.display: str | None = None
@@ -183,7 +188,7 @@ class LoginDesktop:
                 f"--remote-debugging-port={self.cdp_port}"]
         if self.proxy:
             args.append("--proxy-server=" + self.proxy)
-        args.append("https://dreamina.capcut.com/ai-tool/generate")
+        args.append(self.start_url)
         browser = await self._spawn(*args, stdout=asyncio.subprocess.DEVNULL, env=env)
         for _ in range(100):
             if browser.returncode is not None:
@@ -289,9 +294,13 @@ class BrowserLoginManager:
             if cli_auth and cli_auth.busy(account_id):
                 raise LoginError('account is in Canvas CLI authorization')
             proxy = browser_proxy(str(account["proxy_url"]))
+            site = account_browser_site(account)
+            options = account_browser_options(account)
+            if not proxy and site != "jimeng":
+                raise LoginError("account proxy is required", 422)
             desktop = self.desktops.get(account_id)
-            if desktop and desktop.proxy != proxy:
-                raise LoginError("account proxy changed; close the old browser before login")
+            if desktop and (desktop.proxy != proxy or getattr(desktop, "site", "dreamina") != site):
+                raise LoginError("account site or proxy changed; close the old browser before login")
             if desktop and not desktop.alive():
                 await desktop.close()
                 self.desktops.pop(account_id, None)
@@ -314,7 +323,7 @@ class BrowserLoginManager:
                     "login_stage": "manual_login", "watermark_ready": False, "agreement_ready": False,
                     "setup_checked_at": None})
             root = Path(str(self.service.settings()["chrome_user_data_root"]))
-            desktop = desktop or LoginDesktop(root / str(account_id), proxy)
+            desktop = desktop or LoginDesktop(root / str(account_id), proxy, **options)
             active = {"id": secrets.token_urlsafe(18), "ticket": secrets.token_urlsafe(32),
                       "account_id": account_id, "desktop": desktop,
                       "previous": account, "new_desktop": account_id not in self.desktops,
@@ -335,11 +344,11 @@ class BrowserLoginManager:
                     await desktop.start()
                     self.desktops[account_id] = desktop
                 target_deadline = time.monotonic() + 30
-                while not await asyncio.to_thread(browser_alive, desktop.cdp_port):
+                while not await asyncio.to_thread(browser_alive, desktop.cdp_port, **options):
                     if time.monotonic() >= target_deadline:
-                        raise BrowserError("Dreamina login page target did not become ready")
+                        raise BrowserError("account login page target did not become ready")
                     await asyncio.sleep(.1)
-                await asyncio.to_thread(ensure_resource_timing_capture, desktop.cdp_port)
+                await asyncio.to_thread(ensure_resource_timing_capture, desktop.cdp_port, **options)
                 active["phase"] = "login"
                 return self.status()
             except BaseException:
@@ -364,17 +373,38 @@ class BrowserLoginManager:
                     raise LoginError("account no longer exists", 404)
                 temporary = {**account, "cdp_port": active["desktop"].cdp_port}
                 stage = "browser setup"
-                client = UpstreamClient(temporary)
-                stage = "credit read"
-                state = await asyncio.to_thread(client.account_state)
-                stage = 'generation preferences'
-                ready = await asyncio.to_thread(AccountAutomation(temporary, self.service.settings(),
-                    allow_initial_identity=True).ensure_ready)
-                if ready.get('watermark_ready') is not True or ready.get('agreement_ready') is not True:
-                    raise LoginError('generation preferences are not confirmed; check watermark and AI agreement settings')
-                login_user_id = verified_login_user_id(ready)
-                if not login_user_id:
-                    raise LoginError('signed-in account identity is not confirmed; complete login before retrying')
+                jimeng = account_browser_site(account) == "jimeng"
+                if jimeng:
+                    from .jimeng_client import JimengWebClient
+                    client = JimengWebClient(temporary)
+                    stage = "account identity"
+                    identity = await asyncio.to_thread(client.login_identity)
+                    login_user_id = verified_login_user_id({
+                        "identity_verified": isinstance(identity, dict) and identity.get("authenticated") is True,
+                        "identity": identity})
+                    if not login_user_id:
+                        raise LoginError('signed-in Jimeng account identity is not confirmed; complete login before retrying')
+                    stage = "credit read"
+                    state = await asyncio.to_thread(client.account_state)
+                    balance = state.get("available_balance") if isinstance(state, dict) else None
+                    if (isinstance(balance, bool) or not isinstance(balance, (int, float))
+                            or not math.isfinite(balance) or balance < 0):
+                        raise LoginError("Jimeng account balance is not confirmed; retry verification")
+                    # Dreamina generation preferences are not evidence about
+                    # this site. The Jimeng client owns its own preflight.
+                    ready = {"watermark_ready": False, "agreement_ready": False}
+                else:
+                    client = UpstreamClient(temporary)
+                    stage = "credit read"
+                    state = await asyncio.to_thread(client.account_state)
+                    stage = 'generation preferences'
+                    ready = await asyncio.to_thread(AccountAutomation(temporary, self.service.settings(),
+                        allow_initial_identity=True).ensure_ready)
+                    if ready.get('watermark_ready') is not True or ready.get('agreement_ready') is not True:
+                        raise LoginError('generation preferences are not confirmed; check watermark and AI agreement settings')
+                    login_user_id = verified_login_user_id(ready)
+                    if not login_user_id:
+                        raise LoginError('signed-in account identity is not confirmed; complete login before retrying')
                 stage = "page check"
                 project_id = client.browser.project_id()
                 if REQUIRES_PROJECT and not (project_id or account["project_id"]):
@@ -386,7 +416,8 @@ class BrowserLoginManager:
                           "status": "cli_auth_required" if needs_cli else "active" if active["enable_after"] else "disabled",
                           "balance": state["available_balance"],
                           "balance_details": state["buckets"], "last_error": "", "login_stage": "ready",
-                          "watermark_ready": True, "agreement_ready": True, "setup_checked_at": time.time(),
+                          "watermark_ready": ready['watermark_ready'], "agreement_ready": ready['agreement_ready'],
+                          "setup_checked_at": time.time(),
                           "login_user_id": login_user_id, "login_enable_after": active['enable_after']}
                 if project_id:
                     values["project_id"] = project_id
@@ -419,7 +450,8 @@ class BrowserLoginManager:
                     active["phase"] = "login"
                 if isinstance(exc, LoginError):
                     raise
-                raise LoginError(_verification_failure(exc, stage), 409) from exc
+                raise LoginError(_verification_failure(exc, stage,
+                    site=account_browser_site(active['previous'])), 409) from exc
 
     async def cancel(self, session_id: str) -> None:
         async with self.lock:

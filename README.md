@@ -20,7 +20,64 @@ Compose layers, `.env`, data, Chrome profiles, and Cloudflared ingress at
 `ijm2api.aiid.edu.kg`, with a database backup and image rollback. The public management
 page redirects to `/login`; `/health` is unauthenticated.
 
-Use **在线添加账号** with a name and account proxy, sign in through the embedded
+### Jimeng mainland web accounts
+
+Select `jimeng_web` when adding an account for `jimeng.jianying.com`, then
+complete its online browser login. This backend uses that account's persisted
+Chrome profile and the website's authenticated client for submission and
+queries. It does not use international Canvas CLI authorization or email
+automatic login. A mainland web account can leave its proxy blank for a direct
+connection; an explicitly configured proxy remains in use. Existing `browser`
+and `canvas_cli` accounts keep their international execution paths.
+
+The account region is an admission setting independent of its execution
+backend. In the running settings, enable the mainland, US, or other-region
+restriction and list the allowed public model aliases and inclusive duration
+ranges, for example `sd-2-0-mini 4-15`. An enabled empty list rejects every new
+request for that region. Mainland restrictions start enabled with an empty
+list; US and other-region restrictions start disabled to preserve existing
+accounts. Settings changes do not block queries for already submitted tasks.
+
+The corresponding `region_generation_policy` management setting is a complete
+replacement with the following structure:
+
+```json
+{
+  "cn": {
+    "enabled": true,
+    "models": {"sd-2-0-mini": {"min_duration": 4, "max_duration": 15}}
+  },
+  "us": {"enabled": false, "models": {}},
+  "other": {"enabled": false, "models": {}}
+}
+```
+
+Admission checks both these administrator rules and the selected backend's
+verified model capabilities before preparing a submission. Mainland Mini and
+Fast currently expose 720p; declaring a 480p alias in an allowlist cannot add a
+resolution the website does not offer. Native image-generation and preview
+contracts are not enabled for this backend.
+
+| Mainland video aliases | Output duration |
+| --- | --- |
+| `sd-2-0-mini`, `sd-2-0-fast` | 4–15 seconds |
+| `sd-2-0`, `sd-2-0-1080p`, `sd-2-0-4k` | 4–15 seconds |
+| `sd-2-5`, `sd-2-5-480p`, `sd-2-5-1080p` | 4–30 seconds |
+
+These paths accept text prompts and uploaded image, video, and audio references
+through unified reference input. They do not expose independent first/last
+frame, long-video, extend, or edit modes. The `sd-2-5-480p-x` conversion alias
+remains exclusive to its existing international path.
+
+Before generating, the mainland client verifies the original account identity,
+obtains the current native quote, and rechecks available credits and existing
+reservations. It stores the original submission UUID before dispatch. A lost
+response only queries that UUID on the same account, without submitting a
+second generation. The website's separate `gen-...` trace ID is diagnostic and
+is never used as the submission ID. Actual consumption comes from the matched
+task's settled credit record, not the quote or an account balance difference.
+
+For international accounts, use **在线添加账号** with a name and account proxy, sign in through the embedded
 noVNC browser, then click **完成登录并验证**. The account row's **网页登录**
 action reopens the persisted profile. Login, content agreement, watermark
 preferences, official CLI authorization and daily check-in use Chrome only

@@ -75,7 +75,8 @@ def register_browser_login(app, manager, store, admin_auth, admin_token: str) ->
         try:
             browser_proxy(str(body.get("proxy_url") or ""))
             account = store.create_pending_account(str(body.get("name") or ""),
-                str(body.get("proxy_url") or ""), int(body.get("max_concurrency") or 1))
+                str(body.get("proxy_url") or ""), int(body.get("max_concurrency") or 1),
+                execution_mode=body.get("execution_mode", "canvas_cli"), region=body.get("region"))
         except LoginError as exc:
             raise HTTPException(exc.status, str(exc)) from exc
         except (ValueError, TypeError) as exc:

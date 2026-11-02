@@ -129,6 +129,8 @@ class CanvasAuthManager:
             account = self.store.account(account_id, private=True)
             if not account:
                 raise KeyError(account_id)
+            if account.get('execution_mode') == 'jimeng_web':
+                raise ValueError('Jimeng web accounts do not use Canvas CLI authorization')
             if self.busy(account_id):
                 return dict(self._jobs[account_id]['public'])
             if (getattr(self.service, 'auto_login_busy', lambda _: False)(account_id)

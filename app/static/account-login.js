@@ -9,6 +9,13 @@
   let busy = false;
   let viewerReload = 0;
 
+  form.addEventListener('change', (event) => {
+    if (event.target.name !== 'execution_mode') return;
+    const jimeng = form.elements.namedItem('execution_mode').value === 'jimeng_web';
+    form.elements.namedItem('proxy_url').required = !jimeng;
+    form.elements.namedItem('region').value = jimeng ? 'cn' : 'other';
+  });
+
   async function request(path, method = 'GET', body) {
     const response = await fetch(path, {method, credentials:'same-origin',
       headers: {'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined});
@@ -32,7 +39,7 @@
     sessionId = session.active.session_id;
     fields.hidden = true;
     finish.hidden = false;
-    message.textContent = '请在远端浏览器完成登录并打开 Dreamina 生成页，再点击“完成登录并验证”。';
+    message.textContent = '请在远端浏览器完成登录并打开 Dreamina / 即梦生成页，再点击“完成登录并验证”。';
     await reconnectViewer(sessionId);
   }
   async function open(accountId) {

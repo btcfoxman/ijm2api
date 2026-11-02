@@ -8,6 +8,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,18 +17,19 @@ from typing import Any
 from .catalog import MODELS
 from .account_import import masked_email, normalize_email
 from .image_model_routing import recorded_image_route
+from .region_policy import normalize_region, account_requires_proxy
 
 
 ACCOUNT_SECRET_FIELDS = {"login_email", "login_password", "login_user_id", "login_enable_after", "cookie", "cookies", "user_agent", "cli_user_id"}
 ACCOUNT_SETUP_FIELDS = {"login_stage", "watermark_ready", "agreement_ready", "setup_checked_at"}
-EXECUTION_MODES = {"canvas_cli", "browser"}
+EXECUTION_MODES = {"canvas_cli", "browser", "jimeng_web"}
 CLI_AUTH_STATUSES = {"pending", "ready", "expired", "error", "required", "queued", "authorizing",
                      "manual_required", "failed", "cancelled"}
 
 
 def _execution_mode(value: Any, *, unbound: bool = False) -> str:
     if not isinstance(value, str) or value not in EXECUTION_MODES | ({""} if unbound else set()):
-        raise ValueError("execution mode must be canvas_cli or browser")
+        raise ValueError("execution mode must be canvas_cli, browser or jimeng_web")
     return value
 
 
@@ -201,6 +203,7 @@ class Store:
                     ("setup_checked_at", "REAL NOT NULL DEFAULT 0"), ("login_enable_after", "INTEGER DEFAULT NULL"),
                     ("login_user_id", "TEXT NOT NULL DEFAULT ''"),
                     ("execution_mode", "TEXT NOT NULL DEFAULT 'canvas_cli'"),
+                    ("region", "TEXT NOT NULL DEFAULT 'other'"),
                     ("cli_auth_status", "TEXT NOT NULL DEFAULT 'pending'"),
                     ("cli_auth_error", "TEXT NOT NULL DEFAULT ''"),
                     ("cli_user_id", "TEXT NOT NULL DEFAULT ''")):
@@ -318,6 +321,7 @@ class Store:
             raise ValueError("max_concurrency must be between 1 and 50")
         priority = _priority(payload["priority"]) if "priority" in payload else None
         execution_mode = _execution_mode(payload["execution_mode"]) if "execution_mode" in payload else None
+        region = normalize_region(payload["region"]) if payload.get("region") is not None else None
         credentials = self._credential_values(payload)
         now = time.time()
         with self._lock, self._connect() as db:
@@ -333,23 +337,25 @@ class Store:
                           "max_concurrency": max_concurrency,
                           "priority": old["priority"] if priority is None else priority,
                           "enabled": int(bool(payload.get("enabled", old["enabled"]))),
-                          "execution_mode": execution_mode or old["execution_mode"]}
+                          "execution_mode": execution_mode or old["execution_mode"],
+                          "region": region or old["region"]}
                 if 'enabled' in payload:
                     values['login_enable_after'] = None if payload['enabled'] else 0
                 db.execute("""UPDATE accounts SET proxy_url=:proxy_url,project_id=:project_id,
                     cdp_port=:cdp_port,max_concurrency=:max_concurrency,priority=:priority,
-                    enabled=:enabled,execution_mode=:execution_mode,
+                    enabled=:enabled,execution_mode=:execution_mode,region=:region,
                     login_enable_after=:login_enable_after,updated_at=:updated_at WHERE id=:id""",
                     {"login_enable_after": old['login_enable_after'], **values,
                      "updated_at": now, "id": old["id"]})
                 account_id = int(old["id"])
             else:
                 cursor = db.execute("""INSERT INTO accounts(name,cdp_port,proxy_url,project_id,
-                    max_concurrency,priority,enabled,execution_mode,updated_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    max_concurrency,priority,enabled,execution_mode,region,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
                     (name, int(payload.get("cdp_port") or 0), str(payload.get("proxy_url") or ""),
                      str(payload.get("project_id") or ""),
                      max_concurrency, priority if priority is not None else 0,
-                     int(bool(payload.get("enabled", True))), execution_mode or "canvas_cli", now))
+                     int(bool(payload.get("enabled", True))), execution_mode or "canvas_cli",
+                     region or ("cn" if execution_mode == "jimeng_web" else "other"), now))
                 account_id = int(cursor.lastrowid)
                 if credentials:
                     db.execute("UPDATE accounts SET enabled=0,status='pending',managed_profile=1 WHERE id=?", (account_id,))
@@ -433,20 +439,23 @@ class Store:
             return account, True
 
     def create_pending_account(self, name: str, proxy_url: str,
-                               max_concurrency: int = 1) -> dict[str, Any]:
+                               max_concurrency: int = 1, *, execution_mode: str = "canvas_cli",
+                               region: str | None = None) -> dict[str, Any]:
+        mode = _execution_mode(execution_mode)
+        region = normalize_region(region, default="cn" if mode == "jimeng_web" else "other")
         name = name.strip()
         if not name:
             raise ValueError("account name is required")
-        if not proxy_url.strip():
+        if not proxy_url.strip() and account_requires_proxy({"execution_mode": mode}):
             raise ValueError("account proxy is required")
         if not 1 <= max_concurrency <= 50:
             raise ValueError("max_concurrency must be between 1 and 50")
         with self._lock, self._connect() as db:
             try:
                 cursor = db.execute("""INSERT INTO accounts
-                    (name,proxy_url,max_concurrency,managed_profile,enabled,status,updated_at)
-                    VALUES(?,?,?,1,0,'pending',?)""",
-                    (name, proxy_url.strip(), max_concurrency, time.time()))
+                    (name,proxy_url,max_concurrency,execution_mode,region,managed_profile,enabled,status,updated_at)
+                    VALUES(?,?,?,?,?,1,0,'pending',?)""",
+                    (name, proxy_url.strip(), max_concurrency, mode, region, time.time()))
             except sqlite3.IntegrityError as exc:
                 raise ValueError("account name already exists") from exc
         return self.account(int(cursor.lastrowid)) or {}
@@ -457,6 +466,41 @@ class Store:
                 AND (status IN ('preparing','submitted','running','submission_unknown') OR
                  (status IN ('failed','expired') AND error_code='UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'))""",
                 (account_id,)).fetchone()[0])
+
+    @staticmethod
+    def _jimeng_workspace_marker(marker: str) -> str:
+        prefix = "jimeng-create-pending:"
+        if not isinstance(marker, str) or not marker.startswith(prefix):
+            raise ValueError("invalid Jimeng workspace creation marker")
+        value = marker[len(prefix):]
+        try:
+            canonical = str(uuid.UUID(value))
+        except (ValueError, AttributeError):
+            raise ValueError("invalid Jimeng workspace creation marker") from None
+        if canonical != value:
+            raise ValueError("invalid Jimeng workspace creation marker")
+        return marker
+
+    def claim_jimeng_workspace_creation(self, account_id: int, marker: str) -> bool:
+        marker = self._jimeng_workspace_marker(marker)
+        with self._lock, self._connect() as db:
+            cursor = db.execute("""UPDATE accounts SET project_id=?,updated_at=?
+                WHERE id=? AND execution_mode='jimeng_web' AND project_id=''""",
+                (marker, time.time(), account_id))
+            return cursor.rowcount == 1
+
+    def bind_jimeng_workspace(self, account_id: int, expected_marker: str, workspace_id: str | int) -> bool:
+        expected_marker = self._jimeng_workspace_marker(expected_marker)
+        if isinstance(workspace_id, bool) or not isinstance(workspace_id, (str, int)):
+            raise ValueError("invalid Jimeng workspace ID")
+        workspace = str(workspace_id)
+        if not re.fullmatch(r"[1-9][0-9]{0,19}", workspace):
+            raise ValueError("invalid Jimeng workspace ID")
+        with self._lock, self._connect() as db:
+            cursor = db.execute("""UPDATE accounts SET project_id=?,updated_at=?
+                WHERE id=? AND execution_mode='jimeng_web' AND project_id=?""",
+                (workspace, time.time(), account_id, expected_marker))
+            return cursor.rowcount == 1
 
     def scheduling_rows(self) -> dict[str, list[dict[str, Any]]]:
         """Return bounded raw history and every bound unresolved credit hold."""
@@ -493,7 +537,7 @@ class Store:
     def update_account(self, account_id: int, values: dict[str, Any]) -> dict[str, Any]:
         allowed = {"name", "cdp_port", "proxy_url", "project_id", "max_concurrency", "priority", "managed_profile",
                    "enabled", "status", "balance", "last_error", "last_checkin_date", "login_user_id", "login_enable_after",
-                   "execution_mode", "cli_auth_status", "cli_auth_error", "cli_user_id", *ACCOUNT_SETUP_FIELDS}
+                   "execution_mode", "region", "cli_auth_status", "cli_auth_error", "cli_user_id", *ACCOUNT_SETUP_FIELDS}
         data = {key: value for key, value in values.items() if key in allowed}
         if 'enabled' in data and 'status' not in data and 'login_enable_after' not in data:
             data['login_enable_after'] = None if data['enabled'] else 0
@@ -503,6 +547,8 @@ class Store:
             data["priority"] = _priority(data["priority"])
         if "execution_mode" in data:
             data["execution_mode"] = _execution_mode(data["execution_mode"])
+        if "region" in data:
+            data["region"] = normalize_region(data["region"])
         if "cli_auth_status" in data and data["cli_auth_status"] not in CLI_AUTH_STATUSES:
             raise ValueError("invalid CLI authorization status")
         for key in ("cli_auth_error", "cli_user_id"):

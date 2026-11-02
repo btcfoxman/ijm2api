@@ -17,7 +17,8 @@ from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from .browser import BrowserError, BrowserRejected, CDPBrowser, browser_alive
+from .browser import (BrowserError, BrowserRejected, CDPBrowser, account_browser_options,
+    account_proxy_url, browser_alive)
 from .account_automation import AccountAutomation, AutomationError
 from .browser_runtime import BrowserRuntime
 from .canvas_cli import CanvasCLI, CanvasCLIError
@@ -32,9 +33,13 @@ from .image_client import DreaminaImageClient, resolve_image_model, image_model_
 from .image_request import normalize_image_request
 from .image_model_routing import (DEFAULT_LOW_BALANCE_SEEDREAM_TARGET,
     LOW_BALANCE_SEEDREAM_TARGET_OPTIONS, rescue_threshold,
-    validate_rescue_threshold, validate_target_model, recorded_image_route)
+    validate_rescue_threshold, validate_target_model, recorded_image_route, plan_image_execution)
 from .account_policy import DEFAULT_LOW_BALANCE_IMAGE_RESCUE_THRESHOLD
-from .errors import public_error, upstream_review_error
+from .errors import GenerationCapabilityDenied, RegionGenerationDenied, public_error, upstream_review_error
+from .region_policy import (DEFAULT_REGION_GENERATION_POLICY, validate_region_generation_policy,
+    region_denial_detail, account_requires_proxy)
+from .jimeng_client import JimengWebClient, JimengProtocolUnavailable, preflight_model as jimeng_preflight_model
+from .jimeng_service import JimengServiceMixin
 from .media import MediaError
 from .result_transfer import ResultTransferError, transfer, presign, expires_soon, _config
 from .upload import UploadError
@@ -54,10 +59,13 @@ class AccountMaintenanceBusy(BrowserError):
 
 
 def _credential_setup_ready(account: dict[str, Any]) -> bool:
+    if execution_mode(account) == 'jimeng_web':
+        return True  # Jimeng has its own authenticated identity and preflight.
     return not account.get('login_email') or bool(account.get('watermark_ready') and account.get('agreement_ready'))
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
+    "region_generation_policy": DEFAULT_REGION_GENERATION_POLICY,
     "canvas_cli_enabled": False,
     "task_workers": 10,
     "task_queue_capacity": 100,
@@ -85,7 +93,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 
-class Service(CanvasServiceMixin):
+class Service(CanvasServiceMixin, JimengServiceMixin):
     def __init__(self, store: Store):
         self.store = store
         self._pool = ThreadPoolExecutor(max_workers=50, thread_name_prefix="ijm-task")
@@ -122,6 +130,8 @@ class Service(CanvasServiceMixin):
     def update_settings(self, values: dict[str, Any]) -> dict[str, Any]:
         allowed = set(DEFAULT_SETTINGS)
         filtered = {key: value for key, value in values.items() if key in allowed}
+        if 'region_generation_policy' in filtered:
+            filtered['region_generation_policy'] = validate_region_generation_policy(filtered['region_generation_policy'])
         if 'low_balance_image_rescue_threshold' in filtered:
             filtered['low_balance_image_rescue_threshold'] = validate_rescue_threshold(
                 filtered['low_balance_image_rescue_threshold'])
@@ -200,6 +210,15 @@ class Service(CanvasServiceMixin):
                     **context, 'reconciliation_paused': False}}, preserve_terminal=True)
             if task["status"] == "queued":
                 self._pool.submit(self._run, task["id"])
+            elif task.get('execution_backend') == 'jimeng_web':
+                context = task.get('upstream_context') or {}
+                if (task.get('run_id') and context.get('submission_phase') in {'dispatching', 'submitted', 'accepted'}
+                        and (task['status'] not in TERMINAL
+                             or task.get('error_code') == 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN')):
+                    self._pool.submit(self._resume_jimeng_poll, task['id'])
+                elif task['status'] == 'preparing':
+                    self._fail(task['id'], 'JIMENG_PROTOCOL_UNAVAILABLE',
+                        'service restarted before a Jimeng submission identity was recorded; no automatic submission')
             elif task.get("execution_backend") == "canvas_cli" and task.get("upstream_context"):
                 phase = task["upstream_context"].get("submission_phase")
                 if phase in {"submitting", "submitted", "run_dispatching", "accepted"} and (task["status"] not in TERMINAL
@@ -285,7 +304,7 @@ class Service(CanvasServiceMixin):
                     # routine maintenance must not open Chrome for them.
                     if execution_mode(account) == "canvas_cli" and account.get("cli_auth_status") != "ready":
                         checked = account
-                    elif execution_mode(account) == "browser":
+                    elif execution_mode(account) in {"browser", "jimeng_web"}:
                         # Web quota checks share the short-lived auxiliary budget.
                         with self._browser_aux_slots:
                             checked = self.check_account(account_id)
@@ -293,7 +312,8 @@ class Service(CanvasServiceMixin):
                         checked = self.check_account(account_id)
                     if checked["status"] == "login_required":
                         needs_rapid_recheck = True
-                    if settings["daily_checkin_enabled"] and checked['status'] in {'active', 'cli_auth_required'}:
+                    if (settings["daily_checkin_enabled"] and execution_mode(account) != 'jimeng_web'
+                            and checked['status'] in {'active', 'cli_auth_required'}):
                         stage = 'daily_checkin'
                         with self._browser_aux_slots:
                             self.checkin_account(account_id)
@@ -322,6 +342,8 @@ class Service(CanvasServiceMixin):
         account = self.store.account(account_id, private=True)
         if not account:
             raise KeyError(account_id)
+        if execution_mode(account) == 'jimeng_web':
+            raise JimengProtocolUnavailable('Jimeng daily credit claim contract is unavailable')
         today = datetime.now(ZoneInfo(os.getenv("IJM_TIME_ZONE", "Asia/Taipei"))).date().isoformat()
         if account.get("last_checkin_date") == today:
             return {"already_checked_in": True, "date": today}
@@ -366,6 +388,8 @@ class Service(CanvasServiceMixin):
 
     def _wait_checkin_identity(self, account: dict[str, Any]) -> None:
         """Wait only for genuine read-only SDK readiness before one daily claim."""
+        if execution_mode(account) == 'jimeng_web':
+            raise JimengProtocolUnavailable('Jimeng daily credit claim contract is unavailable')
         expected = str(account.get('login_user_id') or '')
         if not expected:
             raise BrowserError('Dreamina check-in requires a verified signed-in account')
@@ -394,6 +418,67 @@ class Service(CanvasServiceMixin):
             return
         raise BrowserError('Dreamina check-in was cancelled before claiming credits')
 
+    def _web_client(self, account: dict[str, Any], *, with_store: bool = False):
+        factory = JimengWebClient if execution_mode(account) == 'jimeng_web' else DreaminaClient
+        return factory(account, store=self.store) if with_store else factory(account)
+
+    def _region_denial(self, account: dict, normalized: dict, settings: dict | None = None) -> str | None:
+        settings = self.settings() if settings is None else settings
+        reason = region_denial_detail(account, normalized, settings)
+        if reason or normalized.get('kind') != 'image':
+            return reason
+        try:
+            effective, _ = plan_image_execution({'normalized': normalized}, account, settings)
+        except ValueError as exc:
+            return str(exc)
+        return region_denial_detail(account, effective, settings)
+
+    def _assert_region_pool_allows(self, normalized: dict) -> None:
+        """Reject disallowed or wholly unsupported pools before creating a task."""
+        settings = self.settings()
+        task = {'normalized': normalized}
+        required = self._required_execution_backend(task)
+        accounts = [account for account in self.store.accounts(private=True)
+            if (account.get('enabled') or account_accepts_task(account, task,
+                threshold=number(settings.get('low_balance_disable_threshold')) or 0,
+                rescue_threshold=rescue_threshold(settings)))
+            and (not required or execution_mode(account) == required)]
+        reasons = [self._region_denial(account, normalized, settings) for account in accounts]
+        if reasons and all(reasons):
+            raise RegionGenerationDenied(reasons[0])
+        usable = [account for account, reason in zip(accounts, reasons) if not reason]
+        capabilities = [self._jimeng_capability_denial(account, normalized, settings) for account in usable]
+        if capabilities and all(capabilities):
+            raise GenerationCapabilityDenied(capabilities[0])
+
+    def _jimeng_capability_denial(self, account: dict, normalized: dict,
+                                 settings: dict | None = None) -> str | None:
+        if execution_mode(account) != 'jimeng_web':
+            return None
+        try:
+            effective, _ = plan_image_execution({'normalized': normalized}, account,
+                self.settings() if settings is None else settings)
+            # This module function is pure and never constructs a web client.
+            jimeng_preflight_model(effective)
+        except (JimengProtocolUnavailable, ValueError) as exc:
+            return str(exc)
+        return None
+
+    def _submission_account(self, task_id: str, account: dict, normalized: dict | None = None) -> dict:
+        """Re-read account and policy at each boundary before new external work."""
+        current = self.store.account(int(account['id']), private=True)
+        if not current or execution_mode(current) != execution_mode(account):
+            raise RegionGenerationDenied('account transport changed before generation was submitted')
+        account_proxy_url(current)
+        task = self.store.task(task_id) or {}
+        request = normalized if normalized is not None else task.get('normalized') or {}
+        reason = self._region_denial(current, task.get('normalized') or request)
+        if not reason and normalized is not None:
+            reason = region_denial_detail(current, normalized, self.settings())
+        if reason:
+            raise RegionGenerationDenied(reason)
+        return {**account, **current}
+
     def create(self, request: dict[str, Any]) -> dict[str, Any]:
         settings = self.settings()
         normalized = normalize_request(request, strict_media_references=bool(
@@ -402,6 +487,7 @@ class Service(CanvasServiceMixin):
             raise ValueError("sd-2-5-480p-x is disabled in service settings")
         if not bool(settings["allow_video_reference_inputs"]) and normalized["videos"]:
             raise ValueError("video reference inputs are disabled by service settings")
+        self._assert_region_pool_allows(normalized)
         if self.store.active_count() >= int(settings["task_workers"]) + int(settings["task_queue_capacity"]):
             raise RuntimeError("IJMAPI queue is full")
         task_id = "ijm_" + uuid.uuid4().hex[:16]
@@ -447,6 +533,7 @@ class Service(CanvasServiceMixin):
         model = str(request.get("model") or "").strip()
         normalized = normalize_image_request(request, resolve_image_model(model))
         settings = self.settings()
+        self._assert_region_pool_allows(normalized)
         if self.store.active_count() >= int(settings["task_workers"]) + int(settings["task_queue_capacity"]):
             raise RuntimeError("IJMAPI queue is full")
         task_id = "ijm_img_" + uuid.uuid4().hex[:16]
@@ -545,7 +632,9 @@ class Service(CanvasServiceMixin):
                 return task
             updated = self.store.update_task(task['id'], {'estimated_cost': cost,
                 'cost_evidence': {'scheduling_estimate': metadata}})
-            if task['id'] in self._credit_reservations:
+            if (task['id'] in self._credit_reservations and not (
+                    task.get('execution_backend') == 'jimeng_web'
+                    and 'quoted_credits' not in (task.get('upstream_context') or {}))):
                 account_id, _ = self._credit_reservations[task['id']]
                 self._credit_reservations[task['id']] = (account_id, cost)
             return updated
@@ -579,7 +668,12 @@ class Service(CanvasServiceMixin):
         for item in self.store.accounts(private=True):
             if (int(item['id']) in excluded or not account_accepts_task(item, task, threshold=threshold,
                                                                        rescue_threshold=image_rescue)
-                    or not item['proxy_url'] or not _credential_setup_ready(item)):
+                    or account_requires_proxy(item) and not item['proxy_url']
+                    or not _credential_setup_ready(item)):
+                continue
+            if task and self._region_denial(item, task.get('normalized') or {}):
+                continue
+            if task and task.get('normalized') and self._jimeng_capability_denial(item, task['normalized']):
                 continue
             if not include_aux_busy and int(item['id']) in self._aux_account_owners:
                 continue
@@ -591,9 +685,18 @@ class Service(CanvasServiceMixin):
             if backend and execution_mode(item) != backend:
                 continue
             available, unknown_hold = self._available_credits(item, pending)
-            if unknown_hold or available is not None and available <= 0:
+            jimeng = execution_mode(item) == 'jimeng_web'
+            if (unknown_hold
+                    or jimeng and (available is None or not math.isfinite(available) or available < 0)
+                    or not jimeng and available is not None and available <= 0):
                 continue
             candidate = {**item, '_available_credits': available}
+            if jimeng:
+                # An old credit estimate cannot reject a new account-specific
+                # native quote. Hold this account's available budget until its
+                # prepared request establishes the current required credits.
+                accounts.append({**candidate, '_credit_reservation_amount': available or 0.0})
+                continue
             if low_balance_image_probe(item, task, threshold, rescue_threshold=image_rescue):
                 # A different account's estimate is not this account's quote.
                 # Reserve its entire available budget until its own quote so
@@ -801,7 +904,8 @@ class Service(CanvasServiceMixin):
         return self._requeue_unaccepted_task(task_id, rejected=True,
             error_code=code, error_message=reason)
 
-    def _submission_funded(self, account: dict, task_id: str, estimated_cost: float, balance: Any) -> bool:
+    def _submission_funded(self, account: dict, task_id: str, estimated_cost: float, balance: Any, *,
+                           allow_zero_cost: bool = False) -> bool:
         with self._lock:
             pending = self._pending_credits(self.store.scheduling_rows(), task_id)
             current = self.store.account(int(account['id']), private=True) or {}
@@ -812,7 +916,8 @@ class Service(CanvasServiceMixin):
                                         rescue_threshold=rescue_threshold(self.settings())):
                 return False
             available, unknown_hold = self._available_credits(checked, pending)
-            return not unknown_hold and available is not None and available > 0 and available >= estimated_cost
+            return (not unknown_hold and available is not None and available >= estimated_cost
+                    and (available > 0 or allow_zero_cost and estimated_cost == 0))
 
     def _submission_budget_status(self, account: dict, task_id: str, estimated_cost: float, balance: Any) -> tuple[bool, bool]:
         with self._lock:
@@ -849,16 +954,20 @@ class Service(CanvasServiceMixin):
     def _check_account_live(self, account: dict[str, Any]) -> dict[str, Any]:
         account_id = int(account["id"])
         port = int(account["cdp_port"] or 0)
-        if not browser_alive(port):
+        if not browser_alive(port, **account_browser_options(account)):
+            label = 'Jimeng' if execution_mode(account) == 'jimeng_web' else 'Dreamina'
             return self.store.update_account(account_id, {"status": "login_required",
-                                                         "last_error": "Dreamina account browser is unavailable"})
+                                                         "last_error": f"{label} account browser is unavailable"})
         # Chrome exposes a CDP page before Dreamina's JavaScript has finished
         # loading. After a service restart, one early fetch failure should not
         # put an otherwise valid account into login_required for an entire
         # maintenance interval. Complete HTTP rejections still fail promptly.
         for attempt in range(3):
             try:
-                state = DreaminaClient(account).account_state()
+                client = self._web_client(account)
+                if execution_mode(account) == 'jimeng_web':
+                    verified = self._jimeng_identity(client, str(account.get('login_user_id') or ''))
+                state = client.account_state()
                 break
             except BrowserRejected as exc:
                 return self.store.update_account(account_id, {"status": "login_required", "last_error": str(exc)[:300]})
@@ -867,10 +976,12 @@ class Service(CanvasServiceMixin):
                     return self.store.update_account(account_id, {"status": "login_required", "last_error": str(exc)[:300]})
                 time.sleep(1)
         balance = state["available_balance"]
-        project_id = DreaminaClient(account).browser.project_id()
+        project_id = client.browser.project_id()
         threshold = float(self.settings()["low_balance_disable_threshold"] or 0)
         values: dict[str, Any] = {"balance": balance, "balance_details": state["buckets"],
                                   "status": "active", "last_error": ""}
+        if execution_mode(account) == 'jimeng_web':
+            values['login_user_id'] = verified
         if not _credential_setup_ready(account):
             values.update(status='setup_required', enabled=False,
                           last_error='账号登录及生成设置尚未完成，请使用自动登录或网页登录完成验证')
@@ -884,6 +995,14 @@ class Service(CanvasServiceMixin):
     def _run(self, task_id: str) -> None:
         task = self.store.task(task_id)
         if not task or task["status"] != "queued":
+            return
+        try:
+            self._assert_region_pool_allows(task['normalized'])
+        except RegionGenerationDenied as exc:
+            self._fail(task_id, 'REGION_GENERATION_DENIED', str(exc))
+            return
+        except ValueError as exc:
+            self._fail(task_id, 'JIMENG_PROTOCOL_UNAVAILABLE', str(exc))
             return
         if self._cli_authorization_missing():
             self._fail(task_id, 'ACCOUNT_POOL_UNAVAILABLE', 'CLI authorization is required for the enabled accounts')
@@ -947,14 +1066,20 @@ class Service(CanvasServiceMixin):
                 account_id = int(account["id"])
                 owned = False
                 try:
+                    account = self._submission_account(task_id, account)
                     deadline = self._admission_deadline(task_id, deadline)
                     if self._admission_expired(task_id, deadline):
                         return
                     backend = execution_mode(account)
-                    self.store.update_task(task_id, {"account_id": account_id,
-                        "status": "preparing", "progress": 5, "balance_before": None,
-                        "execution_backend": backend, "cost_evidence": {'execution_backend': backend},
-                        "error_code": "", "error_message": ""})
+                    with self._lock:
+                        current = self.store.task(task_id) or {}
+                        if (backend == 'jimeng_web' or current.get('execution_backend') == 'jimeng_web') and (
+                                current.get('status') != 'queued' or current.get('run_id')):
+                            return
+                        self.store.update_task(task_id, {"account_id": account_id,
+                            "status": "preparing", "progress": 5, "balance_before": None,
+                            "execution_backend": backend, "cost_evidence": {'execution_backend': backend},
+                            "error_code": "", "error_message": ""})
                     if initial_admission_at is INITIAL_ADMISSION_UNSET:
                         initial_admission_at = time.time()
                     self._remember_preparation_admission(task_id, initial_admission_at)
@@ -975,7 +1100,13 @@ class Service(CanvasServiceMixin):
                             funding_excluded.add(account_id)
                         estimated_cost = float((self.store.task(task_id) or {}).get('estimated_cost') or 0)
                         continue
+                    if backend == 'jimeng_web':
+                        if self._execute_jimeng(task_id, account, deadline):
+                            return
+                        funding_excluded.add(account_id)
+                        continue
                     account, owned = self.browser_runtime.acquire(account)
+                    account = self._submission_account(task_id, account)
                     client = DreaminaClient(account, store=self.store)
                     before = None
                     try:
@@ -995,6 +1126,7 @@ class Service(CanvasServiceMixin):
                             return
                         continue
                     self.store.update_task(task_id, {"balance_before": before, "progress": 12})
+                    account = self._submission_account(task_id, account)
                     assets = client.upload_inputs(task["normalized"])
                     task = self.store.update_task(task_id, {"cost_evidence": input_evidence(assets)})
                     task = self._update_cost_estimate(task)
@@ -1009,10 +1141,12 @@ class Service(CanvasServiceMixin):
                         continue
                     if self._admission_expired(task_id, deadline):
                         return
+                    account = self._submission_account(task_id, account)
                     self.store.update_task(task_id, {"progress": 30})
                     attempted.append(account_id)
                     self.store.update_task(task_id, {"attempted_account_ids": attempted})
                     try:
+                        account = self._submission_account(task_id, account)
                         submitted = client.submit(task["normalized"], assets)
                     except SubmissionPreflightError as exc:
                         self._fail(task_id, "ACCOUNT_VERIFICATION_FAILED", str(exc))
@@ -1039,6 +1173,9 @@ class Service(CanvasServiceMixin):
                                                       "thread_id": submitted["thread_id"]})
                     self._poll(task_id, client, deadline)
                     return
+                except RegionGenerationDenied as exc:
+                    self._fail(task_id, 'REGION_GENERATION_DENIED', str(exc))
+                    return
                 except (BrowserError, DreaminaError, MediaError, UploadError, ValueError) as exc:
                     self._fail(task_id, type(exc).__name__.upper(), str(exc))
                     return
@@ -1060,6 +1197,14 @@ class Service(CanvasServiceMixin):
     def _run_image(self, task_id: str) -> None:
         task = self.store.task(task_id)
         if not task or task["status"] != "queued":
+            return
+        try:
+            self._assert_region_pool_allows(task['normalized'])
+        except RegionGenerationDenied as exc:
+            self._fail(task_id, 'REGION_GENERATION_DENIED', str(exc))
+            return
+        except ValueError as exc:
+            self._fail(task_id, 'JIMENG_PROTOCOL_UNAVAILABLE', str(exc))
             return
         if self._cli_authorization_missing() and not self._has_eligible_account(0, set(), task_id):
             self._fail(task_id, 'ACCOUNT_POOL_UNAVAILABLE', 'CLI authorization is required for the enabled accounts')
@@ -1101,13 +1246,19 @@ class Service(CanvasServiceMixin):
                 account_id = int(account["id"])
                 owned = False
                 try:
+                    account = self._submission_account(task_id, account)
                     deadline = self._admission_deadline(task_id, deadline)
                     if self._admission_expired(task_id, deadline):
                         return
                     backend = execution_mode(account)
-                    self.store.update_task(task_id, {"account_id": account_id,
-                        "status": "preparing", "progress": 5, "error_code": "", "error_message": "",
-                        "execution_backend": backend, 'cost_evidence': {'execution_backend': backend}})
+                    with self._lock:
+                        current = self.store.task(task_id) or {}
+                        if (backend == 'jimeng_web' or current.get('execution_backend') == 'jimeng_web') and (
+                                current.get('status') != 'queued' or current.get('run_id')):
+                            return
+                        self.store.update_task(task_id, {"account_id": account_id,
+                            "status": "preparing", "progress": 5, "error_code": "", "error_message": "",
+                            "execution_backend": backend, 'cost_evidence': {'execution_backend': backend}})
                     if initial_admission_at is INITIAL_ADMISSION_UNSET:
                         initial_admission_at = time.time()
                     self._remember_preparation_admission(task_id, initial_admission_at)
@@ -1125,7 +1276,13 @@ class Service(CanvasServiceMixin):
                             funding_excluded.add(account_id)
                         estimated_cost = float((self.store.task(task_id) or {}).get('estimated_cost') or 0)
                         continue
+                    if backend == 'jimeng_web':
+                        if self._execute_jimeng(task_id, account, deadline):
+                            return
+                        funding_excluded.add(account_id)
+                        continue
                     account, owned = self.browser_runtime.acquire(account)
+                    account = self._submission_account(task_id, account)
                     video_client = DreaminaClient(account, store=self.store)
                     balance = None
                     try:
@@ -1139,13 +1296,16 @@ class Service(CanvasServiceMixin):
                         if not self._requeue_unaccepted_task(task_id):
                             return
                         continue
+                    account = self._submission_account(task_id, account)
                     assets = video_client.upload_inputs(task["normalized"])["images"]
                     if self._admission_expired(task_id, deadline):
                         return
+                    account = self._submission_account(task_id, account)
                     self.store.update_task(task_id, {"progress": 30})
                     attempted.append(account_id)
                     self.store.update_task(task_id, {"attempted_account_ids": attempted})
                     try:
+                        account = self._submission_account(task_id, account)
                         submitted = DreaminaImageClient(int(account["cdp_port"])).submit(
                             task["normalized"], assets)
                     except BrowserRejected as exc:
@@ -1163,6 +1323,9 @@ class Service(CanvasServiceMixin):
                     self.store.update_task(task_id, {"status": "submitted", "progress": 40,
                         "run_id": submitted["run_id"], "thread_id": submitted["thread_id"]})
                     self._poll_image(task_id, DreaminaImageClient(int(account["cdp_port"])), deadline)
+                    return
+                except RegionGenerationDenied as exc:
+                    self._fail(task_id, 'REGION_GENERATION_DENIED', str(exc))
                     return
                 except (BrowserError, DreaminaError, MediaError, UploadError, ValueError) as exc:
                     self._fail(task_id, type(exc).__name__.upper(), str(exc))
@@ -1238,6 +1401,9 @@ class Service(CanvasServiceMixin):
             return
         if task.get('execution_backend') == 'canvas_cli':
             self._resume_canvas_poll(task_id)
+            return
+        if task.get('execution_backend') == 'jimeng_web':
+            self._resume_jimeng_poll(task_id)
             return
         if task["normalized"].get("kind") == "image":
             self._resume_image_poll(task_id)
@@ -1379,6 +1545,9 @@ class Service(CanvasServiceMixin):
             "error_code": code, "error_message": message[:600], "completed_at": time.time()}, preserve_terminal=True)
 
     def _public_task_failure(self, task: dict[str, Any]) -> tuple[dict, dict]:
+        if task.get('execution_backend') == 'jimeng_web' and task.get('error_code') == 'MEDIA_UPLOAD_FAILED':
+            notice = public_error('JIMENG_PROTOCOL_UNAVAILABLE', '')
+            return {'code': 'MEDIA_UPLOAD_FAILED', 'message': notice['message']}, {}
         # Historical rows retain their original diagnostic, identity and finance.
         # Only a bounded, empty original-submission lookup enables route retry.
         facts = self._canvas_retryable_submission_failure(task)
