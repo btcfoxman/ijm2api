@@ -1018,8 +1018,14 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                     for key in ('balance', 'balance_details', 'enabled', 'status', 'last_error'):
                         values.pop(key, None)
                 if not current.get('enabled'):
-                    for key in ('enabled', 'status', 'last_error'):
-                        values.pop(key, None)
+                    values.pop('enabled', None)
+                    # Keep explicit disable intent and prevent a balance read
+                    # from promoting an unavailable account. Pending setup
+                    # still needs its truthful diagnostic transition.
+                    if (current.get('status') in {'disabled', 'disabled_low_balance'}
+                            or values.get('status') == 'active'):
+                        for key in ('status', 'last_error'):
+                            values.pop(key, None)
                 return self.store.update_account(account_id, values)
 
         if jimeng:

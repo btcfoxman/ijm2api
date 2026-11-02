@@ -59,10 +59,12 @@ def start_service(tmp_path, results):
 def assert_background_threads_started(service, thread):
     thread.assert_has_calls([
         call(target=service._maintain_accounts, daemon=True, name='ijm-account-maintenance'),
+        call(target=service._daily_claims._loop, name='ijm-daily-dispatch', daemon=True),
         call(target=service._canvas_result_loop, daemon=True, name='ijm-result-observation')])
-    assert thread.call_count == 2
-    assert set(thread.instances) == {'ijm-account-maintenance', 'ijm-result-observation'}
+    assert thread.call_count == 3
+    assert set(thread.instances) == {'ijm-account-maintenance', 'ijm-daily-dispatch', 'ijm-result-observation'}
     assert service._maintenance is thread.instances['ijm-account-maintenance']
+    assert service._daily_claims._thread is thread.instances['ijm-daily-dispatch']
     assert service._canvas_result_maintenance is thread.instances['ijm-result-observation']
     for instance in thread.instances.values():
         instance.start.assert_called_once_with()

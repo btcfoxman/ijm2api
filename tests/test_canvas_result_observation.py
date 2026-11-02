@@ -3,7 +3,7 @@ from copy import deepcopy
 import json
 import threading
 import time
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 import uuid
 
 import pytest
@@ -249,8 +249,11 @@ def test_start_routes_legacy_result_to_query_dispatcher_and_never_generation_poo
             patch('app.service.threading.Thread') as thread:
         service.start()
     service._pool.submit.assert_not_called()
-    assert thread.call_args.kwargs['target'] == service._canvas_result_loop
-    assert thread.return_value.start.call_count == 2
+    assert thread.call_args_list == [
+        call(target=service._maintain_accounts, daemon=True, name='ijm-account-maintenance'),
+        call(target=service._daily_claims._loop, name='ijm-daily-dispatch', daemon=True),
+        call(target=service._canvas_result_loop, daemon=True, name='ijm-result-observation')]
+    assert thread.return_value.start.call_count == 3
     assert all(store.task(identifier)['status'] == 'running' and
         store.task(identifier)['upstream_context']['result_observation']['attempts'] == 0
         for identifier in identifiers)

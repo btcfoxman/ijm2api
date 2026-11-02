@@ -244,6 +244,36 @@ def test_balance_check_cannot_promote_unprepared_credentials(context):
     assert service._reserve_account() is None
 
 
+@pytest.mark.parametrize('status', ['disabled', 'disabled_low_balance'])
+def test_balance_check_retains_explicit_disable_intent_for_unprepared_credentials(context, status):
+    store, service, _ = context
+    item = account(store)
+    store.update_account(item['id'], {'enabled': False, 'status': status, 'last_error': 'disabled before read'})
+    with patch('app.service.browser_alive', return_value=True), patch('app.service.DreaminaClient') as client:
+        client.return_value.account_state.return_value = {'available_balance': 100, 'buckets': {}}
+        client.return_value.browser.project_id.return_value = ''
+        saved = service._check_account_live(store.account(item['id'], private=True))
+    assert saved['status'] == status and not saved['enabled']
+    assert saved['last_error'] == 'disabled before read' and saved['balance'] == 100
+
+
+def test_balance_check_does_not_undo_disable_arriving_during_its_read(context):
+    store, service, _ = context
+    item = account(store)
+    store.update_account(item['id'], {'enabled': True, 'status': 'active',
+        'watermark_ready': True, 'agreement_ready': True})
+    original = store.account(item['id'], private=True)
+    def disabled():
+        store.update_account(item['id'], {'enabled': False, 'status': 'disabled', 'last_error': 'disabled during read'})
+        return {'available_balance': 100, 'buckets': {}}
+    with patch('app.service.browser_alive', return_value=True), patch('app.service.DreaminaClient') as client:
+        client.return_value.account_state.side_effect = disabled
+        client.return_value.browser.project_id.return_value = ''
+        saved = service._check_account_live(original)
+    assert saved['status'] == 'disabled' and not saved['enabled']
+    assert saved['last_error'] == 'disabled during read'
+
+
 def test_cli_login_stays_disabled_and_starts_auth_after_browser_cleanup(context):
     store, service, manager = context
     item = account(store)
