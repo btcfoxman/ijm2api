@@ -32,7 +32,9 @@ def test_public_images_skip_python_download_without_dropping_or_deduplicating(tm
     body = {"images": [URL, URL], "videos": [], "audios": []}
     original = deepcopy(body)
     result = CanvasServiceMixin()._canvas_local_assets(body, ACCOUNT, tmp_path, deadline=10)
-    assert result == {"images": [{"source_url": URL}, {"source_url": URL}], "videos": [], "audios": []}
+    assert result['videos'] == [] and result['audios'] == []
+    assert [asset['source_url'] for asset in result['images']] == [URL, URL]
+    assert all(callable(asset['fallback_file']) for asset in result['images'])
     assert body == original and not list(tmp_path.iterdir())
 
 
