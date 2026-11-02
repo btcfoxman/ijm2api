@@ -143,10 +143,15 @@ def test_queued_observer_uses_only_remainder_of_claimed_query_window(delivery, c
     advance(60)
     service._run_canvas_result_observer(claimed, account)
     assert service.store.task(TASK_ID)['status'] == 'succeeded'
-    queries = [kwargs for args, kwargs in native.calls if tuple(args[:2]) != ('resource', 'download')]
+    first_download = next(index for index, (args, _) in enumerate(native.calls)
+                          if tuple(args[:2]) == ('resource', 'download'))
+    queries = [kwargs for _, kwargs in native.calls[:first_download]]
     assert queries and all(kwargs['deadline'] <= query_deadline for kwargs in queries)
     download, = [kwargs for args, kwargs in native.calls if tuple(args[:2]) == ('resource', 'download')]
     assert download['deadline'] == now['mono'] + 900
+    settlement_args, settlement = native.calls[-1]
+    assert tuple(settlement_args[:2]) == ('auth', 'account')
+    assert settlement['deadline'] == download['deadline']
 
 
 def test_only_a_new_observer_CAS_claim_can_start_the_next_delivery_attempt(delivery, clock):
