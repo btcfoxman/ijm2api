@@ -230,6 +230,8 @@ def identity_network_error(exc: CanvasCLIError) -> bool:
     error = exc.details.get('error') or {}
     if not isinstance(error, dict) or code.isdigit() or str(error.get('serviceCode') or '').isdigit():
         return False
+    if code == 'CLI.TRANSPORT_FAILED':
+        return preparation_transport_failure(exc)
     return code == 'CLI_COMMAND_TIMEOUT' or (error.get('retryable') is True
         and str(error.get('reason') or '').lower() in {
             'network_timeout', 'dns_resolution_failed', 'network_error', 'transport_error'})
