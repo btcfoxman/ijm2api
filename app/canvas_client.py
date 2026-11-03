@@ -1,4 +1,4 @@
-"""Official Canvas 1.2.0 commands mapped to IJM's durable task lifecycle."""
+"""Official Canvas 1.2.1 commands mapped to IJM's durable task lifecycle."""
 
 from __future__ import annotations
 

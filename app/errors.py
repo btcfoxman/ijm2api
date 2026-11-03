@@ -34,6 +34,10 @@ def upstream_review_error(code: str, message: str) -> str | None:
 def public_error(code: str, message: str) -> dict[str, str]:
     raw = (message or "").lower()
     kind = (code or "").upper()
+    if kind in {'CLI.UPLOAD_STATE_UNKNOWN', 'CLI_QUOTE_UNAVAILABLE'}:
+        # Material registration uncertainty is not a manual generation check.
+        # Original diagnostics remain stored; routing facts require task proof.
+        return {'code': 'CLI_PREPARATION_TRANSIENT_FAILED', 'message': RETRYABLE_SUBMISSION_MESSAGE}
     # Command/admission failures do not prove a refund or an accepted
     # generation. Keep the code and leave routing facts to the task's
     # recorded dispatch/reconciliation evidence.

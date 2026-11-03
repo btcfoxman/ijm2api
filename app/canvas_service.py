@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import mimetypes
@@ -14,7 +15,8 @@ from urllib.parse import urlsplit
 
 from .canvas_cli import TRANSPORT_DIAGNOSTIC_COMMANDS, CanvasCLIError, sanitize
 from .canvas_client import (CanvasClient, identity_network_error, preparation_retryable_failure,
-                            public_image_source_url, submission_evidence_blocks_fallback)
+                            public_image_source_url, submission_evidence_blocks_fallback,
+                            _stable as canvas_input_resource_id, _node_id as canvas_input_node_id)
 from .canvas_timing import PreparationTiming, archived_attempts, INITIAL_ADMISSION_UNSET
 from .canvas_quote_hints import new_hint
 from .canvas_retry_budget import (new_retry_budget, budget_token, claim_attempt,
@@ -338,8 +340,176 @@ class CanvasServiceMixin:
             for ref in pending)
 
     @staticmethod
+    def _canvas_input_only_failure_facts(task: dict) -> dict:
+        try:
+            return CanvasServiceMixin._canvas_input_only_failure_facts_checked(task)
+        except (TypeError, ValueError, AttributeError, KeyError):
+            return {}  # An incomplete legacy audit cannot certify a paid outcome.
+
+    @staticmethod
+    def _canvas_input_only_failure_facts_checked(task: dict) -> dict:
+        """Prove a finished original upload/quote audit, never a paid call."""
+        context = task.get('upstream_context') or {}
+        if (task.get('status') not in {'queued', 'preparing', 'failed', 'expired'}
+                or task.get('execution_backend') != 'canvas_cli'
+                or not isinstance(context, dict)
+                or task.get('actual_cost') is not None and number(task['actual_cost']) != 0
+                or CanvasServiceMixin._canvas_dispatch_evidence(task)):
+            return {}
+        error = context.get('preparation_error') or {}
+        if not isinstance(error, dict):
+            return {}
+        unknown_upload = error.get('code') == 'cli.upload_state_unknown'
+        phases = {'uploading'} if unknown_upload else {'quoting', 'quoted'}
+        if ((not unknown_upload and error.get('code') != 'CLI_QUOTE_UNAVAILABLE')
+                or context.get('phase') not in phases or error.get('phase') not in phases
+                or error.get('outcome_unknown') is not False):
+            return {}
+        for value in (error, error.get('error')):
+            if isinstance(value, dict) and CanvasServiceMixin._canvas_dispatch_evidence({'upstream_context': value}):
+                return {}
+        checkpoint = context.get('upload_checkpoint')
+        if (not isinstance(checkpoint, dict) or type(checkpoint.get('version')) is not int
+                or checkpoint['version'] != 1 or checkpoint.get('backend') != 'canvas_cli'):
+            return {}
+        binding = checkpoint.get('binding')
+        fields = {'task_id', 'account_id', 'profile_sha256', 'user_id_sha256', 'proxy_sha256',
+                  'project_id', 'request_sha256', 'media_sha256'}
+        if (not isinstance(binding, dict) or set(binding) != fields
+                or type(task.get('account_id')) is not int or task['account_id'] <= 0
+                or not isinstance(task.get('id'), str) or not task['id']
+                or type(binding.get('account_id')) is not int or binding['account_id'] != task['account_id']
+                or type(context.get('account_id')) is not int or context['account_id'] != task['account_id']
+                or binding.get('task_id') != task.get('id') or context.get('task_id') != task.get('id')
+                or not isinstance(context.get('profile'), str) or not context['profile']
+                or not isinstance(context.get('project_id'), str) or not context['project_id']
+                or binding.get('project_id') != context['project_id']):
+            return {}
+        def digest(value):
+            return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=True,
+                separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+        if any(not isinstance(binding.get(key), str) or not re.fullmatch(r'[0-9a-f]{64}', binding[key])
+               for key in fields if key.endswith('_sha256')):
+            return {}
+        normalized = task.get('normalized')
+        if not isinstance(normalized, dict):
+            return {}
+        try:
+            if (binding['profile_sha256'] != digest(context['profile'])
+                    or binding['request_sha256'] != digest({key: value for key, value in normalized.items()
+                                                           if not key.startswith('_')})
+                    or context.get('expected_user_id') is not None
+                        and binding['user_id_sha256'] != digest(str(context['expected_user_id']))):
+                return {}
+            binding_hash = digest(binding)
+        except (TypeError, ValueError):
+            return {}
+        resources = context.get('resources')
+        pending, verified = checkpoint.get('pending_refs'), checkpoint.get('refs')
+        if (not isinstance(resources, dict) or set(resources) != {'images', 'videos', 'audios'}
+                or not isinstance(pending, list) or not isinstance(verified, list)
+                or unknown_upload and not pending or not unknown_upload and pending):
+            return {}
+        for group in resources:
+            if (not isinstance(resources[group], list)
+                    or len(resources[group]) != len(normalized.get(group) or [])
+                    or any(value != canvas_input_resource_id(task['account_id'], task['id'], group, index, binding_hash)
+                           for index, value in enumerate(resources[group]))):
+                return {}
+        seen = set()
+        for ref in [*verified, *pending]:
+            if not isinstance(ref, dict):
+                return {}
+            group, index = ref.get('group'), ref.get('index')
+            if (not isinstance(group, str) or group not in resources
+                    or type(index) is not int or index < 0 or index >= len(resources[group])
+                    or ref.get('resource_id') != resources[group][index]
+                    or (group, index) in seen or not isinstance(ref.get('source_kind'), str)
+                    or ref['source_kind'] not in {'url', 'file'}
+                    or not isinstance(ref.get('source_sha256'), str)
+                    or not re.fullmatch(r'[0-9a-f]{64}', ref['source_sha256'])):
+                return {}
+            seen.add((group, index))
+        if (any(ref.get('verified') is not True for ref in verified)
+                or any(ref.get('observe_only') is not True or ref.get('registration') != 'unknown' for ref in pending)):
+            return {}
+        if not unknown_upload and (len(seen) != sum(map(len, resources.values()))
+                or context.get('node_id') != canvas_input_node_id(f"{task['account_id']}:{task['id']}")
+                or context.get('update_id') != canvas_input_resource_id(task['account_id'], task['id'], 'update')
+                or context.get('submit_id') != canvas_input_resource_id(task['account_id'], task['id'], 'submit')):
+            return {}
+        attempts = context.get('preparation_attempts')
+        if (not isinstance(attempts, list) or not attempts
+                or any(not isinstance(entry, dict) or entry.get('reason') == 'accepted' for entry in attempts)
+                or type(context.get('preparation_attempt_count')) is not int
+                or context['preparation_attempt_count'] != len(attempts)):
+            return {}
+        timings = [context.get('preparation_timing')]
+        timings.extend(entry.get('timing') for entry in attempts if isinstance(entry, dict))
+        if len(timings) != len(attempts) + 1:
+            return {}
+        current = timings[0]
+        for timing in timings:
+            if (not isinstance(timing, dict) or timing.get('task_id') != task.get('id')
+                    or timing.get('finished') is not True or type(timing.get('dropped_command_samples')) is not int
+                    or timing['dropped_command_samples'] != 0 or timing.get('current_command') is not None
+                    or timing.get('current_phase') is not None):
+                return {}
+            commands, recent = timing.get('commands'), timing.get('recent_commands')
+            if (not isinstance(commands, dict) or not isinstance(recent, list)
+                    or type(timing.get('command_count')) is not int
+                    or timing['command_count'] != len(recent)):
+                return {}
+            counts, failed = {}, {}
+            for entry in recent:
+                pair = entry.get('command_pair') if isinstance(entry, dict) else None
+                if (not isinstance(pair, list) or len(pair) != 2 or any(not isinstance(x, str) for x in pair)
+                        or pair in (['node', 'run'], ['node', 'confirm'])
+                        or entry.get('outcome') not in {'success', 'failed'}):
+                    return {}
+                name = ' '.join(pair)
+                counts[name] = counts.get(name, 0) + 1
+                failed[name] = failed.get(name, 0) + int(entry['outcome'] == 'failed')
+            if any(not isinstance(value, dict) or type(value.get('count')) is not int
+                   or value['count'] != counts.get(name, 0) or type(value.get('failed')) is not int
+                   or value['failed'] != failed.get(name, 0) for name, value in commands.items()):
+                return {}
+            if set(commands) != set(counts):
+                return {}
+        recent = current['recent_commands']
+        if not any(entry.get('command_pair') == ['auth', 'account'] and entry.get('outcome') == 'success'
+                   for entry in recent):
+            return {}
+        if not unknown_upload:
+            # A complete draft was saved and queried; this certifies no paid
+            # call, without guessing why its quote was unusable or its amount.
+            saved = [i for i, entry in enumerate(recent)
+                if entry['command_pair'] == ['node', 'create'] and entry['outcome'] == 'success']
+            if not any(entry['command_pair'] == ['node', 'quote'] and any(i < j for i in saved)
+                       for j, entry in enumerate(recent)):
+                return {}
+        media_types = {'images': 'image', 'videos': 'video', 'audios': 'audio'}
+        for ref in pending:
+            uploads = [entry for entry in recent if entry.get('command_pair') == ['resource', 'upload']
+                and entry.get('index') == ref['index'] + 1 and entry.get('media_type') == media_types[ref['group']]
+                and entry.get('error_code') == 'cli.upload_state_unknown']
+            if not any(type(upload.get('started_at')) in (int, float)
+                and type(upload.get('elapsed_ms')) in (int, float)
+                and any(entry.get('command_pair') == ['resource', 'get']
+                    and entry.get('index') == ref['index'] + 1 and entry.get('media_type') == media_types[ref['group']]
+                    and type(entry.get('started_at')) in (int, float)
+                    and entry['started_at'] >= upload['started_at'] + upload['elapsed_ms'] / 1000
+                    for entry in recent) for upload in uploads):
+                return {}
+        return {'generation_request_sent': False, 'financial_outcome': 'not_charged_this_invocation',
+                'automatic_resubmission': False, 'fallback_allowed': True}
+
+    @staticmethod
     def _canvas_public_pre_dispatch_facts(task: dict) -> dict:
         """Expose only the new bounded proof; preserve all stored financial data."""
+        if str(task.get('error_code') or '').upper() in {'CLI.UPLOAD_STATE_UNKNOWN', 'CLI_QUOTE_UNAVAILABLE'}:
+            return (CanvasServiceMixin._canvas_input_only_failure_facts(task)
+                    if task.get('status') in {'failed', 'expired'} else {})
         context = task.get('upstream_context') or {}
         facts = context.get('pre_dispatch_failure')
         if (task.get('status') not in {'failed', 'expired'}
@@ -357,9 +527,7 @@ class CanvasServiceMixin:
             return {}
         result = {key: facts[key] for key in ('generation_request_sent', 'financial_outcome',
                                              'automatic_resubmission')}
-        if facts.get('fallback_allowed') is True or task.get('error_code') in {
-                'CLI_PREPARATION_TIMEOUT', 'MEDIA_UPLOAD_PENDING'}:
-            result['fallback_allowed'] = True
+        result['fallback_allowed'] = True  # Only after the complete existing no-dispatch proof above.
         return result
 
     def _canvas_expire_preparation(self, task_id: str, deadline: float, *,
@@ -1320,6 +1488,16 @@ class CanvasServiceMixin:
                     fail_preparation('CLI_PREPARATION_TIMEOUT', '', cause=exc)
                     return True
                 failed_task = self.store.task(task_id) or {}
+                if not submission_started and exc.code in {'cli.upload_state_unknown', 'CLI_QUOTE_UNAVAILABLE'}:
+                    # The client has already observed this exact registration.
+                    # Preserve the vendor's unknown/observe-only state and end;
+                    # never add another observation window or preparation here.
+                    observed_facts = self._canvas_input_only_failure_facts(failed_task)
+                    if observed_facts and not prior_dispatch_evidence:
+                        self._canvas_context(task_id, {'pre_dispatch_failure': {
+                            **observed_facts, 'stage': 'preparation'}})
+                    self._fail_canvas_task(task_id, exc.code, str(exc))
+                    return True
                 pending_reference = self._canvas_pending_reference_retry(failed_task, exc)
                 retryable_preparation = preparation_retryable_failure(exc) or pending_reference
                 facts = (self._canvas_pre_dispatch_facts(failed_task, exc, submission_started)

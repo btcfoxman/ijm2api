@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from app.canvas_cli import CanvasCLI, CanvasCLIError
+from app.canvas_cli import CanvasCLI, CanvasCLIError, PINNED_VERSION
 from app.canvas_client import CanvasClient
 from app.canvas_timing import PreparationTiming
 
@@ -232,7 +232,7 @@ def test_parallel_requires_both_pinned_artifact_and_verified_global_public(tmp_p
     monkeypatch.setattr('app.canvas_cli.PINNED_GLOBAL_LINUX_SHA256',digest if pin_matches else '0'*64)
     runner=CanvasCLI(tmp_path/'state')
     assert not runner._parallel_verified
-    monkeypatch.setattr(runner,'run',lambda account,args,**kwargs:{'data':{'version':'1.2.0','distribution':distribution,'edition':'public'} if args==['version'] else runtime_schema()})
+    monkeypatch.setattr(runner,'run',lambda account,args,**kwargs:{'data':{'version':PINNED_VERSION,'distribution':distribution,'edition':'public'} if args==['version'] else runtime_schema()})
     try:
         if distribution!='global':
             with pytest.raises(CanvasCLIError):runner.verify_runtime()

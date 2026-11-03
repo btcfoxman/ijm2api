@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from app.canvas_cli import CanvasCLI, CanvasCLIError, sanitize
+from app.canvas_cli import CanvasCLI, CanvasCLIError, PINNED_VERSION, sanitize
 from app.canvas_client import CanvasClient, _file_mime, generation_flags, prompt_with_resources, select_model, select_mode
 
 
@@ -471,10 +471,13 @@ def test_failed_diagnostic_does_not_hide_terminal_generation_failure(tmp_path, m
     assert client.poll(context)["status"] == "failed"
 
 
-def test_runtime_probe_rejects_wrong_distribution(tmp_path, monkeypatch):
+@pytest.mark.parametrize('version,distribution,edition', [
+    (PINNED_VERSION, 'cn', 'public'), ('1.2.0', 'global', 'public'),
+    (PINNED_VERSION, 'global', 'internal')])
+def test_runtime_probe_rejects_incompatible_artifact(tmp_path, monkeypatch, version, distribution, edition):
     runner = CanvasCLI(tmp_path, allow_unwrapped_for_tests=True)
     monkeypatch.setattr(runner, "run", lambda *a, **k: {"data": {
-        "version": "1.2.0", "distribution": "cn", "edition": "public"}})
+        "version": version, "distribution": distribution, "edition": edition}})
     with pytest.raises(CanvasCLIError) as found:
         runner.verify_runtime()
     assert found.value.code == "CLI_RUNTIME_INCOMPATIBLE"

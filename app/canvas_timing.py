@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import re
 import threading
@@ -22,6 +23,63 @@ _RESOURCE_STATUSES = frozenset({'pending', 'queued', 'processing', 'uploading', 
 _RESOURCE_ERROR_CODES = frozenset({'upload_failed', 'download_failed', 'processing_failed',
     'invalid_media', 'unsupported_media', 'resource_not_found', 'content_policy_violation',
     'moderation_rejected', 'policy_rejected', 'safety_rejected', 'canceled', 'cancelled'})
+_QUOTE_FIELDS = frozenset({'mode', 'model', 'duration', 'resolution', 'ratio', 'aspect_ratio',
+    'count', 'imageCount', 'prompt', 'references', 'fps', 'frame_rate', 'first_frame',
+    'last_frame', 'audio', 'enable_audio'})
+_QUOTE_ERROR_CLASSES = frozenset({'invalid_input', 'retryable_failure', 'internal_failure',
+    'human_intervention', 'authentication_failure', 'authorization_failure', 'business_failure'})
+_QUOTE_ACTIONS = frozenset({'retry', 'fix_input', 'login', 'resume', 'contact_support',
+    'human_intervention', 'none'})
+
+
+def _quote_observation(args, result):
+    """Keep bounded quote decision facts without item text, references or IDs."""
+    if not isinstance(result, dict) or not any(key in result for key in (
+            'items', 'confirmable', 'totalMaxCredits', 'confirmationRequired')):
+        return None
+    facts = {}
+    for field in ('confirmable', 'confirmationRequired'):
+        if type(result.get(field)) is bool:
+            facts[field] = result[field]
+    amount = result.get('totalMaxCredits')
+    if type(amount) in (int, float) and math.isfinite(amount) and 0 <= amount <= 10**12:
+        facts['total_max_credits'] = amount  # A free quote is still an authoritative quote.
+    items = result.get('items')
+    facts['items_are_list'] = isinstance(items, list)
+    if not isinstance(items, list):
+        return facts
+    facts['item_count'] = len(items)
+    node = args[args.index('--node-id') + 1] if '--node-id' in args and args.index('--node-id') + 1 < len(args) else None
+    samples = []
+    for item in items[:3]:
+        if not isinstance(item, dict):
+            samples.append({'item_is_object': False})
+            continue
+        diff, error = item.get('generationDiff'), item.get('error')
+        sample = {'item_is_object': True, 'requested_node_matches': isinstance(node, str)
+            and bool(node) and item.get('nodeId') == node,
+            'error_present': bool(error), 'generation_diff_present': bool(diff)}
+        if isinstance(diff, dict):
+            sample['generation_diff_fields'] = sorted(key for key in diff if key in _QUOTE_FIELDS)
+        if isinstance(error, dict):
+            for field, allowed in (('class', _QUOTE_ERROR_CLASSES), ('requiredAction', _QUOTE_ACTIONS)):
+                if isinstance(error.get(field), str) and error[field] in allowed:
+                    sample[field] = error[field]
+            if type(error.get('retryable')) is bool:
+                sample['retryable'] = error['retryable']
+            for field in ('code', 'serviceCode'):
+                value = error.get(field)
+                if type(value) is int and -(2**31) <= value < 2**31:
+                    sample[field] = value
+                elif isinstance(value, str) and value:
+                    sample[field + '_sha256'] = hashlib.sha256(value.encode()).hexdigest()
+            for field in ('httpStatus', 'http_status'):
+                value = error.get(field)
+                if type(value) is int and 100 <= value <= 599:
+                    sample['http_status'] = value
+        samples.append(sample)
+    facts['items'] = samples
+    return facts
 
 
 def _resource_observation(args, result):
@@ -225,6 +283,14 @@ class PreparationTiming:
                             entry['resource_facts'] = facts
                 except Exception:
                     pass  # Observation must not replace a successful command result.
+            elif pair == ('node', 'quote'):
+                try:
+                    facts = _quote_observation(args, result)
+                    if facts is not None:
+                        with self._lock:
+                            entry['quote_facts'] = facts
+                except Exception:
+                    pass  # Diagnostics cannot turn a quote result into a failure.
             return result
         except BaseException as error:
             code = str(getattr(error, 'code', type(error).__name__))

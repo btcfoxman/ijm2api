@@ -9,17 +9,17 @@ import tempfile
 import time
 import urllib.request
 
-VERSION = '1.2.0'
+VERSION = '1.2.1'
 # The official front door redirects by region. Pin its verified CDN location
 # instead; every source must still match the same immutable release hash.
 BASE = ('https://sf16-web-login-neutral.capcutstatic.com/obj/capcut-web-login-static/'
-        'videocut/aigc/dreamina_canvas_cli_oversea/1_0_0_26/')
-FALLBACK_BASE = 'https://dreamina.capcut.com/canvas-cli/install/1_0_0_26/'
+        'videocut/aigc/dreamina_canvas_cli_oversea/1_0_0_29/')
+FALLBACK_BASE = 'https://dreamina.capcut.com/canvas-cli/install/1_0_0_29/'
 ARTIFACTS = {
     'linux-amd64': ('dreamina-canvas_linux_amd64',
-        '2bb3bd62585178017a153dcdaf40991e0ac78a80edbeefebbe611cee193ef649'),
+        'f2de31b8ee3290f02d0a12a663fe8f2a5c667629b50307144cac4f2d58624901'),
     'windows-amd64': ('dreamina-canvas_windows_amd64.exe',
-        '18b6001b23de441b33f955222075f23be841f70dbab0cedb50044850da16b3f8'),
+        '30bdc1709465340b65f569a1315b2817a76b8662e639ee5ae89920b72ea12188'),
 }
 
 

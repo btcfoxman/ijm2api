@@ -7,13 +7,13 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 
-from app.canvas_cli import CanvasCLI, CanvasCLIError
+from app.canvas_cli import CanvasCLI, CanvasCLIError, PINNED_VERSION
 from app.catalog import normalize_request
 from app.service import Service
 from app.store import Store
 
 
-RUNTIME = {'available': True, 'version': '1.2.0', 'distribution': 'global',
+RUNTIME = {'available': True, 'version': PINNED_VERSION, 'distribution': 'global',
            'proxy_transport': 'graftcp', 'proxy_version': '0.8.3'}
 
 

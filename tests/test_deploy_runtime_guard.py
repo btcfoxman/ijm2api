@@ -3,16 +3,17 @@ import json
 import pytest
 
 from app import deploy_runtime_guard as guard
+from app.canvas_cli import PINNED_VERSION
 
 
 def ready():
-    return {"canvas_cli_runtime": {"available": True, "version": "1.2.0",
+    return {"canvas_cli_runtime": {"available": True, "version": PINNED_VERSION,
         "distribution": "global", "schema_version": "1",
         "proxy_transport": "graftcp", "proxy_version": "0.8.3"}}
 
 
 @pytest.mark.parametrize("field,value", [
-    ("available", False), ("available", 1), ("version", "1.3.0"),
+    ("available", False), ("available", 1), ("version", "1.2.0"), ("version", "1.3.0"),
     ("distribution", "cn"), ("schema_version", "2"),
     ("proxy_transport", "test_unwrapped"), ("proxy_version", "0.8.2"),
 ])

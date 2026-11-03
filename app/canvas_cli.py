@@ -27,9 +27,9 @@ from urllib.parse import unquote, urlsplit
 from .canvas_account_lane import AccountLane
 
 
-PINNED_VERSION = "1.2.0"
+PINNED_VERSION = "1.2.1"
 PINNED_PROXY_VERSION = "0.8.3"
-PINNED_GLOBAL_LINUX_SHA256 = "2bb3bd62585178017a153dcdaf40991e0ac78a80edbeefebbe611cee193ef649"
+PINNED_GLOBAL_LINUX_SHA256 = "f2de31b8ee3290f02d0a12a663fe8f2a5c667629b50307144cac4f2d58624901"
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 TRANSPORT_DIAGNOSTIC_COMMANDS = frozenset({('auth', 'account'), ('auth', 'status'),
     ('auth', 'login'), ('auth', 'wait'), ('auth', 'refresh'), ('auth', 'logout'),
@@ -232,7 +232,7 @@ class CanvasCLI:
         version = self.run(probe, ["version"], timeout=10)["data"]
         if (version.get("version") != PINNED_VERSION or version.get("distribution") != "global"
                 or version.get("edition") != "public"):
-            raise CanvasCLIError("CLI_RUNTIME_INCOMPATIBLE", "Canvas CLI must be the pinned global public 1.2.0 release")
+            raise CanvasCLIError("CLI_RUNTIME_INCOMPATIBLE", f"Canvas CLI must be the pinned global public {PINNED_VERSION} release")
         schema = self.run(probe, ["schema"], timeout=15)["data"]
         if schema.get("distribution") != "global" or str(schema.get("schemaVersion")) != "1":
             raise CanvasCLIError("CLI_RUNTIME_INCOMPATIBLE", "Canvas CLI schema is incompatible")

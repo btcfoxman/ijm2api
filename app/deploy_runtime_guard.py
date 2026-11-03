@@ -17,7 +17,7 @@ def runtime_ready(value: object) -> bool:
     runtime = value.get("canvas_cli_runtime")
     return bool(isinstance(runtime, dict)
         and runtime.get("available") is True
-        and runtime.get("version") == "1.2.0"
+        and runtime.get("version") == "1.2.1"
         and runtime.get("distribution") == "global"
         and str(runtime.get("schema_version")) == "1"
         and runtime.get("proxy_transport") == "graftcp"

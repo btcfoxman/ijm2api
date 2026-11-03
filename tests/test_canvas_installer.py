@@ -8,9 +8,25 @@ from urllib.error import HTTPError
 
 import pytest
 
+from app import deploy_runtime_guard
+from app.canvas_cli import PINNED_GLOBAL_LINUX_SHA256, PINNED_VERSION
+
 SPEC = importlib.util.spec_from_file_location('canvas_installer', Path(__file__).parents[1] / 'tools/install_canvas_cli.py')
 installer = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(installer)
+
+
+def test_installer_runtime_and_standalone_deploy_guard_share_exact_release():
+    assert installer.VERSION == PINNED_VERSION == '1.2.1'
+    assert installer.ARTIFACTS['linux-amd64'][1] == PINNED_GLOBAL_LINUX_SHA256
+    assert installer.BASE.endswith('/dreamina_canvas_cli_oversea/1_0_0_29/')
+    assert installer.FALLBACK_BASE.endswith('/1_0_0_29/')
+    runtime = {'available': True, 'version': PINNED_VERSION, 'distribution': 'global',
+               'schema_version': '1', 'proxy_transport': 'graftcp', 'proxy_version': '0.8.3'}
+    assert deploy_runtime_guard.runtime_ready({'canvas_cli_runtime': runtime})
+    for version, distribution in [('1.2.0', 'global'), (PINNED_VERSION, 'cn')]:
+        assert not deploy_runtime_guard.runtime_ready({'canvas_cli_runtime': {
+            **runtime, 'version': version, 'distribution': distribution}})
 
 
 def test_cdn_download_is_checked_before_installing(tmp_path):

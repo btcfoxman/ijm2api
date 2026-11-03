@@ -198,8 +198,9 @@ Canvas resource `creditsAmount` is a pre-charge snapshot, not proof of final
 net spend; isolated account balance evidence remains necessary for actual cost.
 Cost history and upload caches are separated by execution backend.
 
-The image build downloads official CLI 1.2.0 from its immutable release
-directory and verifies SHA256 using `tools/install_canvas_cli.py`. The running
+The image build downloads official public/global CLI 1.2.1 from immutable release
+`1_0_0_29` and verifies SHA256 using `tools/install_canvas_cli.py`. This is the
+international distribution; CN artifacts with the same version are rejected. The running
 service never downloads or upgrades the CLI. Builds and full validation run on
 GitHub Actions; the deployment host only pulls and restarts the built image.
 
