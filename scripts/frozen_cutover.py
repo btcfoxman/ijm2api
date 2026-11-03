@@ -868,17 +868,42 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
             except Exception as error:
                 receipt["old_container_wait_diagnostic"] = diagnostic_error(error)
             raise
-        current = json.loads(run(["docker", "inspect", old_id], timeout=10))[0]
-        try:
-            receipt["old_container_death_diagnostic"] = old_container_diagnostic(current, old_id)
-        except Exception as error:
-            receipt["old_container_death_diagnostic"] = diagnostic_error(error)
-        if (container_stable_facts(current) != stable_facts
-                or current["State"].get("Running") is not False or current["State"].get("Restarting")
-                or current["State"].get("Pid") != 0 or current.get("RestartCount") != original_restart_count
-                or current["HostConfig"].get("RestartPolicy") != {"Name": "no", "MaximumRetryCount": 0}):
-            raise RuntimeError("OriginalContainerDeathNotVerified")
         receipt["cgroup_death"] = death
+        # Kernel death is already independently proven. Docker may publish its
+        # stopped metadata later; observe only that same container, never kill
+        # again or use daemon metadata in place of the cgroup/PID proof above.
+        metadata_started = time.monotonic()
+        metadata_deadline = metadata_started + 10
+        metadata_attempts = 0
+        while True:
+            remaining = metadata_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("OriginalContainerDeathNotVerified")
+            current = json.loads(run(["docker", "inspect", old_id], timeout=min(2, remaining)))[0]
+            metadata_attempts += 1
+            try:
+                receipt["old_container_death_diagnostic"] = old_container_diagnostic(current, old_id)
+            except Exception as error:
+                receipt["old_container_death_diagnostic"] = diagnostic_error(error)
+            receipt["docker_metadata_observation"] = {"attempts": metadata_attempts,
+                "elapsed_seconds": max(0, time.monotonic() - metadata_started), "budget_seconds": 10}
+            state = current.get("State") or {}
+            if (container_stable_facts(current) != stable_facts
+                    or type(current.get("RestartCount")) is not int
+                    or current["RestartCount"] != original_restart_count
+                    or current["HostConfig"].get("RestartPolicy") != {"Name": "no", "MaximumRetryCount": 0}
+                    or state.get("Restarting") is not False
+                    or type(state.get("Running")) is not bool or type(state.get("Paused")) is not bool
+                    or type(state.get("Pid")) is not int or state["Pid"] not in {0, identity["pid"]}):
+                raise RuntimeError("OriginalContainerIdentityChangedAfterDeath")
+            remaining = metadata_deadline - time.monotonic()
+            if remaining < 0:
+                raise RuntimeError("OriginalContainerDeathNotVerified")
+            if state["Running"] is False and state["Paused"] is False and state["Pid"] == 0:
+                break
+            if remaining <= 0:
+                raise RuntimeError("OriginalContainerDeathNotVerified")
+            time.sleep(min(0.2, remaining))
         durable_json(release / "frozen-death.safe.json", {
             "cgroup_death": death, "container_id": old_id, "original_process_stopped": True,
             "restart_count": original_restart_count, "restart_policy": "no", "kill_attempts": 1})

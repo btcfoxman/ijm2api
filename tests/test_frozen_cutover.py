@@ -165,6 +165,9 @@ class FakeDocker:
         self.restart_read_mount_field_drift_once = None
         self.snapshot_capacity_failure = False
         self.diagnostic_inspect_failure = False
+        self.postkill_metadata_delays = 0
+        self.postkill_metadata_drift = None
+        self.postkill_metadata_inspects = []
         self.cgroup = FakeCgroup(self)
 
     def export_backup(self, companion_id, destination):
@@ -220,6 +223,21 @@ class FakeDocker:
                 'HostConfig': {'AutoRemove': False, 'RestartPolicy': deepcopy(self.restart_policy), 'PidMode': ''},
                 "State": {"Running": not self.old_stopped and not self.old_removed, "Paused": self.paused,
                           'Pid': 0 if self.old_stopped else 4321, 'Restarting': False}}
+            if self.old_stopped:
+                self.postkill_metadata_inspects.append(timeout)
+                if self.postkill_metadata_delays:
+                    self.postkill_metadata_delays -= 1
+                    value['State'].update(Running=True, Paused=True, Pid=4321)
+                if self.postkill_metadata_drift == 'id': value['Id'] = 'f' * 64
+                elif self.postkill_metadata_drift == 'name': value['Name'] = '/replacement'
+                elif self.postkill_metadata_drift == 'image': value['Image'] = 'sha256:' + 'f' * 64
+                elif self.postkill_metadata_drift == 'config': value['Config']['Image'] = 'replacement:mutable'
+                elif self.postkill_metadata_drift == 'host': value['HostConfig']['PidMode'] = 'host'
+                elif self.postkill_metadata_drift == 'mounts': value['Mounts'] = [{'Destination': '/changed', 'RW': True}]
+                elif self.postkill_metadata_drift == 'policy': value['HostConfig']['RestartPolicy'] = {'Name': 'always', 'MaximumRetryCount': 0}
+                elif self.postkill_metadata_drift == 'restart_count': value['RestartCount'] += 1
+                elif self.postkill_metadata_drift == 'restarting': value['State']['Restarting'] = True
+                elif self.postkill_metadata_drift == 'pid': value['State']['Pid'] = 8765
             if self.restart_read_mount_order_drift_once and self.restart_policy['Name'] == 'no' and not self.companion_exists:
                 value['Mounts'].reverse()
                 self.restart_read_mount_order_drift_once = False
@@ -660,6 +678,63 @@ class FrozenCutoverTests(unittest.TestCase):
             self.invoke()
         self.assertEqual(self.docker.kill_count, 1)
 
+    def test_proven_cgroup_death_waits_for_delayed_docker_metadata_without_another_kill(self):
+        for delayed_reads in (1, 4):
+            with self.subTest(delayed_reads=delayed_reads), tempfile.TemporaryDirectory() as directory:
+                self.release = Path(directory)
+                (self.release / 'query-resume-baseline.safe.json').write_text(json.dumps({'binding_sha256': BINDING}))
+                self.docker = FakeDocker()
+                self.docker.postkill_metadata_delays = delayed_reads
+                clock = [100.0]
+                def sleep(seconds):
+                    clock[0] += seconds
+                with patch.object(cutover.time, 'monotonic', side_effect=lambda: clock[0]), \
+                        patch.object(cutover.time, 'sleep', side_effect=sleep):
+                    receipt = self.invoke()
+                self.assertTrue(receipt['passed'] and self.docker.old_removed)
+                self.assertEqual(self.docker.kill_count, 1)
+                self.assertEqual(receipt['kill_command_invocations'], 1)
+                self.assertEqual(receipt['docker_metadata_observation']['attempts'], delayed_reads + 1)
+                self.assertEqual(len(self.docker.postkill_metadata_inspects), delayed_reads + 1)
+                self.assertTrue(all(0 < timeout <= 2 for timeout in self.docker.postkill_metadata_inspects))
+                self.assertLess(clock[0] - 100, 10)
+                self.assertEqual(self.docker.calls.count(['cgroup_wait_empty']), 1)
+                self.assertNotIn(['docker', 'unpause', self.docker.old_id], self.docker.calls)
+
+    def test_proven_cgroup_death_metadata_wait_has_one_absolute_ten_second_budget(self):
+        self.docker.postkill_metadata_delays = 1000
+        clock = [100.0]
+        def sleep(seconds):
+            clock[0] += seconds
+        with patch.object(cutover.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(cutover.time, 'sleep', side_effect=sleep):
+            with self.assertRaisesRegex(RuntimeError, 'OriginalContainerDeathNotVerified'):
+                self.invoke()
+        self.assertAlmostEqual(clock[0] - 100, 10)
+        self.assertLessEqual(len(self.docker.postkill_metadata_inspects), 52)
+        self.assertTrue(all(0 < timeout <= 2 for timeout in self.docker.postkill_metadata_inspects))
+        self.assertEqual(self.docker.kill_count, 1)
+        self.assertFalse(self.docker.old_removed)
+        self.assertTrue(self.receipt()['postkill_outcome_requires_operator_review'])
+        self.assertNotIn(['docker', 'rm', self.docker.old_id], self.docker.calls)
+
+    def test_postdeath_identity_restart_or_config_drift_rejects_immediately_without_rekill(self):
+        for field in ('id', 'name', 'image', 'config', 'host', 'mounts', 'policy', 'restart_count', 'restarting', 'pid'):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                self.release = Path(directory)
+                (self.release / 'query-resume-baseline.safe.json').write_text(json.dumps({'binding_sha256': BINDING}))
+                self.docker = FakeDocker()
+                self.docker.postkill_metadata_delays = 1000
+                self.docker.postkill_metadata_drift = field
+                with patch.object(cutover.time, 'sleep') as sleep:
+                    with self.assertRaisesRegex(RuntimeError, 'OriginalContainerIdentityChangedAfterDeath'):
+                        self.invoke()
+                    sleep.assert_not_called()
+                self.assertEqual(len(self.docker.postkill_metadata_inspects), 1)
+                self.assertEqual(self.docker.kill_count, 1)
+                self.assertFalse(self.docker.old_removed)
+                self.assertTrue(self.receipt()['postkill_outcome_requires_operator_review'])
+                self.assertNotIn(['docker', 'unpause', self.docker.old_id], self.docker.calls)
     def test_docker_stopped_without_complete_cgroup_death_proof_cannot_remove(self):
         for proof in ({'empty_proof': 'unknown', 'original_pid_gone': True},
                       {'empty_proof': 'held_events_populated_zero', 'original_pid_gone': False}):
