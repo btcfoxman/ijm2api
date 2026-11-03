@@ -25,6 +25,9 @@ from .canvas_cli import CanvasCLI, CanvasCLIError, _has_accepted, account_profil
 from .catalog import ALIASES, media_alias_kind
 from .errors import public_error, upstream_review_error
 from .canvas_upload_limiter import UPLOAD_LIMITER, runner_namespace
+from .canvas_input_recovery import (TICKET_KEY, digest as input_digest, file_identity,
+                                    remaining_deadline, safe_error, validated_tickets)
+from .canvas_operation_recovery import recover_absent_operation
 
 
 _NAMESPACE = uuid.UUID("b867f326-c52e-491e-b971-3937d0c731c1")
@@ -804,7 +807,8 @@ class CanvasClient:
     def _upload_resource(self, path: Path | None, media_type: str, resource_id: str, project_id: str, *,
                          deadline: float | None = None, source_url: str | None = None,
                           on_registered: Callable[[str], Any] | None = None,
-                          fallback_file: Callable[[], Path] | None = None) -> None:
+                           fallback_file: Callable[[], Path] | None = None,
+                           file_recovery=None, file_source_sha256: str | None = None) -> None:
         """Retries keep the same documented registration idempotency key."""
         if source_url is not None:
             if media_type != 'image' or path is not None:
@@ -816,6 +820,11 @@ class CanvasClient:
             source = ['--file', str(path.resolve())]
         else:
             raise CanvasCLIError('MEDIA_INPUT_MISSING', 'Canvas reference file is missing')
+        original_file = None
+        if source_url is None and callable(file_recovery):
+            original_file = file_identity(path, lambda: self._remaining(deadline))
+            if original_file[-1] != file_source_sha256:
+                raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID', 'Canvas input bytes changed before registration')
         for attempt in range(3):
             upload_acknowledged = False
             try:
@@ -833,15 +842,25 @@ class CanvasClient:
                 if exc.code == "MEDIA_UPLOAD_FAILED":
                     raise
                 if exc.code == "cli.upload_state_unknown" or exc.outcome_unknown:
-                    # The CLI explicitly forbids replaying an unknown upload.
-                    # Only observe its original registration ID; this is not a
-                    # node.run recovery and must never allocate another ID.
-                    if on_registered is not None:
-                        on_registered('unknown')
+                    observation_deadline = min(time.monotonic() + 120, deadline) if deadline is not None else time.monotonic() + 120
                     try:
-                        self._observe_unknown_upload(resource_id, project_id, deadline=deadline, media_type=media_type)
+                        if (exc.code == 'cli.upload_state_unknown' and not exc.outcome_unknown
+                                and original_file is not None):
+                            # Input UUIDs have a documented registration-idempotency
+                            # contract. This one FILE recovery is separate from paid
+                            # node.run and retains the original SDK diagnostic.
+                            observation_deadline, eligible = file_recovery('observing', exc, observation_deadline)
+                            if eligible and attempt < 2:
+                                self._recover_unknown_file(path, media_type, resource_id, project_id, exc,
+                                    original_file, file_recovery, observation_deadline, on_registered)
+                        elif on_registered is not None:
+                            on_registered('unknown')
+                        self._observe_unknown_upload(resource_id, project_id, deadline=deadline, media_type=media_type,
+                            observation_deadline=observation_deadline)
                     except CanvasCLIError as observed:
-                        if observed.code == "MEDIA_UPLOAD_PENDING":
+                        if (observed.code == 'MEDIA_UPLOAD_PENDING'
+                                or observed.code == 'CLI_TASK_DEADLINE_EXCEEDED'
+                                   and (deadline is None or time.monotonic() < deadline)):
                             raise exc from observed
                         raise
                     return
@@ -865,9 +884,9 @@ class CanvasClient:
                             if not retryable_read or _resource_read_intervention(check):
                                 raise
                             if on_registered is not None:
-                                # This is our failed read after a known retryable,
-                                # unacknowledged URL write, not the vendor's
-                                # cli.upload_state_unknown no-replay contract.
+                                # A locally unacknowledged URL is a different
+                                # state from SDK unknown. Same-ID FILE recovery
+                                # needs its own durable ticket and binding proof.
                                 on_registered('unacknowledged')
                             raise exc from check
                         if attempt == 2:
@@ -898,9 +917,77 @@ class CanvasClient:
                     raise
                 self._sleep(0.5 * 2 ** attempt, deadline)
 
+    def _recover_unknown_file(self, path, media_type, resource_id, project_id, original_error,
+                              original_file, ticket, observation_deadline, on_registered):
+        """Fresh exact read + durable once claim; no generic unknown replay."""
+        details = original_error.details if isinstance(original_error.details, dict) else {}
+        facts = details.get('error') if isinstance(details.get('error'), dict) else {}
+        classification = ' '.join(str(facts.get(key) or '').lower() for key in ('class', 'reason'))
+        if (facts.get('class') in {'permanent_failure', 'business_failure', 'invalid_input'}
+                or facts.get('requiredAction') in {'login', 'fix_input'}
+                or any(word in classification for word in ('auth', 'identity', 'mismatch', 'permission',
+                    'policy', 'moderation', 'copyright', 'invalid_input', 'insufficient', 'unsupported'))
+                or any(value.get(key) for value in (details, facts) for key in
+                       ('partialData', 'accepted', 'resources', 'receipt', 'run_receipt', 'submission'))):
+            raise original_error
+        try:
+            identity = self.identity(deadline=observation_deadline)
+        except CanvasCLIError as check:
+            if identity_network_error(check):
+                return  # An unavailable fresh identity permits reads, never a write.
+            raise
+        expected = str(self.account.get('login_user_id') or self.account.get('cli_user_id') or '')
+        if (not expected or str(identity.get('user_id') or '') != expected
+                or any(str(self.account.get(key) or '') not in {'', expected}
+                       for key in ('login_user_id', 'cli_user_id'))):
+            raise CanvasCLIError('CLI_IDENTITY_MISMATCH', 'Canvas input recovery identity changed')
+        try:
+            current = self._call(['resource', 'get', resource_id, '--project-id', project_id],
+                timeout=10, read_only=True, deadline=observation_deadline)
+        except CanvasCLIError as check:
+            if not _planned_resource_not_found(check, resource_id):
+                if (not check.outcome_unknown and not _resource_read_intervention(check)
+                        and (preparation_retryable_failure(check) or identity_network_error(check)
+                             or check.code in {'CLI_INVALID_RESPONSE', 'cli.resource_unavailable'})):
+                    return  # A failed absence probe stays on the original observation path.
+                raise
+            if any(value.get(key) for value in (check.details, check.details.get('error') or {})
+                   if isinstance(value, dict) for key in ('partialData', 'accepted', 'resources', 'receipt', 'submission')):
+                raise  # Contradictory partial presence is not registration absence.
+        else:
+            if current.get('projectId') not in (None, '', project_id):
+                raise CanvasCLIError('CLI_RESOURCE_MISMATCH', 'Canvas input recovery returned another project')
+            self._reference_state(current, resource_id, media_type)
+            if on_registered is not None:
+                on_registered('acknowledged')
+            return  # A ready/processing registration is observed, never rewritten.
+        if file_identity(path, lambda: self._remaining(observation_deadline)) != original_file:
+            raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID', 'Canvas recovery input path or bytes changed')
+        if not ticket('claim', original_error, observation_deadline)[1]:
+            return
+        # Saving the claim may take time or invoke a callback. Recheck the file
+        # after that durable boundary; a failed check burns the ticket safely.
+        if file_identity(path, lambda: self._remaining(observation_deadline)) != original_file:
+            raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID', 'Canvas recovery input changed after its claim')
+        if not ticket('verify', original_error, observation_deadline)[1]:
+            return
+        try:
+            self._call(['resource', 'upload', '--file', str(path.resolve()), '--type', media_type,
+                '--project-id', project_id, '--resource-id', resource_id], timeout=180, deadline=observation_deadline)
+        except CanvasCLIError as retried:
+            if (retried.code != 'cli.upload_state_unknown'
+                    and not preparation_retryable_failure(retried)
+                    and retried.code not in {'CLI_COMMAND_TIMEOUT', 'CLI_INVALID_RESPONSE'}):
+                raise
+            return  # A second ambiguous write only observes the original UUID.
+        if on_registered is not None:
+            on_registered('acknowledged')
+
     def _observe_unknown_upload(self, resource_id: str, project_id: str, *,
-                                deadline: float | None = None, media_type: str | None = None) -> None:
-        observation_deadline = time.monotonic() + 120
+                                deadline: float | None = None, media_type: str | None = None,
+                                observation_deadline: float | None = None) -> None:
+        if observation_deadline is None:
+            observation_deadline = time.monotonic() + 120
         if deadline is not None:
             observation_deadline = min(observation_deadline, deadline)
         try:
@@ -1002,6 +1089,8 @@ class CanvasClient:
             and checkpoint['version'] == 1 and checkpoint.get('backend') == 'canvas_cli'
             and checkpoint.get('binding') == binding and isinstance(checkpoint.get('refs'), list)
             and len(checkpoint['refs']) <= len(refs))
+        if isinstance(checkpoint, dict) and checkpoint.get(TICKET_KEY) and not candidate_valid:
+            raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID', 'Canvas input recovery tickets require their original binding')
         if has_pending and not candidate_valid:
             raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID',
                 'Canvas pending uploads must retain their original input binding')
@@ -1036,6 +1125,9 @@ class CanvasClient:
                         raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID',
                             'Canvas unacknowledged upload requires its original URL image fallback')
                 pending_refs[resource_id] = disposition
+        tickets = validated_tickets(checkpoint, jobs, binding) if isinstance(checkpoint, dict) else []
+        if any(item['resource_id'] not in verified and item['resource_id'] not in pending_refs for item in tickets):
+            raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID', 'Canvas input recovery lost its original registration state')
         context['resources'] = {group: [job['resource_id'] for job in jobs if job['group'] == group]
                                 for group in ('images', 'videos', 'audios')}
         context['uploaded_resources'] = [ref['resource_id'] for ref in refs if ref['resource_id'] in verified]
@@ -1043,10 +1135,12 @@ class CanvasClient:
             'refs': [expected[ref['resource_id']] for ref in refs if ref['resource_id'] in verified],
             'pending_refs': [{**ref, 'observe_only': True, 'registration': pending_refs[ref['resource_id']]}
                 for ref in refs if ref['resource_id'] in pending_refs]}
+        if tickets:
+            context['upload_checkpoint'][TICKET_KEY] = tickets
         return jobs, refs, expected, verified, pending_refs
 
     def _upload_references(self, jobs, refs, expected, verified, pending_refs, context, save, state_lock,
-                           epoch, deadline):
+                           epoch, deadline, *, durable_persist=False):
         stopped = Event()
         failure_lock = threading.Lock()
         first_failure = []
@@ -1060,7 +1154,7 @@ class CanvasClient:
         def upload(job):
             admitted = False
 
-            def registered(disposition):
+            def registered(disposition, *, flush=True):
                 with state_lock:
                     pending_refs[job['resource_id']] = disposition
                     context['upload_checkpoint']['pending_refs'] = [
@@ -1068,12 +1162,69 @@ class CanvasClient:
                         for ref in refs if ref['resource_id'] in pending_refs]
                     # Commit the observe-only restriction before any readiness
                     # call can fail or another sibling can select a retry.
+                    if flush:
+                        save('uploading')
+
+            original_binding = copy.deepcopy(context['upload_checkpoint']['binding'])
+            started_ticket = None
+
+            def file_recovery(event, error, observation_deadline):
+                nonlocal started_ticket
+                with state_lock:
+                    checkpoint = context['upload_checkpoint']
+                    if (_upload_dispatch_evidence(context) or checkpoint.get('binding') != original_binding
+                            or int(self.account['id']) != original_binding['account_id']
+                            or context.get('task_id') != original_binding['task_id']
+                            or input_digest(str(self.account.get('login_user_id') or self.account.get('cli_user_id') or '')) != original_binding['user_id_sha256']
+                            or any(input_digest(str(self.account[key])) != original_binding['user_id_sha256']
+                                   for key in ('login_user_id', 'cli_user_id') if self.account.get(key))
+                            or input_digest(str(self.account.get('proxy_url') or '')) != original_binding['proxy_sha256']
+                            or context.get('project_id') != original_binding['project_id']):
+                        raise CanvasCLIError('CLI_ACCOUNT_MISMATCH', 'Canvas input recovery binding changed')
+                    self._check_context(context, deadline=observation_deadline)
+                    getter = getattr(self.runner, 'credential_epoch', None)
+                    if epoch is not None and callable(getter) and getter(self.account) != epoch:
+                        raise CanvasCLIError('CLI_ACCOUNT_MISMATCH', 'Canvas input recovery credentials changed')
+                    self._remaining(observation_deadline)
+                    entries = validated_tickets(checkpoint, jobs, original_binding)
+                    previous = next((item for item in entries if item['resource_id'] == job['resource_id']), None)
+                    if event == 'observing':
+                        if previous is not None:
+                            return remaining_deadline(previous, clock=time.monotonic, wall_time=time.time,
+                                                      deadline=observation_deadline), False
+                        now = time.time()
+                        started_ticket = {'version': 1, 'resource_id': job['resource_id'],
+                            'media_type': job['media_type'], 'source_sha256': job['source_sha256'],
+                            'binding_sha256': input_digest(original_binding), 'attempt': 0, 'state': 'observing',
+                            'observation_started_at': now,
+                            'observation_deadline_at': now + max(0, observation_deadline - time.monotonic()),
+                            'original_error': safe_error(error)}
+                        registered('unknown', flush=False)
+                        checkpoint[TICKET_KEY] = [*entries, copy.deepcopy(started_ticket)]
+                    elif (event == 'claim' and started_ticket is not None and previous == started_ticket
+                            and pending_refs.get(job['resource_id']) == 'unknown'
+                            and job['resource_id'] not in verified):
+                        claimed = {**started_ticket, 'attempt': 1, 'state': 'claimed'}
+                        checkpoint[TICKET_KEY] = [claimed if item['resource_id'] == job['resource_id'] else item for item in entries]
+                    elif (event == 'verify' and started_ticket is not None
+                            and previous == {**started_ticket, 'attempt': 1, 'state': 'claimed'}
+                            and pending_refs.get(job['resource_id']) == 'unknown' and job['resource_id'] not in verified):
+                        return observation_deadline, True
+                    else:
+                        return observation_deadline, False
+                    # The state-zero deadline and state-one claim are each
+                    # durable before a query/write can advance this recovery.
                     save('uploading')
+                    return observation_deadline, True
 
             try:
+                on_wait = None
+                if self.preparation_timing is not None:
+                    on_wait = lambda seconds, admitted: self.preparation_timing.record_upload_admission(
+                        seconds, admitted, index=job['index'] + 1, media_type=job['media_type'])
                 with UPLOAD_LIMITER.slot(namespace, int(self.account['id']),
                         account_limit=self.account_upload_concurrency, total_limit=self.total_upload_concurrency,
-                        deadline=deadline, stopped=cancelled, clock=time.monotonic):
+                        deadline=deadline, stopped=cancelled, clock=time.monotonic, on_wait=on_wait):
                     admitted = True
                     with self._upload_binding_guard(context, epoch, deadline):
                         with self._phase('reference_upload', index=job['index'] + 1, media_type=job['media_type']):
@@ -1086,15 +1237,21 @@ class CanvasClient:
                                         job['media_type'], deadline=deadline, fallback_file=job['fallback_file'],
                                         on_registered=registered)
                                 elif pending_refs[job['resource_id']] == 'unknown':
+                                    previous = next((item for item in context['upload_checkpoint'].get(TICKET_KEY, [])
+                                                     if item['resource_id'] == job['resource_id']), None)
+                                    observed_until = (remaining_deadline(previous, clock=time.monotonic,
+                                        wall_time=time.time, deadline=deadline) if previous else None)
                                     self._observe_unknown_upload(job['resource_id'], context['project_id'],
-                                        deadline=deadline, media_type=job['media_type'])
+                                        deadline=deadline, media_type=job['media_type'], observation_deadline=observed_until)
                                 else:
                                     self._resource_ready(job['resource_id'], context['project_id'],
                                         deadline=deadline, media_type=job['media_type'])
                             else:
                                 self._upload_resource(job['path'], job['media_type'], job['resource_id'],
                                     context['project_id'], deadline=deadline, source_url=job['source_url'],
-                                     on_registered=registered, fallback_file=job['fallback_file'])
+                                      on_registered=registered, fallback_file=job['fallback_file'],
+                                      file_recovery=file_recovery if durable_persist and epoch is not None and job['source_kind'] == 'file' else None,
+                                      file_source_sha256=job['source_sha256'])
                         self._remaining(deadline)
                         # Successful siblings remain useful after another worker fails.
                         with state_lock:
@@ -1252,7 +1409,7 @@ class CanvasClient:
             with self._phase('project'):
                 self._ensure_project(context, deadline=deadline)
         self._upload_references(jobs, refs, expected, verified, pending_refs, context, save, state_lock,
-                                credential_epoch, deadline)
+                                credential_epoch, deadline, durable_persist=callable(persist))
         args = ["node", "create", kind, "--project-id", context["project_id"],
                 "--node-id", context["node_id"], "--update-id", context["update_id"],
                 "--title", "IJM " + task_id, "--mode", context["mode"],
@@ -1662,8 +1819,15 @@ class CanvasClient:
                 raise CanvasCLIError("CLI_STOPPING", "Canvas result observation was stopped before delivery")
         phase("querying")
         query_deadline = min(deadline, time.monotonic() + 15) if deadline is not None and not context.get('resource_ids') else deadline
-        data = self._call(["operation", "status", context["submit_id"],
-                           "--project-id", context["project_id"]], read_only=True, deadline=query_deadline)
+        recovered_node = False
+        try:
+            data = self._call(["operation", "status", context["submit_id"],
+                               "--project-id", context["project_id"]], read_only=True, deadline=query_deadline)
+        except CanvasCLIError as original:
+            data = recover_absent_operation(self, context, original, deadline=query_deadline)
+            if data is None:
+                raise
+            recovered_node = True
         reference = data.get("operationRef")
         if not isinstance(reference, str) or not reference.strip():
             raise CanvasCLIError("CLI_INVALID_RESPONSE", "Canvas operation response omitted its submission identity", outcome_unknown=True)
@@ -1749,10 +1913,12 @@ class CanvasClient:
         # Publish the complete original-operation binding before the first file
         # operation. A later download failure must not lose recovered output IDs.
         outputs = [resource_id for resource_id, _ in checked_resources]
-        receipt = {"version": 1, "source": "operation_status", "operation_ref": reference,
+        receipt = {"version": 1, "source": "node_show_original_submission" if recovered_node else "operation_status", "operation_ref": reference,
                    **{key: context.get(key) for key in ("account_id", "task_id", "profile", "project_id", "node_id",
                                                        "submit_id", "expected_user_id", "kind")},
                    "resource_ids": outputs}
+        if recovered_node:
+            receipt['node_recovery'] = copy.deepcopy(data['node_recovery'])
         if persist_output_binding is not None:
             candidate = {**context, "resource_ids": outputs}
             if self._download_binding(candidate, outputs[0], context["kind"]) is None:

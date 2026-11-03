@@ -21,22 +21,36 @@ class UploadLimiter:
 
     @contextmanager
     def slot(self, namespace, account_id, *, account_limit, total_limit,
-             deadline=None, stopped=lambda: False, clock=None):
+             deadline=None, stopped=lambda: False, clock=None, on_wait=None):
         clock = clock or time.monotonic
         key = (namespace, account_id)
-        with self._condition:
-            while True:
-                if stopped():
-                    raise CanvasCLIError('CLI_TASK_TERMINATED', 'Canvas reference preparation stopped')
-                remaining = None if deadline is None else deadline - clock()
-                if remaining is not None and remaining <= 0:
-                    raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas reference upload deadline reached')
-                if self._totals.get(namespace, 0) < total_limit and self._accounts.get(key, 0) < account_limit:
-                    self._totals[namespace] = self._totals.get(namespace, 0) + 1
-                    self._accounts[key] = self._accounts.get(key, 0) + 1
-                    break
-                self._condition.wait(min(0.05, remaining) if remaining is not None else 0.05)
+        started = clock() if callable(on_wait) else None
+
+        def observed(admitted):
+            if started is not None:
+                try:
+                    on_wait(max(0, clock() - started), admitted)
+                except Exception:
+                    pass  # Diagnostics cannot change admission or its original error.
+
         try:
+            with self._condition:
+                while True:
+                    if stopped():
+                        raise CanvasCLIError('CLI_TASK_TERMINATED', 'Canvas reference preparation stopped')
+                    remaining = None if deadline is None else deadline - clock()
+                    if remaining is not None and remaining <= 0:
+                        raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'Canvas reference upload deadline reached')
+                    if self._totals.get(namespace, 0) < total_limit and self._accounts.get(key, 0) < account_limit:
+                        self._totals[namespace] = self._totals.get(namespace, 0) + 1
+                        self._accounts[key] = self._accounts.get(key, 0) + 1
+                        break
+                    self._condition.wait(min(0.05, remaining) if remaining is not None else 0.05)
+        except BaseException:
+            observed(False)  # Outside the limiter condition: callbacks may persist a snapshot.
+            raise
+        try:
+            observed(True)
             yield
         finally:
             with self._condition:

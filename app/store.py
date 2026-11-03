@@ -64,6 +64,31 @@ def _priority(value: Any) -> int:
     return result
 
 
+def canvas_output_source_valid(binding: Any) -> bool:
+    """A node-derived receipt must prove every output belongs to this submit."""
+    if not isinstance(binding, dict):
+        return False
+    if binding.get('source') == 'operation_status':
+        return True
+    if binding.get('source') != 'node_show_original_submission':
+        return False
+    proof = binding.get('node_recovery')
+    fields = {'version', 'project_id', 'node_id', 'submit_id', 'resource_ids', 'resource_submit_ids'}
+    if (not isinstance(proof, dict) or set(proof) != fields
+            or type(proof.get('version')) is not int or proof['version'] != 1
+            or any(not isinstance(binding.get(key), str) or not binding[key]
+                   or proof.get(key) != binding[key] for key in ('project_id', 'node_id', 'submit_id'))):
+        return False
+    ids = binding.get('resource_ids')
+    if (not isinstance(ids, list) or not ids or proof.get('resource_ids') != ids
+            or any(not isinstance(value, str) or re.fullmatch(r'[a-f0-9-]{36}', value) is None for value in ids)
+            or len(set(ids)) != len(ids)):
+        return False
+    submitted = proof.get('resource_submit_ids')
+    return (isinstance(submitted, dict) and set(submitted) == set(ids)
+            and all(submitted[value] == binding['submit_id'] for value in ids))
+
+
 def accepted_canvas_result(task: dict[str, Any], *, allow_closed: bool = False) -> bool:
     """A bound, affirmative output receipt; never an uncertain submission."""
     context = task.get('upstream_context') or {}
@@ -72,7 +97,7 @@ def accepted_canvas_result(task: dict[str, Any], *, allow_closed: bool = False) 
     binding = context.get('output_binding')
     recovered = (isinstance(binding, dict) and binding.get('durable') is True
         and type(binding.get('version')) is int and binding['version'] == 1
-        and binding.get('source') == 'operation_status'
+        and canvas_output_source_valid(binding)
         and binding.get('operation_ref') == context.get('submit_id')
         and all(binding.get(key) == context.get(key) for key in (
             'account_id', 'task_id', 'profile', 'project_id', 'node_id', 'submit_id',
@@ -938,7 +963,7 @@ class Store:
                   'submit_id', 'expected_user_id', 'kind')
         ids = binding.get('resource_ids') if isinstance(binding, dict) else None
         if (not isinstance(binding, dict) or type(binding.get('version')) is not int
-                or binding['version'] != 1 or binding.get('source') != 'operation_status'
+                or binding['version'] != 1 or not canvas_output_source_valid(binding)
                 or binding.get('operation_ref') != binding.get('submit_id')
                 or binding.get('task_id') != task_id or type(binding.get('account_id')) is not int
                 or binding.get('kind') not in {'image', 'video'}

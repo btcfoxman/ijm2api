@@ -135,6 +135,12 @@ Failures after preparation starts or an unknown paid outcome do not use this
 identity-only reselection path and never switch automatically to a browser.
 
 Lost generation receipts retain the original account and submission UUID.
+If the exact original operation lookup reports an absent submission, the
+adapter also reads the original node within the same query deadline. Only
+direct node outputs explicitly naming that submission UUID, with matching
+resource facts, may establish a recovered output binding. Its recorded source
+is `node_show_original_submission`; missing or contradictory association never
+authorizes another paid generation or a zero-charge/refund claim.
 Three explicit `operation_submission_absent` responses, or expiry of the fixed
 observation deadline, end the task as `failed` (`CLI_SUBMISSION_UNCONFIRMED`).
 For known invalid-response or retryable service failures, three explicit
@@ -174,6 +180,20 @@ Verified checkpoints retain successful same-account uploads across preparation
 retries; the original resources are checked again before they are referenced.
 Account identity, profile, proxy and input bindings must still match. No draft
 is submitted until every required reference is ready.
+
+A newly interrupted local-file upload can use one normal same-ID input retry
+after a fresh exact lookup cannot find its original registration. The adapter
+rechecks the original file bytes and account bindings, durably records the
+one-use claim before writing, and retains the original unknown-upload audit.
+The probe, retry and remaining observation share the first 120-second absolute
+recovery deadline. A restart never adds another write or recovery window.
+Acknowledged or processing resources are only observed; old unknown checkpoints
+without this new claim remain read-only. No new resource UUID, force option or
+generation command is used by this input recovery.
+
+Upload limits and lock ordering remain unchanged. Preparation diagnostics now
+measure actual upload-admission wait separately from credential-lock waits,
+CLI command execution and resource-readiness observation.
 
 For new preparation failures, the durable retry window starts at the first
 proven transient failure, allowing up to 180 additional seconds within the

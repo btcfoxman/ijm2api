@@ -142,6 +142,11 @@ class PreparationTiming:
         self._phases = {}
         self._commands = {}
         self._count = 0
+        self._upload_admission_recent = deque(maxlen=32)
+        self._upload_admission_count = 0
+        self._upload_admission_failed = 0
+        self._upload_admission_total_ms = 0.0
+        self._upload_admission_max_ms = 0.0
 
     def _ms(self, start):
         return round(max(0, self._mono() - start) * 1000, 3)
@@ -157,7 +162,7 @@ class PreparationTiming:
         valid_queue = isinstance(queued, (int, float)) and not isinstance(queued, bool) and math.isfinite(queued)
         valid_initial = isinstance(initial, (int, float)) and not isinstance(initial, bool) and math.isfinite(initial)
         queue_wait = round(max(0, initial - queued) * 1000, 3) if valid_queue and valid_initial else None
-        return copy.deepcopy({'task_id': self.task_id, 'started_at': self.started_at,
+        value = {'task_id': self.task_id, 'started_at': self.started_at,
             'finished': self._ended is not None, 'elapsed_ms': total,
             'queue_wait_ms': queue_wait, 'first_admission_queue_ms': queue_wait,
             'elapsed_before_attempt_ms': round(max(0, self.started_at - queued) * 1000, 3) if valid_queue else None,
@@ -165,7 +170,36 @@ class PreparationTiming:
             'current_phase': self._active[-1] if self._active else None,
             'current_command': next(reversed(self._active_commands.values()), None), 'command_count': self._count,
             'dropped_command_samples': max(0, self._count - len(self._recent)),
-            'recent_commands': list(self._recent)})
+            'recent_commands': list(self._recent)}
+        if self._upload_admission_count:
+            value['upload_admission'] = {
+                'count': self._upload_admission_count, 'failed': self._upload_admission_failed,
+                'total_wait_ms': self._upload_admission_total_ms,
+                'max_wait_ms': self._upload_admission_max_ms,
+                'dropped_samples': max(0, self._upload_admission_count - len(self._upload_admission_recent)),
+                'recent': list(self._upload_admission_recent)}
+        return copy.deepcopy(value)
+
+    def record_upload_admission(self, seconds, admitted, *, index=None, media_type=None):
+        """Measure the limiter wait separately from profile locks and SDK calls."""
+        if (type(seconds) not in (int, float) or not math.isfinite(seconds)
+                or seconds < 0 or seconds > 86400 or type(admitted) is not bool):
+            return
+        elapsed = round(seconds * 1000, 3)
+        entry = {'wait_ms': elapsed, 'admitted': admitted}
+        if type(index) is int and 1 <= index <= 10000:
+            entry['index'] = index
+        if isinstance(media_type, str) and media_type in {'image', 'video', 'audio'}:
+            entry['media_type'] = media_type
+        with self._lock:
+            if self._ended is not None:
+                return
+            self._upload_admission_count += 1
+            self._upload_admission_failed += int(not admitted)
+            self._upload_admission_total_ms = round(self._upload_admission_total_ms + elapsed, 3)
+            self._upload_admission_max_ms = max(self._upload_admission_max_ms, elapsed)
+            self._upload_admission_recent.append(entry)
+        self._changed()
 
     def _changed(self):
         # Serialize persistence callbacks without holding the timing-data lock.
