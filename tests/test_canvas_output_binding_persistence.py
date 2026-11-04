@@ -355,10 +355,11 @@ def test_positive_in_progress_ends_an_anomaly_episode_without_a_stale_sixty_seco
         current = store.task(before["id"])
         episode = current["upstream_context"]["missing_resource_recovery"]
         waits.append(deepcopy(episode))
-        if len(waits) == 1:
+        if episode['active']:
             assert episode["active"] is True and episode["attempts"] == 1
-            failing[0] = False; clock[0] += 1
-        elif len(waits) == 2:
+            # Include the fixed next-read slot; the extra wait spends no read.
+            failing[0] = False; clock[0] += max(1, _delay)
+        elif sum(not item['active'] for item in waits) == 1:
             assert episode["active"] is False
             clock[0] += 155
         else:
@@ -367,9 +368,9 @@ def test_positive_in_progress_ends_an_anomaly_episode_without_a_stale_sixty_seco
         return False
     monkeypatch.setattr(service._stop, "wait", wait)
     try:
-        service._poll_canvas(before["id"], client, time.monotonic() + 10)
+        service._poll_canvas(before["id"], client, time.monotonic() + 300)
         current = store.task(before["id"])
-        assert len(waits) == 3 and current["status"] == "running" and current["error_code"] == ""
+        assert len(waits) == 4 and current["status"] == "running" and current["error_code"] == ""
         assert waits[0]["started_at"] == waits[-1]["started_at"]
         assert runner.count(("operation", "status")) == 2 and runner.count(("resource", "download")) == 0
         assert all(args[:2] != ["node", "run"] for args in runner.calls)

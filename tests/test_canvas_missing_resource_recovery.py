@@ -109,6 +109,95 @@ def test_each_recovery_read_gets_remaining_absolute_budget(context, monkeypatch)
     assert row['upstream_context']['missing_resource_recovery']['attempts'] == 2
 
 
+def test_real_808_fast_absence_timings_use_fixed_slots_without_extra_run_or_extended_deadline(context, monkeypatch):
+    store, service, client = started(context)
+    wall, mono = time.time(), time.monotonic()
+    clock = {'wall': wall, 'mono': mono}
+    monkeypatch.setattr('app.canvas_service.time.time', lambda: clock['wall'])
+    monkeypatch.setattr('app.canvas_service.time.monotonic', lambda: clock['mono'])
+    store.update_task('task', {'status': 'submitted', 'account_id': 1, 'execution_backend': 'canvas_cli',
+        'upstream_context': {'submit_id': 'original-submit', 'project_id': 'original-project',
+            'resource_ids': [], 'observation_deadline': wall + 3000, 'submission_phase': 'run_dispatching',
+            'submit_error': {'dispatch_started': True, 'outcome_unknown': True}}})
+    starts, deadlines = [], []
+    durations = iter([7.637, 7.4, 7.323])
+    def advance(seconds):
+        clock['wall'] += seconds
+        clock['mono'] += seconds
+    def wait(seconds):
+        advance(seconds)
+        return False
+    service._stop.wait.side_effect = wait
+    def absent(_context, *, deadline):
+        starts.append(round(clock['wall'] - wall, 3)); deadlines.append(deadline)
+        advance(next(durations))
+        raise CanvasCLIError('cli.operation_submission_absent', 'original absence', exit_code=20,
+            details={'error': {'class': 'operation_incomplete', 'requiredAction': 'resume', 'retryable': True}})
+    client.poll.side_effect = absent
+    service._poll_canvas('task', client, mono + 3000)
+    row = store.task('task'); budget = row['upstream_context']['missing_resource_recovery']
+    assert starts == [0, 20, 40]
+    assert row['completed_at'] - wall == pytest.approx(47.323)
+    assert budget['attempts'] == budget['max_attempts'] == 3
+    assert budget['started_at'] == wall and budget['deadline'] == wall + 60
+    assert all(value == pytest.approx(mono + 60, abs=1e-6) for value in deadlines)
+    assert row['error_code'] == 'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED'
+    assert row['upstream_context']['financial_outcome'] == 'unconfirmed'
+    client.submit.assert_not_called()
+
+
+@pytest.mark.parametrize('change', ['manual_stop', 'output_receipt'])
+def test_stop_or_new_original_receipt_during_cadence_wait_wins_before_next_read(context, monkeypatch, change):
+    store, service, client = started(context)
+    wall, mono = time.time(), time.monotonic()
+    clock = {'wall': wall, 'mono': mono}
+    monkeypatch.setattr('app.canvas_service.time.time', lambda: clock['wall'])
+    monkeypatch.setattr('app.canvas_service.time.monotonic', lambda: clock['mono'])
+    original = {'submit_id': 'original-submit', 'project_id': 'original-project',
+        'resource_ids': [], 'observation_deadline': wall + 3000, 'submission_phase': 'run_dispatching',
+        'submit_error': {'dispatch_started': True, 'outcome_unknown': True},
+        'missing_resource_recovery': {'version': 1, 'started_at': wall, 'deadline': wall + 60,
+            'attempts': 1, 'max_attempts': 3, 'active': True}}
+    store.update_task('task', {'status': 'submitted', 'account_id': 1,
+        'execution_backend': 'canvas_cli', 'upstream_context': original})
+    def wait(seconds):
+        clock['wall'] += seconds; clock['mono'] += seconds
+        fresh = store.task('task'); ctx = fresh['upstream_context']
+        ctx.update({'manual_termination': True} if change == 'manual_stop' else {'resource_ids': ['original-output']})
+        store.update_task('task', {'upstream_context': ctx})
+        return False
+    service._stop.wait.side_effect = wait
+    client.poll.side_effect = lambda *args, **kwargs: service._stop.set()
+    service._poll_canvas('task', client, mono + 3000)
+    row = store.task('task')
+    assert row['upstream_context']['missing_resource_recovery']['attempts'] == 1
+    assert client.poll.call_count == (0 if change == 'manual_stop' else 1)
+    assert not row['upstream_context'].get('reconciliation_closed')
+    client.submit.assert_not_called()
+
+
+def test_shorter_outer_deadline_during_cadence_wait_does_not_spend_another_read(context, monkeypatch):
+    store, service, client = started(context)
+    wall, mono = time.time(), time.monotonic()
+    clock = {'wall': wall, 'mono': mono}
+    monkeypatch.setattr('app.canvas_service.time.time', lambda: clock['wall'])
+    monkeypatch.setattr('app.canvas_service.time.monotonic', lambda: clock['mono'])
+    original = {'submit_id': 'original-submit', 'project_id': 'original-project', 'resource_ids': [],
+        'observation_deadline': wall + 3000, 'submission_phase': 'run_dispatching',
+        'submit_error': {'dispatch_started': True, 'outcome_unknown': True},
+        'missing_resource_recovery': {'version': 1, 'started_at': wall, 'deadline': wall + 60,
+            'attempts': 1, 'max_attempts': 3, 'active': True}}
+    store.update_task('task', {'status': 'submitted', 'account_id': 1,
+        'execution_backend': 'canvas_cli', 'upstream_context': original})
+    def wait(seconds):
+        clock['wall'] += seconds; clock['mono'] += seconds
+        return False
+    service._stop.wait.side_effect = wait
+    service._poll_canvas('task', client, mono + 10)
+    assert store.task('task')['upstream_context']['missing_resource_recovery']['attempts'] == 1
+    client.poll.assert_not_called(); client.submit.assert_not_called()
+
+
 @pytest.mark.parametrize('code', ['CLI_PREPARATION_RETRY_EXHAUSTED', 'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED'])
 @pytest.mark.parametrize('raw', ['积分已返还', 'Canvas generation failed (20115)', '上游维护中，请稍后再试~'])
 def test_budget_public_failure_is_authoritative_and_never_fabricates_refund(code, raw):

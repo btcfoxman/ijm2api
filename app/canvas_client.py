@@ -1956,6 +1956,7 @@ class CanvasClient:
              persist_download: Callable[[dict[str, Any]], Any] | None = None,
               persist_output_binding: Callable[[dict[str, Any]], Any] | None = None,
              persist_operation_receipt: Callable[[dict[str, Any]], Any] | None = None,
+             persist_node_recovery: Callable[[dict[str, Any]], Any] | None = None,
              get_delivery_deadline: Callable[[], float] | None = None,
              on_phase: Callable[[str], Any] | None = None) -> dict[str, Any]:
         with self.runner.account_guard(self.account, deadline=deadline):
@@ -1963,12 +1964,14 @@ class CanvasClient:
             return self._poll(context, deadline=deadline, persist_download=persist_download,
                               persist_output_binding=persist_output_binding,
                               persist_operation_receipt=persist_operation_receipt,
+                              persist_node_recovery=persist_node_recovery,
                               get_delivery_deadline=get_delivery_deadline, on_phase=on_phase)
 
     def _poll(self, context: dict[str, Any], *, deadline: float | None = None,
               persist_download: Callable[[dict[str, Any]], Any] | None = None,
                persist_output_binding: Callable[[dict[str, Any]], Any] | None = None,
               persist_operation_receipt: Callable[[dict[str, Any]], Any] | None = None,
+              persist_node_recovery: Callable[[dict[str, Any]], Any] | None = None,
               get_delivery_deadline: Callable[[], float] | None = None,
               on_phase: Callable[[str], Any] | None = None) -> dict[str, Any]:
         def phase(name: str, *, phase_deadline: float | None = None) -> None:
@@ -2005,7 +2008,8 @@ class CanvasClient:
                 data = observe_bound_resources(self, context, error=original, deadline=query_deadline)
                 recovered_resources = data is not None
                 if data is None:
-                    data = recover_absent_operation(self, context, original, deadline=query_deadline)
+                    data = recover_absent_operation(self, context, original, deadline=query_deadline,
+                                                    on_diagnostic=persist_node_recovery)
                     if data is None:
                         raise
                     recovered_node = True

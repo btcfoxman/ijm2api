@@ -20,6 +20,7 @@ from .canvas_client import (CanvasClient, identity_network_error, preparation_re
 from .canvas_timing import PreparationTiming, archived_attempts, INITIAL_ADMISSION_UNSET
 from .canvas_quote_hints import new_hint
 from .canvas_resource_recovery import accepted_output_context, resource_observation_retryable
+from .canvas_operation_recovery import safe_recovery_diagnostic
 from .canvas_validation import MATERIAL_REQUIREMENTS_ERROR
 from .canvas_retry_budget import (new_retry_budget, budget_token, claim_attempt,
                                  seed_from_verified_preparations, RetryBudgetError,
@@ -1833,6 +1834,21 @@ class CanvasServiceMixin:
                 return {'stopped': True}
             return value
 
+    def _canvas_persist_node_recovery(self, task_id: str, value: dict) -> None:
+        diagnostic = safe_recovery_diagnostic(value)
+        if diagnostic:
+            self._canvas_context(task_id, {'node_recovery_diagnostic': {**diagnostic, 'at': time.time()}})
+
+    @staticmethod
+    def _canvas_missing_resource_next_read(recovery: dict) -> float:
+        """Fixed slots preserve the existing count/deadline, including restart.
+
+        Three reads in sixty seconds start at 0/20/40, leaving twenty
+        seconds for the final bounded query instead of spending all reads early.
+        """
+        return (recovery['started_at'] + (recovery['deadline'] - recovery['started_at'])
+                * recovery['attempts'] / recovery['max_attempts'])
+
     def _finish_canvas_observation(self, task_id: str, *, reason: str) -> dict:
         """Keep accepted outputs on the bounded original-result observer."""
         with self._lock:
@@ -1922,6 +1938,19 @@ class CanvasServiceMixin:
                 self._close_unconfirmed_canvas_task(task_id, 'missing_output_resource_budget_exhausted')
                 return
             if recovery.get('active'):
+                delay = max(0, self._canvas_missing_resource_next_read(recovery) - time.time())
+                if delay:
+                    wait(delay)
+                    # Receipt, manual stop and deadline changes during the wait
+                    # win before another read is claimed. No ticket is spent waiting.
+                    task = self.store.task(task_id)
+                    if self._stop.is_set() or self._canvas_task_terminated(task):
+                        return
+                    if time.monotonic() >= query_deadline or time.time() >= absolute_deadline:
+                        break
+                    context = task.get('upstream_context') or {}
+                    if context.get('resource_ids'):
+                        continue
                 recovery = self._canvas_missing_resource_budget(task_id, claim=True)
                 if recovery.get('stopped'):
                     return
@@ -1947,6 +1976,7 @@ class CanvasServiceMixin:
                                   persist_output_binding=persist_output_binding,
                                   persist_operation_receipt=lambda receipt: self._canvas_persist_operation_receipt(
                                       task_id, receipt, client.account),
+                                  persist_node_recovery=lambda value: self._canvas_persist_node_recovery(task_id, value),
                                   on_phase=client_phase, get_delivery_deadline=get_delivery_deadline)
                 try:
                     state = client.poll(context, **kwargs)
