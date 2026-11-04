@@ -26,8 +26,8 @@ def test_image_fallback_is_lazy_per_input_and_retains_download_policy(tmp_path, 
     assert [call.args for call in download.call_args_list] == [
         (URLS[0], 'images', ACCOUNT['proxy_url']), (URLS[1], 'images', ACCOUNT['proxy_url'])]
     assert [call.kwargs for call in download.call_args_list] == [
-        {'allow_direct_fallback': False, 'deadline': 120},
-        {'allow_direct_fallback': False, 'deadline': 120}]
+        {'allow_direct_fallback': False, 'deadline': 120, 'fair_route_budget': False},
+        {'allow_direct_fallback': False, 'deadline': 120, 'fair_route_budget': False}]
     assert [Path(path).name for path in paths] == ['images-1.png', 'images-2.jpg']
     assert assets['images'][0]['source_url'] == URLS[0]
 
@@ -51,7 +51,8 @@ def test_known_public_image_host_tries_url_import_and_preserves_lazy_direct_firs
     assert not download.called and not list(tmp_path.iterdir())
     assert assets['images'][0]['fallback_file']().read_bytes() == b'image'
     assert download.call_args.args == (source, 'images', ACCOUNT['proxy_url'])
-    assert download.call_args.kwargs == {'allow_direct_fallback': True, 'deadline': 120}
+    assert download.call_args.kwargs == {'allow_direct_fallback': True, 'deadline': 120,
+                                        'fair_route_budget': True}
 
 
 def test_fallback_uses_existing_bounded_media_error_diagnostics(tmp_path, monkeypatch):
