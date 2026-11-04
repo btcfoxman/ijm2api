@@ -146,9 +146,12 @@ def test_observer_lease_prevents_restart_or_second_store_from_reclaiming_during_
 
 
 @pytest.mark.parametrize('queue_delay', [60, 105])
-def test_queued_observer_uses_only_remainder_of_claimed_query_window(delivery, clock, queue_delay):
+@pytest.mark.parametrize('monotonic_start', [None, 138.076710104])
+def test_queued_observer_uses_only_remainder_of_claimed_query_window(delivery, clock, queue_delay, monotonic_start):
     service, native = delivery['service'], delivery['runner']
     now, advance = clock
+    if monotonic_start is not None:
+        now['mono'] = monotonic_start
     row = service.store.task(TASK_ID)
     query_deadline = now['mono'] + 120
     claimed = service.store.queue_canvas_result_observation(TASK_ID, row['updated_at'], claim=True)
@@ -173,7 +176,10 @@ def test_queued_observer_uses_only_remainder_of_claimed_query_window(delivery, c
     assert tuple(settlement_args[:2]) == ('auth', 'account')
     assert len(identity_started) == 2
     assert settlement['deadline'] == min(identity_started[-1] + 30, download['deadline'])
-    assert settlement['timeout'] == min(30, download['deadline'] - identity_started[-1])
+    # The CI clock above produces one ULP of subtraction error, not extra time.
+    assert 0 < settlement['timeout'] <= 30
+    assert settlement['timeout'] == pytest.approx(
+        min(30, download['deadline'] - identity_started[-1]), rel=0, abs=1e-12)
 
 
 def test_only_a_new_observer_CAS_claim_can_start_the_next_delivery_attempt(delivery, clock):

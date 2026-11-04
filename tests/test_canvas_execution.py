@@ -463,8 +463,9 @@ def test_known_running_clears_obsolete_query_error_but_keeps_first_submit_error(
     client = fake_client(store, service, account)
     success = client.poll.return_value
     client.submit.side_effect = CanvasCLIError('CLI_TIMEOUT', 'original receipt unavailable', outcome_unknown=True)
+    # A matched native running operation ends the abnormal-read episode.
     client.poll.side_effect = [CanvasCLIError('CLI_NETWORK_ERROR', 'query broke'),
-                               {'status': 'running', 'progress': 52}, success]
+                               {'status': 'running', 'progress': 52, 'operation_state': 'running'}, success]
     inspected = []
     def observe(_seconds):
         current = store.task('task')
