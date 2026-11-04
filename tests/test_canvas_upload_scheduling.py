@@ -1,4 +1,4 @@
-"""Multi-reference preparations use their account's quote, never another plan's price."""
+"""Native quotes estimate exact-shape admission; each account's own quote wins."""
 import time
 
 import pytest
@@ -28,15 +28,23 @@ def test_unknown_multi_reference_quote_prefers_larger_balance_despite_positive_h
     assert not store.canvas_quote_hints()
 
 
-def test_another_accounts_quote_is_not_a_floor_for_unknown_account(context):
+def test_exact_native_request_quote_filters_unknown_account_before_preparation(context):
     store, service, _ = context
     known = owner(store, 'known-underfunded', balance=100)
     unknown = owner(store, 'unknown-plan', balance=40)
     row = multi(store)
     seed(store, service, known, 200, row['normalized'])
-    selected = choose(service, row, 50)
+    # No task quote exists yet. The current eligible account's exact request
+    # quote supplies a conservative estimate, so neither known balance fits.
+    assert choose(service, row) is None
+    assert not service._credit_reservations and not service._active
+    # Unknown pricing is not an account disable. Once it has enough available
+    # credits, it can prepare and obtain its own authoritative native quote.
+    store.update_account(unknown['id'], {'balance': 250})
+    selected = choose(service, row)
     assert selected['id'] == unknown['id']
-    assert '_scheduling_quote_amount' not in selected
+    assert selected['_scheduling_quote_amount'] == 200
+    assert selected['_credit_reservation_amount'] == 200
     assert store.account(known['id'])['enabled']
 
 
@@ -69,15 +77,18 @@ def test_unknown_lower_priority_never_bypasses_funded_higher_priority(context):
     assert choose(service, row)['id'] == high['id']
 
 
-def test_all_old_unfunded_hints_still_allow_live_quote_probe(context):
+def test_all_current_insufficient_quotes_do_not_fall_back_to_live_upload_probes(context):
     store, service, _ = context
     large = owner(store, 'large', balance=42)
     small = owner(store, 'small', balance=41)
     row = multi(store)
     for account in (large, small):
         seed(store, service, account, 100, row['normalized'])
-    selected = choose(service, row, 150)
-    assert selected['id'] == large['id'] and '_scheduling_quote_amount' not in selected
+    before = store.task(row['id'])
+    assert choose(service, row, 150) is None
+    assert not service._credit_reservations and not service._active
+    assert store.task(row['id']) == before
+    assert all(store.account(account['id'])['enabled'] for account in (large, small))
 
 
 @pytest.mark.parametrize('change', ['counts', 'duration', 'epoch', 'expired', 'video_duration'])
@@ -122,7 +133,7 @@ def test_unknown_holds_busy_accounts_and_missing_proxy_remain_ineligible(context
 
 
 @pytest.mark.parametrize('mode', ['canvas_cli', 'browser', 'jimeng_web'])
-def test_single_reference_and_non_canvas_balance_order_is_unchanged(context, mode):
+def test_single_reference_estimate_and_non_canvas_keep_balance_order(context, mode):
     store, service, _ = context
     small = owner(store, 'small', balance=42, mode=mode)
     owner(store, 'large', balance=200, mode=mode)
@@ -137,7 +148,11 @@ def test_single_reference_and_non_canvas_balance_order_is_unchanged(context, mod
         service._region_denial = lambda *_: None
     selected = choose(service, row, 10)
     assert selected['id'] == small['id']
-    assert '_scheduling_quote_unknown' not in selected
+    if mode == 'canvas_cli':
+        assert selected['_scheduling_quote_unknown'] is False
+        assert selected['_scheduling_quote_amount'] == selected['_credit_reservation_amount'] == 10
+    else:
+        assert '_scheduling_quote_unknown' not in selected
 
 
 @pytest.mark.parametrize('key,default,maximum', [

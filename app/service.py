@@ -810,7 +810,8 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                     continue
                 quoted = {'_scheduling_quote_amount': required} if required > 0 else {}
                 accounts.append({**candidate, **quoted, '_known_credit_shortfall': short,
-                    '_scheduling_quote_unknown': hint is None and (estimated_cost <= 0 or multi_reference_video),
+                    '_scheduling_quote_unknown': hint is None and multi_reference_video,
+                    '_scheduling_quote_known': hint is not None,
                     '_credit_reservation_amount': required if required > 0 else available or 0.0})
                 continue
             if available is None or available >= estimated_cost:
@@ -860,7 +861,8 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
             backend = self._required_execution_backend(task) or task.get('execution_backend')
             excluded = excluded | self._model_excluded_accounts(task)
             accounts = self._funded_accounts(estimated_cost, excluded, pending, backend, task=task)
-            hinted_priorities = {int(item['priority']) for item in accounts if '_scheduling_quote_amount' in item}
+            hinted_priorities = {int(item['priority']) for item in accounts
+                if '_scheduling_quote_amount' in item and item.get('_scheduling_quote_known', True)}
             # Unknown cost is not a free task: probe a larger balance until a
             # measured budget exists. Explicit priority always remains first.
             accounts.sort(key=lambda item: (-int(item['priority']), item['_available_credits'] is None,

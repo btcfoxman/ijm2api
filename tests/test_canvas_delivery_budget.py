@@ -51,11 +51,12 @@ def test_full_download_over_95_seconds_and_all_outputs_share_fresh_delivery_budg
     context.update(resource_ids=resources, output_count=outputs)
     before = service.store.update_task(TASK_ID, {'upstream_context': context})
     original_run = native.run
-    deadlines, s3_deadlines = [], []
+    deadlines, s3_deadlines, identity_started = [], [], []
     query_started = now['wall']
     def slow_native(account, args, **kwargs):
         pair = tuple(args[:2])
         if pair == ('auth', 'account'):
+            identity_started.append(now['mono'])
             advance(8)
             return original_run(account, args, **kwargs)
         native.calls.append((list(args), dict(kwargs)))
@@ -87,7 +88,12 @@ def test_full_download_over_95_seconds_and_all_outputs_share_fresh_delivery_budg
     assert len(deadlines) == outputs and len(s3_deadlines) == outputs
     assert len(set(deadlines + s3_deadlines)) == 1
     identities = [kwargs for args, kwargs in native.calls if tuple(args[:2]) == ('auth', 'account')]
-    assert len(identities) == 2 and identities[-1]['deadline'] == deadlines[0]
+    assert len(identities) == len(identity_started) == 2
+    assert identities[0]['deadline'] == identity_started[0] + 30
+    # Settlement has its own bounded identity read inside the original shared
+    # delivery cutoff. It cannot inherit the whole remaining download budget.
+    assert identities[-1]['deadline'] == min(identity_started[-1] + 30, deadlines[0])
+    assert identities[-1]['timeout'] == min(30, deadlines[0] - identity_started[-1])
     assert identities[-1]['deadline'] > identities[0]['deadline']
     assert row['balance_after'] == 90 and row['actual_cost'] == 10
     attempt = row['upstream_context']['result_delivery_attempt']
@@ -139,25 +145,35 @@ def test_observer_lease_prevents_restart_or_second_store_from_reclaiming_during_
     assert restarted.store.task(TASK_ID)['upstream_context']['result_observation'] == recovery
 
 
-def test_queued_observer_uses_only_remainder_of_claimed_query_window(delivery, clock):
+@pytest.mark.parametrize('queue_delay', [60, 105])
+def test_queued_observer_uses_only_remainder_of_claimed_query_window(delivery, clock, queue_delay):
     service, native = delivery['service'], delivery['runner']
     now, advance = clock
     row = service.store.task(TASK_ID)
     query_deadline = now['mono'] + 120
     claimed = service.store.queue_canvas_result_observation(TASK_ID, row['updated_at'], claim=True)
     account = service.store.account(row['account_id'], private=True)
-    advance(60)
+    original_run, identity_started = native.run, []
+    def record_identity_start(account, args, **kwargs):
+        if tuple(args[:2]) == ('auth', 'account'):
+            identity_started.append(now['mono'])
+        return original_run(account, args, **kwargs)
+    native.run = record_identity_start
+    advance(queue_delay)
     service._run_canvas_result_observer(claimed, account)
     assert service.store.task(TASK_ID)['status'] == 'succeeded'
     first_download = next(index for index, (args, _) in enumerate(native.calls)
                           if tuple(args[:2]) == ('resource', 'download'))
     queries = [kwargs for _, kwargs in native.calls[:first_download]]
     assert queries and all(kwargs['deadline'] <= query_deadline for kwargs in queries)
+    assert queries[0]['deadline'] == min(identity_started[0] + 30, query_deadline)
     download, = [kwargs for args, kwargs in native.calls if tuple(args[:2]) == ('resource', 'download')]
     assert download['deadline'] == now['mono'] + 900
     settlement_args, settlement = native.calls[-1]
     assert tuple(settlement_args[:2]) == ('auth', 'account')
-    assert settlement['deadline'] == download['deadline']
+    assert len(identity_started) == 2
+    assert settlement['deadline'] == min(identity_started[-1] + 30, download['deadline'])
+    assert settlement['timeout'] == min(30, download['deadline'] - identity_started[-1])
 
 
 def test_only_a_new_observer_CAS_claim_can_start_the_next_delivery_attempt(delivery, clock):
