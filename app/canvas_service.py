@@ -119,6 +119,21 @@ class CanvasServiceMixin:
             return self.store.bind_canvas_outputs(task_id, binding,
                 expected_updated_at=task['updated_at'], expected_account=account)
 
+    def _canvas_persist_operation_receipt(self, task_id: str, receipt: dict,
+                                          expected_account: dict) -> bool:
+        """Commit original acceptance before resource.get can consume its budget."""
+        with self._lock:
+            task = self.store.task(task_id) or {}
+            if self._stop.is_set() or self._canvas_task_terminated(task):
+                return False
+            context = task.get('upstream_context') or {}
+            if (task.get('account_id') != expected_account.get('id')
+                    or self.canvas_cli.profile(expected_account) != context.get('profile')):
+                return False
+            return self.store.remember_canvas_operation_receipt(task_id, receipt,
+                expected_updated_at=task['updated_at'], expected_context=context,
+                expected_account=expected_account)
+
     def _canvas_result_delivery_deadline(self, task_id: str, observer_claim_id: str | None,
                                          expected_binding: dict) -> float:
         """Start only after verified output binding; the claim never renews."""
@@ -1863,6 +1878,8 @@ class CanvasServiceMixin:
                         query_timing = client.preparation_timing = PreparationTiming(task_id)
                     kwargs.update(persist_download=lambda receipt: self._canvas_delivery_progress(task_id, download=receipt),
                                   persist_output_binding=persist_output_binding,
+                                  persist_operation_receipt=lambda receipt: self._canvas_persist_operation_receipt(
+                                      task_id, receipt, client.account),
                                   on_phase=client_phase, get_delivery_deadline=get_delivery_deadline)
                 try:
                     state = client.poll(context, **kwargs)
@@ -1874,6 +1891,10 @@ class CanvasServiceMixin:
                         self._canvas_context(task_id, {'last_result_query_timing': snapshot})
                 if self._stop.is_set() or self._canvas_task_terminated(self.store.task(task_id)):
                     return
+                # poll may have committed acceptance before a resource read.
+                # Further decisions must use those durable locators, even when
+                # the original run response was a transport failure.
+                context = (self.store.task(task_id) or {}).get('upstream_context') or {}
                 errors = 0
             except CanvasCLIError as exc:
                 if self._canvas_task_terminated(self.store.task(task_id)):

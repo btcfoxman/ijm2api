@@ -48,7 +48,8 @@ class Reader:
         assert args[:2] == ['resource', 'get']
         assert kwargs['read_only'] is True
         assert args[-2:] == ['--project-id', PROJECT]
-        assert kwargs['timeout'] <= 10
+        assert 0 < kwargs['timeout'] <= 60
+        assert kwargs['timeout'] <= kwargs['deadline'] - time.monotonic() + 0.01
         self.calls.append((list(args), dict(kwargs)))
         if self.failure:
             raise self.failure
@@ -70,7 +71,7 @@ def test_ordinary_accepted_receipt_does_not_require_a_nonexistent_nested_receipt
     assert result['operationRef'] == SUBMIT and result['resources'][0]['resourceId'] == RID
     assert result['resource_recovery']['receipt_evidence'] == bound['submission_evidence']
     assert reader.calls[0][0] == ['resource', 'get', RID, '--project-id', PROJECT]
-    assert reader.calls[0][1]['deadline'] <= time.monotonic() + 15
+    assert reader.calls[0][1]['deadline'] <= time.monotonic() + 30
     assert bound == before
 
 
@@ -196,6 +197,42 @@ def test_four_slow_output_reads_fit_the_shared_count_scaled_budget(monkeypatch):
     assert {kwargs['deadline'] for _, kwargs in reader.calls} == {1060.0}
     assert clock['now'] == 1032.0
     assert list(result['_observed_resource_facts']) == identifiers
+
+
+def test_single_cold_resource_read_can_finish_after_ten_seconds_within_one_shared_window(monkeypatch):
+    clock = {'now': 1000.0}
+    monkeypatch.setattr('app.canvas_resource_recovery.time.monotonic', lambda: clock['now'])
+    reader = Reader()
+    original = reader._call
+    def cold_read(args, **kwargs):
+        value = original(args, **kwargs)
+        assert kwargs['timeout'] == 30 and kwargs['deadline'] == 1030
+        clock['now'] += 18
+        return value
+    reader._call = cold_read
+    assert observe_bound_resources(reader, context(), deadline=1100)['state'] == 'completed'
+    assert clock['now'] == 1018 and len(reader.calls) == 1
+
+
+def test_four_resource_reads_cannot_renew_the_shared_sixty_second_window(monkeypatch):
+    clock = {'now': 1000.0}
+    monkeypatch.setattr('app.canvas_resource_recovery.time.monotonic', lambda: clock['now'])
+    reader, bound = Reader(), context()
+    identifiers = [RID, OTHER, PROJECT, SUBMIT]
+    bound.update(output_count=4, resource_ids=identifiers)
+    reader.facts.update({identifier: {'resourceId': identifier, 'type': 'video', 'status': 'succeeded'}
+                         for identifier in identifiers})
+    original = reader._call
+    def slow_read(args, **kwargs):
+        value = original(args, **kwargs)
+        clock['now'] += min(16, kwargs['timeout'])
+        return value
+    reader._call = slow_read
+    with pytest.raises(CanvasCLIError) as found:
+        observe_bound_resources(reader, bound, deadline=1200)
+    assert found.value.code == 'CLI_TASK_DEADLINE_EXCEEDED' and clock['now'] == 1060
+    assert {options['deadline'] for _, options in reader.calls} == {1060}
+    assert [options['timeout'] for _, options in reader.calls] == [60, 44, 28, 12]
 
 
 def test_slow_batch_cannot_extend_the_original_task_deadline(monkeypatch):

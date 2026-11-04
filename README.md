@@ -169,6 +169,14 @@ phase. Temporary query errors keep the original generation window, and its
 expiry hands an accepted result to the existing bounded, read-only result
 observer without starting another generation.
 
+When an original operation query first returns positive acceptance and its
+complete output IDs, that receipt is committed before any resource read. A
+slow resource read therefore cannot lose already accepted output locators.
+The original submission error remains in the audit. Subsequent reads use the
+saved original IDs, with a separate shared 30-to-60-second resource-read budget
+clipped to the original task deadline. This receipt does not settle credits
+or authorize a download until the complete output binding is verified.
+
 Known service and invalid-response failures before generation use bounded
 retries within the original deadline. Draft writes reuse their project, node
 and update IDs; retries do not call `node run`. Exhausted preparation failures
@@ -203,7 +211,8 @@ keep their original reference order even when transfers finish out of order.
 Limits are captured for each preparation; changes apply to new preparations
 and do not interrupt transfers that are already running.
 Verified checkpoints retain successful same-account uploads across preparation
-retries; the original resources are checked again before they are referenced.
+retries; their original request/media and current account bindings are checked
+before reuse. Pending resources still require readiness checks.
 Account identity, profile, proxy and input bindings must still match. No draft
 is submitted until every required reference is ready.
 
@@ -236,6 +245,13 @@ preparations per account; earlier verified credit-rejected preparations count
 toward these limits. Existing saved budgets retain their original deadlines,
 including after restarts. Accepted or uncertain generation requests are never
 replayed by this preparation retry mechanism.
+
+Resuming a preparation reuses already verified inputs only after recomputing
+the complete request and media bindings, checking the original profile/proxy,
+and verifying the current account identity and credential guard. This replaces
+duplicate per-resource readiness reads with one identity check. Pending or
+unacknowledged inputs still require their original readiness/recovery checks;
+the complete native quote remains mandatory before generation.
 
 For Canvas videos with multiple references, accounts without an exact matching
 quote prefer a larger available balance at equal priority. Valid account-bound

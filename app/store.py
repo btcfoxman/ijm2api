@@ -1064,6 +1064,59 @@ class Store:
                 (_upstream_context(context), time.time(), task_id))
         return True
 
+    def remember_canvas_operation_receipt(self, task_id: str, receipt: dict[str, Any], *,
+                                          expected_updated_at: float,
+                                          expected_context: dict[str, Any],
+                                          expected_account: dict[str, Any]) -> bool:
+        """Save accepted output locators before a potentially slow resource read.
+
+        This is acceptance evidence, not output validation or credit settlement.
+        An interrupted resource read must not erase an original accepted receipt.
+        """
+        from .canvas_resource_recovery import operation_receipt_valid
+        if not operation_receipt_valid(receipt, expected_context):
+            return False
+        account_fields = ('login_user_id', 'cli_user_id', 'execution_mode', 'project_id',
+                          'proxy_url', 'managed_profile', 'region')
+        with self._lock, self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if row is None:
+                return False
+            task = self._task(row)
+            context = task['upstream_context']
+            account = db.execute('SELECT * FROM accounts WHERE id=?', (receipt['account_id'],)).fetchone()
+            if (account is None or task['updated_at'] != expected_updated_at
+                    or context != expected_context or 'manual_termination' in context
+                    or task['status'] not in {'submitted', 'running'}
+                    or task.get('execution_backend') != 'canvas_cli'
+                    or task.get('account_id') != receipt['account_id']
+                    or receipt['task_id'] != task_id
+                    or expected_account.get('id') != receipt['account_id']
+                    or any(account[key] != expected_account.get(key) for key in account_fields)
+                    or str(account['login_user_id'] or account['cli_user_id'] or '') != receipt['expected_user_id']
+                    or any(str(account[key] or '') not in {'', receipt['expected_user_id']}
+                           for key in ('login_user_id', 'cli_user_id'))
+                    or (task.get('normalized') or {}).get('kind', 'video') != receipt['kind']
+                    or not operation_receipt_valid(receipt, context)):
+                return False
+            context.update(operation_receipt={**receipt, 'durable': True},
+                           resource_ids=list(receipt['resource_ids']),
+                           phase='accepted', submission_phase='accepted',
+                           submission_receipt_evidence=True)
+            evidence = {'version': 1, 'accepted': False, 'output_resources': False,
+                'receipt': False, 'identity_conflict': False, 'ambiguous_partial': False,
+                **dict(context.get('submission_evidence') or {})}
+            evidence.update(accepted=True, output_resources=True, receipt=True)
+            context['submission_evidence'] = evidence
+            recovery = context.get('missing_resource_recovery')
+            if isinstance(recovery, dict):
+                context['missing_resource_recovery'] = {**recovery, 'active': False,
+                    'resolved_at': time.time(), 'resolution': 'original_operation_receipt'}
+            db.execute('UPDATE tasks SET upstream_context_json=?,updated_at=? WHERE id=?',
+                (_upstream_context(context), time.time(), task_id))
+        return True
+
     def bind_canvas_outputs(self, task_id: str, binding: dict[str, Any], *,
                             expected_updated_at: float,
                             expected_account: dict[str, Any]) -> bool:

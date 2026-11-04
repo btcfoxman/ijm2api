@@ -29,7 +29,7 @@ from .canvas_input_recovery import (TICKET_KEY, digest as input_digest, file_ide
                                     remaining_deadline, safe_error, validated_tickets)
 from .canvas_operation_recovery import recover_absent_operation
 from .canvas_resource_recovery import (SOURCE as ACCEPTED_RESOURCE_SOURCE,
-    accepted_output_context, observe_bound_resources, resource_observation_retryable)
+    accepted_output_context, observe_bound_resources, resource_observation_retryable, operation_receipt)
 from .canvas_validation import (MATERIAL_REQUIREMENTS_ERROR, MATERIAL_REQUIREMENTS_MESSAGE,
     material_validation_from_quote)
 
@@ -1190,6 +1190,46 @@ class CanvasClient:
         first_failure = []
         fatal_failures = []
         namespace = runner_namespace(self.runner)
+        reusable_verified = frozenset()
+        reusable_binding = None
+        epoch_getter = getattr(self.runner, 'credential_epoch', None)
+        if (verified and durable_persist and type(epoch) is int and epoch >= 0
+                and callable(epoch_getter)):
+            # _upload_plan has just recomputed request/input hashes and checked
+            # every saved verified descriptor against these original IDs. A
+            # fresh account read under the current credential guard can replace
+            # N duplicate resource reads, never a pending-input readiness read.
+            binding = context['upload_checkpoint']['binding']
+            expected_uid = str(self.account.get('login_user_id') or self.account.get('cli_user_id') or '')
+            scope_matches = (bool(expected_uid)
+                and binding.get('task_id') == context.get('task_id')
+                and binding.get('account_id') == int(self.account['id'])
+                and binding.get('project_id') == context.get('project_id')
+                and binding.get('profile_sha256') == input_digest(context.get('profile'))
+                and binding.get('user_id_sha256') == input_digest(expected_uid)
+                and binding.get('proxy_sha256') == input_digest(str(self.account.get('proxy_url') or ''))
+                and binding.get('media_sha256') == input_digest([
+                    {key: job[key] for key in ('group', 'index', 'source_kind', 'source_sha256')}
+                    for job in jobs])
+                and all(str(self.account[key]) == expected_uid
+                        for key in ('login_user_id', 'cli_user_id') if self.account.get(key)))
+            if scope_matches:
+                with self._upload_binding_guard(context, epoch, deadline):
+                    # One bounded read. A transport failure keeps its original
+                    # typed error for the durable preparation retry policy.
+                    identity_deadline = time.monotonic() + 30
+                    if deadline is not None:
+                        identity_deadline = min(identity_deadline, deadline)
+                    fresh = self._call(['auth', 'account'], timeout=30, deadline=identity_deadline)
+                    fresh_uid = str(fresh.get('userId') or '')
+                    if not fresh_uid:
+                        raise CanvasCLIError('CLI_INVALID_RESPONSE',
+                            'Canvas could not verify the account for its saved inputs')
+                    if fresh_uid != expected_uid or epoch_getter(self.account) != epoch:
+                        raise CanvasCLIError('CLI_ACCOUNT_MISMATCH',
+                            'Canvas saved inputs belong to another credential identity')
+                    reusable_binding = copy.deepcopy(binding)
+                    reusable_verified = frozenset(verified)
 
         def cancelled():
             closed = getattr(self.runner, '_closed', None)
@@ -1280,8 +1320,22 @@ class CanvasClient:
                     with self._upload_binding_guard(context, epoch, deadline):
                         with self._phase('reference_upload', index=job['index'] + 1, media_type=job['media_type']):
                             if job['resource_id'] in verified:
-                                self._resource_ready(job['resource_id'], context['project_id'],
-                                    deadline=deadline, media_type=job['media_type'])
+                                if job['resource_id'] in reusable_verified:
+                                    if (context['upload_checkpoint']['binding'] != reusable_binding
+                                            or epoch_getter(self.account) != epoch
+                                            or context.get('task_id') != reusable_binding['task_id']
+                                            or context.get('project_id') != reusable_binding['project_id']
+                                            or context.get('profile') is None
+                                            or input_digest(context['profile']) != reusable_binding['profile_sha256']
+                                            or input_digest(str(self.account.get('login_user_id') or self.account.get('cli_user_id') or '')) != reusable_binding['user_id_sha256']
+                                            or any(input_digest(str(self.account[key])) != reusable_binding['user_id_sha256']
+                                                   for key in ('login_user_id', 'cli_user_id') if self.account.get(key))
+                                            or input_digest(str(self.account.get('proxy_url') or '')) != reusable_binding['proxy_sha256']):
+                                        raise CanvasCLIError('CLI_ACCOUNT_MISMATCH',
+                                            'Canvas saved input binding changed during preparation')
+                                else:
+                                    self._resource_ready(job['resource_id'], context['project_id'],
+                                        deadline=deadline, media_type=job['media_type'])
                             elif job['resource_id'] in pending_refs:
                                 if pending_refs[job['resource_id']] == 'unacknowledged':
                                     self._resume_unacknowledged_upload(job['resource_id'], context['project_id'],
@@ -1858,17 +1912,20 @@ class CanvasClient:
     def poll(self, context: dict[str, Any], *, deadline: float | None = None,
              persist_download: Callable[[dict[str, Any]], Any] | None = None,
               persist_output_binding: Callable[[dict[str, Any]], Any] | None = None,
+             persist_operation_receipt: Callable[[dict[str, Any]], Any] | None = None,
              get_delivery_deadline: Callable[[], float] | None = None,
              on_phase: Callable[[str], Any] | None = None) -> dict[str, Any]:
         with self.runner.account_guard(self.account, deadline=deadline):
             self._check_context(context, deadline=deadline)
             return self._poll(context, deadline=deadline, persist_download=persist_download,
                               persist_output_binding=persist_output_binding,
+                              persist_operation_receipt=persist_operation_receipt,
                               get_delivery_deadline=get_delivery_deadline, on_phase=on_phase)
 
     def _poll(self, context: dict[str, Any], *, deadline: float | None = None,
               persist_download: Callable[[dict[str, Any]], Any] | None = None,
                persist_output_binding: Callable[[dict[str, Any]], Any] | None = None,
+              persist_operation_receipt: Callable[[dict[str, Any]], Any] | None = None,
               get_delivery_deadline: Callable[[], float] | None = None,
               on_phase: Callable[[str], Any] | None = None) -> dict[str, Any]:
         def phase(name: str, *, phase_deadline: float | None = None) -> None:
@@ -1876,14 +1933,17 @@ class CanvasClient:
             if on_phase is not None and on_phase(name) is False:
                 raise CanvasCLIError("CLI_STOPPING", "Canvas result observation was stopped before delivery")
         phase("querying")
+        query_started = time.monotonic()
+        originally_accepted = accepted_output_context(context)
         output_count = context.get('output_count')
         query_seconds = (max(30, 15 * output_count)
                          if context.get('resource_ids') and type(output_count) is int and 1 <= output_count <= 4 else 15)
         query_deadline = min(deadline, time.monotonic() + query_seconds) if deadline is not None else time.monotonic() + query_seconds
         recovered_node = False
         recovered_resources = False
+        ordinary_operation = False
         data = None
-        if accepted_output_context(context):
+        if originally_accepted:
             try:
                 data = observe_bound_resources(self, context, deadline=query_deadline)
             except CanvasCLIError as original:
@@ -1894,7 +1954,10 @@ class CanvasClient:
         if data is None:
             try:
                 data = self._call(["operation", "status", context["submit_id"],
-                                   "--project-id", context["project_id"]], read_only=True, deadline=query_deadline)
+                                   "--project-id", context["project_id"]], read_only=True,
+                    deadline=(min(query_deadline, query_started + 15)
+                              if persist_operation_receipt is not None and not originally_accepted else query_deadline))
+                ordinary_operation = True
             except CanvasCLIError as original:
                 data = observe_bound_resources(self, context, error=original, deadline=query_deadline)
                 recovered_resources = data is not None
@@ -1920,12 +1983,16 @@ class CanvasClient:
         resources = data.get("resources")
         if not isinstance(resources, list):
             raise CanvasCLIError("CLI_INVALID_RESPONSE", "Canvas operation response omitted its resource list", outcome_unknown=True)
-        resource_states = {"pending", "queued", "running", "in_progress", "processing", "completed", "success", "succeeded",
+        resource_states = {"pending", "queued", "accepted", "running", "in_progress", "processing", "completed", "success", "succeeded",
                            "failed", "rejected", "error", "canceled", "cancelled"}
         for resource in resources:
             if (not isinstance(resource, dict)
                     or not isinstance(resource.get("resourceId"), str) or not resource["resourceId"].strip()
-                    or not isinstance(resource.get("state"), str) or resource["state"].strip().lower() not in resource_states):
+                    or (not isinstance(resource.get("state"), str)
+                        or resource["state"].strip().lower() not in resource_states)
+                       and not (persist_operation_receipt is not None and resource.get('state') is None
+                                and state in {'pending', 'queued', 'accepted', 'running', 'in_progress',
+                                              'processing', 'completed', 'success', 'succeeded'})):
                 raise CanvasCLIError("CLI_INVALID_RESPONSE", "Canvas operation response contains an invalid resource", outcome_unknown=True)
         resource_ids = [resource["resourceId"] for resource in resources]
         if len(set(resource_ids)) != len(resource_ids):
@@ -1935,6 +2002,38 @@ class CanvasClient:
                 or len(set(expected)) != len(expected)
                 or expected and not set(resource_ids).issubset(expected)):
             raise CanvasCLIError("CLI_RESOURCE_MISMATCH", "Canvas operation resources do not match the original receipt", outcome_unknown=True)
+        if ordinary_operation and not originally_accepted and persist_operation_receipt is not None:
+            receipt = operation_receipt(context, data)
+            if receipt is not None:
+                try:
+                    saved = persist_operation_receipt(copy.deepcopy(receipt))
+                except CanvasCLIError:
+                    raise
+                except Exception as exc:
+                    raise CanvasCLIError('CLI_OUTPUT_BINDING_PERSIST_FAILED',
+                        'Canvas operation receipt could not be durably saved', outcome_unknown=True) from exc
+                if saved is not True:
+                    raise CanvasCLIError('CLI_STOPPING', 'Canvas operation receipt changed before observation')
+                # Commit acceptance and original locators before a slower
+                # resource read can fail. The paid error remains in its audit.
+                context.update(resource_ids=list(receipt['resource_ids']), phase='accepted', submission_phase='accepted',
+                               operation_receipt={**copy.deepcopy(receipt), 'durable': True})
+                _remember_submission_evidence(context, {'accepted': True, 'receipt': True, 'resources': data['resources']})
+                self._check_context(context, deadline=deadline)
+                resource_seconds = max(30, 15 * context['output_count'])
+                query_deadline = min(query_started + 75, time.monotonic() + resource_seconds)
+                if deadline is not None:
+                    query_deadline = min(query_deadline, deadline)
+                observed = observe_bound_resources(self, context, deadline=query_deadline)
+                if observed is None:
+                    phase('generating')
+                    return {'status': 'running', 'progress': 45, 'result_urls': [], 'result_paths': [],
+                            'result_files': [], 'credit_facts': [], 'error_code': '', 'error_message': '',
+                            'operation_state': state, 'output_resources_missing': False,
+                            'resource_recovery_required': True, 'resource_ids': list(receipt['resource_ids'])}
+                data, recovered_resources = observed, True
+                state, resources = data['state'], data['resources']
+                expected = list(context['resource_ids'])
         result: dict[str, Any] = {"status": "running", "progress": 45, "result_urls": [],
                                   "result_paths": [], "result_files": [], "credit_facts": [],
                                    "error_code": "", "error_message": "", "operation_state": state,

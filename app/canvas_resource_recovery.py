@@ -16,6 +16,7 @@ from .canvas_cli import CanvasCLIError
 
 
 SOURCE = 'accepted_receipt_resource_get'
+OPERATION_RECEIPT_SOURCE = 'operation_status_receipt'
 _UUID = re.compile(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\Z')
 _NODE = re.compile(r'node_[0123456789abcdefghjkmnpqrstvwxyz]{10}\Z')
 _FLAGS = frozenset({'accepted', 'output_resources', 'receipt', 'identity_conflict', 'ambiguous_partial'})
@@ -25,11 +26,148 @@ _RUNNING = frozenset({'pending', 'queued', 'accepted', 'running', 'in_progress',
 _READ_FAILURES = frozenset({'CLI_COMMAND_TIMEOUT', 'CLI_INVALID_RESPONSE', 'cli.transport_failed',
     'cli.invalid_service_response', 'cli.operation_submission_absent', 'cli.resource_unavailable',
     'service.1', 'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'})
+_RECEIPT_BINDINGS = ('account_id', 'task_id', 'profile', 'project_id', 'node_id',
+                     'submit_id', 'expected_user_id', 'kind', 'output_count')
+_RECEIPT_FIELDS = frozenset({'version', 'source', 'operation_ref', 'operation_state',
+    'resource_ids', 'resource_states', *_RECEIPT_BINDINGS})
 
 
 def _mismatch() -> CanvasCLIError:
     return CanvasCLIError('CLI_RESOURCE_MISMATCH',
         'Canvas accepted-resource observation changed its original task binding', outcome_unknown=True)
+
+
+def _receipt_context(context: Any) -> bool:
+    """Only an existing original dispatch identity can acquire output locators."""
+    if (not isinstance(context, dict) or context.get('backend') != 'canvas_cli'
+            or 'manual_termination' in context or context.get('previous_submissions')
+            or type(context.get('account_id')) is not int or context['account_id'] < 1
+            or not all(isinstance(context.get(key), str) and context[key]
+                       for key in ('task_id', 'profile', 'expected_user_id'))
+            or context.get('kind') not in {'image', 'video'}
+            or any(not isinstance(context.get(key), str) or not _UUID.fullmatch(context[key])
+                   for key in ('project_id', 'submit_id'))
+            or not isinstance(context.get('node_id'), str) or not _NODE.fullmatch(context['node_id'])
+            or type(context.get('output_count')) is not int or not 1 <= context['output_count'] <= 4):
+        return False
+    evidence = context.get('submission_evidence')
+    if evidence is not None and (not isinstance(evidence, dict)
+            or set(evidence) != {'version', *_FLAGS} or type(evidence.get('version')) is not int
+            or evidence['version'] != 1 or any(type(evidence.get(key)) is not bool for key in _FLAGS)
+            or evidence['identity_conflict']):
+        return False
+    error = context.get('submit_error')
+    if error:
+        if not isinstance(error, dict):
+            return False
+        if error.get('class') in ('invalid_input', 'permanent_failure', 'business_failure', 'authorization_failure'):
+            return False
+        if error.get('requiredAction') not in (None, '', 'none', 'retry', 'resume', 'contact_support'):
+            return False
+        for key in ('code', 'reason', 'class'):
+            if any(word in str(error.get(key) or '').lower() for word in ('auth', 'identity', 'mismatch',
+                    'permission', 'forbidden', 'policy', 'moderation', 'copyright', 'insufficient',
+                    'invalid_input', 'unsupported')):
+                return False
+    return True
+
+
+def operation_receipt_valid(receipt: Any, context: Any, *, durable: bool = False) -> bool:
+    """Validate acceptance/locators only; this is never a terminal output binding."""
+    if (not _receipt_context(context) or not isinstance(receipt, dict)
+            or set(receipt) != _RECEIPT_FIELDS | ({'durable'} if durable else set())
+            or durable and receipt.get('durable') is not True
+            or type(receipt.get('version')) is not int or receipt['version'] != 1
+            or type(receipt.get('account_id')) is not int or type(receipt.get('output_count')) is not int
+            or receipt.get('source') != OPERATION_RECEIPT_SOURCE
+            or receipt.get('operation_ref') != context['submit_id']
+            or any(receipt.get(key) != context[key] for key in _RECEIPT_BINDINGS)
+            or not isinstance(receipt.get('operation_state'), str)
+            or receipt['operation_state'] not in _RUNNING | _SUCCESS):
+        return False
+    count, ids, states = context['output_count'], receipt.get('resource_ids'), receipt.get('resource_states')
+    if (not isinstance(ids, list) or len(ids) != count
+            or any(not isinstance(value, str) or not _UUID.fullmatch(value) for value in ids)
+            or len(set(ids)) != count
+            or not isinstance(states, list) or len(states) != count):
+        return False
+    expected = context.get('resource_ids') or []
+    if (not isinstance(expected, list) or expected and expected != ids
+            or any(not isinstance(value, str) or not _UUID.fullmatch(value) for value in expected)):
+        return False
+    input_ids = {value for group in (context.get('resources') or {}).values() if isinstance(group, list)
+                 for value in group if isinstance(value, str)} if isinstance(context.get('resources'), dict) else set()
+    for identifier, item in zip(ids, states):
+        if (identifier in input_ids or not isinstance(item, dict) or set(item) != {'resource_id', 'state'}
+                or item.get('resource_id') != identifier
+                or item.get('state') is not None and (not isinstance(item['state'], str)
+                                                       or item['state'] not in _RUNNING | _SUCCESS)):
+            return False
+    return True
+
+
+def operation_receipt(context: Any, operation: Any) -> dict | None:
+    """Project a fully bound ordinary status reply before further resource I/O."""
+    if not _receipt_context(context) or not isinstance(operation, dict):
+        return None
+    if operation.get('operationRef') != context['submit_id'] or operation.get('submissionError'):
+        return None
+    _optional_bindings(operation, context)
+    submission = operation.get('submission')
+    if submission is not None:
+        if not isinstance(submission, dict):
+            raise CanvasCLIError('CLI_INVALID_RESPONSE', 'Canvas operation has contradictory submission facts', outcome_unknown=True)
+        _optional_bindings(submission, context)
+        submission_state = submission.get('state')
+        if isinstance(submission_state, str):
+            submission_state = submission_state.strip().lower()
+        advice = submission.get('adviceCode')
+        if (submission_state not in (None, '') and (not isinstance(submission_state, str)
+                or submission_state not in _RUNNING | _SUCCESS | {'submitted'})
+                or submission.get('resubmittable') is not None and submission['resubmittable'] is not False
+                or advice is not None and (not isinstance(advice, str) or any(word in advice.lower()
+                    for word in ('reject', 'absent', 'partial', 'unknown', 'unconfirmed', 'mismatch',
+                                 'forbidden', 'not_submitted')))
+                or submission.get('error')):
+            raise CanvasCLIError('CLI_INVALID_RESPONSE', 'Canvas operation has contradictory submission facts', outcome_unknown=True)
+    state = operation.get('state')
+    state = state.strip().lower() if isinstance(state, str) else ''
+    if state not in _RUNNING | _SUCCESS:
+        return None
+    values = operation.get('resources')
+    if not isinstance(values, list) or len(values) != context['output_count']:
+        return None
+    ids, states = [], []
+    for value in values:
+        if not isinstance(value, dict):
+            return None
+        _optional_bindings(value, context)
+        if value.get('type') not in (None, '', context['kind']):
+            raise _mismatch()
+        resource_state = value.get('state')
+        resource_state = resource_state.strip().lower() if isinstance(resource_state, str) else resource_state
+        if resource_state is not None and (not isinstance(resource_state, str) or resource_state not in _RUNNING | _SUCCESS):
+            return None
+        ids.append(value.get('resourceId'))
+        states.append({'resource_id': value.get('resourceId'), 'state': resource_state})
+    expected = context.get('resource_ids') or []
+    if any(not isinstance(identifier, str) or not _UUID.fullmatch(identifier) for identifier in ids):
+        return None
+    if not isinstance(expected, list) or any(not isinstance(identifier, str) or not _UUID.fullmatch(identifier)
+                                             for identifier in expected):
+        return None
+    inputs = context.get('resources')
+    input_ids = {value for group in inputs.values() if isinstance(group, list) for value in group
+                 if isinstance(value, str)} if isinstance(inputs, dict) else set()
+    if any(identifier in input_ids for identifier in ids):
+        raise _mismatch()
+    if isinstance(expected, list) and expected and set(ids) == set(expected):
+        by_id = {item['resource_id']: item for item in states}
+        ids, states = list(expected), [by_id[identifier] for identifier in expected]
+    receipt = {'version': 1, 'source': OPERATION_RECEIPT_SOURCE,
+        'operation_ref': context['submit_id'], 'operation_state': state,
+        **{key: context[key] for key in _RECEIPT_BINDINGS}, 'resource_ids': ids, 'resource_states': states}
+    return receipt if operation_receipt_valid(receipt, context) else None
 
 
 def accepted_output_context(context: Any) -> bool:
@@ -43,7 +181,8 @@ def accepted_output_context(context: Any) -> bool:
     if (not isinstance(context, dict) or context.get('backend') != 'canvas_cli'
             or context.get('phase') != 'accepted'
             or context.get('submission_phase') not in {'accepted', 'submitted'}
-            or context.get('submit_error') or 'manual_termination' in context
+            or context.get('submit_error') and not operation_receipt_valid(context.get('operation_receipt'), context, durable=True)
+            or 'manual_termination' in context
             or context.get('previous_submissions')
             or type(context.get('account_id')) is not int or context['account_id'] < 1
             or not all(isinstance(context.get(key), str) and context[key]
@@ -93,6 +232,8 @@ def resource_observation_retryable(error: Any) -> bool:
 
 
 def _optional_bindings(value: dict, context: dict) -> None:
+    if value.get('identity_conflict') is True:
+        raise _mismatch()
     for field, key in (('projectId', 'project_id'), ('nodeId', 'node_id'), ('submitId', 'submit_id'),
                        ('operationRef', 'submit_id')):
         if value.get(field) not in (None, '', context[key]):
@@ -118,9 +259,9 @@ def observe_bound_resources(client, context: dict, *, deadline: float | None,
         details = error.details if isinstance(error.details, dict) else {}
         facts = details.get('error') if isinstance(details.get('error'), dict) else {}
         for value in (details, facts):
-            _optional_bindings(value, context)
             if value.get('identity_conflict') is True:
                 return None
+            _optional_bindings(value, context)
     if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
         return None
     client._remaining(deadline)
@@ -128,7 +269,7 @@ def observe_bound_resources(client, context: dict, *, deadline: float | None,
     # A fixed 15s batch cap could starve the fourth output forever when each
     # normal resource read takes several seconds. The original task deadline
     # remains authoritative; no per-resource or per-retry budget is renewed.
-    query_deadline = min(deadline, time.monotonic() + 15 * context['output_count'])
+    query_deadline = min(deadline, time.monotonic() + max(30, 15 * context['output_count']))
     client._check_context(context, deadline=query_deadline)
     account = client.account
     uids = [str(account.get(key) or '') for key in ('login_user_id', 'cli_user_id')]
@@ -168,7 +309,7 @@ def observe_bound_resources(client, context: dict, *, deadline: float | None,
         client._remaining(query_deadline)
         client._check_context(context, deadline=query_deadline)
         facts = client._call(['resource', 'get', identifier, '--project-id', context['project_id']],
-            timeout=client._remaining(query_deadline, 10), read_only=True, deadline=query_deadline)
+            timeout=client._remaining(query_deadline), read_only=True, deadline=query_deadline)
         client._remaining(query_deadline)
         if not isinstance(facts, dict):
             return None
