@@ -23,7 +23,7 @@ from .account_automation import AccountAutomation, AutomationError
 from .browser_runtime import BrowserRuntime
 from .canvas_cli import CanvasCLI, CanvasCLIError
 from .canvas_service import ADMISSION_AUDIT_FIELDS, CanvasServiceMixin, execution_mode
-from .canvas_quote_hints import matching_hint
+from .canvas_quote_hints import matching_hint, request_quote_estimate
 from .canvas_timing import INITIAL_ADMISSION_UNSET
 from .canvas_account_health import account_cooldowns
 from .account_policy import (account_accepts_task, low_balance_image_probe,
@@ -720,7 +720,7 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
 
     def _funded_accounts(self, estimated_cost: float, excluded: set[int], pending: dict,
                          backend: str | None = None, *, include_aux_busy: bool = False,
-                         task: dict | None = None) -> list[dict]:
+                         task: dict | None = None, include_underfunded: bool = False) -> list[dict]:
         accounts, legacy, all_quotes = [], [], []
         try:
             exhausted, blocked, allowed = self._canvas_preparation_capacity(task or {})
@@ -741,6 +741,12 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
             except Exception as exc:
                 logger.warning('Canvas scheduling quote cache unavailable (%s)', type(exc).__name__)
         account_rows = self.store.accounts(private=True)
+        quote_owners = [item for item in account_rows if execution_mode(item) == 'canvas_cli'
+            and account_accepts_task(item, task, threshold=threshold, rescue_threshold=image_rescue)
+            and _credential_setup_ready(item) and item.get('cli_auth_status') == 'ready'
+            and (not task or not self._region_denial(item, normalized))]
+        quoted_estimate = request_quote_estimate(all_quotes, quote_owners, self.canvas_cli.data_dir, normalized)
+        canvas_required = number(estimated_cost) or quoted_estimate or 0.0
         cooldowns = self._canvas_account_cooldowns(task, account_rows, self.settings())
         context = (task or {}).get('upstream_context') or {}
         checkpoint = context.get('upload_checkpoint')
@@ -792,21 +798,23 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                 # This is a temporary hold, never a price or actual debit.
                 accounts.append({**candidate, '_credit_reservation_amount': available})
                 continue
-            canvas_reference_probe = multi_reference_video and execution_mode(item) == 'canvas_cli'
-            if canvas_reference_probe:
-                # Keep a live-quote fallback if all cached predictions are
-                # underfunded or busy; no account is disabled by a hint.
-                legacy.append({**candidate, '_scheduling_quote_unknown': True})
-            elif available is None or available >= estimated_cost:
-                legacy.append(candidate)
             hint = next((row for row in all_quotes if row['account_id'] == int(item['id'])
                 and matching_hint(row, item, self.canvas_cli.data_dir, task['normalized'])), None)
-            if canvas_reference_probe and hint is None:
-                # Another identity's estimate is not this account's price.
-                # Prefer a well-funded probe before uploading many references;
-                # its own fresh quote remains the final submission gate.
-                accounts.append({**candidate, '_scheduling_quote_unknown': True})
+            if execution_mode(item) == 'canvas_cli' and normalized.get('kind') != 'image':
+                # An exact account quote overrides an admission estimate; neither
+                # is a debit. Known insufficient balances never enter the legacy
+                # fallback, even when a higher-priority owner is busy or absent.
+                required = hint['amount'] if hint is not None else canvas_required
+                short = available is not None and required > 0 and available < required
+                if short and not include_underfunded:
+                    continue
+                quoted = {'_scheduling_quote_amount': required} if required > 0 else {}
+                accounts.append({**candidate, **quoted, '_known_credit_shortfall': short,
+                    '_scheduling_quote_unknown': hint is None and (estimated_cost <= 0 or multi_reference_video),
+                    '_credit_reservation_amount': required if required > 0 else available or 0.0})
                 continue
+            if available is None or available >= estimated_cost:
+                legacy.append(candidate)
             required = hint['amount'] if hint is not None else estimated_cost
             if available is None or available >= required:
                 accounts.append({**candidate, '_scheduling_quote_amount': hint['amount']} if hint else candidate)
@@ -825,6 +833,14 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
             if not any(int(item['priority']) >= highest for item in accounts):
                 accounts.extend(item for item in legacy if int(item['priority']) == highest)
         return accounts
+
+    def _canvas_pool_credit_shortfall(self, estimated_cost: float, excluded: set[int], task_id: str) -> bool:
+        """Explain an empty Canvas pool without reserving an owner or using CLI."""
+        task = self.store.task(task_id) or {}
+        rows = self._funded_accounts(estimated_cost, excluded, {},
+            self._required_execution_backend(task) or task.get('execution_backend'),
+            include_aux_busy=True, task=task, include_underfunded=True)
+        return bool(rows) and all(row.get('_known_credit_shortfall') is True for row in rows)
 
     @staticmethod
     def _required_execution_backend(task: dict) -> str:
@@ -1239,6 +1255,14 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                         return
                     account = self._reserve_account(estimated_cost, exclude_ids=excluded,
                                                     prefer_balance=bool(attempted), task_id=task_id)
+                    if not account and self._canvas_pool_credit_shortfall(estimated_cost, excluded, task_id):
+                        current = self.store.task(task_id) or {}
+                        facts = self._canvas_pre_dispatch_facts(current,
+                            CanvasCLIError('INSUFFICIENT_CREDITS', 'No account can fund the known Canvas quote'), False)
+                        if facts:
+                            self._canvas_context(task_id, {'pre_dispatch_failure': {**facts, 'fallback_allowed': True}})
+                        self._fail(task_id, 'INSUFFICIENT_CREDITS', 'No available account has enough credits for the known Canvas quote')
+                        return
                     if account or ((attempted or funding_excluded or self._model_excluded_accounts(self.store.task(task_id) or {}))
                             and not self._has_eligible_account(
                             estimated_cost, excluded, task_id) and not self._has_waiting_credit_account(
@@ -1248,7 +1272,7 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                 if not account:
                     if self._admission_expired(task_id, deadline):
                         return
-                    rejected = attempted or self._model_excluded_accounts(self.store.task(task_id) or {})
+                    rejected = attempted or funding_excluded or self._model_excluded_accounts(self.store.task(task_id) or {})
                     code = admission_code if rejected else "ACCOUNT_POOL_UNAVAILABLE"
                     message = credit_reason if rejected else "no available Dreamina account before timeout"
                     self._fail(task_id, code, message)

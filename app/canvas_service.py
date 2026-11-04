@@ -1315,6 +1315,23 @@ class CanvasServiceMixin:
                 self.store.update_account(account_id, {"balance": fresh_before})
             # Cached credits can admit a quoted task, but cannot prove spend.
             self._update_canvas_task(task_id, {"balance_before": fresh_before})
+            required = number(account.get('_scheduling_quote_amount')) or number(task.get('estimated_cost')) or 0.0
+            if task['normalized'].get('kind') != 'image' and required > 0 and budget_balance < required:
+                # Recheck a fresh balance before model/material preparation.
+                # No node or resource is created for a known unaffordable task.
+                finish_attempt('insufficient_credits')
+                current = self.store.task(task_id) or {}
+                facts = self._canvas_pre_dispatch_facts(current,
+                    CanvasCLIError('INSUFFICIENT_CREDITS', 'Fresh Canvas balance is below the known quote'), False)
+                if facts:
+                    self._canvas_context(task_id, {'pre_dispatch_failure': {**facts, 'fallback_allowed': True}})
+                if self._canvas_uploads_pending(current):
+                    self._fail_canvas_task(task_id, 'INSUFFICIENT_CREDITS',
+                        'Original input owner cannot fund the known Canvas quote')
+                    return True
+                return False if self._requeue_unaccepted_task(task_id,
+                    error_code='INSUFFICIENT_CREDITS', error_message='Fresh Canvas balance is below the known quote',
+                    estimated_cost=required) else True
             normalized = dict(task["normalized"])
             normalized["_execution_backend"] = "canvas_cli"
             if normalized.get('kind') == 'image':

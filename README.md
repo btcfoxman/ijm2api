@@ -243,6 +243,28 @@ quote hints can still guide best-fit selection. A historical quote is only a
 scheduling hint: the fresh complete quote and confirmation ceiling remain
 mandatory before generation.
 
+A known insufficient Canvas video balance is excluded before account assignment,
+including fallback selection when a funded account is busy or lower priority.
+The task's known quote, or the lowest fresh native quote for exactly the same
+request dimensions from currently eligible identities, supplies its admission
+estimate. A selected account's own exact quote takes precedence. Estimates never
+scale a per-second price or become actual consumption. Fresh identity credits
+are checked again before downloading or uploading references. If no eligible
+account can fund the known amount, the task returns `INSUFFICIENT_CREDITS`
+without repeating uploads on another underfunded account. Unknown prices still
+require a fresh native quote; image-rescue and browser policies are unchanged.
+
+URL-image fallback uploads now retain their original URL binding and separately
+bind the fallback file's bytes in a version-2 input-recovery ticket. A technical
+unknown upload can use at most one claimed same-resource FILE recovery after a
+fresh matching identity and exact registration-absence check. It shares the
+original observation deadline and never repeats a paid generation. Acknowledged
+resources and restarted legacy unknown checkpoints remain observe-only.
+
+Read-only identity checks share a 30-second absolute window, clipped by the
+original task deadline. The first request can use the full remaining window;
+retries and optional credit reads do not create additional windows.
+
 
 CLI result downloads preserve original media bytes and are published through
 the existing s3-center configuration. Signed URLs are renewed on queries.

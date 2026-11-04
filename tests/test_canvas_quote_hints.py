@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app.canvas_quote_hints import new_hint, matching_hint, TTL_SECONDS
+from app.canvas_quote_hints import new_hint, matching_hint, request_quote_estimate, TTL_SECONDS
 from app.catalog import normalize_request
 from test_canvas_execution import context, owner, task, fake_client
 
@@ -36,6 +36,97 @@ def seed(store,service,account,amount,body=None):
 
 def target(store,identifier='target',**overrides):
     return task(store,identifier,image_urls=['https://fixture.example/one.png'],**overrides)
+
+
+def test_request_estimate_is_minimum_verified_current_quote_not_an_average_or_rate(context):
+    store,service,_=context
+    first=owner(store,'first',balance=1000);second=owner(store,'second',balance=1000)
+    rows=[seed(store,service,first,551),seed(store,service,second,323)]
+    assert request_quote_estimate(rows,[first,second],service.canvas_cli.data_dir,normalized())==323
+    assert request_quote_estimate(rows,[first],service.canvas_cli.data_dir,normalized())==551
+    assert request_quote_estimate(rows,[second],service.canvas_cli.data_dir,normalized())==323
+    assert request_quote_estimate(rows,[],service.canvas_cli.data_dir,normalized()) is None
+
+
+def test_request_estimate_does_not_change_the_selected_accounts_own_quote(context):
+    store,service,_=context
+    first=owner(store,'first',balance=1000);second=owner(store,'second',balance=1000)
+    rows=[seed(store,service,first,551),seed(store,service,second,323)]
+    before=deepcopy(rows)
+    assert request_quote_estimate(rows,[first,second],service.canvas_cli.data_dir,normalized())==323
+    assert matching_hint(rows[0],first,service.canvas_cli.data_dir,normalized())
+    assert rows[0]['amount']==551 and rows==before
+
+
+@pytest.mark.parametrize('mutation',[
+    {'identity_epoch':'old-profile'}, {'observed_at':0},
+    {'observed_at':time.time()+86400}, {'model':'seedance_2.0_fast'},
+    {'mode':'t2v'}, {'source':'actual_cost'}, {'amount':0}, {'amount':-1},
+    {'amount':True}, {'amount':float('nan')}, {'amount':float('inf')},
+])
+def test_request_estimate_discards_untrusted_cheaper_quote(context,mutation):
+    store,service,_=context
+    first=owner(store,'first');second=owner(store,'second')
+    trusted=seed(store,service,first,551);invalid=seed(store,service,second,1)
+    invalid.update(mutation)
+    assert request_quote_estimate([trusted,invalid],[first,second],
+        service.canvas_cli.data_dir,normalized())==551
+    assert request_quote_estimate([invalid],[second],service.canvas_cli.data_dir,normalized()) is None
+
+
+@pytest.mark.parametrize('change',[
+    {'duration':5}, {'resolution':'1080p'}, {'aspect_ratio':'9:16'}, {'count':2},
+    {'images':['a','b']}, {'audios':['audio-a','audio-b']},
+    {'videos':['video-a'],'_cost_evidence':{'reference_seconds':2}},
+    {'model':'sd-2-0-fast'}, {'mode':'first_last_frame'},
+])
+def test_request_estimate_never_scales_or_transfers_across_dimensions(context,change):
+    store,service,_=context;account=owner(store)
+    hint=seed(store,service,account,76)
+    assert request_quote_estimate([hint],[account],service.canvas_cli.data_dir,
+        {**normalized(),**change}) is None
+
+
+def test_request_estimate_requires_measured_reference_video_seconds(context):
+    store,service,_=context;account=owner(store)
+    body={**normalized(),'videos':['video-a'],'_cost_evidence':{'reference_seconds':2}}
+    hint=seed(store,service,account,323,body)
+    assert request_quote_estimate([hint],[account],service.canvas_cli.data_dir,body)==323
+    for evidence in ({},{'reference_seconds':0},{'reference_seconds':3}):
+        assert request_quote_estimate([hint],[account],service.canvas_cli.data_dir,
+            {**body,'_cost_evidence':evidence}) is None
+
+
+@pytest.mark.parametrize('account_change',[
+    {'login_user_id':'changed'}, {'cli_user_id':'changed'},
+    {'cli_auth_status':'error'}, {'execution_mode':'browser'},
+])
+def test_request_estimate_requires_current_authenticated_canvas_identity(context,account_change):
+    store,service,_=context;account=owner(store);hint=seed(store,service,account,323)
+    assert request_quote_estimate([hint],[{**account,**account_change}],
+        service.canvas_cli.data_dir,normalized()) is None
+
+
+def test_request_estimate_missing_epoch_does_not_create_or_restore_a_profile(context):
+    store,service,_=context;account=owner(store);hint=seed(store,service,account,323)
+    marker=service.canvas_cli.account_directory(account)/'credential-profile'
+    marker.unlink()
+    assert request_quote_estimate([hint],[account],service.canvas_cli.data_dir,normalized()) is None
+    assert not marker.exists()
+
+
+def test_request_estimate_ignores_unrelated_dimensions_before_reading_profiles(context):
+    store,service,_=context;account=owner(store);hint=seed(store,service,account,323)
+    with patch('app.canvas_quote_hints.identity_epoch',side_effect=AssertionError('unrelated profile read')):
+        assert request_quote_estimate([hint],[account],service.canvas_cli.data_dir,
+            {**normalized(),'duration':5}) is None
+
+
+def test_request_estimate_does_not_turn_unknown_or_image_work_into_zero_cost(context):
+    store,service,_=context;account=owner(store)
+    assert request_quote_estimate([],[account],service.canvas_cli.data_dir,normalized()) is None
+    assert request_quote_estimate([],[account],service.canvas_cli.data_dir,
+        {**normalized(),'kind':'image'}) is None
 
 
 def test_known_account44_does_not_fit42_and_does_not_override_account40(context):
@@ -101,31 +192,28 @@ def test_hints_keep_priority_and_smallest_funded_balance(context):
     service._release_account(small['id'],row['id'])
 
 
-def test_all_unfunded_predictions_fall_back_to_original_live_quote_path(context):
+def test_all_insufficient_account_quotes_are_excluded_without_fallback(context):
     store,service,_=context
     big=owner(store,'big',balance=42);small=owner(store,'small',balance=41)
     seed(store,service,big,100);seed(store,service,small,100);row=target(store)
-    selected=service._reserve_account(0,task_id=row['id'])
-    assert selected['id']==big['id'] and '_scheduling_quote_amount' not in selected
-    service._release_account(big['id'],row['id'])
+    assert service._reserve_account(0,task_id=row['id']) is None
 
 
-def test_busy_hint_funded_account_does_not_starve_idle_legacy_candidate(context):
+def test_busy_funded_account_does_not_authorize_insufficient_idle_account(context):
     store,service,_=context
     busy=owner(store,'busy',balance=200);idle=owner(store,'idle',balance=42)
     store.update_account(busy['id'],{'max_concurrency':1});seed(store,service,busy,40);seed(store,service,idle,100)
     service._active[busy['id']]=1;service._credit_reservations['running']=(busy['id'],40);row=target(store)
-    selected=service._reserve_account(0,task_id=row['id'])
-    assert selected['id']==idle['id'] and '_scheduling_quote_amount' not in selected
-    service._release_account(idle['id'],row['id']);service._active.clear();service._credit_reservations.clear()
+    assert service._reserve_account(0,task_id=row['id']) is None
+    service._active.clear();service._credit_reservations.clear()
 
 
-def test_hints_never_bypass_higher_priority_unverified_account(context):
+def test_insufficient_higher_priority_account_does_not_block_funded_account(context):
     store,service,_=context
     high=owner(store,'high',balance=42,priority=9);low=owner(store,'low',balance=200,priority=8)
     seed(store,service,high,100);seed(store,service,low,40);row=target(store)
-    assert service._reserve_account(0,task_id=row['id'])['id']==high['id']
-    service._release_account(high['id'],row['id'])
+    assert service._reserve_account(0,task_id=row['id'])['id']==low['id']
+    service._release_account(low['id'],row['id'])
 
 
 def test_lower_priority_hint_does_not_change_unknown_higher_priority_balance_order(context):

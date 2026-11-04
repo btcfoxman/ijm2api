@@ -172,6 +172,18 @@ def test_only_exact_not_found_not_wrong_identity_or_failure_allows_file(clock, r
     assert sum(args[:2] == ['resource', 'upload'] for args, _ in runner.calls) == 1
 
 
+@pytest.mark.parametrize('location', ['envelope', 'error'])
+def test_contradictory_partial_presence_is_not_registration_absence(clock, location):
+    absent = not_found()
+    value = absent.details if location == 'envelope' else absent.details['error']
+    value['partialData'] = {'resources': ['original-resource']}
+    callback = Mock()
+    runner = Runner([unavailable()], [absent])
+    with pytest.raises(CanvasCLIError): invoke(runner, callback)
+    assert not callback.called
+    assert sum(args[:2] == ['resource', 'upload'] for args, _ in runner.calls) == 1
+
+
 def test_failed_read_is_unacknowledged_and_cannot_rewrite_without_positive_absence(clock):
     failure = unavailable()
     callback = Mock()

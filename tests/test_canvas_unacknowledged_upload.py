@@ -184,7 +184,7 @@ def test_resume_absence_does_not_upload_after_callback_stop(tmp_path, clock):
     assert not any(args[:2] == ['resource', 'upload'] for args in runner.calls)
 
 
-def test_resumed_file_transport_has_three_original_id_writes_and_one_lazy_download(tmp_path, clock):
+def test_resumed_file_transport_has_two_remaining_original_id_writes_and_one_lazy_download(tmp_path, clock):
     path = tmp_path/'fallback.png';path.write_bytes(b'validated-image')
     callback = Mock(return_value=path)
     runner = Runner([unavailable()], [not_found()])
@@ -192,7 +192,8 @@ def test_resumed_file_transport_has_three_original_id_writes_and_one_lazy_downlo
         CanvasClient(runner, ACCOUNT)._resume_unacknowledged_upload('original-resource', 'original-project', 'image',
             deadline=180, fallback_file=callback, on_registered=lambda value: None)
     writes = [args for args, _ in runner.calls if args[:2] == ['resource', 'upload']]
-    assert caught.value.code == 'service.1' and len(writes) == 3 and callback.call_count == 1
+    # The original unacknowledged URL command already consumed one write.
+    assert caught.value.code == 'service.1' and len(writes) == 2 and callback.call_count == 1
     assert all('--file' in args and '--source-url' not in args and args[-1] == 'original-resource' for args in writes)
     assert all(value['deadline'] <= 180 for _, value in runner.calls)
 

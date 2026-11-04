@@ -64,7 +64,8 @@ def test_real_scheduler_stops_after_first_first_second_without_binding_third(con
         service._run(identifier)
     row = store.task(identifier)
     assert row['status'] == 'failed' and row['error_code'] == 'INSUFFICIENT_CREDITS'
-    assert row['error_message'] == 'Canvas quote exceeds available unreserved credits'
+    assert row['error_message'] == ('Fresh Canvas balance is below the known quote' if kind == 'video'
+                                    else 'Canvas quote exceeds available unreserved credits')
     assert [entry['account_id'] for entry in row['upstream_context']['preparation_retry_budget']['attempts']] == [
         first['id'], first['id'], second['id']]
     assert [entry['reason'] for entry in row['upstream_context']['preparation_attempts']] == [
@@ -73,7 +74,9 @@ def test_real_scheduler_stops_after_first_first_second_without_binding_third(con
     assert row['request'] == request and row['actual_cost'] is None
     assert service._canvas_public_pre_dispatch_facts(row)['generation_request_sent'] is False
     assert not service._credit_reservations and all(value == 0 for value in service._active.values())
-    assert sum(client.prepare.call_count for client in clients.values()) == 3
+    assert sum(client.prepare.call_count for client in clients.values()) == (1 if kind == 'video' else 3)
+    if kind == 'video':
+        clients[second['id']].prepare.assert_not_called()
     for client in clients.values():
         client.submit.assert_not_called()
         client.poll.assert_not_called()

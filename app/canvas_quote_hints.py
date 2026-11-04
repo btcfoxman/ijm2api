@@ -93,3 +93,27 @@ def matching_hint(row, account, data_dir, normalized, *, now=None):
         and _key(row.get('model')) in {_key(value) for value in _model_candidates(normalized) if value}
         and amount is not None and amount > 0 and stamp is not None
         and now - TTL_SECONDS <= stamp <= now)
+
+
+def request_quote_estimate(rows, accounts, data_dir, normalized, *, now=None) -> float | None:
+    """Return the lowest current account quote for exactly this request shape.
+
+    This is a scheduling estimate, not another account's authoritative quote.
+    The selected account's own valid hint and its fresh node.quote still take
+    precedence. Missing dimensions or evidence never imply a free generation.
+    """
+    dimensions = request_dimensions(normalized)
+    if dimensions is None:
+        return None
+    key = dimension_key(dimensions)
+    current = {int(account['id']): account for account in accounts}
+    observed_at = time.time() if now is None else now
+    amounts = []
+    for row in rows:
+        # Filter unrelated requests before reading any credential epoch files.
+        if row.get('dimension_key') != key or row.get('source') != 'node.quote':
+            continue
+        account = current.get(row.get('account_id'))
+        if account is not None and matching_hint(row, account, data_dir, normalized, now=observed_at):
+            amounts.append(number(row['amount']))
+    return min(amounts) if amounts else None

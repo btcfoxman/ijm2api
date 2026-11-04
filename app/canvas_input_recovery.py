@@ -14,6 +14,7 @@ from .canvas_cli import CanvasCLIError
 TICKET_KEY = 'file_unknown_retries'
 _FIELDS = {'version', 'resource_id', 'media_type', 'source_sha256', 'binding_sha256',
            'attempt', 'state', 'observation_started_at', 'observation_deadline_at', 'original_error'}
+_URL_FIELDS = _FIELDS | {'fallback_file_sha256'}
 
 
 def digest(value):
@@ -40,19 +41,26 @@ def validated_tickets(checkpoint, jobs, binding):
     planned = {job['resource_id']: job for job in jobs}
     seen = set()
     for item in entries:
-        if not isinstance(item, dict) or set(item) != _FIELDS:
+        if not isinstance(item, dict) or set(item) not in (_FIELDS, _URL_FIELDS):
             raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID', 'Canvas input retry ticket is invalid')
         identifier = item.get('resource_id')
         job = planned.get(identifier) if isinstance(identifier, str) else None
         start, end = item['observation_started_at'], item['observation_deadline_at']
         error = item['original_error']
+        file_source = (job is not None and job['source_kind'] == 'file'
+            and item.get('version') == 1 and set(item) == _FIELDS)
+        url_fallback = (job is not None and job['source_kind'] == 'url'
+            and job['media_type'] == 'image' and callable(job.get('fallback_file'))
+            and item.get('version') == 2 and set(item) == _URL_FIELDS
+            and isinstance(item.get('fallback_file_sha256'), str)
+            and re.fullmatch(r'[0-9a-f]{64}', item['fallback_file_sha256']) is not None)
         registered = any(isinstance(ref, dict) and ref.get('resource_id') == identifier
             and (ref.get('verified') is True or ref.get('observe_only') is True
                  and ref.get('registration') in {'unknown', 'acknowledged'})
             for ref in [*(checkpoint.get('refs') or []), *(checkpoint.get('pending_refs') or [])])
-        if (job is None or identifier in seen or job['source_kind'] != 'file'
+        if (job is None or identifier in seen or not (file_source or url_fallback)
                 or not registered
-                or type(item['version']) is not int or item['version'] != 1
+                or type(item['version']) is not int
                 or item['media_type'] != job['media_type'] or item['source_sha256'] != job['source_sha256']
                 or item['binding_sha256'] != digest(binding)
                 or type(item['attempt']) is not int or item['attempt'] not in {0, 1}
