@@ -169,9 +169,40 @@ def preparation_transport_failure(exc: CanvasCLIError) -> bool:
     return True
 
 
+def preparation_upload_credential_failure(exc: CanvasCLIError) -> bool:
+    """The exact media-upload credential outage is not account authorization.
+
+    This only classifies a preparation error. In an already claimed unknown
+    upload it permits observation of the original UUID, never another write.
+    """
+    details = exc.details if isinstance(exc.details, dict) else {}
+    error = details.get('error')
+    if (exc.code != 'cli.upload_credential_unavailable' or exc.outcome_unknown
+            or not isinstance(error, dict) or error.get('code') != exc.code
+            or error.get('class') != 'retryable_failure' or error.get('retryable') is not True
+            or error.get('requiredAction') != 'retry' or error.get('serviceCode') not in (None, '')
+            or error.get('reason') not in (None, '')):
+        return False
+    for value in (details, error):
+        local = value.get('localStorage')
+        if local is not None and (not isinstance(local, dict) or local.get('submissionPhase') != 'before_submit'):
+            return False
+        for facts in (value, local) if isinstance(local, dict) else (value,):
+            if (facts.get('dispatch_started') is True or facts.get('outcome_unknown') is True
+                    or facts.get('phase') in ('run_dispatching', 'submitted', 'accepted', 'unknown')
+                    or any(facts.get(key) for key in ('partialData', 'data', 'accepted', 'resources',
+                        'items', 'submission', 'receipt', 'run_receipt', 'run_data', 'operation',
+                        'operationRef', 'operation_ref', 'operation_id', 'operationId', 'resource_ids',
+                        'resourceIds', 'run_id', 'runId', 'thread_id', 'threadId',
+                        'submission_evidence', 'submission_receipt_evidence'))):
+                return False
+    return True
+
+
 def preparation_retryable_failure(exc: CanvasCLIError) -> bool:
     """Known service/transport/decoding failures before a generation command."""
-    if preparation_service_unavailable(exc) or preparation_transport_failure(exc):
+    if (preparation_service_unavailable(exc) or preparation_transport_failure(exc)
+            or preparation_upload_credential_failure(exc)):
         return True
     error = exc.details.get('error') or {}
     return (not exc.outcome_unknown
@@ -903,12 +934,12 @@ class CanvasClient:
                     # Only exact registration absence permits changing the
                     # transport of this same planned ID. A failed/pending read
                     # is not evidence that a new write is safe.
-                    probe_deadline = time.monotonic() + 5
+                    probe_deadline = time.monotonic() + 15
                     if deadline is not None:
                         probe_deadline = min(probe_deadline, deadline)
                     try:
                         existing = self._call(['resource', 'get', resource_id, '--project-id', project_id],
-                            timeout=5, read_only=True, deadline=probe_deadline)
+                            timeout=15, read_only=True, deadline=probe_deadline)
                     except CanvasCLIError as check:
                         if not _planned_resource_not_found(check, resource_id):
                             retryable_read = (not check.outcome_unknown and (
@@ -1067,7 +1098,8 @@ class CanvasClient:
             self._remaining(deadline)
             yield
 
-    def _upload_plan(self, normalized, task_id, assets, context, checkpoint, deadline):
+    def _upload_plan(self, normalized, task_id, assets, context, checkpoint, deadline,
+                     input_binding_guard=None):
         """Bind verified checkpoints to inputs, never to temporary file paths."""
         def digest(value):
             return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=True,
@@ -1110,6 +1142,13 @@ class CanvasClient:
             'media_sha256': digest([{key: job[key] for key in ('group', 'index', 'source_kind', 'source_sha256')}
                                    for job in jobs])}
         binding_hash = digest(binding)
+        if input_binding_guard is not None:
+            from .canvas_input_handoff import verify_input_guard
+            try:
+                verify_input_guard(input_binding_guard, binding)
+            except (ValueError, TypeError, KeyError):
+                raise CanvasCLIError('CLI_UPLOAD_CHECKPOINT_INVALID',
+                    'Canvas original input content changed before account handoff') from None
         if isinstance(checkpoint, dict):
             if _upload_dispatch_evidence(checkpoint):
                 raise CanvasCLIError('UPSTREAM_SUBMIT_OUTCOME_UNKNOWN',
@@ -1453,17 +1492,20 @@ class CanvasClient:
     def prepare(self, normalized: dict[str, Any], task_id: str,
                 assets: dict[str, list[Any]], *,
                 persist: Callable[[dict[str, Any]], Any] | None = None,
-                deadline: float | None = None, checkpoint: dict | None = None) -> dict[str, Any]:
+                deadline: float | None = None, checkpoint: dict | None = None,
+                input_binding_guard: dict | None = None) -> dict[str, Any]:
         with self._account_guard(deadline):
             getter = getattr(self.runner, 'credential_epoch', None)
             epoch = getter(self.account) if callable(getter) else None
             segmented = isinstance(self.runner, CanvasCLI) and self.runner._parallel_verified
             if not segmented and not self._parallel_uploads():
                 return self._prepare(normalized, task_id, assets, persist=persist, deadline=deadline,
-                                     checkpoint=checkpoint, credential_epoch=epoch)
+                                     checkpoint=checkpoint, credential_epoch=epoch,
+                                     input_binding_guard=input_binding_guard)
         # No parent reader remains while child readers wait behind an auth writer.
         return self._prepare(normalized, task_id, assets, persist=persist, deadline=deadline,
-                             checkpoint=checkpoint, credential_epoch=epoch)
+                             checkpoint=checkpoint, credential_epoch=epoch,
+                             input_binding_guard=input_binding_guard)
 
     def _project_guard(self, context, deadline):
         return (self.runner.project_guard(self.account, context['project_id'], deadline=deadline)
@@ -1473,7 +1515,7 @@ class CanvasClient:
                  assets: dict[str, list[Any]], *,
                  persist: Callable[[dict[str, Any]], Any] | None = None,
                  deadline: float | None = None, checkpoint: dict | None = None,
-                 credential_epoch=None) -> dict[str, Any]:
+                 credential_epoch=None, input_binding_guard=None) -> dict[str, Any]:
         kind = "image" if normalized.get("kind") == "image" else "video"
         counts = {x: len(assets.get(x, [])) for x in ("images", "videos", "audios")}
         model = self.preflight_model(normalized, deadline=deadline)
@@ -1502,7 +1544,8 @@ class CanvasClient:
         if _upload_dispatch_evidence(context):
             raise CanvasCLIError("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "Canvas submission must be resumed by its original submit ID", outcome_unknown=True)
         jobs, refs, expected, verified, pending_refs = self._upload_plan(normalized, task_id, assets, context,
-            checkpoint if checkpoint is not None else context.get('upload_checkpoint'), deadline)
+            checkpoint if checkpoint is not None else context.get('upload_checkpoint'), deadline,
+            input_binding_guard=input_binding_guard)
         state_lock = threading.RLock()
         def save(phase: str) -> None:
             with state_lock:

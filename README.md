@@ -194,7 +194,7 @@ The management setting `canvas_account_failure_cooldown_seconds` defaults to
 the original failure time; later queries do not extend it. Evidence must match
 the current account identity, credential profile, proxy, backend and actual
 model. A later positive acceptance or recovered successful result clears that
-lane; successful identity or balance checks alone do not. Existing bound tasks
+lane; successful identity or balance checks alone do not. Dispatched tasks
 keep their original owner and recovery records. This scheduling rule does not
 resubmit an uncertain generation or alter its financial outcome.
 
@@ -222,6 +222,11 @@ invalid-response failure is followed by an exact missing-registration reply,
 the original input ID can use a lazy local FILE fallback. That download keeps
 the existing public-host direct-first policy and account-proxy fallback. A
 positive or ambiguous registration never permits changing the input transport.
+The initial exact-registration query has a shared 15-second read window clipped
+to the preparation deadline. A timeout is never treated as registration absence.
+For the fixed public image host, the lazy download's existing 30 seconds are
+shared between its direct/proxy routes so that the final direct retry remains
+reachable. Safe diagnostics retain each route's budget and failure category.
 
 A newly interrupted local-file upload can use one normal same-ID input retry
 after a fresh exact lookup cannot find its original registration. The adapter
@@ -232,6 +237,11 @@ recovery deadline. A restart never adds another write or recovery window.
 Acknowledged or processing resources are only observed; old unknown checkpoints
 without this new claim remain read-only. No new resource UUID, force option or
 generation command is used by this input recovery.
+
+The exact retryable `cli.upload_credential_unavailable` response is a preparation
+service outage. It does not mark account login as revoked. After an unknown
+upload has used its one FILE retry, this error permits only observing its
+original UUID within the original recovery window; it adds no upload claim.
 
 Upload limits and lock ordering remain unchanged. Preparation diagnostics now
 measure actual upload-admission wait separately from credential-lock waits,
@@ -245,6 +255,16 @@ preparations per account; earlier verified credit-rejected preparations count
 toward these limits. Existing saved budgets retain their original deadlines,
 including after restarts. Accepted or uncertain generation requests are never
 replayed by this preparation retry mechanism.
+
+Before any generation or confirmation command, a video preparation can hand
+off its inputs once to another funded account. This requires complete finished
+command audits proving zero `node run` and zero `node confirm`, original input
+bindings and an unexpired retry ledger. The old checkpoint is archived without
+deleting its upstream inputs. The new account must reproduce the original
+request and input manifest before any write; FILE inputs retain byte hashes,
+while URL inputs retain their original locator strings. The same three-attempt,
+two-account limit and original deadline apply. Missing or conflicting evidence,
+an accepted/uncertain generation, or an already closed task cannot use this path.
 
 Resuming a preparation reuses already verified inputs only after recomputing
 the complete request and media bindings, checking the original profile/proxy,

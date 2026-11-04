@@ -1,0 +1,6 @@
+ARG VERIFIED_RUNTIME_IMAGE
+FROM ${VERIFIED_RUNTIME_IMAGE}
+
+# Build only on the hosted runner; remove retired source files before copying.
+RUN rm -rf /app/app
+COPY app /app/app

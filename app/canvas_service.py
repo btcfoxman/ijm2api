@@ -24,6 +24,7 @@ from .canvas_validation import MATERIAL_REQUIREMENTS_ERROR
 from .canvas_retry_budget import (new_retry_budget, budget_token, claim_attempt,
                                  seed_from_verified_preparations, RetryBudgetError,
                                  MAX_ATTEMPTS, MAX_ACCOUNTS, MAX_ATTEMPTS_PER_ACCOUNT)
+from .canvas_input_handoff import HANDOFF_KEY, handoff_input_guard, propose_input_handoff
 from .account_policy import credit_rejected
 from .daily_checkin import AccountMaintenanceBusy, cli_credit_details, decode_details, identity_binding, read_state
 from .image_model_routing import plan_image_execution, recorded_image_route
@@ -38,7 +39,7 @@ logger = logging.getLogger(__name__)
 ADMISSION_AUDIT_FIELDS = frozenset({'previous_submissions', 'recovery_resolution',
     'preflight_failures', 'model_eligibility_exclusions', 'preparation_admission_at',
     'preparation_attempts', 'preparation_attempt_count', 'preparation_retry_budget', 'pre_dispatch_failure',
-    'preparation_failures', 'upload_checkpoint'})
+    'preparation_failures', 'upload_checkpoint', HANDOFF_KEY})
 
 
 def execution_mode(account: dict) -> str:
@@ -955,7 +956,8 @@ class CanvasServiceMixin:
                                      category="invalid_source", attempt_count=0)
                 contents, mime, filename = _download(str(source), kind,
                     str(account["proxy_url"]),
-                    allow_direct_fallback=self._canvas_direct_media_allowed(str(source)), deadline=fetch_deadline)
+                    allow_direct_fallback=self._canvas_direct_media_allowed(str(source)), deadline=fetch_deadline,
+                    fair_route_budget=kind == 'images' and self._canvas_direct_media_allowed(str(source)))
             except MediaError as exc:
                 exc.diagnostic.update(media_kind=kind, media_index=index + 1)
                 raise
@@ -1148,6 +1150,9 @@ class CanvasServiceMixin:
             account_id = int(account['id'])
             count = sum(entry['account_id'] == account_id for entry in budget['attempts'])
             if count >= 2 and self._canvas_uploads_pending(task):
+                handed_off = self._canvas_handoff_preparation(task_id, account, exc)
+                if handed_off:
+                    return 'retry_preparation' if handed_off is True else True
                 self._fail_canvas_task(task_id, 'CLI_PREPARATION_RETRY_EXHAUSTED',
                     'Canvas pending uploads require their original account; preparation retry limit reached')
                 return True
@@ -1168,6 +1173,46 @@ class CanvasServiceMixin:
         self._stop.wait(min(1, max(0, budget['deadline'] - time.time())))
         return self._execute_canvas(task_id, account, deadline)
 
+    def _canvas_handoff_preparation(self, task_id: str, account: dict, exc: CanvasCLIError):
+        """Use the remaining third ticket only after joined, zero-paid input work."""
+        with self._lock:
+            task = self.store.task(task_id) or {}
+            if self._canvas_task_terminated(task) or self._canvas_dispatch_evidence(task):
+                return 'stopped'
+            current = self.store.account(int(account['id']), private=True)
+            if current is None or task.get('account_id') != int(account['id']):
+                return 'stopped'
+            marker = self.canvas_cli.account_directory(current) / 'credential-profile'
+            try:
+                if marker.is_symlink() or not marker.is_file():
+                    return False
+                profile = marker.read_text(encoding='utf-8').strip()
+            except (OSError, UnicodeError):
+                return False
+            proposal = propose_input_handoff(task, current, profile,
+                self._canvas_diagnostic(exc, 'uploading'), now=time.time(), workers_joined=True)
+            if proposal is None:
+                return False
+            prospective = {**task, 'status': 'queued', 'account_id': None,
+                'upstream_context': proposal['context'],
+                'attempted_account_ids': proposal['attempted_account_ids'],
+                'execution_backend': 'canvas_cli'}
+            pending = self._pending_credits(self.store.scheduling_rows(), task_id)
+            candidates = self._funded_accounts(float(task.get('estimated_cost') or 0),
+                set(proposal['attempted_account_ids']), pending, 'canvas_cli',
+                include_aux_busy=True, task=prospective)
+            if not candidates:
+                return False
+            committed = self.store.migrate_canvas_input_preparation(task_id, proposal,
+                expected_updated_at=task['updated_at'], expected_context=task['upstream_context'],
+                expected_account=current)
+            if committed:
+                return True
+            # A receipt/user stop/another handoff wins. A mere progress writer
+            # must not leave this finished preparation without a future owner.
+            self.store.close_canvas_input_handoff_conflict(task_id, int(account['id']))
+            return 'stopped'
+
     def _execute_canvas(self, task_id: str, account: dict, deadline: float, *,
                         initial_admission_at=INITIAL_ADMISSION_UNSET) -> bool | str:
         """Return False only for a verified pre-run funding rejection."""
@@ -1177,9 +1222,8 @@ class CanvasServiceMixin:
         prior_dispatch_evidence = self._canvas_dispatch_evidence(task)
         account_id = int(account["id"])
         if self._canvas_uploads_pending(task):
-            # A pending material registration is not a generation receipt.
-            # Preserve paid recovery ownership, and never discard this upload
-            # binding to obtain fresh resource IDs on another account.
+            # Active input checkpoints stay with their owner. Only the audited
+            # zero-paid handoff can retire one before selecting another account.
             if prior_dispatch_evidence:
                 return True
             checkpoint = (task.get('upstream_context') or {}).get('upload_checkpoint')
@@ -1293,7 +1337,7 @@ class CanvasServiceMixin:
             # A submit receipt may contain an older context copy from before
             # finish_attempt archived the current attempt. Keep the durable audit.
             durable = (self.store.task(task_id) or {}).get('upstream_context') or {}
-            for key in ('preparation_admission_at', 'preparation_attempts', 'preparation_attempt_count', 'preparation_retry_budget'):
+            for key in ('preparation_admission_at', 'preparation_attempts', 'preparation_attempt_count', 'preparation_retry_budget', HANDOFF_KEY):
                 if key in durable:
                     context[key] = durable[key]
             context['preparation_timing'] = timing.snapshot()
@@ -1375,6 +1419,9 @@ class CanvasServiceMixin:
                 self._update_canvas_task(task_id, {"cost_evidence": input_evidence(assets), "progress": 15})
                 account = self._submission_account(task_id, account, normalized)
                 prepare_options = {'checkpoint': checkpoint} if checkpoint is not None else {}
+                source_guard = handoff_input_guard(self.store.task(task_id) or task)
+                if source_guard is not None:
+                    prepare_options['input_binding_guard'] = source_guard
                 prepared = client.prepare(normalized, task_id, assets, persist=persist, deadline=deadline,
                     **prepare_options)
                 persist(prepared)
@@ -1539,6 +1586,26 @@ class CanvasServiceMixin:
                     if observed_facts and not prior_dispatch_evidence:
                         self._canvas_context(task_id, {'pre_dispatch_failure': {
                             **observed_facts, 'stage': 'preparation'}})
+                        if exc.code == 'cli.upload_state_unknown':
+                            try:
+                                current = self.store.task(task_id) or {}
+                                with self._lock:
+                                    # No alternate owner means the original
+                                    # bounded observation remains terminal; do
+                                    # not open an unused new retry window.
+                                    pending = self._pending_credits(self.store.scheduling_rows(), task_id)
+                                    alternatives = self._funded_accounts(float(current.get('estimated_cost') or 0),
+                                        {account_id, *current.get('attempted_account_ids', [])}, pending,
+                                        'canvas_cli', include_aux_busy=True, task=current)
+                                    if alternatives:
+                                        if (current.get('upstream_context') or {}).get('preparation_retry_budget') is None:
+                                            self._canvas_claim_preparation(task_id, account_id, generation_deadline,
+                                                initial_failure=True)
+                                        handed_off = self._canvas_handoff_preparation(task_id, account, exc)
+                                        if handed_off:
+                                            return 'retry_preparation' if handed_off is True else True
+                            except RetryBudgetError:
+                                pass  # An invalid/exhausted ledger never grants a new input owner.
                     self._fail_canvas_task(task_id, exc.code, str(exc))
                     return True
                 pending_reference = self._canvas_pending_reference_retry(failed_task, exc)

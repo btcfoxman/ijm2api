@@ -5,8 +5,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import ipaddress
+import math
 import mimetypes
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -57,6 +59,19 @@ def _safe_media_fields(fields: dict) -> dict:
                          ("media_kind", {"images", "videos", "audios"})):
         if isinstance(fields.get(key), str) and fields[key] in allowed:
             result[key] = fields[key]
+    attempts = fields.get('route_attempts')
+    if isinstance(attempts, list):
+        result['route_attempts'] = []
+        for item in attempts[:4]:
+            if not isinstance(item, dict):
+                continue
+            clean = _safe_media_fields({key: value for key, value in item.items()
+                                       if key != 'route_attempts'})
+            for key in ('elapsed_seconds', 'budget_seconds'):
+                value = item.get(key)
+                if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 300:
+                    clean[key] = round(value, 3)
+            result['route_attempts'].append(clean)
     return result
 
 
@@ -216,7 +231,8 @@ def _deadline_chunks(response: requests.Response, deadline: float):
 
 
 def _download(source: str, kind: str, proxy_url: str = "", *,
-              allow_direct_fallback: bool = True, deadline: float | None = None) -> tuple[bytes, str, str]:
+              allow_direct_fallback: bool = True, deadline: float | None = None,
+              fair_route_budget: bool = False) -> tuple[bytes, str, str]:
     diagnostic = {"media_kind": kind, "attempt_count": 0}
     _media_remaining(deadline, diagnostic=diagnostic)
     if source.startswith("data:"):
@@ -254,13 +270,21 @@ def _download(source: str, kind: str, proxy_url: str = "", *,
             routes = ([direct_route] + routes + [direct_route]) if direct_first else (routes + [direct_route])
         for index, (route_name, route_proxy) in enumerate(routes):
             remaining = _media_remaining(deadline, diagnostic=diagnostic)
+            route_started = time.monotonic()
+            route_category = 'unknown'
+            route_deadline = deadline
+            if fair_route_budget and direct_allowed and remaining is not None:
+                # Reserve time for the remaining public-media routes. A single
+                # stalled route must not consume the lazy input's whole window.
+                route_deadline = min(deadline, route_started + remaining / (len(routes) - index))
+            route_remaining = _media_remaining(route_deadline, diagnostic=diagnostic)
             session = requests.Session()
             session.trust_env = False
             diagnostic.update(attempt_count=index + 1, route="account_proxy" if route_proxy else "direct_media")
             diagnostic.pop("http_status", None)
             try:
-                timeout = ((10, 45) if route_proxy else (10, 60)) if remaining is None else Timeout(
-                    total=remaining, connect=min(10, remaining), read=min(45, remaining))
+                timeout = ((10, 45) if route_proxy else (10, 60)) if route_remaining is None else Timeout(
+                    total=route_remaining, connect=min(10, route_remaining), read=min(45, route_remaining))
                 headers = {"User-Agent": "Mozilla/5.0"}
                 if deadline is not None:
                     headers['Accept-Encoding'] = 'identity'
@@ -277,7 +301,7 @@ def _download(source: str, kind: str, proxy_url: str = "", *,
                     chunks = []
                     total = 0
                     chunks_source = (response.iter_content(1024 * 1024) if deadline is None
-                                     else _deadline_chunks(response, deadline))
+                                     else _deadline_chunks(response, route_deadline))
                     for chunk in chunks_source:
                         total += len(chunk)
                         if total > MAX_MEDIA_BYTES:
@@ -295,6 +319,7 @@ def _download(source: str, kind: str, proxy_url: str = "", *,
                     break
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, Urllib3HTTPError,
                     requests.exceptions.ChunkedEncodingError) as exc:
+                route_category = _media_transport_category(exc)
                 if direct_allowed and not route_proxy:
                     with _MEDIA_ROUTE_LOCK:
                         _DIRECT_MEDIA_UNTIL.pop(parsed.hostname, None)
@@ -304,6 +329,7 @@ def _download(source: str, kind: str, proxy_url: str = "", *,
                 delay = 0.5 * (index + 1)
                 time.sleep(delay if deadline is None else min(delay, _media_remaining(deadline, diagnostic=diagnostic)))
             except requests.exceptions.HTTPError as exc:
+                route_category = 'http'
                 status = exc.response.status_code if exc.response is not None else 0
                 if direct_allowed and not route_proxy and index < len(routes) - 1:
                     with _MEDIA_ROUTE_LOCK:
@@ -315,6 +341,7 @@ def _download(source: str, kind: str, proxy_url: str = "", *,
                 delay = 0.5 * (index + 1)
                 time.sleep(delay if deadline is None else min(delay, _media_remaining(deadline, diagnostic=diagnostic)))
             except requests.RequestException as exc:
+                route_category = _media_transport_category(exc)
                 if direct_allowed and not route_proxy and index < len(routes) - 1:
                     with _MEDIA_ROUTE_LOCK:
                         _DIRECT_MEDIA_UNTIL.pop(parsed.hostname, None)
@@ -322,13 +349,28 @@ def _download(source: str, kind: str, proxy_url: str = "", *,
                 raise MediaError(f"media download failed via {route_name}: {type(exc).__name__}",
                                  category=_media_transport_category(exc), **diagnostic) from exc
             except MediaError as exc:
+                route_category = exc.diagnostic.get('category', 'unknown')
                 exc.diagnostic = _safe_media_fields({**diagnostic, **exc.diagnostic})
+                if (fair_route_budget and direct_allowed and exc.diagnostic.get('category') == 'deadline'
+                        and deadline is not None and route_deadline < deadline
+                        and time.monotonic() < deadline and index < len(routes) - 1):
+                    continue
                 if direct_first and index < len(routes) - 1 and "direct media fallback redirected" in str(exc):
                     with _MEDIA_ROUTE_LOCK:
                         _DIRECT_MEDIA_UNTIL.pop(parsed.hostname, None)
                     continue
                 raise
             finally:
+                if fair_route_budget and direct_allowed:
+                    history = diagnostic.setdefault('route_attempts', [])
+                    history.append({'route': diagnostic['route'], 'attempt_count': index + 1,
+                        'category': route_category,
+                        'elapsed_seconds': max(0, time.monotonic() - route_started),
+                        'budget_seconds': route_remaining,
+                        **({'http_status': diagnostic['http_status']} if 'http_status' in diagnostic else {})})
+                    raised = sys.exception()
+                    if isinstance(raised, MediaError):
+                        raised.diagnostic = _safe_media_fields({**raised.diagnostic, 'route_attempts': history})
                 session.close()
     else:
         raise MediaError("media must be an HTTPS URL, HTTP URL, data URL, or Dreamina asset ID",

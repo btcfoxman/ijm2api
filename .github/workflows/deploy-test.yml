@@ -112,12 +112,17 @@ jobs:
           registry: ghcr.io
           username: ${{ secrets.GHCR_USERNAME || github.actor }}
           password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+      - name: Select verified same-day runtime dependencies
+        id: runtime_selection
+        if: ${{ inputs.smoke_only_image_tag == '' && inputs.reuse_image_tag == '' }}
+        run: python tools/select_verified_runtime.py
       - name: Build and push verified image
         if: ${{ inputs.smoke_only_image_tag == '' && inputs.reuse_image_tag == '' }}
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ${{ steps.runtime_selection.outputs.dockerfile }}
+          build-args: ${{ steps.runtime_selection.outputs.build_args }}
           push: true
           platforms: linux/amd64
           tags: |

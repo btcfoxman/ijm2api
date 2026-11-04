@@ -1064,6 +1064,67 @@ class Store:
                 (_upstream_context(context), time.time(), task_id))
         return True
 
+    def migrate_canvas_input_preparation(self, task_id: str, proposal: dict, *,
+                                         expected_updated_at: float,
+                                         expected_context: dict,
+                                         expected_account: dict) -> bool:
+        """CAS-retire one proven-unpaid input owner; never revive terminal work."""
+        from .canvas_input_handoff import propose_input_handoff
+        account_fields = ('login_user_id', 'cli_user_id', 'execution_mode', 'project_id',
+                          'proxy_url', 'managed_profile', 'region')
+        with self._lock, self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if row is None:
+                return False
+            task = self._task(row)
+            account = db.execute('SELECT * FROM accounts WHERE id=?', (task.get('account_id'),)).fetchone()
+            if (account is None or task.get('status') != 'preparing'
+                    or task.get('execution_backend') != 'canvas_cli'
+                    or task['updated_at'] != expected_updated_at
+                    or task['upstream_context'] != expected_context
+                    or 'manual_termination' in task['upstream_context']
+                    or expected_account.get('id') != task.get('account_id')
+                    or any(account[key] != expected_account.get(key) for key in account_fields)):
+                return False
+            marker = self.path.parent / 'canvas-cli' / f"account-{int(account['id'])}" / 'credential-profile'
+            try:
+                if marker.is_symlink() or not marker.is_file():
+                    return False
+                profile = marker.read_text(encoding='utf-8').strip()
+                record = proposal['context']['input_preparation_handoffs'][0]
+                fresh = propose_input_handoff(task, dict(account), profile, record['diagnostic'],
+                    now=record['at'], workers_joined=True)
+                if fresh != proposal or time.time() >= record['budget_before']['deadline']:
+                    return False
+            except (ValueError, TypeError, KeyError, OSError, UnicodeError):
+                return False
+            db.execute('''UPDATE tasks SET status='queued',progress=0,account_id=NULL,
+                balance_before=NULL,execution_backend='canvas_cli',upstream_context_json=?,
+                attempted_account_ids_json=?,error_code='CLI_PREPARATION_TRANSIENT_FAILED',
+                error_message='Canvas input preparation will continue on another account',
+                updated_at=? WHERE id=?''', (_upstream_context(fresh['context']),
+                _json(fresh['attempted_account_ids']), time.time(), task_id))
+        return True
+
+    def close_canvas_input_handoff_conflict(self, task_id: str, account_id: int) -> bool:
+        """Stop an owned, finished zero-paid conflict without overwriting receipts."""
+        from .canvas_input_handoff import input_handoff_conflict_can_close
+        with self._lock, self._connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if row is None:
+                return False
+            task = self._task(row)
+            if task.get('account_id') != account_id or not input_handoff_conflict_can_close(task):
+                return False
+            now = time.time()
+            db.execute('''UPDATE tasks SET status='failed',progress=100,
+                error_code='CLI_PREPARATION_RETRY_EXHAUSTED',
+                error_message='Canvas input handoff could not be committed after task progress changed',
+                completed_at=?,updated_at=? WHERE id=?''', (now, now, task_id))
+        return True
+
     def remember_canvas_operation_receipt(self, task_id: str, receipt: dict[str, Any], *,
                                           expected_updated_at: float,
                                           expected_context: dict[str, Any],

@@ -107,7 +107,8 @@ def test_foreign_or_incomplete_receipts_have_no_task_or_finance_effect(uncertain
 
 def test_manual_stop_or_concurrent_task_write_wins_transaction_CAS(uncertain):
     store, service, account, runner, row, receipt = uncertain
-    current = store.update_task(row['id'], {'progress': 46})
+    current = store.update_task(row['id'], {'progress': 46, 'upstream_context': {
+        **row['upstream_context'], 'last_query_error': {'code': 'CLI_COMMAND_TIMEOUT'}}})
     assert not store.remember_canvas_operation_receipt(row['id'], receipt,
         expected_updated_at=row['updated_at'], expected_context=row['upstream_context'],
         expected_account=account)
@@ -116,6 +117,19 @@ def test_manual_stop_or_concurrent_task_write_wins_transaction_CAS(uncertain):
         **current['upstream_context'], 'manual_termination': {'reason': 'operator'}}})
     assert not service._canvas_persist_operation_receipt(row['id'], receipt, account)
     assert store.task(row['id']) == stopped
+
+
+def test_same_clock_progress_update_is_preserved_when_acceptance_is_saved(uncertain, monkeypatch):
+    store, service, account, runner, row, receipt = uncertain
+    monkeypatch.setattr('app.store.time.time', lambda: row['updated_at'])
+    current = store.update_task(row['id'], {'progress': 46})
+    assert current['updated_at'] == row['updated_at']
+    assert store.remember_canvas_operation_receipt(row['id'], receipt,
+        expected_updated_at=row['updated_at'], expected_context=row['upstream_context'],
+        expected_account=account)
+    saved = store.task(row['id'])
+    assert saved['progress'] == 46 and saved['actual_cost'] is None
+    assert saved['upstream_context']['operation_receipt']['durable'] is True
 
 
 @pytest.mark.parametrize('status', ['queued', 'preparing'])
