@@ -109,7 +109,7 @@ def test_verified_output_claims_delivery_once_and_long_download_outlives_query_b
 
     def run(account, args, **kwargs):
         if args[:2] in (["operation", "status"], ["resource", "get"]):
-            assert kwargs["deadline"] == 220.0
+            assert kwargs["deadline"] == 130.0  # One bounded query turn, clipped inside the original 220 cutoff.
             clock[0] += 5
         else:
             assert kwargs["deadline"] == 1010.0
@@ -178,6 +178,8 @@ def test_delivery_not_claimed_before_successful_complete_binding(tmp_path, monke
         if args[:2] == ["operation", "status"]:
             if case == "running":
                 reply["data"]["state"] = "running"
+                for resource in reply['data']['resources']:
+                    resource['state'] = 'processing'
             elif case == "wrong_operation":
                 reply["data"]["operationRef"] = "another-submit"
             elif case == "query_timeout":
