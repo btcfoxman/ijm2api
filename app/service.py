@@ -25,6 +25,7 @@ from .canvas_cli import CanvasCLI, CanvasCLIError
 from .canvas_service import ADMISSION_AUDIT_FIELDS, CanvasServiceMixin, execution_mode
 from .canvas_quote_hints import matching_hint
 from .canvas_timing import INITIAL_ADMISSION_UNSET
+from .canvas_account_health import account_cooldowns
 from .account_policy import (account_accepts_task, low_balance_image_probe,
                              credit_rejected as _credit_rejected)
 from .catalog import MODELS, normalize_request
@@ -76,6 +77,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "canvas_missing_resource_query_attempts": 3,
     "canvas_missing_resource_timeout_seconds": 60,
     "canvas_result_delivery_timeout_seconds": 900,
+    "canvas_account_failure_cooldown_seconds": 3600,
     "account_maintenance_interval_seconds": 300,
     "daily_checkin_enabled": False,
     "chrome_executable": os.getenv("IJM_CHROME_EXECUTABLE", "/usr/bin/chromium" if os.name != "nt" else "chrome.exe"),
@@ -116,6 +118,7 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
         self.canvas_runtime: dict[str, Any] = {'available': None, 'status': 'not_checked'}
         self._browser_aux_slots = threading.BoundedSemaphore(2)
         self._maintenance_failures: dict[int, tuple[int, float]] = {}
+        self._canvas_health_history_cache: tuple[float, list[dict]] | None = None
         self._browser_views: dict[int, tuple[dict[str, Any], bool, float]] = {}
         self._browser_views_lock = threading.RLock()
         self._daily_claims = DailyClaimScheduler(self)
@@ -155,6 +158,10 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                            ("canvas_total_upload_concurrency", 32)):
             if key in filtered and (type(filtered[key]) is not int or not 1 <= filtered[key] <= upper):
                 raise ValueError(f"invalid {key}")
+        if 'canvas_account_failure_cooldown_seconds' in filtered:
+            value = filtered['canvas_account_failure_cooldown_seconds']
+            if type(value) is not int or not 0 <= value <= 86400:
+                raise ValueError('invalid canvas_account_failure_cooldown_seconds')
         candidate = {**self.settings(), **filtered}
         if candidate["enable_sd_2_5_480p_x"]:
             try:
@@ -669,6 +676,48 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
         uncertain = any(amount <= 0 for amount in amounts) or balance is None and bool(amounts)
         return (None if balance is None else balance - sum(amounts), uncertain)
 
+    def _canvas_account_cooldowns(self, task: dict | None, accounts: list[dict], settings: dict) -> dict:
+        """Read bounded generation health for future admissions, without CLI calls."""
+        normalized = (task or {}).get('normalized') or {}
+        seconds = settings.get('canvas_account_failure_cooldown_seconds', 3600)
+        if (not normalized or type(seconds) is not int or seconds <= 0
+                or not settings.get('canvas_cli_enabled')):
+            return {}
+        try:
+            now = time.time()
+            cached = self._canvas_health_history_cache
+            if cached is None or time.monotonic() >= cached[0]:
+                rows = self.store.canvas_account_health_rows(since=now - 86400, limit=500)
+                self._canvas_health_history_cache = (time.monotonic() + 1, rows)
+            else:
+                rows = cached[1]
+            if not rows:
+                return {}
+            profiles, effective = {}, {}
+            for account in accounts:
+                if execution_mode(account) != 'canvas_cli':
+                    continue
+                # Read existing metadata only; CLI.profile() could initialize a
+                # new credential profile and must not run during admission.
+                try:
+                    path = self.canvas_cli.data_dir / 'canvas-cli' / f"account-{int(account['id'])}" / 'credential-profile'
+                    if path.is_symlink() or not path.is_file():
+                        continue
+                    profile = path.read_text(encoding='utf-8').strip()
+                    if not profile or len(profile) > 256:
+                        continue
+                    request = (plan_image_execution(task, account, settings)[0]
+                        if normalized.get('kind') == 'image' else normalized)
+                except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+                    continue
+                profiles[int(account['id'])] = profile
+                effective[int(account['id'])] = request
+            return account_cooldowns(rows, accounts, normalized, profiles=profiles,
+                effective_requests=effective, now=now, cooldown_seconds=seconds)
+        except Exception as exc:
+            logger.warning('Canvas scheduling health snapshot unavailable (%s)', type(exc).__name__)
+            return {}
+
     def _funded_accounts(self, estimated_cost: float, excluded: set[int], pending: dict,
                          backend: str | None = None, *, include_aux_busy: bool = False,
                          task: dict | None = None) -> list[dict]:
@@ -691,7 +740,13 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                 all_quotes = self.store.canvas_quote_hints()
             except Exception as exc:
                 logger.warning('Canvas scheduling quote cache unavailable (%s)', type(exc).__name__)
-        for item in self.store.accounts(private=True):
+        account_rows = self.store.accounts(private=True)
+        cooldowns = self._canvas_account_cooldowns(task, account_rows, self.settings())
+        context = (task or {}).get('upstream_context') or {}
+        checkpoint = context.get('upload_checkpoint')
+        original = checkpoint.get('binding') if isinstance(checkpoint, dict) else None
+        original = original if isinstance(original, dict) else {}
+        for item in account_rows:
             if allowed is not None and int(item['id']) not in allowed:
                 continue
             if (int(item['id']) in excluded or not account_accepts_task(item, task, threshold=threshold,
@@ -711,6 +766,11 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
                     or self.canvas_runtime.get('available') is False):
                 continue
             if backend and execution_mode(item) != backend:
+                continue
+            original_owner = (task and task.get('account_id') == item['id']
+                and context.get('task_id') == task.get('id') and context.get('account_id') == item['id']
+                and original.get('task_id') == task.get('id') and original.get('account_id') == item['id'])
+            if execution_mode(item) == 'canvas_cli' and item['id'] in cooldowns and not original_owner:
                 continue
             available, unknown_hold = self._available_credits(item, pending)
             jimeng = execution_mode(item) == 'jimeng_web'
@@ -813,6 +873,7 @@ class Service(CanvasServiceMixin, JimengServiceMixin):
 
     def _release_account(self, account_id: int, task_id: str | None = None) -> None:
         with self._lock:
+            self._canvas_health_history_cache = None
             self._active[account_id] = max(self._active.get(account_id, 1) - 1, 0)
             key = task_id or next((key for key, (owner, _) in self._credit_reservations.items() if owner == account_id), None)
             if key:

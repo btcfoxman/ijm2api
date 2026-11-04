@@ -567,6 +567,102 @@ class Store:
                 ORDER BY created_at,id""").fetchall()
         return {"history": [dict(row) for row in history], "inflight": [dict(row) for row in inflight]}
 
+    def canvas_account_health_rows(self, *, since: float, limit: int = 500) -> list[dict]:
+        """Bounded read-only scheduling facts; never return prompts or locators.
+
+        This reads existing task audit data rather than creating a second mutable
+        health ledger. Observation/query updates cannot renew failure timestamps.
+        """
+        import math
+        if (type(since) not in (int, float) or not math.isfinite(since) or since < 0
+                or type(limit) is not int or not 1 <= limit <= 1000):
+            raise ValueError('invalid Canvas account-health history bounds')
+        columns = {
+            'backend': '$.backend', 'account_id': '$.account_id', 'task_id': '$.task_id',
+            'profile': '$.profile', 'project_id': '$.project_id', 'node_id': '$.node_id',
+            'submit_id': '$.submit_id', 'expected_user_id': '$.expected_user_id',
+            'phase': '$.phase', 'submission_phase': '$.submission_phase', 'output_count': '$.output_count',
+            'resource_ids': '$.resource_ids', 'submission_evidence': '$.submission_evidence',
+            'submission_receipt_evidence': '$.submission_receipt_evidence',
+            'previous_submissions': '$.previous_submissions',
+            'image_model_route': '$.image_model_route', 'dispatch_started_at': '$.dispatch_started_at',
+            'reconciliation_closed': '$.reconciliation_closed',
+            'reconciliation_close_reason': '$.reconciliation_close_reason',
+            'reconciliation_closed_at': '$.reconciliation_closed_at',
+            'financial_outcome': '$.financial_outcome',
+            'consecutive_submission_absent': '$.consecutive_submission_absent',
+            'missing_resource_recovery': '$.missing_resource_recovery',
+            'submit_error': '$.submit_error', 'preparation_error': '$.preparation_error',
+            'binding': '$.upload_checkpoint.binding', 'commands': '$.preparation_timing.commands',
+        }
+        projection = ','.join("json_extract(ctx,'" + path + "') AS h_" + name for name, path in columns.items())
+        sql = """WITH recent AS (
+            SELECT id,account_id,model,status,error_code,created_at,updated_at,completed_at,execution_backend,
+                CASE WHEN json_valid(normalized_json) THEN normalized_json ELSE '{}' END AS norm,
+                CASE WHEN json_valid(upstream_context_json) THEN upstream_context_json ELSE '{}' END AS ctx
+            FROM tasks WHERE execution_backend='canvas_cli' AND account_id IS NOT NULL
+                AND status IN ('succeeded','failed','expired','submitted','running')
+                AND COALESCE(completed_at,updated_at)>=?
+            ORDER BY COALESCE(completed_at,updated_at) DESC,updated_at DESC,id DESC LIMIT ?)
+            SELECT id,account_id,model,status,error_code,created_at,updated_at,completed_at,execution_backend,
+                json_extract(norm,'$.kind') AS normalized_kind,
+                json_extract(norm,'$.model') AS normalized_model,
+                json_extract(norm,'$.upstream_model') AS normalized_upstream_model,
+                json_type(ctx,'$.manual_termination') IS NOT NULL AS has_manual_termination,""" + projection + ' FROM recent'
+        db = sqlite3.connect(self.path.resolve().as_uri() + '?mode=ro', uri=True, timeout=5)
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute('PRAGMA query_only=ON')
+            selected = [dict(row) for row in db.execute(sql, (since, limit))]
+        finally:
+            db.close()
+        structured = {'resource_ids', 'submission_evidence', 'previous_submissions', 'image_model_route',
+                      'missing_resource_recovery', 'submit_error', 'preparation_error', 'binding', 'commands'}
+        booleans = {'submission_receipt_evidence', 'reconciliation_closed'}
+        diagnostic_fields = {'code', 'class', 'reason', 'serviceCode', 'exit_code', 'phase',
+            'dispatch_started', 'outcome_unknown', 'requiredAction', 'retryable', 'at'}
+        result = []
+        for row in selected:
+            context = {}
+            for name in columns:
+                value = row.pop('h_' + name)
+                if value is None:
+                    continue
+                if name in structured:
+                    try:
+                        value = json.loads(value) if isinstance(value, str) else value
+                    except (TypeError, ValueError):
+                        continue
+                if name in {'submit_error', 'preparation_error'} and isinstance(value, dict):
+                    value = {key: item for key, item in value.items() if key in diagnostic_fields
+                             and (item is None or type(item) in (str, bool, int, float))}
+                if name == 'previous_submissions':
+                    value = bool(value)
+                if name == 'missing_resource_recovery' and isinstance(value, dict):
+                    value = {key: item for key, item in value.items() if key in {
+                        'version', 'attempts', 'max_attempts', 'started_at', 'deadline'}}
+                if name == 'image_model_route' and isinstance(value, dict):
+                    value = {key: item for key, item in value.items() if key in {
+                        'account_id', 'requested_model', 'requested_upstream_model',
+                        'effective_model', 'effective_upstream_model'}}
+                if name == 'commands' and isinstance(value, dict):
+                    value = {key: {field: item[field] for field in ('count', 'failed') if field in item}
+                             for key, item in value.items() if key in {'node run', 'node confirm'}
+                             and isinstance(item, dict)}
+                if name in booleans:
+                    value = bool(value) if type(value) is int and value in (0, 1) else value
+                if name == 'binding':
+                    context['upload_checkpoint'] = {'binding': value}
+                elif name == 'commands':
+                    context['preparation_timing'] = {'commands': value}
+                else:
+                    context[name] = value
+            if row.pop('has_manual_termination'):
+                context['manual_termination'] = {}
+            normalized = {key: row.pop('normalized_' + key) for key in ('kind', 'model', 'upstream_model')}
+            result.append({**row, 'normalized': normalized, 'upstream_context': context})
+        return result
+
     def save_canvas_quote_hint(self, hint: dict) -> None:
         """Cache a validated node quote independently of task costs/status."""
         from .canvas_quote_hints import MAX_HINTS, TTL_SECONDS

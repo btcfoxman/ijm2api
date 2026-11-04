@@ -179,6 +179,17 @@ dimension limits remain readable in administrator diagnostics. This input
 failure ends before confirmation or generation and disallows route retry;
 an arbitrary service error or zero-credit quote alone does not qualify.
 
+New tasks temporarily avoid a Canvas account/model lane after one closed,
+unconfirmed dispatch system failure or two separate preparation system failures.
+The management setting `canvas_account_failure_cooldown_seconds` defaults to
+3600 seconds, accepts 0 through 86400, and is disabled by 0. The window starts at
+the original failure time; later queries do not extend it. Evidence must match
+the current account identity, credential profile, proxy, backend and actual
+model. A later positive acceptance or recovered successful result clears that
+lane; successful identity or balance checks alone do not. Existing bound tasks
+keep their original owner and recovery records. This scheduling rule does not
+resubmit an uncertain generation or alter its financial outcome.
+
 Reference uploads have separate, configurable concurrency limits:
 
 | Setting | Default | Range |
