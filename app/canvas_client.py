@@ -28,6 +28,10 @@ from .canvas_upload_limiter import UPLOAD_LIMITER, runner_namespace
 from .canvas_input_recovery import (TICKET_KEY, digest as input_digest, file_identity,
                                     remaining_deadline, safe_error, validated_tickets)
 from .canvas_operation_recovery import recover_absent_operation
+from .canvas_resource_recovery import (SOURCE as ACCEPTED_RESOURCE_SOURCE,
+    accepted_output_context, observe_bound_resources, resource_observation_retryable)
+from .canvas_validation import (MATERIAL_REQUIREMENTS_ERROR, MATERIAL_REQUIREMENTS_MESSAGE,
+    material_validation_from_quote)
 
 
 _NAMESPACE = uuid.UUID("b867f326-c52e-491e-b971-3937d0c731c1")
@@ -187,8 +191,7 @@ def _source_url_fallback_allowed(exc: CanvasCLIError) -> bool:
     error = exc.details.get('error') or {}
     if not isinstance(error, dict):
         return False
-    if ('retryable' in error and error['retryable'] is not True
-            or error.get('class') in {'permanent_failure', 'business_failure', 'human_intervention'}):
+    if error.get('class') in {'permanent_failure', 'business_failure', 'human_intervention'}:
         return False
     facts = ' '.join(str(value).lower() for value in
                      (exc.code, error.get('code'), error.get('class'), error.get('reason')))
@@ -199,6 +202,8 @@ def _source_url_fallback_allowed(exc: CanvasCLIError) -> bool:
         return False
     if preparation_retryable_failure(exc):
         return True
+    if 'retryable' in error and error['retryable'] is not True:
+        return False
     return (exc.code == 'CLI_COMMAND_TIMEOUT' and error.get('serviceCode') in (None, '')
         and not exc.details.get('partialData')
         and not any(error.get(key) for key in ('resources', 'submission', 'items', 'accepted')))
@@ -1426,6 +1431,12 @@ class CanvasClient:
             with self._phase('quote'):
                 quote = self._call(["node", "quote", "--project-id", context["project_id"],
                                     "--node-id", context["node_id"]], read_only=True, deadline=deadline)
+        material_validation = material_validation_from_quote(quote, context['node_id'])
+        if material_validation is not None:
+            context['material_validation'] = material_validation
+            save('quoting')
+            raise CanvasCLIError(MATERIAL_REQUIREMENTS_ERROR, MATERIAL_REQUIREMENTS_MESSAGE,
+                details={'material_validation': material_validation})
         items = quote.get("items")
         if (not isinstance(items, list) or len(items) != 1 or items[0].get("nodeId") != context["node_id"]
                 or items[0].get("error") or items[0].get("generationDiff") or not quote.get("confirmable", False)):
@@ -1818,16 +1829,33 @@ class CanvasClient:
             if on_phase is not None and on_phase(name) is False:
                 raise CanvasCLIError("CLI_STOPPING", "Canvas result observation was stopped before delivery")
         phase("querying")
-        query_deadline = min(deadline, time.monotonic() + 15) if deadline is not None and not context.get('resource_ids') else deadline
+        output_count = context.get('output_count')
+        query_seconds = (max(30, 15 * output_count)
+                         if context.get('resource_ids') and type(output_count) is int and 1 <= output_count <= 4 else 15)
+        query_deadline = min(deadline, time.monotonic() + query_seconds) if deadline is not None else time.monotonic() + query_seconds
         recovered_node = False
-        try:
-            data = self._call(["operation", "status", context["submit_id"],
-                               "--project-id", context["project_id"]], read_only=True, deadline=query_deadline)
-        except CanvasCLIError as original:
-            data = recover_absent_operation(self, context, original, deadline=query_deadline)
-            if data is None:
-                raise
-            recovered_node = True
+        recovered_resources = False
+        data = None
+        if accepted_output_context(context):
+            try:
+                data = observe_bound_resources(self, context, deadline=query_deadline)
+            except CanvasCLIError as original:
+                if not resource_observation_retryable(original):
+                    raise
+                self._remaining(query_deadline)
+            recovered_resources = data is not None
+        if data is None:
+            try:
+                data = self._call(["operation", "status", context["submit_id"],
+                                   "--project-id", context["project_id"]], read_only=True, deadline=query_deadline)
+            except CanvasCLIError as original:
+                data = observe_bound_resources(self, context, error=original, deadline=query_deadline)
+                recovered_resources = data is not None
+                if data is None:
+                    data = recover_absent_operation(self, context, original, deadline=query_deadline)
+                    if data is None:
+                        raise
+                    recovered_node = True
         reference = data.get("operationRef")
         if not isinstance(reference, str) or not reference.strip():
             raise CanvasCLIError("CLI_INVALID_RESPONSE", "Canvas operation response omitted its submission identity", outcome_unknown=True)
@@ -1874,8 +1902,9 @@ class CanvasClient:
                 or failed or data.get("submissionError")):
             result.update(self._failure_details(context, data, resources, failed, deadline=deadline))
             return result
-        terminal = state in {"completed", "success", "succeeded"}
         successful = [x for x in resources if str(x.get("state") or "").lower() in {"success", "succeeded", "completed"}]
+        terminal = (state in {"completed", "success", "succeeded"}
+                    or bool(resources) and len(successful) == len(resources))
         if terminal and (not resources or len(successful) != len(resources)):
             result['resource_recovery_required'] = True
         if not terminal or not resources or len(successful) != len(resources):
@@ -1897,8 +1926,11 @@ class CanvasClient:
             resource_id = str(resource.get("resourceId") or "")
             if re.fullmatch(r"[a-f0-9-]{36}", resource_id) is None:
                 raise CanvasCLIError("CLI_RESULT_INVALID", "Canvas completed a task without its output resource ID")
-            facts = self._call(["resource", "get", resource_id, "--project-id", context["project_id"]],
-                               read_only=True, deadline=deadline)
+            observed = data.get('_observed_resource_facts') if recovered_resources else None
+            facts = observed.get(resource_id) if isinstance(observed, dict) else None
+            if not isinstance(facts, dict):
+                facts = self._call(["resource", "get", resource_id, "--project-id", context["project_id"]],
+                                   read_only=True, deadline=query_deadline)
             if facts.get("resourceId") != resource_id or facts.get("type") != context["kind"]:
                 raise CanvasCLIError("CLI_RESOURCE_MISMATCH", "Canvas returned another output resource or media type")
             for key, expected_key in (("projectId", "project_id"), ("nodeId", "node_id"), ("submitId", "submit_id")):
@@ -1913,12 +1945,16 @@ class CanvasClient:
         # Publish the complete original-operation binding before the first file
         # operation. A later download failure must not lose recovered output IDs.
         outputs = [resource_id for resource_id, _ in checked_resources]
-        receipt = {"version": 1, "source": "node_show_original_submission" if recovered_node else "operation_status", "operation_ref": reference,
+        source = (ACCEPTED_RESOURCE_SOURCE if recovered_resources else
+                  "node_show_original_submission" if recovered_node else "operation_status")
+        receipt = {"version": 1, "source": source, "operation_ref": reference,
                    **{key: context.get(key) for key in ("account_id", "task_id", "profile", "project_id", "node_id",
                                                        "submit_id", "expected_user_id", "kind")},
                    "resource_ids": outputs}
         if recovered_node:
             receipt['node_recovery'] = copy.deepcopy(data['node_recovery'])
+        if recovered_resources:
+            receipt['resource_recovery'] = copy.deepcopy(data['resource_recovery'])
         if persist_output_binding is not None:
             candidate = {**context, "resource_ids": outputs}
             if self._download_binding(candidate, outputs[0], context["kind"]) is None:

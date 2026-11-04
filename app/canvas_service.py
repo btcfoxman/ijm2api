@@ -19,6 +19,8 @@ from .canvas_client import (CanvasClient, identity_network_error, preparation_re
                             _stable as canvas_input_resource_id, _node_id as canvas_input_node_id)
 from .canvas_timing import PreparationTiming, archived_attempts, INITIAL_ADMISSION_UNSET
 from .canvas_quote_hints import new_hint
+from .canvas_resource_recovery import accepted_output_context, resource_observation_retryable
+from .canvas_validation import MATERIAL_REQUIREMENTS_ERROR
 from .canvas_retry_budget import (new_retry_budget, budget_token, claim_attempt,
                                  seed_from_verified_preparations, RetryBudgetError,
                                  MAX_ATTEMPTS, MAX_ACCOUNTS, MAX_ATTEMPTS_PER_ACCOUNT)
@@ -360,8 +362,19 @@ class CanvasServiceMixin:
         if not isinstance(error, dict):
             return {}
         unknown_upload = error.get('code') == 'cli.upload_state_unknown'
+        material_invalid = error.get('code') == MATERIAL_REQUIREMENTS_ERROR
+        if material_invalid:
+            validation = context.get('material_validation')
+            if (not isinstance(validation, dict) or validation.get('version') != 1
+                    or validation.get('source') != 'node.quote'
+                    or validation.get('reason_code') != 'MATERIAL_RULE_VIOLATED'
+                    or type(validation.get('material_index')) is not int
+                    or validation['material_index'] < 0
+                    or not isinstance(validation.get('field_path'), str)
+                    or not validation['field_path'].startswith(f"materials[{validation['material_index']}].")):
+                return {}
         phases = {'uploading'} if unknown_upload else {'quoting', 'quoted'}
-        if ((not unknown_upload and error.get('code') != 'CLI_QUOTE_UNAVAILABLE')
+        if ((not unknown_upload and error.get('code') not in {'CLI_QUOTE_UNAVAILABLE', MATERIAL_REQUIREMENTS_ERROR})
                 or context.get('phase') not in phases or error.get('phase') not in phases
                 or error.get('outcome_unknown') is not False):
             return {}
@@ -502,12 +515,12 @@ class CanvasServiceMixin:
                     for entry in recent) for upload in uploads):
                 return {}
         return {'generation_request_sent': False, 'financial_outcome': 'not_charged_this_invocation',
-                'automatic_resubmission': False, 'fallback_allowed': True}
+                'automatic_resubmission': False, 'fallback_allowed': not material_invalid}
 
     @staticmethod
     def _canvas_public_pre_dispatch_facts(task: dict) -> dict:
         """Expose only the new bounded proof; preserve all stored financial data."""
-        if str(task.get('error_code') or '').upper() in {'CLI.UPLOAD_STATE_UNKNOWN', 'CLI_QUOTE_UNAVAILABLE'}:
+        if str(task.get('error_code') or '').upper() in {'CLI.UPLOAD_STATE_UNKNOWN', 'CLI_QUOTE_UNAVAILABLE', MATERIAL_REQUIREMENTS_ERROR}:
             return (CanvasServiceMixin._canvas_input_only_failure_facts(task)
                     if task.get('status') in {'failed', 'expired'} else {})
         context = task.get('upstream_context') or {}
@@ -955,13 +968,10 @@ class CanvasServiceMixin:
             for index, source in enumerate(normalized.get(kind) or []):
                 if kind == 'images' and str(source).startswith(('https://', 'http://')):
                     source_url = public_image_source_url(source)
-                    if self._canvas_direct_media_allowed(source_url):
-                        # URL import bypasses our known public-host transport
-                        # policy. Fetch these images through the existing direct
-                        # first route, then keep official CLI calls on the account
-                        # proxy. The content hash still binds stable file IDs.
-                        assets[kind].append({'path': str(image_fallback(source_url, index)())})
-                        continue
+                    # Public image registration can let the service fetch the
+                    # original URL without a second binary/VOD upload. Keep the
+                    # existing direct-first download policy for the lazy FILE
+                    # fallback, after exact absence of this original input ID.
                     assets[kind].append({'source_url': source_url,
                         'fallback_file': image_fallback(source_url, index)})
                     continue
@@ -1416,7 +1426,7 @@ class CanvasServiceMixin:
             with timing.phase('confirmation_submit'), timing.defer_notifications():
                 submitted = client.submit(context, int(math.ceil(quote)), persist=persist, deadline=deadline)
             finish_attempt('accepted')
-            persist({**submitted, "submission_phase": "submitted"})
+            persist({**submitted, "submission_phase": "accepted"})
             self._update_canvas_task(task_id, {"status": "submitted", "progress": 40})
             self._poll_canvas(task_id, client, generation_deadline)
             return True
@@ -1483,12 +1493,13 @@ class CanvasServiceMixin:
                         self._canvas_context(task_id, {'preparation_error': diagnostic,
                             'preparation_failures': [*failures[-15:], failure],
                             'preparation_timing': timing.snapshot()})
-                expired_preparation = not submission_started and time.monotonic() >= deadline
+                expired_preparation = (not submission_started and exc.code != MATERIAL_REQUIREMENTS_ERROR
+                                       and time.monotonic() >= deadline)
                 if expired_preparation:
                     fail_preparation('CLI_PREPARATION_TIMEOUT', '', cause=exc)
                     return True
                 failed_task = self.store.task(task_id) or {}
-                if not submission_started and exc.code in {'cli.upload_state_unknown', 'CLI_QUOTE_UNAVAILABLE'}:
+                if not submission_started and exc.code in {'cli.upload_state_unknown', 'CLI_QUOTE_UNAVAILABLE', MATERIAL_REQUIREMENTS_ERROR}:
                     # The client has already observed this exact registration.
                     # Preserve the vendor's unknown/observe-only state and end;
                     # never add another observation window or preparation here.
@@ -1723,6 +1734,22 @@ class CanvasServiceMixin:
                 return {'stopped': True}
             return value
 
+    def _finish_canvas_observation(self, task_id: str, *, reason: str) -> dict:
+        """Keep accepted outputs on the bounded original-result observer."""
+        with self._lock:
+            task = self.store.task(task_id) or {}
+            if self._canvas_task_terminated(task):
+                return task
+            if accepted_canvas_result(task):
+                return self.store.queue_canvas_result_observation(task_id, task['updated_at']) or task
+            return self._close_unconfirmed_canvas_task(task_id, reason)
+
+    @staticmethod
+    def _canvas_terminal_output_binding(task: dict) -> bool:
+        binding = (task.get('upstream_context') or {}).get('output_binding')
+        return (isinstance(binding, dict) and binding.get('durable') is True
+                and accepted_canvas_result(task))
+
     def _poll_canvas(self, task_id: str, client, deadline: float, *,
                      one_shot: bool = False, result_observer: bool = False,
                      observer_claim_id: str | None = None) -> None:
@@ -1857,7 +1884,12 @@ class CanvasServiceMixin:
                     if not recovery.get('stopped'):
                         self._close_unconfirmed_canvas_task(task_id, 'missing_output_resource_budget_exhausted')
                     return
-                if result_observer or accepted_canvas_result(fresh):
+                if (not one_shot and exc.code == 'CLI_TASK_DEADLINE_EXCEEDED'
+                        and (time.monotonic() >= query_deadline or time.time() >= absolute_deadline)
+                        and accepted_output_context(fresh.get('upstream_context'))):
+                    self._finish_canvas_observation(task_id, reason='observation_deadline_reached')
+                    return
+                if result_observer or self._canvas_terminal_output_binding(fresh):
                     self._canvas_context(task_id, {'last_result_query_error': self._canvas_diagnostic(exc, 'query')})
                     if not result_observer:
                         pending = self.store.task(task_id) or {}
@@ -1866,6 +1898,17 @@ class CanvasServiceMixin:
                                       'UPSTREAM_SUBMIT_OUTCOME_UNKNOWN'}:
                         raise
                     return
+                if accepted_output_context(fresh.get('upstream_context')):
+                    self._canvas_context(task_id, {'last_result_query_error': self._canvas_diagnostic(exc, 'query')})
+                    if not resource_observation_retryable(exc):
+                        self._fail_canvas_task(task_id, exc.code, str(exc))
+                        return
+                    self._update_canvas_task(task_id, {'status': 'running', 'completed_at': None,
+                        'error_code': '', 'error_message': '', 'progress': max(45, int(fresh.get('progress') or 45))})
+                    if one_shot:
+                        return
+                    wait(min(60, 2 ** min(errors, 6)))
+                    continue
                 absent = str(exc.code).lower() == 'cli.operation_submission_absent'
                 count = int(context.get('consecutive_submission_absent') or 0) + 1 if absent else 0
                 self._canvas_context(task_id, {'last_query_error': self._canvas_diagnostic(exc, 'query'),
@@ -1902,12 +1945,20 @@ class CanvasServiceMixin:
                         if not recovery.get('stopped'):
                             self._close_unconfirmed_canvas_task(task_id, 'missing_output_resource_budget_exhausted')
                         return
-                if result_observer or accepted_canvas_result(task):
+                if result_observer or self._canvas_terminal_output_binding(task):
                     self._canvas_context(task_id, {'last_result_query_error': self._canvas_diagnostic(diagnostic, 'query')})
                     if not result_observer:
                         pending = self.store.task(task_id) or {}
                         self.store.queue_canvas_result_observation(task_id, pending.get('updated_at'))
                     return
+                if accepted_output_context(task.get('upstream_context')):
+                    self._canvas_context(task_id, {'last_result_query_error': self._canvas_diagnostic(diagnostic, 'query')})
+                    self._update_canvas_task(task_id, {'status': 'running', 'completed_at': None,
+                        'error_code': '', 'error_message': '', 'progress': max(45, int(task.get('progress') or 45))})
+                    if one_shot:
+                        return
+                    wait(min(5, max(2, int(self.settings()['poll_interval_seconds']))))
+                    continue
                 self._canvas_context(task_id, {'last_query_error': self._canvas_diagnostic(diagnostic, 'query'),
                     'consecutive_submission_absent': count})
                 self._update_canvas_task(task_id, {'status': 'submitted', 'progress': min(40, task['progress']),
@@ -1993,7 +2044,7 @@ class CanvasServiceMixin:
                         transfer_errors += 1
                         result_storage_pending = True
                         diagnostic = self._canvas_delivery_error(task_id, exc, phase='transferring')
-                        if result_observer or accepted_canvas_result(task):
+                        if result_observer or self._canvas_terminal_output_binding(task):
                             self._canvas_context(task_id, {'last_result_query_error': {
                                 **diagnostic, 'code': 'RESULT_TRANSFER_FAILED'}})
                             if not result_observer:
@@ -2016,7 +2067,7 @@ class CanvasServiceMixin:
                 if not urls:
                     pending = CanvasCLIError('CLI_RESULT_PENDING',
                         'Canvas reported completion before the final output became available', outcome_unknown=True)
-                    if result_observer or accepted_canvas_result(task):
+                    if result_observer or self._canvas_terminal_output_binding(task):
                         self._canvas_context(task_id, {'last_result_query_error': self._canvas_diagnostic(pending, 'query')})
                         if not result_observer:
                             current = self.store.task(task_id) or {}
@@ -2078,7 +2129,7 @@ class CanvasServiceMixin:
                 self._park_canvas_task(task_id, 'result_transfer_failed',
                     'Canvas generation completed; the result storage observation window expired; retry original result storage only')
             else:
-                self._close_unconfirmed_canvas_task(task_id, 'observation_deadline_reached')
+                self._finish_canvas_observation(task_id, reason='observation_deadline_reached')
 
     def _resume_canvas_poll(self, task_id: str) -> None:
         task = self.store.task(task_id)

@@ -70,6 +70,24 @@ def canvas_output_source_valid(binding: Any) -> bool:
         return False
     if binding.get('source') == 'operation_status':
         return True
+    if binding.get('source') == 'accepted_receipt_resource_get':
+        proof = binding.get('resource_recovery')
+        fields = {'version', 'project_id', 'node_id', 'submit_id', 'resource_ids', 'receipt_evidence'}
+        if (not isinstance(proof, dict) or set(proof) != fields
+                or type(proof.get('version')) is not int or proof['version'] != 1
+                or any(not isinstance(binding.get(key), str) or not binding[key]
+                       or proof.get(key) != binding[key] for key in ('project_id', 'node_id', 'submit_id'))):
+            return False
+        ids, evidence = binding.get('resource_ids'), proof.get('receipt_evidence')
+        flags = {'accepted', 'output_resources', 'receipt', 'identity_conflict', 'ambiguous_partial'}
+        return (isinstance(ids, list) and bool(ids) and ids == proof.get('resource_ids')
+            and all(isinstance(value, str) and re.fullmatch(r'[a-f0-9-]{36}', value) for value in ids)
+            and len(set(ids)) == len(ids)
+            and isinstance(evidence, dict) and set(evidence) == {'version', *flags}
+            and type(evidence.get('version')) is int and evidence['version'] == 1
+            and all(type(evidence.get(key)) is bool for key in flags)
+            and evidence['accepted'] is True and evidence['output_resources'] is True
+            and evidence['identity_conflict'] is False)
     if binding.get('source') != 'node_show_original_submission':
         return False
     proof = binding.get('node_recovery')
@@ -982,6 +1000,11 @@ class Store:
             task = self._task(row)
             context = task['upstream_context']
             account = db.execute('SELECT * FROM accounts WHERE id=?', (binding['account_id'],)).fetchone()
+            if binding.get('source') == 'accepted_receipt_resource_get':
+                from .canvas_resource_recovery import accepted_output_context
+                if (not accepted_output_context(context)
+                        or binding['resource_recovery']['receipt_evidence'] != context.get('submission_evidence')):
+                    return False
             if (account is None or task['updated_at'] != expected_updated_at
                     or task.get('execution_backend') != 'canvas_cli'
                     or 'manual_termination' in context

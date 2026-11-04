@@ -141,7 +141,7 @@ direct node outputs explicitly naming that submission UUID, with matching
 resource facts, may establish a recovered output binding. Its recorded source
 is `node_show_original_submission`; missing or contradictory association never
 authorizes another paid generation or a zero-charge/refund claim.
-Three explicit `operation_submission_absent` responses, or expiry of the fixed
+For an unconfirmed run, three explicit `operation_submission_absent` responses, or expiry of the fixed
 observation deadline, end the task as `failed` (`CLI_SUBMISSION_UNCONFIRMED`).
 For known invalid-response or retryable service failures, three explicit
 absence responses with no accepted receipt, generated resource or result
@@ -159,10 +159,25 @@ deadline survives restarts. Administrator task details retain the first
 submission error and latest query error. `POST /api/tasks/{id}/reconcile`
 only queries an original operation and cannot revive a closed failure.
 
+A positively accepted run with complete original output IDs reads those
+resources directly. A slow or stale operation summary cannot hide a completed
+resource set. Every resource still has to match the original account, profile,
+project, submission receipt and media type; the complete binding is persisted
+before downloading. This path records `accepted_receipt_resource_get` and the
+original receipt evidence. Successful submissions retain their `accepted`
+phase. Temporary query errors keep the original generation window, and its
+expiry hands an accepted result to the existing bounded, read-only result
+observer without starting another generation.
+
 Known service and invalid-response failures before generation use bounded
 retries within the original deadline. Draft writes reuse their project, node
 and update IDs; retries do not call `node run`. Exhausted preparation failures
 return a normalized retry message so the caller can select its next route.
+An authoritative `MATERIAL_RULE_VIOLATED` quote instead records its material
+index and typed field and returns `MEDIA_REQUIREMENTS_INVALID`. Known image
+dimension limits remain readable in administrator diagnostics. This input
+failure ends before confirmation or generation and disallows route retry;
+an arbitrary service error or zero-credit quote alone does not qualify.
 
 Reference uploads have separate, configurable concurrency limits:
 
@@ -180,6 +195,13 @@ Verified checkpoints retain successful same-account uploads across preparation
 retries; the original resources are checked again before they are referenced.
 Account identity, profile, proxy and input bindings must still match. No draft
 is submitted until every required reference is ready.
+
+Public image URLs use the documented URL-import path first, avoiding an
+unnecessary local binary/VOD transfer. If a known transient or internal
+invalid-response failure is followed by an exact missing-registration reply,
+the original input ID can use a lazy local FILE fallback. That download keeps
+the existing public-host direct-first policy and account-proxy fallback. A
+positive or ambiguous registration never permits changing the input transport.
 
 A newly interrupted local-file upload can use one normal same-ID input retry
 after a fresh exact lookup cannot find its original registration. The adapter

@@ -61,6 +61,38 @@ def test_exact_absent_registration_permits_one_lazy_file_download_same_original_
     assert all(kwargs['deadline'] <= 180 for _, kwargs in runner.calls)
 
 
+def test_internal_invalid_response_can_change_input_transport_after_exact_absence(tmp_path, clock):
+    # This is the observed GLOBAL SDK envelope: retryable=False describes
+    # the command failure and does not prohibit an alternate same-ID input
+    # transport once a fresh service reply proves registration is absent.
+    failure = CanvasCLIError('cli.invalid_service_response', 'invalid service response',
+        exit_code=1, details={'error': {'code': 'cli.invalid_service_response',
+            'class': 'internal_failure', 'requiredAction': 'contact_support', 'retryable': False}})
+    path = tmp_path / 'original.png';path.write_bytes(b'original-image')
+    callback = Mock(return_value=path)
+    runner = Runner([failure, {'resourceId': 'original-resource'}], [not_found(), ready()])
+    invoke(runner, callback)
+    writes = [args for args, _ in runner.calls if args[:2] == ['resource', 'upload']]
+    assert len(writes) == 2 and '--source-url' in writes[0] and '--file' in writes[1]
+    assert all(args[-1] == 'original-resource' for args in writes)
+    assert callback.call_count == 1
+
+
+@pytest.mark.parametrize('change', [
+    {'class': 'invalid_input'}, {'reason': 'content_policy'}, {'serviceCode': 20115},
+    {'requiredAction': 'login'}, {'accepted': True},
+])
+def test_invalid_response_exception_cannot_override_business_or_identity_proof(clock, change):
+    failure = CanvasCLIError('cli.invalid_service_response', 'invalid response', details={
+        'error': {'code': 'cli.invalid_service_response', 'class': 'internal_failure',
+                  'requiredAction': 'contact_support', 'retryable': False, **change}})
+    callback = Mock()
+    runner = Runner([failure], [not_found()])
+    with pytest.raises(CanvasCLIError) as caught:
+        invoke(runner, callback)
+    assert caught.value is failure and not callback.called and len(runner.calls) == 1
+
+
 def test_url_and_file_share_three_write_cap_and_only_one_lazy_download(tmp_path, clock, monkeypatch):
     file = tmp_path / 'reference.png';file.write_bytes(b'validated-image')
     callback = Mock(return_value=file)

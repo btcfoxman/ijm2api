@@ -41,14 +41,15 @@ def test_fallback_download_has_short_bound_inside_original_cutoff(tmp_path, monk
     assert download.call_args.kwargs['deadline'] == 130
 
 
-def test_known_direct_first_image_host_uses_local_file_immediately(tmp_path, monkeypatch):
+def test_known_public_image_host_tries_url_import_and_preserves_lazy_direct_first_download(tmp_path, monkeypatch):
     monkeypatch.setattr('app.canvas_service.time.monotonic', lambda: 100)
     download = Mock(return_value=(b'image', 'image/png', 'reference.png'))
     monkeypatch.setattr('app.canvas_service._download', download)
     source = 'https://media.juxingdonghua.com/original.png'
     assets = CanvasServiceMixin()._canvas_local_assets({'images': [source]}, ACCOUNT, tmp_path, deadline=120)
-    assert len(assets['images']) == 1 and 'source_url' not in assets['images'][0]
-    assert Path(assets['images'][0]['path']).read_bytes() == b'image'
+    assert len(assets['images']) == 1 and assets['images'][0]['source_url'] == source
+    assert not download.called and not list(tmp_path.iterdir())
+    assert assets['images'][0]['fallback_file']().read_bytes() == b'image'
     assert download.call_args.args == (source, 'images', ACCOUNT['proxy_url'])
     assert download.call_args.kwargs == {'allow_direct_fallback': True, 'deadline': 120}
 

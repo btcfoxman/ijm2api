@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from .canvas_validation import MATERIAL_REQUIREMENTS_ERROR, MATERIAL_REQUIREMENTS_MESSAGE
 
 
 class RegionGenerationDenied(ValueError):
@@ -34,6 +35,8 @@ def upstream_review_error(code: str, message: str) -> str | None:
 def public_error(code: str, message: str) -> dict[str, str]:
     raw = (message or "").lower()
     kind = (code or "").upper()
+    if kind == MATERIAL_REQUIREMENTS_ERROR:
+        return {'code': kind, 'message': MATERIAL_REQUIREMENTS_MESSAGE}
     if kind in {'CLI.UPLOAD_STATE_UNKNOWN', 'CLI_QUOTE_UNAVAILABLE'}:
         # Material registration uncertainty is not a manual generation check.
         # Original diagnostics remain stored; routing facts require task proof.
