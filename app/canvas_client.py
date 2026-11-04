@@ -1983,7 +1983,7 @@ class CanvasClient:
         originally_accepted = accepted_output_context(context)
         output_count = context.get('output_count')
         query_seconds = (max(30, 15 * output_count)
-                         if context.get('resource_ids') and type(output_count) is int and 1 <= output_count <= 4 else 15)
+                         if context.get('resource_ids') and type(output_count) is int and 1 <= output_count <= 4 else 30)
         query_deadline = min(deadline, time.monotonic() + query_seconds) if deadline is not None else time.monotonic() + query_seconds
         recovered_node = False
         recovered_resources = False
@@ -2001,7 +2001,7 @@ class CanvasClient:
             try:
                 data = self._call(["operation", "status", context["submit_id"],
                                    "--project-id", context["project_id"]], read_only=True,
-                    deadline=(min(query_deadline, query_started + 15)
+                    deadline=(min(query_deadline, query_started + 30)
                               if persist_operation_receipt is not None and not originally_accepted else query_deadline))
                 ordinary_operation = True
             except CanvasCLIError as original:

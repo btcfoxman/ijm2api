@@ -1191,7 +1191,8 @@ class CanvasServiceMixin:
             except (OSError, UnicodeError):
                 return False
             proposal = propose_input_handoff(task, current, profile,
-                self._canvas_diagnostic(exc, 'uploading'), now=time.time(), workers_joined=True)
+                self._canvas_diagnostic(exc, str((task.get('upstream_context') or {}).get('phase') or '')),
+                now=time.time(), workers_joined=True)
             if proposal is None:
                 return False
             prospective = {**task, 'status': 'queued', 'account_id': None,

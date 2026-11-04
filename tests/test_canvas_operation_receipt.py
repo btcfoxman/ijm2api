@@ -179,8 +179,20 @@ def test_slow_status_persists_original_ids_then_gets_a_fresh_shared_resource_bud
     assert case.bound['submit_error'] == before and accepted_output_context(case.bound)
     assert case.bound['submission_evidence']['receipt'] is True
     assert case.bound['operation_receipt'] == {**case.saved[0], 'durable': True}
-    assert [options['deadline'] for _, options in case.runner.calls] == [115, 140.2]
+    assert [options['deadline'] for _, options in case.runner.calls] == [130, 140.2]
     assert case.terminal[0]['source'] == 'accepted_receipt_resource_get'
+
+
+def test_real_44_slow_original_status_can_return_after_25_seconds_without_a_local_15_second_kill(case):
+    case.runner.operation_seconds = 25
+    original_submit_error = deepcopy(case.bound['submit_error'])
+    result = observe(case)
+    assert result['status'] == 'succeeded' and case.clock['now'] == 133
+    assert [options['deadline'] for _, options in case.runner.calls] == [130, 155]
+    assert [args[:2] for args, _ in case.runner.calls] == [['operation', 'status'], ['resource', 'get']]
+    assert len(case.saved) == 1 and case.bound['resource_ids'] == [RID]
+    assert accepted_output_context(case.bound) and case.bound['submit_error'] == original_submit_error
+    assert case.terminal and case.downloaded == [RID]
 
 
 @pytest.mark.parametrize('state', ['running', None])

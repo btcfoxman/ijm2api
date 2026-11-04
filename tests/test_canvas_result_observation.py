@@ -37,9 +37,11 @@ def accepted(store, service, identifier='accepted', *, failed=True, account=None
     return row, account
 
 
-def test_old_accepted_timeout_CAS_retains_finance_failure_binding_and_original_deadline(context):
+def test_old_accepted_timeout_CAS_retains_finance_failure_binding_and_original_deadline(context, monkeypatch):
     store, service, _ = context
     before, _ = accepted(store, service)
+    # This case tests a stale timestamp, independently of wall-clock granularity.
+    monkeypatch.setattr('app.store.time.time', lambda: before['updated_at'] + 1e-3)
     after = store.queue_canvas_result_observation(before['id'], before['updated_at'])
     assert after['status'] == 'running' and after['completed_at'] is None
     assert after['error_code'] == after['error_message'] == ''

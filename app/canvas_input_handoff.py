@@ -199,6 +199,26 @@ def _checkpoint(task, account, profile):
     return checkpoint
 
 
+def _project_read_recovery(task):
+    """A resumed input checkpoint failed before any new remote write.
+
+    Prior input uploads remain part of the complete audit. This is an unpaid
+    input handoff, never a claim that the whole task performed only reads.
+    """
+    context = task['upstream_context']
+    attempts = context.get('preparation_attempts')
+    _require(isinstance(attempts, list) and len(attempts) == 2)
+    timing = attempts[-1].get('timing') or {}
+    commands = timing.get('commands')
+    _require(isinstance(commands, dict) and set(commands) <= {'auth account', 'model list', 'canvas ls'}
+        and isinstance(commands.get('canvas ls'), dict) and commands['canvas ls'].get('failed', 0) > 0
+        and any((entry.get('timing') or {}).get('commands', {}).get('resource upload', {}).get('count', 0) > 0
+                for entry in attempts[:-1]))
+    recent = timing.get('recent_commands')
+    _require(isinstance(recent, list) and recent and recent[-1].get('command_pair') == ['canvas', 'ls']
+        and recent[-1].get('outcome') == 'failed')
+
+
 def propose_input_handoff(task, account, profile, diagnostic, *, now, workers_joined):
     """Return a deterministic CAS proposal, or None when any proof is absent."""
     try:
@@ -217,20 +237,27 @@ def _propose(task, account, profile, diagnostic, *, now, workers_joined):
         and '_execution' not in normalized and HANDOFF_KEY not in context and 'manual_termination' not in context
         and not any(key in context for key in ('operation_receipt', 'output_binding', 'run_data',
             'run_receipt', 'receipt', 'result_observation', 'result_delivery', 'previous_submissions'))
-        and context.get('phase') == 'uploading' and context.get('submission_phase') in (None, '')
+        and context.get('phase') in {'uploading', 'preparing'} and context.get('submission_phase') in (None, '')
         and not context.get('resource_ids') and not any(context.get(k) for k in _VETO)
         and context.get('financial_outcome') not in {'unknown', 'unconfirmed', 'charged'}
         and not submission_evidence_blocks_fallback(context))
     _no_generation(task)
-    _require(isinstance(diagnostic, dict) and diagnostic.get('phase') == 'uploading'
+    _require(isinstance(diagnostic, dict) and diagnostic.get('phase') == context['phase']
         and diagnostic.get('outcome_unknown') is False and diagnostic.get('dispatch_started') is not True)
     code = str(diagnostic.get('code') or '')
     unknown_input = code == 'cli.upload_state_unknown'
+    pending_input = code == 'MEDIA_UPLOAD_PENDING'
     _require(not any(word in code.lower() for word in ('identity', 'auth', 'mismatch', 'policy', 'material', 'invalid_input')))
     _require(not any(word in str(diagnostic.get('class') or '').lower() for word in
         (('auth', 'invalid_input', 'business') if unknown_input else ('auth', 'invalid_input', 'business', 'human'))))
     failure = CanvasCLIError(code, '', details={'error': diagnostic}, outcome_unknown=False)
-    if unknown_input:
+    if pending_input:
+        from .canvas_service import CanvasServiceMixin
+        _require(context['phase'] == 'uploading'
+            and all(diagnostic.get(key) in (None, '') for key in
+                    ('class', 'reason', 'requiredAction', 'serviceCode', 'exit_code'))
+            and bool(CanvasServiceMixin._canvas_pending_reference_retry(task, failure)))
+    elif unknown_input:
         from .canvas_service import CanvasServiceMixin
         _require(bool(CanvasServiceMixin._canvas_input_only_failure_facts_checked(task)))
     else:
@@ -249,6 +276,8 @@ def _propose(task, account, profile, diagnostic, *, now, workers_joined):
             and entry['ordinal'] == index + 1 and entry['account_id'] == account['id']
             and entry['reason'] == 'command_failed')
         _finished_zero_paid(entry['timing'], task['id'])
+    if context['phase'] == 'preparing':
+        _project_read_recovery(task)
     checkpoint = _checkpoint(task, account, profile)
     attempted = task.get('attempted_account_ids')
     _require(isinstance(attempted, list) and all(type(v) is int and v == account['id'] for v in attempted))
@@ -272,7 +301,7 @@ def input_handoff_conflict_can_close(task):
         context = task['upstream_context']
         _require(task.get('status') == 'preparing' and task.get('execution_backend') == 'canvas_cli'
             and task.get('actual_cost') is None and HANDOFF_KEY not in context
-            and context.get('phase') == 'uploading'
+            and context.get('phase') in {'uploading', 'preparing'}
             and not any(task.get(k) for k in ('run_id', 'thread_id', 'result_urls', 'upstream_result_urls', 'result_transfer')))
         _no_generation(task)
         attempts = context.get('preparation_attempts')
@@ -289,6 +318,8 @@ def input_handoff_conflict_can_close(task):
                 and attempt['ordinal'] == index + 1 and attempt.get('account_id') == task.get('account_id')
                 and attempt.get('reason') == 'command_failed')
             _finished_zero_paid(attempt.get('timing'), task['id'])
+        if context['phase'] == 'preparing':
+            _project_read_recovery(task)
         return True
     except (ValueError, TypeError, KeyError, AttributeError):
         return False

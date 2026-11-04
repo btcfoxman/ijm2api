@@ -140,7 +140,8 @@ def test_real_808_fast_absence_timings_use_fixed_slots_without_extra_run_or_exte
     assert row['completed_at'] - wall == pytest.approx(47.323)
     assert budget['attempts'] == budget['max_attempts'] == 3
     assert budget['started_at'] == wall and budget['deadline'] == wall + 60
-    assert all(value == pytest.approx(mono + 60, abs=1e-6) for value in deadlines)
+    assert all(value == pytest.approx(mono + 60, rel=0, abs=1e-6)
+               and value <= mono + 60 + 1e-6 for value in deadlines)
     assert row['error_code'] == 'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED'
     assert row['upstream_context']['financial_outcome'] == 'unconfirmed'
     client.submit.assert_not_called()
@@ -196,6 +197,36 @@ def test_shorter_outer_deadline_during_cadence_wait_does_not_spend_another_read(
     service._poll_canvas('task', client, mono + 10)
     assert store.task('task')['upstream_context']['missing_resource_recovery']['attempts'] == 1
     client.poll.assert_not_called(); client.submit.assert_not_called()
+
+
+def test_two_slow_thirty_second_original_reads_exhaust_only_the_original_sixty_second_window(context, monkeypatch):
+    store, service, client = started(context)
+    wall, mono = time.time(), time.monotonic()
+    clock = {'wall': wall, 'mono': mono}
+    monkeypatch.setattr('app.canvas_service.time.time', lambda: clock['wall'])
+    monkeypatch.setattr('app.canvas_service.time.monotonic', lambda: clock['mono'])
+    store.update_task('task', {'status': 'submitted', 'account_id': 1, 'execution_backend': 'canvas_cli',
+        'upstream_context': {'submit_id': 'original-submit', 'project_id': 'original-project',
+            'resource_ids': [], 'observation_deadline': wall + 3000, 'submission_phase': 'run_dispatching',
+            'submit_error': {'dispatch_started': True, 'outcome_unknown': True}}})
+    starts = []
+    def advance(seconds):
+        clock['wall'] += seconds; clock['mono'] += seconds
+        return False
+    service._stop.wait.side_effect = advance
+    def timeout(_context, *, deadline):
+        starts.append(clock['wall'] - wall)
+        advance(min(30, deadline - clock['mono']))
+        raise CanvasCLIError('CLI_TASK_DEADLINE_EXCEEDED', 'original read timeout')
+    client.poll.side_effect = timeout
+    service._poll_canvas('task', client, mono + 3000)
+    row = store.task('task'); budget = row['upstream_context']['missing_resource_recovery']
+    assert starts == [0, 32] and budget['attempts'] == 2 and budget['max_attempts'] == 3
+    assert row['completed_at'] - wall == pytest.approx(60, rel=0, abs=1e-6)
+    assert budget['deadline'] == wall + 60
+    assert row['error_code'] == 'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED'
+    assert row['upstream_context']['financial_outcome'] == 'unconfirmed'
+    client.submit.assert_not_called()
 
 
 @pytest.mark.parametrize('code', ['CLI_PREPARATION_RETRY_EXHAUSTED', 'CLI_OUTPUT_RESOURCE_RECOVERY_EXHAUSTED'])
