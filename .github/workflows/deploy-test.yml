@@ -66,7 +66,7 @@ jobs:
             test "$GITHUB_EVENT_NAME" = workflow_dispatch
             [[ "$REUSE_IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]
             git fetch --quiet --no-tags origin "$REUSE_IMAGE_TAG"
-            git diff --quiet "$REUSE_IMAGE_TAG" "$GITHUB_SHA" -- app Dockerfile .dockerignore requirements.txt tools/install_canvas_cli.py tools/install_canvas_proxy.py
+            git diff --quiet "$REUSE_IMAGE_TAG" "$GITHUB_SHA" -- app Dockerfile .dockerignore requirements.txt tools/install_canvas_cli.py tools/install_canvas_proxy.py tools/build_canvas_proxy.py tools/stress_canvas_proxy.py tools/test_canvas_proxy_image.py tools/patches/graftcp-0.8.3-thread-pinning.patch
             echo "image_tag=$REUSE_IMAGE_TAG" >> "$GITHUB_OUTPUT"
           else
             echo "image_tag=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
@@ -99,12 +99,35 @@ jobs:
           node --check app/static/app.js
           python -m compileall -q app
           bash -n scripts/deploy_pre.sh
-      - name: Verify pinned Canvas account proxy tracer
-        if: ${{ inputs.smoke_only_image_tag == '' }}
+      - uses: actions/setup-go@v5
+        if: ${{ inputs.smoke_only_image_tag == '' && inputs.reuse_image_tag == '' }}
+        with:
+          go-version: '1.25.x'
+          cache: false
+      - name: Build and stress-test the thread-pinned Canvas account proxy
+        if: ${{ inputs.smoke_only_image_tag == '' && inputs.reuse_image_tag == '' }}
+        timeout-minutes: 20
+        shell: bash
         run: |
+          set -euo pipefail
+          command -v make
+          command -v gcc
           python tools/install_canvas_proxy.py --destination "$RUNNER_TEMP/canvas-proxy/graftcp" --license-directory "$RUNNER_TEMP/canvas-proxy/licenses"
-          "$RUNNER_TEMP/canvas-proxy/graftcp" --version
-          "$RUNNER_TEMP/canvas-proxy/graftcp" --config /dev/null --select_proxy_mode only_http_proxy --http_proxy 127.0.0.1:9 -- /bin/true
+          python tools/install_canvas_cli.py --destination "$RUNNER_TEMP/canvas-proxy/dreamina-canvas"
+          python tools/build_canvas_proxy.py --destination .canvas-proxy-build --comparison-directory .canvas-proxy-comparison
+          python tools/stress_canvas_proxy.py --release "$RUNNER_TEMP/canvas-proxy/graftcp" --original .canvas-proxy-comparison/graftcp-unpatched --patched .canvas-proxy-build/graftcp --cli "$RUNNER_TEMP/canvas-proxy/dreamina-canvas" --count 500 --workers 8 --output .canvas-proxy-comparison/stress-results.json
+          cp .canvas-proxy-comparison/stress-results.json .canvas-proxy-build/docs/offline-stress.json
+          python tools/build_canvas_proxy.py --verify-only .canvas-proxy-build
+      - name: Preserve Canvas proxy source, patch and stress proof
+        if: ${{ always() && inputs.smoke_only_image_tag == '' && inputs.reuse_image_tag == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: canvas-proxy-provenance
+          include-hidden-files: true
+          path: |
+            .canvas-proxy-build/docs
+            .canvas-proxy-comparison/stress-results.json
+          if-no-files-found: warn
       - uses: docker/setup-buildx-action@v3
         if: ${{ inputs.smoke_only_image_tag == '' && inputs.reuse_image_tag == '' }}
       - uses: docker/login-action@v3
@@ -141,7 +164,15 @@ jobs:
           [[ "$tag" =~ ^[0-9a-f]{40}$ ]]
           image="$IMAGE_REGISTRY/$IMAGE_NAMESPACE/$IMAGE_NAME:$tag"
           docker pull "$image"
+          python tools/test_canvas_proxy_image.py --image "$image" --output "$RUNNER_TEMP/canvas-proxy-image-smoke.json"
           python tools/test_deploy_freeze_runtime.py --image "$image"
+      - name: Preserve final-image proxy smoke proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canvas-proxy-final-image-proof
+          path: ${{ runner.temp }}/canvas-proxy-image-smoke.json
+          if-no-files-found: warn
 
   deploy:
     needs: build

@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from .canvas_cli import CanvasCLI, CanvasCLIError, _has_accepted, account_profile, admission_verdict, sanitize
+from .canvas_cli import (CanvasCLI, CanvasCLIError, _has_accepted, account_profile,
+                         admission_verdict, safe_transport_diagnostic, sanitize)
 from .catalog import ALIASES, media_alias_kind
 from .errors import public_error, upstream_review_error
 from .canvas_upload_limiter import UPLOAD_LIMITER, runner_namespace
@@ -320,6 +321,9 @@ def safe_cli_diagnostic(exc: CanvasCLIError, *, secrets: tuple[str, ...] = ()) -
                 if secret:
                     value = value.replace(secret, "[redacted]")
             result[key] = sanitize(value)
+    transport = safe_transport_diagnostic(exc.details.get('transport_diagnostic'))
+    if transport:
+        result['transport_diagnostic'] = transport
     return result
 
 
@@ -1718,6 +1722,10 @@ class CanvasClient:
             exc.message = str(diagnostic["message"])
             exc.args = (exc.message,)
             exc.details = {"error": diagnostic, "dispatch_started": dispatched, "phase": diagnostic["phase"]}
+            if diagnostic.get('transport_diagnostic'):
+                # Preserve only fingerprints through the submission boundary;
+                # the original stdout/stderr and credentials are never saved.
+                exc.details['transport_diagnostic'] = diagnostic['transport_diagnostic']
             if persist:
                 try:
                     persist(copy.deepcopy(context))

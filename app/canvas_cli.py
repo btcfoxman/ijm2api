@@ -52,6 +52,28 @@ _STDERR_SYMPTOMS = {
 }
 
 
+def safe_transport_diagnostic(value: Any) -> dict[str, Any]:
+    """Only bounded transport fingerprints, enums and known command names."""
+    if not isinstance(value, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    pair = value.get('command_pair')
+    if (isinstance(pair, (list, tuple)) and 1 <= len(pair) <= 2
+            and all(isinstance(item, str) for item in pair)
+            and tuple(pair) in TRANSPORT_DIAGNOSTIC_COMMANDS):
+        safe['command_pair'] = list(pair)
+    for kind in ('stdout', 'stderr'):
+        size, digest = value.get(kind + '_bytes'), value.get(kind + '_sha256')
+        if isinstance(size, int) and not isinstance(size, bool) and 0 <= size <= MAX_OUTPUT_BYTES:
+            safe[kind + '_bytes'] = size
+        if isinstance(digest, str) and re.fullmatch(r'[a-f0-9]{64}', digest):
+            safe[kind + '_sha256'] = digest
+    symptoms = value.get('stderr_symptoms')
+    if isinstance(symptoms, list):
+        safe['stderr_symptoms'] = [name for name in _STDERR_SYMPTOMS if name in symptoms]
+    return safe
+
+
 def command_failure_facts(error) -> dict:
     """Fixed scalar facts only: no exception prose, stdout, stderr or locators."""
     result = {}
@@ -67,20 +89,11 @@ def command_failure_facts(error) -> dict:
             if (isinstance(value, (bool, int)) or isinstance(value, str)
                     and re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', value)):
                 result[key] = value
-    transport = details.get('transport_diagnostic') or {}
-    if isinstance(transport, dict):
-        safe = {}
-        for kind in ('stdout', 'stderr'):
-            size, digest = transport.get(kind + '_bytes'), transport.get(kind + '_sha256')
-            if isinstance(size, int) and not isinstance(size, bool) and 0 <= size <= MAX_OUTPUT_BYTES:
-                safe[kind + '_bytes'] = size
-            if isinstance(digest, str) and re.fullmatch(r'[a-f0-9]{64}', digest):
-                safe[kind + '_sha256'] = digest
-        symptoms = transport.get('stderr_symptoms')
-        if isinstance(symptoms, list):
-            safe['stderr_symptoms'] = [name for name in _STDERR_SYMPTOMS if name in symptoms]
-        if safe:
-            result['transport'] = safe
+    safe = safe_transport_diagnostic(details.get('transport_diagnostic'))
+    # Command identity is already the timing sample's pair; retain its schema.
+    safe.pop('command_pair', None)
+    if safe:
+        result['transport'] = safe
     return result
 
 

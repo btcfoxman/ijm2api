@@ -31,10 +31,10 @@ MIME_EXTENSIONS = {"audio/mpeg": ".mp3", "audio/wav": ".wav", "image/jpeg": ".jp
                    "image/png": ".png", "video/mp4": ".mp4", "video/quicktime": ".mov"}
 _MEDIA_ROUTE_LOCK = threading.RLock()
 _DIRECT_MEDIA_UNTIL: dict[str, float] = {}
-# This caller-owned public media host consistently fails TLS through the
-# account proxy on pre, while its direct route succeeds. Dreamina hosts never
+# These caller-owned public media hosts have failed or timed out through the
+# account proxy while their direct routes succeeded. Dreamina hosts never
 # enter this list and always use the account proxy.
-_DIRECT_FIRST_MEDIA_HOSTS = frozenset({"media.juxingdonghua.com"})
+_DIRECT_FIRST_MEDIA_HOSTS = frozenset({"media.juxingdonghua.com", "cdn.epixa.art"})
 _MEDIA_ERROR_CATEGORIES = frozenset({"unknown", "invalid_source", "proxy_required", "deadline",
     "transport", "connection", "proxy", "tls", "timeout", "http", "redirect", "decode",
     "unsupported_encoding", "unbounded_stream", "too_large", "empty", "content_type"})

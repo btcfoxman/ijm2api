@@ -221,7 +221,9 @@ def test_third_reference_failure_is_durable_safe_and_never_reaches_canvas_prepar
     result = store.task(row["id"])
     diagnostic = result["upstream_context"]["media_download_error"]
     assert result["status"] == "failed" and result["error_code"] == "MEDIA_DOWNLOAD_FAILED"
-    assert result["error_message"] == "MediaError: Canvas preparation failed"
+    assert result["error_message"] == (
+        "Canvas reference media download failed (category=http; media_kind=audios; "
+        "media_index=3; attempt_count=2; route=account_proxy; http_status=503)")
     assert diagnostic == {"category": "http", "http_status": 503, "attempt_count": 2, "retry_count": 1,
         "route": "account_proxy", "media_kind": "audios", "media_index": 3,
         "exception_types": ["MediaError", "HTTPError"]}
@@ -238,3 +240,32 @@ def test_third_reference_failure_is_durable_safe_and_never_reaches_canvas_prepar
     assert public["error"]["message"] == "素材下载失败，请检查素材链接后重试~"
     assert "media_download_error" not in public
     assert_no_secrets(public)
+
+
+def test_mutated_media_diagnostic_cannot_leak_source_or_proxy_into_admin_message(context, caplog):
+    store, service, _ = context
+    account = owner(store)
+    store.update_account(account["id"], {"proxy_url": PROXY})
+    account = store.account(account["id"], private=True)
+    row = task(store, audio_urls=[SOURCE.replace("reference.png", "reference.mp3")])
+    client = fake_client(store, service, account)
+    error = MediaError(SOURCE + PROXY)
+    error.diagnostic = {"category": SOURCE, "route": PROXY, "http_status": SOURCE,
+                        "attempt_count": True, "media_index": -1, "request": request()}
+    with patch.object(service, "canvas_client", return_value=client), patch(
+            "app.canvas_service._download", side_effect=error):
+        service._run(row["id"])
+    result = store.task(row["id"])
+    assert result["status"] == "failed" and result["error_code"] == "MEDIA_DOWNLOAD_FAILED"
+    assert result["error_message"] == (
+        "Canvas reference media download failed (category=unknown; media_kind=audios; media_index=1)")
+    assert result["upstream_context"]["media_download_error"] == {
+        "category": "unknown", "media_kind": "audios", "media_index": 1, "exception_types": ["MediaError"]}
+    assert_no_secrets(result["error_message"])
+    assert_no_secrets(result["upstream_context"])
+    assert_no_secrets(caplog.text)
+    public = service.public_task(result)
+    assert public["error"]["message"] == "素材下载失败，请检查素材链接后重试~"
+    assert_no_secrets(public)
+    client.prepare.assert_not_called()
+    client.submit.assert_not_called()

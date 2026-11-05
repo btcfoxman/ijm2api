@@ -16,7 +16,10 @@ import time
 APPROVED_REPOSITORY = 'btcfoxman/ijm2api'
 APPROVED_BASE_COMMIT = '5daa0df2b37e309b4016e933cb9f312d11397b7b'
 RUNTIME_INPUTS = ('Dockerfile', '.dockerignore', 'requirements.txt',
-                  'tools/install_canvas_cli.py', 'tools/install_canvas_proxy.py')
+                  'tools/install_canvas_cli.py', 'tools/install_canvas_proxy.py',
+                  'tools/build_canvas_proxy.py', 'tools/stress_canvas_proxy.py',
+                  'tools/test_canvas_proxy_image.py',
+                  'tools/patches/graftcp-0.8.3-thread-pinning.patch')
 MAX_AGE_SECONDS = 24 * 60 * 60
 FETCH_DEPTH = 64
 _SHA = re.compile(r'[a-f0-9]{40}\Z')

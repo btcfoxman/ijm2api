@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .canvas_cli import TRANSPORT_DIAGNOSTIC_COMMANDS, CanvasCLIError, sanitize
+from .canvas_cli import CanvasCLIError, sanitize, safe_transport_diagnostic
 from .canvas_client import (CanvasClient, identity_network_error, preparation_retryable_failure,
                             public_image_source_url, submission_evidence_blocks_fallback,
                             _stable as canvas_input_resource_id, _node_id as canvas_input_node_id)
@@ -739,24 +739,9 @@ class CanvasServiceMixin:
         diagnostic = {key: sanitize(value)[:600] if isinstance(value, str) else value
             for key, value in values.items() if isinstance(value, (str, int, float, bool)) or value is None}
         diagnostic['at'] = time.time()
-        transport = details.get('transport_diagnostic')
-        if isinstance(transport, dict):
-            safe_transport = {}
-            pair = transport.get('command_pair')
-            if (isinstance(pair, (list, tuple)) and len(pair) == 2
-                    and all(isinstance(value, str) for value in pair)
-                    and tuple(pair) in TRANSPORT_DIAGNOSTIC_COMMANDS):
-                safe_transport['command_pair'] = list(pair)
-            for name in ('stdout', 'stderr'):
-                length = transport.get(name + '_bytes')
-                digest = transport.get(name + '_sha256')
-                if isinstance(length, int) and not isinstance(length, bool) and length >= 0:
-                    safe_transport[name + '_bytes'] = length
-                if (isinstance(digest, str) and len(digest) == 64
-                        and all(char in '0123456789abcdef' for char in digest)):
-                    safe_transport[name + '_sha256'] = digest
-            if safe_transport:
-                diagnostic['transport_diagnostic'] = safe_transport
+        transport = safe_transport_diagnostic(details.get('transport_diagnostic'))
+        if transport:
+            diagnostic['transport_diagnostic'] = transport
         return diagnostic
 
     def _canvas_observation_deadline(self, task_id: str) -> float:
@@ -1635,12 +1620,19 @@ class CanvasServiceMixin:
                         str(current.get('submission_phase') or 'submitting'))})
                 self._close_unconfirmed_canvas_task(task_id, 'submission_interrupted')
             else:
+                preparation_message = f"{type(exc).__name__}: Canvas preparation failed"
                 if isinstance(exc, MediaError):
                     diagnostic = media_error_diagnostic(exc)
                     self._canvas_context(task_id, {"media_download_error": diagnostic})
                     logger.warning("Canvas media download failed task=%s account=%s diagnostic=%s",
                                    task_id, account_id, diagnostic)
-                fail_preparation(code, f"{type(exc).__name__}: Canvas preparation failed", cause=exc)
+                    # Only the enum/number allowlist reaches admin diagnostics.
+                    # Callers continue to receive the approved public message.
+                    facts = "; ".join(f"{key}={diagnostic[key]}" for key in
+                        ("category", "media_kind", "media_index", "attempt_count", "route", "http_status")
+                        if key in diagnostic)
+                    preparation_message = f"Canvas reference media download failed ({facts})"
+                fail_preparation(code, preparation_message, cause=exc)
             logger.warning("Canvas task %s failed in %s (%s)", task_id,
                            "submission" if submission_started else "preparation", type(exc).__name__)
             return True

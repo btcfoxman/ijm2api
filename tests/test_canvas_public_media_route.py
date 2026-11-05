@@ -45,6 +45,20 @@ def test_other_hosts_schemes_credentials_ports_and_parse_failures_cannot_enable_
     assert not CanvasServiceMixin._canvas_direct_media_allowed(source)
 
 
+@pytest.mark.parametrize("source", [
+    "https://cdn.epixa.art.evil.example/fixture.mp4",
+    "https://evil-cdn.epixa.art/fixture.mp4",
+    "https://cdn.epixa.art./fixture.mp4",
+    "http://cdn.epixa.art/fixture.mp4",
+    "https://user:password@cdn.epixa.art/fixture.mp4",
+    "https://@cdn.epixa.art/fixture.mp4",
+    "https://cdn.epixa.art:8443/fixture.mp4",
+    "https://cdn.epixa.art:bad/fixture.mp4",
+])
+def test_new_public_host_does_not_expand_to_spoofed_or_credentialed_sources(source):
+    assert not CanvasServiceMixin._canvas_direct_media_allowed(source)
+
+
 def response():
     value = Mock()
     value.__enter__ = Mock(return_value=value)
@@ -89,10 +103,12 @@ def assert_original_proxy(value):
         "https": PROXY.replace("socks5://", "socks5h://")}
 
 
-def test_real_download_uses_direct_first_then_original_account_proxy(tmp_path, sessions):
+@pytest.mark.parametrize("hostname", ["media.juxingdonghua.com", "cdn.epixa.art"])
+def test_real_download_uses_direct_first_then_original_account_proxy(tmp_path, sessions, hostname):
     actions, opened = sessions
     actions.extend([requests.ReadTimeout("fixture interruption"), response()])
-    assets = CanvasServiceMixin()._canvas_local_assets({"videos": [SOURCE]}, ACCOUNT, tmp_path, deadline=10**12)
+    source = SOURCE.replace("media.juxingdonghua.com", hostname)
+    assets = CanvasServiceMixin()._canvas_local_assets({"videos": [source]}, ACCOUNT, tmp_path, deadline=10**12)
     assert len(opened) == 2
     assert opened[0].get.call_args.kwargs["proxies"] == {}
     assert opened[0].get.call_args.kwargs["allow_redirects"] is False
@@ -121,6 +137,23 @@ def test_other_public_and_official_hosts_remain_proxy_only(tmp_path, sessions, m
         assert_original_proxy(value)
     assert media_error_diagnostic(found.value)["route"] == "account_proxy"
     assert media_error_diagnostic(found.value)["attempt_count"] == 2
+
+
+def test_new_public_host_redirect_is_not_followed_directly(tmp_path, sessions):
+    actions, opened = sessions
+    redirected = response()
+    redirected.status_code = 302
+    redirected.headers["Location"] = "https://dreamina.capcut.com/private?token=fixture-secret"
+    actions.extend([redirected, response()])
+    source = SOURCE.replace("media.juxingdonghua.com", "cdn.epixa.art")
+    assets = CanvasServiceMixin()._canvas_local_assets({"videos": [source]}, ACCOUNT, tmp_path, deadline=10**12)
+    assert len(opened) == 2
+    assert opened[0].get.call_args.kwargs["allow_redirects"] is False
+    assert opened[0].get.call_args.kwargs["proxies"] == {}
+    assert_original_proxy(opened[1])
+    assert opened[1].get.call_args.kwargs["allow_redirects"] is True
+    assert all(item.get.call_args.args[0] == source for item in opened)
+    assert Path(assets["videos"][0]["path"]).read_bytes() == VIDEO
 
 
 def test_direct_retry_consumes_original_shared_download_deadline(tmp_path, sessions, monkeypatch):
