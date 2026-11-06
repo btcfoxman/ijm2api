@@ -11,7 +11,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from app.account_automation import AccountAutomation, AutomationError, _CLICK, _IDENTITY, _OPEN_LOGIN_TARGET, _VIEW, _WATERMARK
+from app.account_automation import AccountAutomation, AutomationError, _CLICK, _IDENTITY, _OPEN_LOGIN_TARGET, _SIGN_OUT, _UI_LOCK, _VIEW, _WATERMARK
 from app.browser import BrowserError
 
 
@@ -527,19 +527,21 @@ Promise.resolve(vm.runInNewContext(payload.source,context)).then(result=>process
         action.assert_called_once_with('promotion', '', '')
         browser.post.assert_called_once_with('/mweb/v1/get_settings', {})
 
-    def test_promotion_close_is_single_and_bounded(self):
+    def test_promotion_close_retries_are_spaced_and_bounded(self):
         browser = browser_with_settings(READY)
         browser.evaluate.side_effect = None
         browser.evaluate.return_value = {'stage': 'promotion'}
         automation = AccountAutomation(ACCOUNT, browser=browser)
         clock = [0.0]
-        with patch.object(automation, '_action', return_value=True) as action, \
+        attempts = []
+        with patch.object(automation, '_action', side_effect=lambda *_: attempts.append(clock[0]) or True) as action, \
              patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]), \
              patch('app.account_automation.time.sleep', side_effect=lambda _: clock.__setitem__(0, clock[0] + 1)):
             with self.assertRaises(AutomationError) as caught:
                 automation.ensure_ready()
         self.assertEqual(caught.exception.status, 'setup_required')
-        action.assert_called_once_with('promotion', '', '')
+        self.assertEqual(action.call_count, 3)
+        self.assertEqual(attempts, [0, 5, 10])
         browser.post.assert_not_called()
 
     def test_ensure_ready_waits_for_unknown_fading_wrapper_then_checks_identity(self):
@@ -579,6 +581,94 @@ Promise.resolve(vm.runInNewContext(payload.source,context)).then(result=>process
         action.assert_called_once_with('promotion', '', '')
         browser.post.assert_not_called()
 
+    def test_known_optional_close_retries_only_the_same_strict_stage_after_readback(self):
+        for stage in ('promotion', 'questionnaire'):
+            with self.subTest(stage=stage):
+                browser = browser_with_settings(READY)
+                automation = AccountAutomation(ACCOUNT, browser=browser)
+                clock, attempts = [0.0], []
+                browser.evaluate.side_effect = lambda *_args, **_kwargs: {'stage': 'waiting' if len(attempts) == 2 else stage}
+                with (patch.object(automation, '_action', side_effect=lambda *_: attempts.append(clock[0]) or True) as action,
+                      patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]),
+                      patch('app.account_automation.time.sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds))):
+                    self.assertTrue(automation._known_optional_close(stage))
+                self.assertEqual(attempts, [0.0, 5.0])
+                self.assertEqual(action.call_args_list, [unittest.mock.call(stage, '', '')] * 2)
+                self.assertEqual(automation._optional_close_attempts[stage], 2)
+                self.assertFalse(automation._password_submitted)
+                browser.post.assert_not_called()
+
+    def test_optional_retry_never_clicks_an_unknown_or_security_replacement(self):
+        for stage in ('promotion', 'questionnaire'):
+            for replacement in ('unknown', 'challenge', 'verification'):
+                with self.subTest(stage=stage, replacement=replacement):
+                    browser = browser_with_settings(READY)
+                    automation = AccountAutomation(ACCOUNT, browser=browser)
+                    clock, dispatched = [0.0], [False]
+                    browser.evaluate.side_effect = lambda *_args, **_kwargs: {'stage': replacement if dispatched[0] else stage}
+                    with (patch.object(automation, '_action', side_effect=lambda *_: dispatched.__setitem__(0, True) or True) as action,
+                          patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]),
+                          patch('app.account_automation.time.sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds))):
+                        with self.assertRaises(AutomationError):
+                            automation._known_optional_close(stage)
+                    action.assert_called_once_with(stage, '', '')
+                    self.assertLessEqual(clock[0], 5.0)
+                    self.assertFalse(automation._password_submitted)
+
+    def test_optional_close_can_reveal_known_watermark_without_mutating_its_controls(self):
+        for stage in ('promotion', 'questionnaire'):
+            with self.subTest(stage=stage):
+                browser = browser_with_settings(READY)
+                automation = AccountAutomation(ACCOUNT, browser=browser)
+                closed = [False]
+                browser.evaluate.side_effect = lambda *_args, **_kwargs: {'stage': 'watermark' if closed[0] else stage}
+                with (patch.object(automation, '_action', side_effect=lambda *_: closed.__setitem__(0, True) or True) as action,
+                      patch.object(automation, '_watermark_action') as watermark,
+                      patch.object(automation, '_identity') as identity):
+                    self.assertTrue(automation._known_optional_close(stage))
+                action.assert_called_once_with(stage, '', '')
+                watermark.assert_not_called()
+                identity.assert_not_called()
+                self.assertFalse(automation._password_submitted)
+
+    def test_optional_close_cannot_accept_a_readback_returning_after_original_login_deadline(self):
+        for where in ('window', 'refresh'):
+            with self.subTest(where=where):
+                browser = browser_with_settings(READY)
+                automation = AccountAutomation(ACCOUNT, browser=browser)
+                automation._login_deadline = 1.0 if where == 'window' else 6.0
+                clock, closed = [0.0], [False]
+
+                def evaluate(*_args, **_kwargs):
+                    if closed[0] and (where == 'window' or clock[0] >= 5):
+                        clock[0] = 2.0 if where == 'window' else 7.0
+                        return {'stage': 'waiting'}
+                    return {'stage': 'promotion'}
+
+                browser.evaluate.side_effect = evaluate
+                with (patch.object(automation, '_action', side_effect=lambda *_: closed.__setitem__(0, True) or True) as action,
+                      patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]),
+                      patch('app.account_automation.time.sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)),
+                      self.assertLogs('app.account_automation', level='WARNING') as logs):
+                    with self.assertRaises(AutomationError):
+                        automation._known_optional_close('promotion')
+                action.assert_called_once_with('promotion', '', '')
+                self.assertNotIn('optional_closed_observed', '\n'.join(logs.output))
+                self.assertFalse(automation._password_submitted)
+
+    def test_ui_lifecycle_logs_only_scoped_fixed_phases_and_bounded_numbers(self):
+        automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
+        automation._login_started = -100000.0
+        with (patch('app.account_automation.time.monotonic', return_value=0.0),
+              self.assertLogs('app.account_automation', level='WARNING') as logs):
+            automation._ui_lifecycle('PRIVATE_PHASE', 100000.0, optional='PRIVATE_SECRET')
+        value = '\n'.join(logs.output)
+        self.assertIn('account_ui_lifecycle account_id=42 phase=recovery_failed elapsed_s=86400 remaining_s=300 optional=none', value)
+        self.assertIn('promotion_close_attempts=0 questionnaire_close_attempts=0', value)
+        self.assertNotIn('PRIVATE', value)
+        self.assertNotIn(ACCOUNT['login_email'], value)
+        self.assertNotIn(ACCOUNT['proxy_url'], value)
+
 
 class LoginTests(unittest.TestCase):
     def test_resource_timing_session_wraps_entire_login_and_cleans_up_on_failure(self):
@@ -617,30 +707,26 @@ class LoginTests(unittest.TestCase):
         automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
         sequence = [{'stage': 'promotion'}, {'stage': 'unknown'}, {'stage': 'unknown'}, {'stage': 'waiting'}]
         with patch.object(automation, '_view', side_effect=sequence), \
-             patch.object(automation, '_action', return_value=True) as action, \
+             patch.object(automation, '_known_optional_close', return_value=True) as action, \
+             patch.object(automation, '_dismiss_promotion', return_value=False), \
              patch('app.account_automation.time.sleep'):
             result = automation.run(ACCOUNT['login_email'], 'synthetic-password')
         self.assertIs(result['identity_verified'], True)
-        action.assert_called_once_with('promotion', ACCOUNT['login_email'], 'synthetic-password')
+        action.assert_called_once_with('promotion')
 
     def test_run_unknown_after_known_close_expires_without_clicking_unknown(self):
         automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
-        clock, count = [0.0], [0]
-
-        def view():
-            count[0] += 1
-            return {'stage': 'promotion' if count[0] == 1 else 'unknown'}
-
-        with patch.object(automation, '_view', side_effect=view), \
+        clock = [0.0]
+        automation.browser.evaluate.side_effect = [{'stage': 'promotion'}, *[{'stage': 'unknown'}] * 200]
+        with patch.object(automation, '_view', return_value={'stage': 'promotion'}), \
              patch.object(automation, '_action', return_value=True) as action, \
              patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]), \
              patch('app.account_automation.time.sleep', side_effect=lambda _: clock.__setitem__(0, clock[0] + .2)):
             with self.assertRaises(AutomationError) as caught:
                 automation.run(ACCOUNT['login_email'], 'synthetic-password')
         self.assertEqual(caught.exception.status, 'setup_required')
-        self.assertGreaterEqual(clock[0], 30)
-        self.assertLess(clock[0], 30.5)
-        action.assert_called_once_with('promotion', ACCOUNT['login_email'], 'synthetic-password')
+        self.assertLess(clock[0], 5.3)
+        action.assert_called_once_with('promotion', '', '')
 
     def test_password_exit_unknown_animation_only_waits_then_verifies_identity(self):
         browser = browser_with_settings(READY)
@@ -699,21 +785,22 @@ class LoginTests(unittest.TestCase):
             with self.subTest(stage=stage):
                 automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
                 with patch.object(automation, '_view', side_effect=[{'stage': 'promotion'}, {'stage': stage}]), \
-                     patch.object(automation, '_action', return_value=True) as action, \
+                     patch.object(automation, '_known_optional_close', return_value=True) as action, \
                      patch('app.account_automation.time.sleep'):
                     with self.assertRaises(AutomationError) as caught:
                         automation.run(ACCOUNT['login_email'], 'synthetic-password')
                 self.assertEqual(caught.exception.status, status)
-                action.assert_called_once_with('promotion', ACCOUNT['login_email'], 'synthetic-password')
+                action.assert_called_once_with('promotion')
 
     def test_existing_authenticated_session_only_closes_promotion_without_replaying_password(self):
         automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
         with patch.object(automation, '_view', side_effect=[{'stage': 'promotion'}, {'stage': 'waiting'}]), \
-             patch.object(automation, '_action', return_value=True) as action, \
+             patch.object(automation, '_known_optional_close', return_value=True) as action, \
+             patch.object(automation, '_dismiss_promotion', return_value=False), \
              patch('app.account_automation.time.sleep'):
             result = automation.run(ACCOUNT['login_email'], 'synthetic-password')
         self.assertIs(result['identity_verified'], True)
-        action.assert_called_once_with('promotion', ACCOUNT['login_email'], 'synthetic-password')
+        action.assert_called_once_with('promotion')
 
     def test_top_login_uses_trusted_mouse_events_and_never_credential_input(self):
         browser = browser_with_settings(READY)
@@ -896,11 +983,294 @@ class LoginTests(unittest.TestCase):
     def test_known_optional_questionnaire_closes_without_selecting_occupation(self):
         automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
         with patch.object(automation, '_view', side_effect=[{'stage': 'questionnaire'}, {'stage': 'waiting'}]), \
-             patch.object(automation, '_action', return_value=True) as action, \
+             patch.object(automation, '_known_optional_close', return_value=True) as action, \
+             patch.object(automation, '_dismiss_promotion', return_value=False), \
              patch('app.account_automation.time.sleep'):
             result = automation.run(ACCOUNT['login_email'], 'synthetic-password')
         self.assertIs(result['identity_verified'], True)
-        action.assert_called_once_with('questionnaire', ACCOUNT['login_email'], 'synthetic-password')
+        action.assert_called_once_with('questionnaire')
+
+    def test_signout_navigation_has_its_own_clipped_budget_and_never_replays_signout(self):
+        for case in ('success', 'overall_clipped', 'menu_timeout', 'late_signedout'):
+            with self.subTest(case=case):
+                browser = browser_with_settings(READY)
+                automation = AccountAutomation(ACCOUNT, browser=browser)
+                clock, sent_at = [0.0], [None]
+                automation._login_started = 0.0
+                automation._login_deadline = 35.0 if case == 'overall_clipped' else 180.0
+
+                def evaluate(expression, **_):
+                    if expression == _SIGN_OUT:
+                        self.assertIsNone(sent_at[0])
+                        sent_at[0] = clock[0]
+                        return True
+                    if sent_at[0] is not None and case == 'late_signedout':
+                        clock[0] = sent_at[0] + 31
+                        return {'stage': 'signed_out'}
+                    return {'stage': 'signed_out' if sent_at[0] is not None and clock[0] - sent_at[0] >= 20 else 'waiting'}
+
+                def menu(action='view'):
+                    self.assertEqual(action, 'view')
+                    return {'stage': 'menu' if case != 'menu_timeout' and clock[0] >= 28.5 else 'waiting'}
+
+                browser.evaluate.side_effect = evaluate
+                with (patch.object(automation, '_watermark_action', side_effect=menu),
+                      patch.object(automation, '_action') as action,
+                      patch.object(automation, '_identity') as identity,
+                      patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]),
+                      patch('app.account_automation.time.sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)),
+                      self.assertLogs('app.account_automation', level='WARNING') as logs):
+                    if case == 'success':
+                        automation._restart_unbound_session()
+                    else:
+                        with self.assertRaises(AutomationError):
+                            automation._restart_unbound_session()
+                signouts = sum(c.args[0] == _SIGN_OUT for c in browser.evaluate.call_args_list)
+                self.assertEqual(signouts, 0 if case == 'menu_timeout' else 1)
+                self.assertLessEqual(clock[0], 60 if case in {'success', 'late_signedout'} else 35.0 if case == 'overall_clipped' else 30.3)
+                value = '\n'.join(logs.output)
+                self.assertIn('phase=menu_started', value)
+                self.assertEqual('phase=signout_dispatched' in value, case != 'menu_timeout')
+                self.assertEqual('phase=signedout_observed' in value, case == 'success')
+                self.assertNotIn(ACCOUNT['login_email'], value)
+                action.assert_not_called()
+                identity.assert_not_called()
+                self.assertFalse(automation._password_submitted)
+
+    def test_recovery_lock_wait_does_not_consume_local_menu_and_navigation_budgets(self):
+        for overall in (120.0, 35.0):
+            with self.subTest(overall=overall):
+                browser = browser_with_settings(READY)
+                automation = AccountAutomation(ACCOUNT, browser=browser)
+                automation._login_started = 0.0
+                automation._login_deadline = overall
+                clock, sent_at = [0.0], [None]
+                waiting = threading.Event()
+
+                def acquire(*args, **kwargs):
+                    waiting.set()  # The worker has already calculated its lock deadline.
+                    return _UI_LOCK.acquire(*args, **kwargs)
+
+                observed_lock = Mock()
+                observed_lock.acquire.side_effect = acquire
+                observed_lock.release.side_effect = _UI_LOCK.release
+
+                def evaluate(expression, **_):
+                    if expression == _SIGN_OUT:
+                        self.assertIsNone(sent_at[0])
+                        sent_at[0] = clock[0]
+                        return True
+                    return {'stage': 'signed_out' if sent_at[0] is not None and clock[0] - sent_at[0] >= 20 else 'waiting'}
+
+                browser.evaluate.side_effect = evaluate
+                with (patch('app.account_automation._UI_LOCK', observed_lock),
+                      patch.object(automation, '_watermark_action', side_effect=lambda *_:
+                                   {'stage': 'menu' if clock[0] >= 48.5 else 'waiting'}),
+                      patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]),
+                      patch('app.account_automation.time.sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)),
+                      ThreadPoolExecutor(max_workers=1) as pool):
+                    with _UI_LOCK:
+                        future = pool.submit(automation._restart_unbound_session)
+                        self.assertTrue(waiting.wait(1))
+                        self.assertFalse(future.done())
+                        clock[0] = 20.0
+                    if overall == 120.0:
+                        future.result(timeout=2)
+                        self.assertGreater(clock[0], 68.0)
+                        self.assertLessEqual(clock[0], 80.0)
+                    else:
+                        with self.assertRaises(AutomationError):
+                            future.result(timeout=2)
+                        self.assertLessEqual(clock[0], overall + .3)
+                self.assertEqual(sum(c.args[0] == _SIGN_OUT for c in browser.evaluate.call_args_list), int(overall == 120.0))
+                self.assertFalse(automation._password_submitted)
+
+    def test_unbound_questionnaire_before_menu_or_delayed_after_logout_still_requires_fresh_password(self):
+        for when in ('before_menu', 'before_menu_mounting', 'after_logout'):
+            with self.subTest(when=when):
+                browser = browser_with_settings(READY)
+                automation = AccountAutomation(ACCOUNT, browser=browser)
+                clock, state, actions = [0.0], {'phase': 'initial', 'identity_reads': 0, 'logout_reads': 0, 'fade_reads': 0}, []
+                masked = {**IDENTITY, 'email': 'o***tor@example.invalid'}
+                close = _CLICK.replace('__ACTION__', json.dumps('questionnaire'))
+                password = _CLICK.replace('__ACTION__', json.dumps('password'))
+
+                def evaluate(expression, **_):
+                    phase = state['phase']
+                    if expression == _IDENTITY:
+                        state['identity_reads'] += 1
+                        if state['identity_reads'] == 1:
+                            state['phase'] = ('mounting' if when == 'before_menu_mounting' else
+                                              'questionnaire' if when == 'before_menu' else 'residual')
+                        else:
+                            self.assertTrue(automation._password_submitted)
+                            self.assertEqual(phase, 'authenticated')
+                        return masked.copy()
+                    if expression == _VIEW:
+                        if phase == 'mounting':
+                            state['phase'] = 'questionnaire'
+                            return {'stage': 'unknown'}
+                        if phase == 'logout_pending':
+                            state['logout_reads'] += 1
+                            if state['logout_reads'] <= 2:
+                                return {'stage': 'waiting'}
+                            state['phase'] = phase = 'questionnaire' if when == 'after_logout' else 'password'
+                        if phase == 'closing':
+                            state['fade_reads'] += 1
+                            if state['fade_reads'] <= 2:
+                                return {'stage': 'questionnaire'}
+                            if state['fade_reads'] <= 4:
+                                return {'stage': 'unknown'}
+                            state['phase'] = phase = 'residual' if when.startswith('before_menu') else 'password'
+                        return {'stage': phase if phase in {'questionnaire', 'password'} else 'waiting'}
+                    if expression == close:
+                        self.assertTrue(_UI_LOCK._is_owned())
+                        actions.append('close_questionnaire')
+                        state['phase'] = 'closing'
+                        return True
+                    if expression == _SIGN_OUT:
+                        actions.append('sign_out')
+                        state['phase'] = 'logout_pending'
+                        return True
+                    if expression == password:
+                        actions.append('password')
+                        state['phase'] = 'authenticated'
+                        return True
+                    raise AssertionError('Unexpected browser expression')
+
+                def identity_bound(value):
+                    self.assertEqual(value['user_id'], IDENTITY['user_id'])
+                    self.assertTrue(automation._password_submitted)
+                    self.assertIn('sign_out', actions)
+
+                browser.evaluate.side_effect = evaluate
+                with (patch.object(automation, '_watermark_action', return_value={'stage': 'menu'}),
+                      patch.object(automation, '_fill', return_value=True) as fill,
+                      patch.object(automation, 'ensure_ready', return_value={'identity_verified': True}) as ready,
+                      patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]),
+                      patch('app.account_automation.time.sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds))):
+                    automation.run(ACCOUNT['login_email'], 'synthetic-password', on_identity=identity_bound)
+                self.assertEqual(actions, ['close_questionnaire', 'sign_out', 'password'] if when.startswith('before_menu')
+                                 else ['sign_out', 'close_questionnaire', 'password'])
+                self.assertEqual(state['identity_reads'], 2)
+                self.assertEqual(fill.call_count, 2)
+                ready.assert_called_once_with()
+                browser.post.assert_not_called()
+
+    def test_unbound_questionnaire_close_cap_is_shared_across_both_signout_phases(self):
+        browser = browser_with_settings(READY)
+        automation = AccountAutomation(ACCOUNT, browser=browser)
+        clock, phase = [0.0], ['before']
+        close = _CLICK.replace('__ACTION__', json.dumps('questionnaire'))
+
+        def evaluate(expression, **_):
+            if expression == close:
+                if phase[0] == 'before':
+                    phase[0] = 'residual'
+                return True
+            if expression == _SIGN_OUT:
+                phase[0] = 'after'
+                return True
+            return {'stage': 'waiting' if phase[0] == 'residual' else 'questionnaire'}
+
+        browser.evaluate.side_effect = evaluate
+        with (patch.object(automation, '_watermark_action', return_value={'stage': 'menu'}),
+              patch.object(automation, '_fill') as fill,
+              patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]),
+              patch('app.account_automation.time.sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds))):
+            with self.assertRaisesRegex(AutomationError, 'optional dialog could not be closed'):
+                automation._restart_unbound_session()
+        self.assertEqual(sum(c.args[0] == close for c in browser.evaluate.call_args_list), 3)
+        self.assertEqual(sum(c.args[0] == _SIGN_OUT for c in browser.evaluate.call_args_list), 1)
+        self.assertLessEqual(clock[0], 10.3)
+        self.assertEqual(automation.verified_user_id, '')
+        fill.assert_not_called()
+
+    def test_unbound_questionnaire_close_does_not_prove_signout_or_bind_identity(self):
+        browser = browser_with_settings(READY)
+        automation = AccountAutomation(ACCOUNT, browser=browser)
+        clock, phase, observed = [0.0], ['initial'], Mock()
+        automation.timeout = 2
+        close = _CLICK.replace('__ACTION__', json.dumps('questionnaire'))
+
+        def evaluate(expression, **_):
+            if expression == _IDENTITY:
+                return {**IDENTITY, 'email': 'o***tor@example.invalid'}
+            if expression == _SIGN_OUT:
+                phase[0] = 'questionnaire'
+                return True
+            if expression == close:
+                phase[0] = 'waiting'
+                return True
+            return {'stage': 'questionnaire' if phase[0] == 'questionnaire' else 'waiting'}
+
+        browser.evaluate.side_effect = evaluate
+        with (patch.object(automation, '_watermark_action', return_value={'stage': 'menu'}),
+              patch.object(automation, '_fill') as fill,
+              patch.object(automation, 'ensure_ready') as ready,
+              patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]),
+              patch('app.account_automation.time.sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds))):
+            with self.assertRaisesRegex(AutomationError, 'signed-out state was not confirmed'):
+                automation.run(ACCOUNT['login_email'], 'synthetic-password', on_identity=observed)
+        observed.assert_not_called()
+        fill.assert_not_called()
+        ready.assert_not_called()
+        self.assertFalse(automation._password_submitted)
+        self.assertEqual(automation.verified_user_id, '')
+
+    def test_unbound_questionnaire_close_refuses_expiry_changed_shape_and_security_dialogs(self):
+        for failure in ('expired', 'changed_shape', 'challenge', 'verification', 'unknown'):
+            with self.subTest(failure=failure):
+                browser = browser_with_settings(READY)
+                automation = AccountAutomation(ACCOUNT, browser=browser)
+                clock = [0.0]
+                automation._login_deadline = 1.0
+
+                def evaluate(expression, **_):
+                    if failure == 'expired':
+                        clock[0] = 1.0
+                    return {'stage': failure if failure in {'challenge', 'verification', 'unknown'} else 'questionnaire'}
+
+                browser.evaluate.side_effect = evaluate
+                with (patch.object(automation, '_action', return_value=False) as action,
+                      patch.object(automation, '_watermark_action') as menu,
+                      patch.object(automation, '_fill') as fill,
+                      patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0])):
+                    with self.assertRaises(AutomationError):
+                        automation._restart_unbound_session()
+                self.assertEqual(action.call_count, int(failure == 'changed_shape'))
+                if failure == 'changed_shape':
+                    action.assert_called_once_with('questionnaire', '', '')
+                menu.assert_not_called()
+                fill.assert_not_called()
+
+    def test_unbound_questionnaire_wait_preserves_login_deadline_and_stops_on_challenge(self):
+        for failure in ('deadline', 'challenge', 'verification'):
+            with self.subTest(failure=failure):
+                browser = browser_with_settings(READY)
+                automation = AccountAutomation(ACCOUNT, browser=browser)
+                automation._login_deadline = 1.0
+                clock, closed = [0.0], [False]
+                close = _CLICK.replace('__ACTION__', json.dumps('questionnaire'))
+
+                def evaluate(expression, **_):
+                    if expression == _SIGN_OUT:
+                        return True
+                    if expression == close:
+                        closed[0] = True
+                        return True
+                    return {'stage': failure if closed[0] and failure != 'deadline' else
+                            'questionnaire' if closed[0] or clock[0] > 0 else 'waiting'}
+
+                browser.evaluate.side_effect = evaluate
+                with (patch.object(automation, '_watermark_action', return_value={'stage': 'menu'}),
+                      patch('app.account_automation.time.monotonic', side_effect=lambda: clock[0]),
+                      patch('app.account_automation.time.sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds))):
+                    with self.assertRaises(AutomationError):
+                        automation._restart_unbound_session()
+                self.assertEqual(sum(c.args[0] == close for c in browser.evaluate.call_args_list), 1)
+                self.assertLessEqual(clock[0], 1.3)
+                self.assertFalse(automation._password_submitted)
 
     def test_navigation_transient_after_submit_does_not_replay_credentials(self):
         automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
@@ -1228,12 +1598,14 @@ const expected=['Art professional','Designer','TV and film industry professional
  'Digital marketing and e-commerce professional','Social media content creator','Tech professional','Other (please specify)'];
 const cfg=payload.config,title=make(cfg.title||'What role best describes you?'),description=make("We'll use this to personalize your experience.");
 const labels=cfg.options||expected,options=labels.map(make),close=make('');
-const root=make('role questionnaire',!!cfg.hidden),extra=make('Subscription or privacy terms');
+const root=make('role questionnaire',!!cfg.hidden),extra=make('Subscription or privacy terms'),wrapper=make('known questionnaire wrapper');
+wrapper.contains=e=>e===wrapper||e===root;
+root.contains=e=>e===root||(cfg.nestedUnknown&&e===extra);
 root.querySelector=s=>s.includes('title-')?title:s.includes('desc-')?description:null;
 root.querySelectorAll=s=>s.includes('option-text-')?options:s.includes('close-btn-')?(cfg.closeCount===0?[]:cfg.closeCount===2?[close,make('')]:[close]):[];
 const doc={querySelectorAll(s){
  if(s==='[class*="user-portrait-dialog-"]')return [root];
- if(s.startsWith('[role=dialog],dialog'))return cfg.extraDialog?[root,extra]:[root];
+ if(s.startsWith('[role=dialog],dialog'))return cfg.extraDialog||cfg.nestedUnknown?[root,extra]:cfg.nestedDialog?[wrapper,root]:[root];
  if(s==='button,[role=button]')return [close,...options];
  return [];
 }};
@@ -1241,7 +1613,8 @@ const context={document:doc,innerHeight:960,innerWidth:1280,getComputedStyle:()=
 const view=vm.runInNewContext(payload.view,context),clicked=vm.runInNewContext(payload.action,context);
 process.stdout.write(JSON.stringify({view,clicked,clicks}));
 '''
-        cases = [({}, True), ({'title': 'Privacy preferences'}, False), ({'extraDialog': True}, False),
+        cases = [({}, True), ({'nestedDialog': True}, True), ({'nestedUnknown': True}, False),
+                 ({'title': 'Privacy preferences'}, False), ({'extraDialog': True}, False),
                  ({'closeCount': 0}, False), ({'closeCount': 2}, False), ({'hidden': True}, False),
                  ({'options': ['Art professional', 'Designer']}, False)]
         for config, allowed in cases:

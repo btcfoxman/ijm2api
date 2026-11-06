@@ -7,6 +7,7 @@ confirmation dialog or calls a generation endpoint.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import threading
@@ -30,6 +31,7 @@ class UnboundSessionError(AutomationError):
 _UI_LOCK = _DESKTOP_UI_LOCK
 _SETTINGS_GUARD = threading.Lock()
 _SETTINGS_LOCKS: dict[tuple[int, int], threading.RLock] = {}
+_UI_LOG = logging.getLogger(__name__)
 
 _DIAGNOSTIC_STAGES = frozenset({'signed_out', 'provider', 'email', 'password', 'questionnaire',
     'promotion', 'watermark', 'waiting', 'unknown', 'challenge', 'verification', 'failed',
@@ -203,7 +205,7 @@ _VIEW = r"""(() => {
  if(heading('Sign in to Dreamina')&&buttons.some(e=>text(e)==='Continue with email')&&
    dialogs.every(e=>e.contains(heading('Sign in to Dreamina'))))return {stage:'provider'};
  const survey=questionnaire();
- if(survey&&dialogs.every(e=>e.contains(survey)||survey.contains(e)))return {stage:'questionnaire'};
+ if(survey&&dialogs.every(e=>e===survey||e.contains(survey)))return {stage:'questionnaire'};
  const watermark=[...document.querySelectorAll('[class*="watermark-setting-modal-"]')].filter(visible)
    .find(e=>text(e).includes('Remove AI watermarks')&&text(e).includes('Save preference'));
  if(watermark&&dialogs.every(e=>e.contains(watermark)||watermark.contains(e)))return {stage:'watermark'};
@@ -234,7 +236,7 @@ _CLICK = r"""(() => {
  }
  if(wanted==='questionnaire'){
    const root=questionnaire(),dialogs=[...document.querySelectorAll('[role=dialog],dialog,.lv-modal-wrapper')].filter(visible);
-   if(!root||dialogs.some(e=>!e.contains(root)&&!root.contains(e)))return false;
+   if(!root||dialogs.some(e=>e!==root&&!e.contains(root)))return false;
    options=[...root.querySelectorAll('[class*="close-btn-"][role=button][aria-label="Close"]')].filter(visible);
  }
  if(wanted==='email'||wanted==='password'){
@@ -359,6 +361,7 @@ class AccountAutomation:
         self._last_settings: dict[str, Any] = {}
         self._identity_observation = 'not_observed'
         self._ui_action_expired = False
+        self._optional_close_attempts = {'promotion': 0, 'questionnaire': 0}
         settings = settings or {}
         self.timeout = min(300.0, max(15.0, float(settings.get('auto_login_timeout_seconds') or 180)))
         key = (int(account.get('id') or 0), int(account.get('cdp_port') or 0))
@@ -526,32 +529,73 @@ class AccountAutomation:
                 raise AutomationError('setup_required', 'Dreamina account settings were not confirmed')
             return evidence
 
-    def _dismiss_promotion(self) -> bool:
-        """Close only the recorded optional offer, never a subscription flow."""
-        deadline = min(time.monotonic() + 5,
+    def _ui_lifecycle(self, phase: str, deadline: float, *, optional: str = 'none') -> None:
+        phases = {'optional_close_dispatched', 'optional_closed_observed', 'menu_started',
+                  'signout_dispatched', 'signedout_observed', 'recovery_failed'}
+        now = time.monotonic()
+        _UI_LOG.warning('account_ui_lifecycle account_id=%d phase=%s elapsed_s=%d remaining_s=%d optional=%s promotion_close_attempts=%d questionnaire_close_attempts=%d',
+            int(self.account.get('id') or 0), phase if phase in phases else 'recovery_failed',
+            min(86400, max(0, int(now - getattr(self, '_login_started', now)))),
+            min(300, max(0, math.ceil(deadline - now))),
+            optional if optional in {'promotion', 'questionnaire'} else 'none',
+            self._optional_close_attempts['promotion'], self._optional_close_attempts['questionnaire'])
+
+    def _known_optional_close(self, stage: str) -> bool:
+        """At most three strictly rechecked Close actions per type and login."""
+        if stage not in {'promotion', 'questionnaire'}:
+            raise ValueError('unsupported optional dialog')
+        deadline = min(time.monotonic() + 15,
                        getattr(self, '_menu_deadline', float('inf')),
                        getattr(self, '_login_deadline', float('inf')))
         view = self.browser.evaluate(_VIEW)
-        if not isinstance(view, dict) or view.get('stage') != 'promotion':
+        if not isinstance(view, dict) or view.get('stage') != stage:
             return False
-        if time.monotonic() >= deadline:
-            raise AutomationError('setup_required', 'Dreamina optional offer could not be closed')
-        if not self._action('promotion', '', ''):
-            raise AutomationError('setup_required', 'Dreamina optional offer could not be closed')
+        message = ('Dreamina optional offer could not be closed' if stage == 'promotion'
+                   else 'Dreamina optional dialog could not be closed')
         while time.monotonic() < deadline:
-            current = self.browser.evaluate(_VIEW)
-            if isinstance(current, dict) and current.get('stage') != 'promotion':
-                stage = current.get('stage')
-                if stage == 'challenge':
+            if self._optional_close_attempts[stage] >= 3:
+                break
+            self._optional_close_attempts[stage] += 1
+            # _action performs its own fresh full signature and unique-Close
+            # validation. Never retry a rejected/changed control shape.
+            if not self._action(stage, '', ''):
+                break
+            self._ui_lifecycle('optional_close_dispatched', deadline, optional=stage)
+            readback_deadline = min(deadline, time.monotonic() + 5)
+            while time.monotonic() < readback_deadline:
+                current = self.browser.evaluate(_VIEW)
+                if time.monotonic() >= deadline:
+                    break
+                observed = current.get('stage') if isinstance(current, dict) else 'unknown'
+                if observed == 'challenge':
                     raise AutomationError('challenge_required', 'Dreamina login requires a human security challenge')
-                if stage == 'verification':
+                if observed == 'verification':
                     raise AutomationError('verification_required', 'Dreamina login requires email or security verification')
-                if stage != 'unknown':
+                if observed in {'signed_out', 'provider', 'email', 'password', 'waiting', 'watermark', 'promotion', 'questionnaire', 'failed'} and observed != stage:
+                    self._ui_lifecycle('optional_closed_observed', deadline, optional=stage)
                     return True
-                # The known modal's fading wrapper briefly outlives its
-                # content. Wait without interacting with any unknown UI.
-            time.sleep(min(.2, max(0, deadline - time.monotonic())))
-        raise AutomationError('setup_required', 'Dreamina optional offer could not be closed')
+                time.sleep(min(.2, max(0, readback_deadline - time.monotonic())))
+            # An unchanged known dialog can be unhydrated or remounted. Spend
+            # another Close only after a full readback window and fresh VIEW.
+            if time.monotonic() >= deadline:
+                break
+            current = self.browser.evaluate(_VIEW)
+            if time.monotonic() >= deadline:
+                break
+            observed = current.get('stage') if isinstance(current, dict) else 'unknown'
+            if observed == 'challenge':
+                raise AutomationError('challenge_required', 'Dreamina login requires a human security challenge')
+            if observed == 'verification':
+                raise AutomationError('verification_required', 'Dreamina login requires email or security verification')
+            if observed in {'signed_out', 'provider', 'email', 'password', 'waiting', 'watermark', 'promotion', 'questionnaire', 'failed'} and observed != stage:
+                self._ui_lifecycle('optional_closed_observed', deadline, optional=stage)
+                return True
+            if observed != stage:
+                break
+        raise AutomationError('setup_required', message)
+
+    def _dismiss_promotion(self) -> bool:
+        return self._known_optional_close('promotion')
 
     def _watermark_action(self, action: str = 'view') -> dict[str, Any]:
         if action not in {'view', 'warm_avatar', 'open_avatar', 'open_setting', 'toggle', 'save'}:
@@ -646,30 +690,39 @@ class AccountAutomation:
 
     def _restart_unbound_session(self) -> None:
         """Sign out through the recorded menu; never accept the residual identity."""
-        deadline = time.monotonic() + min(30, self.timeout)
-        with self._menu_transaction(deadline) as deadline:
-            return self._restart_unbound_session_locked(deadline)
+        lock_deadline = getattr(self, '_login_deadline', time.monotonic() + self.timeout)
+        deadline = lock_deadline
+        try:
+            with self._menu_transaction(lock_deadline) as overall_deadline:
+                # Waiting for another account's desktop does not consume this
+                # account's menu/navigation budget, only the original login budget.
+                deadline = min(overall_deadline, time.monotonic() + min(60, self.timeout))
+                self._menu_deadline = deadline
+                return self._restart_unbound_session_locked(deadline)
+        except Exception:
+            self._ui_lifecycle('recovery_failed', min(deadline, getattr(self, '_login_deadline', deadline)))
+            raise
 
     def _restart_unbound_session_locked(self, deadline: float) -> None:
         warmed = opened = False
-        promotion_closed = False
-        while time.monotonic() < deadline:
+        menu_deadline = min(deadline, time.monotonic() + 30)
+        self._menu_deadline = menu_deadline
+        self._ui_lifecycle('menu_started', menu_deadline)
+        while time.monotonic() < menu_deadline:
             view = self.browser.evaluate(_VIEW)
             if isinstance(view, dict) and view.get('stage') == 'unknown' and time.monotonic() < deadline:
-                # A mounting offer can be unknown for one frame. Reclassify
-                # once, accepting only the same strict recorded offer shape.
+                # A mounting optional dialog can be unknown for one frame.
+                # Reclassify once, accepting only its strict recorded shape.
                 latest = self.browser.evaluate(_VIEW)
-                if isinstance(latest, dict) and latest.get('stage') == 'promotion':
+                if isinstance(latest, dict) and latest.get('stage') in {'promotion', 'questionnaire'}:
                     view = latest
-            if isinstance(view, dict) and view.get('stage') == 'promotion':
-                if promotion_closed:
-                    raise AutomationError('login_required', 'Dreamina session recovery requires manual page review')
-                promotion_closed = self._dismiss_promotion()
+            if isinstance(view, dict) and view.get('stage') in {'promotion', 'questionnaire'}:
+                closed = self._known_optional_close(view['stage'])
                 # The close can replace wrappers and menu coordinates. Read a
                 # fresh view before opening the normal account sign-out menu.
                 warmed = opened = False
-                if not promotion_closed:
-                    time.sleep(min(.2, max(0, deadline - time.monotonic())))
+                if not closed:
+                    time.sleep(min(.2, max(0, menu_deadline - time.monotonic())))
                 continue
             if not isinstance(view, dict) or view.get('stage') in {'unknown', 'challenge', 'verification'}:
                 raise AutomationError('login_required', 'Dreamina session recovery requires manual page review')
@@ -689,12 +742,22 @@ class AccountAutomation:
             time.sleep(.3)
         else:
             raise AutomationError('login_required', 'Dreamina sign-out did not finish')
-        while time.monotonic() < deadline:
+        post_deadline = min(deadline, time.monotonic() + 30)
+        self._menu_deadline = post_deadline
+        self._ui_lifecycle('signout_dispatched', post_deadline)
+        while time.monotonic() < post_deadline:
             view = self.browser.evaluate(_VIEW)
+            if time.monotonic() >= post_deadline:
+                break
             if isinstance(view, dict) and view.get('stage') in {'signed_out', 'provider', 'email', 'password'}:
                 self.verified_user_id = ''
+                self._ui_lifecycle('signedout_observed', post_deadline)
                 return
-            time.sleep(.3)
+            if isinstance(view, dict) and view.get('stage') in {'challenge', 'verification'}:
+                raise AutomationError('login_required', 'Dreamina session recovery requires manual page review')
+            if isinstance(view, dict) and view.get('stage') in {'promotion', 'questionnaire'}:
+                self._known_optional_close(view['stage'])
+            time.sleep(min(.3, max(0, post_deadline - time.monotonic())))
         raise AutomationError('login_required', 'Dreamina signed-out state was not confirmed')
 
     def _fill(self, selector: str, value: str) -> bool:
@@ -764,8 +827,10 @@ class AccountAutomation:
         self.expected_email = email.casefold()
         self._password_submitted = False
         callback = on_stage or (lambda _stage: None)
-        deadline = time.monotonic() + self.timeout
+        self._login_started = time.monotonic()
+        deadline = self._login_started + self.timeout
         self._login_deadline = deadline
+        self._optional_close_attempts = {'promotion': 0, 'questionnaire': 0}
         actions: set[str] = set()
         # Only opening the login UI and choosing its email provider are safe
         # navigation. A cold page may ignore the first event while its SDK
@@ -774,7 +839,6 @@ class AccountAutomation:
         navigation = {stage: {'count': 0, 'at': -float('inf')} for stage in ('signed_out', 'provider')}
         identity_checked_at = -float('inf')
         submitted_at: float | None = None
-        optional_closed_at: dict[str, float] = {}
         unknown_since: float | None = None
         restarted_session = False
         callback('login')
@@ -806,14 +870,10 @@ class AccountAutomation:
                 raise AutomationError(str(view.get('reason') or 'setup_required'), 'Dreamina requires manual page review')
             unknown_since = None
             if stage in {'questionnaire', 'promotion'}:
-                if stage not in actions and self._action(stage, email, password):
-                    actions.add(stage)
-                    optional_closed_at[stage] = time.monotonic()
-                if stage in optional_closed_at and time.monotonic() - optional_closed_at[stage] > 5:
-                    raise AutomationError('setup_required', 'Dreamina optional dialog could not be closed')
+                self._known_optional_close(stage)
                 time.sleep(.3)
                 continue
-            if now - identity_checked_at >= 2:
+            if now - identity_checked_at >= 2 and (not restarted_session or self._password_submitted):
                 identity_checked_at = now
                 try:
                     identity = self._identity()
