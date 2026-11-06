@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import math
+import re
 import threading
 import time
 from typing import Any, Callable
@@ -30,6 +31,10 @@ _AUTH_DIAGNOSTIC_CODES = {
     'cli_proxy_wrapper_unavailable', 'cli_output_read_failed', 'cli_unavailable',
     'cli_account_busy', 'cli_stopping', 'cli_task_deadline_exceeded',
 }
+_AUTH_SYMBOLIC_CODE = re.compile(r'(?:cli\.[a-z]+(?:_[a-z]+)*|CLI_[A-Z]+(?:_[A-Z]+)*)')
+_AUTH_DIAGNOSTIC_CLASSES = {'invalid_input', 'retryable_failure', 'internal_failure',
+    'human_intervention', 'authentication_failure', 'authorization_failure', 'business_failure',
+    'auth_required', 'service_error', 'operation_incomplete'}
 
 
 def _auth_diagnostic(account_id: int, phase: str, error: Exception | None = None, *,
@@ -38,14 +43,26 @@ def _auth_diagnostic(account_id: int, phase: str, error: Exception | None = None
     phases = {'auth_wait', 'identity', 'browser_confirmation', 'authorization_deadline',
               'prepare_browser', 'auth_start', 'browser_open', 'flow'}
     code = getattr(error, 'code', '') if error is not None else ''
-    code = code.lower() if isinstance(code, str) else ''
+    safe_code = 'other' if error is not None else 'none'
+    if isinstance(code, str) and len(code) <= 80 and code.isascii():
+        if code.lower() in _AUTH_DIAGNOSTIC_CODES:
+            safe_code = code.lower()
+        elif _AUTH_SYMBOLIC_CODE.fullmatch(code):
+            safe_code = code
     kind = type(error).__name__ if error is not None else 'none'
-    _AUTH_LOG.warning('canvas_auth_diagnostic account_id=%d phase=%s code=%s error_type=%s confirmed=%s manual=%s',
+    exit_code = getattr(error, 'exit_code', None)
+    exit_code = exit_code if type(exit_code) is int and -1 <= exit_code <= 255 else 'none'
+    details = getattr(error, 'details', None)
+    source = details.get('error') if isinstance(details, dict) else None
+    classification = source.get('class') if isinstance(source, dict) else None
+    error_class = (classification if isinstance(classification, str) and classification in _AUTH_DIAGNOSTIC_CLASSES
+                   else 'none' if classification is None else 'other')
+    _AUTH_LOG.warning('canvas_auth_diagnostic account_id=%d phase=%s code=%s error_type=%s confirmed=%s manual=%s exit_code=%s error_class=%s',
         int(account_id), phase if phase in phases else 'flow',
-        code if code in _AUTH_DIAGNOSTIC_CODES else 'other' if error is not None else 'none',
+        safe_code,
         kind if kind in {'CanvasCLIError', 'BrowserError', 'TimeoutError', 'ConnectionError',
                          'WebSocketTimeoutException', 'RuntimeError', 'AutomationError', 'none'} else 'other',
-        bool(confirmed), bool(manual))
+        bool(confirmed), bool(manual), exit_code, error_class)
 _CONFIRM = r"""(() => {
  if(location.protocol!=='https:'||location.hostname!=='dreamina.capcut.com'||!/^\/ai-tool\/cli-auth-os\/?$/.test(location.pathname))return 'manual_required';
  const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>1&&r.height>1&&s.display!=='none'&&s.visibility!=='hidden';};

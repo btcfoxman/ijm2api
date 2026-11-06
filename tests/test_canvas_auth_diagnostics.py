@@ -60,3 +60,62 @@ def test_unknown_error_metadata_and_phase_are_never_logged_verbatim(caplog):
     _auth_diagnostic(60, 'PRIVATE_PHASE', error)
     assert 'phase=flow code=other error_type=other' in caplog.text
     assert 'PRIVATE' not in caplog.text
+
+
+@pytest.mark.parametrize('code', ['cli.authorization_exchange_failed',
+    'CLI_AUTHORIZATION_EXCHANGE_FAILED', 'cli.' + 'a' * 76])
+def test_new_official_symbolic_code_is_retained_without_exception_payload(caplog, code):
+    caplog.set_level(logging.WARNING, logger='app.canvas_auth')
+    error = CanvasCLIError(code, 'PRIVATE_MESSAGE https://secret.invalid/?nonce=TOKEN user@example.test',
+                           details={'code': 'PRIVATE_DETAILS', 'deviceCode': 'PRIVATE_DEVICE_CODE'})
+    _auth_diagnostic(60, 'auth_wait', error, confirmed=True, manual=False)
+    assert 'code=' + code + ' error_type=CanvasCLIError confirmed=True manual=False' in caplog.text
+    assert all(secret not in caplog.text for secret in ('PRIVATE', 'secret.invalid', 'TOKEN', 'example.test'))
+
+
+@pytest.mark.parametrize('code', ['https://secret.invalid/?token=PRIVATE', 'user@example.test',
+    'TOKEN_WITHOUT_NAMESPACE', 'cli.authorization_exchange_failed?token=PRIVATE',
+    'cli.authorization exchange_failed', 'cli.authorization_exchange_failed\nPRIVATE',
+    'cli.authorization_exchange_failed\x00PRIVATE', 'cli.授权失败', 'cli.exchange_échec',
+    'Cli.authorization_exchange_failed', 'CLI_authorization_exchange_failed',
+    'cli.authorization__exchange_failed', 'cli.authorization_exchange_failed_',
+    'cli.' + 'a' * 77, 'CLI_' + 'A' * 77, None, 42, {'code': 'cli.exchange_failed'}])
+def test_non_symbolic_or_unbounded_structured_codes_remain_other(caplog, code):
+    caplog.set_level(logging.WARNING, logger='app.canvas_auth')
+    error = CanvasCLIError(code, 'PRIVATE_MESSAGE', details={'code': 'cli.authorization_exchange_failed'})
+    _auth_diagnostic(60, 'auth_wait', error)
+    assert 'phase=auth_wait code=other error_type=CanvasCLIError' in caplog.text
+    assert 'PRIVATE' not in caplog.text and 'cli.authorization_exchange_failed' not in caplog.text
+
+
+def test_existing_known_code_normalization_and_no_error_diagnostic_are_preserved(caplog):
+    caplog.set_level(logging.WARNING, logger='app.canvas_auth')
+    _auth_diagnostic(60, 'auth_wait', CanvasCLIError('CLI_COMMAND_TIMEOUT', 'PRIVATE'))
+    assert 'code=cli_command_timeout' in caplog.text
+    caplog.clear()
+    _auth_diagnostic(60, 'authorization_deadline')
+    assert 'code=none error_type=none' in caplog.text
+
+
+@pytest.mark.parametrize('exit_code', [-1, 0, 11, 255])
+@pytest.mark.parametrize('error_class', ['invalid_input', 'retryable_failure', 'internal_failure', 'authentication_failure', 'service_error'])
+def test_exit_code_and_fixed_error_class_retain_only_bounded_facts(caplog, exit_code, error_class):
+    caplog.set_level(logging.WARNING, logger='app.canvas_auth')
+    error = CanvasCLIError('cli.authorization_exchange_failed', 'PRIVATE_MESSAGE', exit_code=exit_code,
+        details={'error': {'class': error_class, 'message': 'PRIVATE_ERROR', 'nonce': 'PRIVATE_NONCE'},
+                 'deviceCode': 'PRIVATE_DEVICE', 'url': 'https://secret.invalid/?token=PRIVATE'})
+    _auth_diagnostic(60, 'auth_wait', error)
+    assert 'exit_code=' + str(exit_code) + ' error_class=' + error_class in caplog.text
+    assert 'PRIVATE' not in caplog.text and 'secret.invalid' not in caplog.text
+
+
+@pytest.mark.parametrize('exit_code', [-2, 256, True, 1.5, 'PRIVATE_EXIT'])
+@pytest.mark.parametrize('details', [{'error': {'class': 'PRIVATE_CLASS', 'message': 'PRIVATE_MESSAGE'}},
+    {'error': {'class': ['PRIVATE_CLASS']}}, {'error': 'PRIVATE_ERROR'}, 'PRIVATE_DETAILS'])
+def test_invalid_exit_code_or_error_payload_is_never_logged_verbatim(caplog, exit_code, details):
+    caplog.set_level(logging.WARNING, logger='app.canvas_auth')
+    error = CanvasCLIError('CLI_COMMAND_FAILED', 'PRIVATE_MESSAGE', exit_code=exit_code, details=details)
+    _auth_diagnostic(60, 'auth_wait', error)
+    assert 'exit_code=none' in caplog.text
+    assert 'error_class=other' in caplog.text or 'error_class=none' in caplog.text
+    assert 'PRIVATE' not in caplog.text
