@@ -168,6 +168,11 @@ class FakeDocker:
         self.postkill_metadata_delays = 0
         self.postkill_metadata_drift = None
         self.postkill_metadata_inspects = []
+        self.postkill_metadata_timeouts = 0
+        self.postkill_metadata_timeout_after_reads = 0
+        self.postkill_metadata_failure = None
+        self.postkill_metadata_clock = None
+        self.postkill_metadata_late_seconds = 0
         self.cgroup = FakeCgroup(self)
 
     def export_backup(self, companion_id, destination):
@@ -224,7 +229,20 @@ class FakeDocker:
                 "State": {"Running": not self.old_stopped and not self.old_removed, "Paused": self.paused,
                           'Pid': 0 if self.old_stopped else 4321, 'Restarting': False}}
             if self.old_stopped:
+                assert args[-1] == self.old_id
                 self.postkill_metadata_inspects.append(timeout)
+                if self.postkill_metadata_timeouts and len(self.postkill_metadata_inspects)>self.postkill_metadata_timeout_after_reads:
+                    self.postkill_metadata_timeouts -= 1
+                    if self.postkill_metadata_clock is not None:
+                        self.postkill_metadata_clock[0] += timeout
+                    raise subprocess.TimeoutExpired(args, timeout,
+                        output='[{"State":{"Pid":0,"Running":false,"Paused":false},"PRIVATE":"TOKEN"}]',
+                        stderr='PRIVATE_TOKEN=metadata-must-not-leak')
+                if self.postkill_metadata_failure is not None:
+                    if isinstance(self.postkill_metadata_failure, Exception):raise self.postkill_metadata_failure
+                    return self.postkill_metadata_failure
+                if self.postkill_metadata_clock is not None:
+                    self.postkill_metadata_clock[0] += self.postkill_metadata_late_seconds
                 if self.postkill_metadata_delays:
                     self.postkill_metadata_delays -= 1
                     value['State'].update(Running=True, Paused=True, Pid=4321)
@@ -717,6 +735,96 @@ class FrozenCutoverTests(unittest.TestCase):
         self.assertFalse(self.docker.old_removed)
         self.assertTrue(self.receipt()['postkill_outcome_requires_operator_review'])
         self.assertNotIn(['docker', 'rm', self.docker.old_id], self.docker.calls)
+
+    def test_postkill_inspect_timeouts_retry_only_observation_within_original_budget(self):
+        for timeouts,delays,prior_reads in ((1,0,0),(2,0,0),(1,2,0),(1,1,1)):
+            with self.subTest(timeouts=timeouts,delays=delays,prior_reads=prior_reads),tempfile.TemporaryDirectory() as directory:
+                self.release=Path(directory)
+                (self.release/'query-resume-baseline.safe.json').write_text(json.dumps({'binding_sha256':BINDING}))
+                self.docker=FakeDocker();clock=[100.]
+                self.docker.postkill_metadata_clock=clock
+                self.docker.postkill_metadata_timeouts=timeouts
+                self.docker.postkill_metadata_timeout_after_reads=prior_reads
+                self.docker.postkill_metadata_delays=delays
+                with patch.object(cutover.time,'monotonic',side_effect=lambda:clock[0]), \
+                     patch.object(cutover.time,'sleep',side_effect=lambda seconds:clock.__setitem__(0,clock[0]+seconds)):
+                    receipt=self.invoke()
+                self.assertTrue(receipt['passed'] and self.docker.old_removed)
+                self.assertEqual(receipt['docker_metadata_observation']['attempts'],timeouts+delays+1)
+                self.assertEqual(receipt['docker_metadata_observation']['timeout_count'],timeouts)
+                self.assertEqual(self.docker.kill_count,1)
+                self.assertEqual(self.docker.calls.count(['cgroup_wait_empty']),1)
+                self.assertLess(clock[0]-100,10)
+                self.assertNotIn('PRIVATE',json.dumps(receipt))
+                self.assertNotIn(['docker','unpause',self.docker.old_id],self.docker.calls)
+
+    def test_continuous_postkill_timeout_ignores_partial_json_and_cannot_remove_or_rekill(self):
+        clock=[100.];self.docker.postkill_metadata_clock=clock
+        self.docker.postkill_metadata_timeouts=1000
+        with patch.object(cutover.time,'monotonic',side_effect=lambda:clock[0]), \
+             patch.object(cutover.time,'sleep',side_effect=lambda seconds:clock.__setitem__(0,clock[0]+seconds)):
+            with self.assertRaisesRegex(RuntimeError,'OriginalContainerDeathNotVerified'):self.invoke()
+        receipt=self.receipt();observation=receipt['docker_metadata_observation']
+        self.assertAlmostEqual(clock[0]-100,10)
+        self.assertEqual(observation['attempts'],observation['timeout_count'])
+        self.assertEqual(observation['budget_seconds'],10)
+        self.assertTrue(any(timeout<2 for timeout in self.docker.postkill_metadata_inspects))
+        self.assertTrue(all(0<timeout<=2 for timeout in self.docker.postkill_metadata_inspects))
+        self.assertEqual(self.docker.kill_count,1)
+        self.assertEqual(self.docker.calls.count(['cgroup_wait_empty']),1)
+        self.assertTrue(receipt['cgroup_death']['original_pid_gone'])
+        self.assertFalse(receipt['passed'])
+        self.assertTrue(receipt['postkill_outcome_requires_operator_review'])
+        self.assertNotIn('PRIVATE',json.dumps(receipt))
+        self.assertNotIn(['docker','rm',self.docker.old_id],self.docker.calls)
+        self.assertNotIn(['docker','unpause',self.docker.old_id],self.docker.calls)
+
+    def test_postkill_drift_after_timeout_is_not_retried_or_accepted(self):
+        for field in ('id','name','image','config','host','mounts','policy','restart_count','restarting','pid'):
+            with self.subTest(field=field),tempfile.TemporaryDirectory() as directory:
+                self.release=Path(directory)
+                (self.release/'query-resume-baseline.safe.json').write_text(json.dumps({'binding_sha256':BINDING}))
+                self.docker=FakeDocker();clock=[100.]
+                self.docker.postkill_metadata_clock=clock;self.docker.postkill_metadata_timeouts=1
+                self.docker.postkill_metadata_drift=field
+                with patch.object(cutover.time,'monotonic',side_effect=lambda:clock[0]), \
+                     patch.object(cutover.time,'sleep',side_effect=lambda seconds:clock.__setitem__(0,clock[0]+seconds)):
+                    with self.assertRaisesRegex(RuntimeError,'OriginalContainerIdentityChangedAfterDeath'):self.invoke()
+                self.assertEqual(len(self.docker.postkill_metadata_inspects),2)
+                self.assertEqual(self.receipt()['docker_metadata_observation']['timeout_count'],1)
+                self.assertEqual(self.docker.kill_count,1)
+                self.assertNotIn(['docker','rm',self.docker.old_id],self.docker.calls)
+                self.assertNotIn(['docker','unpause',self.docker.old_id],self.docker.calls)
+
+    def test_postkill_late_complete_result_is_rejected_and_last_timeout_is_clamped(self):
+        clock=[100.];self.docker.postkill_metadata_clock=clock
+        self.docker.postkill_metadata_timeouts=4;self.docker.postkill_metadata_late_seconds=1.3
+        with patch.object(cutover.time,'monotonic',side_effect=lambda:clock[0]), \
+             patch.object(cutover.time,'sleep',side_effect=lambda seconds:clock.__setitem__(0,clock[0]+seconds)):
+            with self.assertRaisesRegex(RuntimeError,'OriginalContainerDeathNotVerified'):self.invoke()
+        self.assertLess(self.docker.postkill_metadata_inspects[-1],2)
+        self.assertAlmostEqual(self.docker.postkill_metadata_inspects[-1],1.2)
+        self.assertGreater(clock[0]-100,10)
+        self.assertEqual(self.docker.kill_count,1)
+        self.assertNotIn(['docker','rm',self.docker.old_id],self.docker.calls)
+        self.assertNotIn(['docker','unpause',self.docker.old_id],self.docker.calls)
+
+    def test_non_timeout_metadata_errors_after_timeout_fail_closed_without_retry(self):
+        for failure in (PermissionError('PRIVATE'),subprocess.CalledProcessError(1,['inspect'],stderr='PRIVATE'),'{bad json'):
+            with self.subTest(kind=type(failure).__name__),tempfile.TemporaryDirectory() as directory:
+                self.release=Path(directory)
+                (self.release/'query-resume-baseline.safe.json').write_text(json.dumps({'binding_sha256':BINDING}))
+                self.docker=FakeDocker();clock=[100.]
+                self.docker.postkill_metadata_clock=clock;self.docker.postkill_metadata_timeouts=1
+                self.docker.postkill_metadata_failure=failure
+                with patch.object(cutover.time,'monotonic',side_effect=lambda:clock[0]), \
+                     patch.object(cutover.time,'sleep',side_effect=lambda seconds:clock.__setitem__(0,clock[0]+seconds)):
+                    with self.assertRaises((PermissionError,subprocess.CalledProcessError,json.JSONDecodeError)):self.invoke()
+                self.assertEqual(len(self.docker.postkill_metadata_inspects),2)
+                self.assertEqual(self.docker.kill_count,1)
+                self.assertNotIn('PRIVATE',json.dumps(self.receipt()))
+                self.assertNotIn(['docker','rm',self.docker.old_id],self.docker.calls)
+                self.assertNotIn(['docker','unpause',self.docker.old_id],self.docker.calls)
 
     def test_postdeath_identity_restart_or_config_drift_rejects_immediately_without_rekill(self):
         for field in ('id', 'name', 'image', 'config', 'host', 'mounts', 'policy', 'restart_count', 'restarting', 'pid'):

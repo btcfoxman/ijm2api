@@ -875,18 +875,34 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
         metadata_started = time.monotonic()
         metadata_deadline = metadata_started + 10
         metadata_attempts = 0
+        metadata_timeout_count = 0
         while True:
             remaining = metadata_deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError("OriginalContainerDeathNotVerified")
-            current = json.loads(run(["docker", "inspect", old_id], timeout=min(2, remaining)))[0]
             metadata_attempts += 1
+            receipt["docker_metadata_observation"] = {"attempts": metadata_attempts,
+                "timeout_count": metadata_timeout_count,
+                "elapsed_seconds": max(0, time.monotonic() - metadata_started), "budget_seconds": 10}
+            try:
+                metadata_output = run(["docker", "inspect", old_id], timeout=min(2, remaining))
+            except subprocess.TimeoutExpired:
+                metadata_timeout_count += 1
+                receipt["docker_metadata_observation"].update(timeout_count=metadata_timeout_count,
+                    elapsed_seconds=max(0, time.monotonic() - metadata_started))
+                remaining = metadata_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("OriginalContainerDeathNotVerified") from None
+                time.sleep(min(0.2, remaining))
+                continue
+            receipt["docker_metadata_observation"]["elapsed_seconds"] = max(0, time.monotonic() - metadata_started)
+            if time.monotonic() >= metadata_deadline:
+                raise RuntimeError("OriginalContainerDeathNotVerified")
+            current = json.loads(metadata_output)[0]
             try:
                 receipt["old_container_death_diagnostic"] = old_container_diagnostic(current, old_id)
             except Exception as error:
                 receipt["old_container_death_diagnostic"] = diagnostic_error(error)
-            receipt["docker_metadata_observation"] = {"attempts": metadata_attempts,
-                "elapsed_seconds": max(0, time.monotonic() - metadata_started), "budget_seconds": 10}
             state = current.get("State") or {}
             if (container_stable_facts(current) != stable_facts
                     or type(current.get("RestartCount")) is not int
@@ -897,7 +913,7 @@ def freeze_remove(service, image, release, query_ids, startup_sha, run=execute,
                     or type(state.get("Pid")) is not int or state["Pid"] not in {0, identity["pid"]}):
                 raise RuntimeError("OriginalContainerIdentityChangedAfterDeath")
             remaining = metadata_deadline - time.monotonic()
-            if remaining < 0:
+            if remaining <= 0:
                 raise RuntimeError("OriginalContainerDeathNotVerified")
             if state["Running"] is False and state["Paused"] is False and state["Pid"] == 0:
                 break
