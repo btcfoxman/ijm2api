@@ -151,6 +151,53 @@ def test_raw_browser_failure_never_exposes_credentials(context):
     assert 'private' not in json.dumps(saved)
 
 
+def test_verified_identity_survives_later_settings_failure_without_enabling(context):
+    from app.account_automation import AutomationError
+    store, service, manager = context
+    item = account(store)
+    pool = queued(manager)
+    manager.start(item['id'])
+
+    def run(email, password, *, on_stage, on_identity):
+        on_identity({'user_id': 'synthetic-verified-user', 'email': email})
+        saved = store.account(item['id'], private=True)
+        assert saved['login_user_id'] == 'synthetic-verified-user'
+        assert not saved['enabled'] and not saved['watermark_ready'] and not saved['agreement_ready']
+        raise AutomationError('setup_required', 'synthetic unavailable preference')
+
+    with patch('app.auto_login.start_managed_browser', return_value=19301), \
+         patch('app.auto_login.AccountAutomation') as automation, patch('app.auto_login.DreaminaClient') as client:
+        automation.return_value.run.side_effect = run
+        fn, identifier, enable = pool.submit.call_args.args
+        fn(identifier, enable)
+    saved = store.account(item['id'], private=True)
+    assert saved['login_user_id'] == 'synthetic-verified-user'
+    assert saved['status'] == 'setup_required' and not saved['enabled']
+    assert not saved['watermark_ready'] and not saved['agreement_ready']
+    client.assert_not_called()
+
+
+def test_early_identity_binding_rejects_changed_credentials(context):
+    store, service, manager = context
+    item = account(store)
+    pool = queued(manager)
+    manager.start(item['id'])
+
+    def run(email, password, *, on_stage, on_identity):
+        store.update_account(item['id'], {'login_password': 'Changed synthetic credential'})
+        on_identity({'user_id': 'synthetic-verified-user', 'email': email})
+        pytest.fail('changed credentials received a binding')
+
+    with patch('app.auto_login.start_managed_browser', return_value=19301), \
+         patch('app.auto_login.AccountAutomation') as automation, patch('app.auto_login.DreaminaClient') as client:
+        automation.return_value.run.side_effect = run
+        fn, identifier, enable = pool.submit.call_args.args
+        fn(identifier, enable)
+    saved = store.account(item['id'], private=True)
+    assert saved['login_user_id'] == '' and not saved['enabled']
+    client.assert_not_called()
+
+
 def test_only_two_login_jobs_execute_concurrently(context):
     store, service, manager = context
     entered = threading.Event()

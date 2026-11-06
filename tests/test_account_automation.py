@@ -30,6 +30,25 @@ def browser_with_settings(settings):
 
 
 class ReadinessTests(unittest.TestCase):
+    def test_identity_callback_precedes_preference_failure_and_does_not_bypass_identity(self):
+        automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
+        observed = Mock()
+        with patch.object(automation, 'ensure_ready', side_effect=AutomationError('setup_required', 'synthetic preference failure')):
+            with self.assertRaises(AutomationError):
+                automation.run(ACCOUNT['login_email'], 'synthetic-password', on_identity=observed)
+        observed.assert_called_once_with({'user_id': IDENTITY['user_id'], 'email': IDENTITY['email']})
+
+        masked = {**IDENTITY, 'email': 'o***tor@example.invalid'}
+        browser = browser_with_settings(READY)
+        browser.evaluate.side_effect = lambda expression, **_: masked if expression == _IDENTITY else {'stage': 'waiting'}
+        automation = AccountAutomation(ACCOUNT, browser=browser)
+        observed.reset_mock()
+        with patch.object(automation, '_restart_unbound_session', side_effect=AutomationError('login_required', 'synthetic reauthentication required')):
+            with self.assertRaises(AutomationError):
+                automation.run(ACCOUNT['login_email'], 'synthetic-password', on_identity=observed)
+        observed.assert_not_called()
+        browser.post.assert_not_called()
+
     def test_identity_only_does_not_depend_on_or_request_generation_settings(self):
         browser = browser_with_settings(READY)
         browser.post.side_effect = BrowserError('settings are unavailable')
@@ -592,7 +611,7 @@ class LoginTests(unittest.TestCase):
                     else:
                         self.assertIs(automation.run(ACCOUNT['login_email'], 'synthetic-password')['identity_verified'], True)
                 self.assertEqual(events, ['enter', 'exit'])
-                run_login.assert_called_once_with(ACCOUNT['login_email'], 'synthetic-password', None)
+                run_login.assert_called_once_with(ACCOUNT['login_email'], 'synthetic-password', None, None)
 
     def test_run_waits_for_unknown_promotion_animation_before_identity_ready(self):
         automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))
@@ -1056,7 +1075,7 @@ root.querySelectorAll=s=>s==='.lv-modal.lv-modal-simple.lv-modal-closable'?(cfg.
  s==='button'?(cfg.extraButton?[offer,make('Subscribe')]:[offer]):s==='.lv-modal-close-icon'?
  (cfg.duplicateClose?[close,close]:[close]):s==='input,select,textarea'&&cfg.input?[make('')]:[];
 const document={querySelectorAll(s){
- if(s==='.lv-modal-wrapper.wrapper-u1VKtB')return cfg.otherClass?[]:[root];
+ if(s==='.lv-modal-wrapper.wrapper-u1VKtB,.lv-modal-wrapper.wrapper-dYQOPn')return cfg.otherClass?[]:[root];
  if(s.startsWith('[role=dialog],dialog'))return cfg.extraDialog?[root,extra]:[root];
  if(s==='button,[role=button]')return [offer];
  return [];
@@ -1068,6 +1087,8 @@ process.stdout.write(JSON.stringify({view,action,clicks}));
         variants = [({}, True), ({'body': 'Save up to 50% on plans to unlock Seedance. '
             'Seedance 2.5 at 720p from A$0.12/sec. Upgrade for up to 500 Seedance 2.5 + '
             '6,000 GPT Image 2.5 free generations. Get offer'}, True),
+                    ({'body': 'Save up to -% on plans to unlock Seedance. Find the right plan to keep your creations coming. Get offer'}, True),
+                    ({'body': 'Save up to -% on plans to unlock Seedance. Upgrade now. Get offer'}, False),
                     ({'body': 'Upgrade now. Get offer'}, False), ({'otherClass': True}, False),
                     ({'extraDialog': True}, False), ({'extraButton': True}, False), ({'badClose': True}, False),
                     ({'duplicateClose': True}, False), ({'input': True}, False), ({'badPanel': True}, False)]

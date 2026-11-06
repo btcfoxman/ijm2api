@@ -22,6 +22,10 @@ class AutomationError(BrowserError):
         self.status = status
 
 
+class UnboundSessionError(AutomationError):
+    """A masked residual session needs a fresh normal credential login."""
+
+
 _UI_LOCK = threading.RLock()
 _SETTINGS_GUARD = threading.Lock()
 _SETTINGS_LOCKS: dict[tuple[int, int], threading.RLock] = {}
@@ -73,13 +77,15 @@ _PROVIDER = r"""const provider=()=>{
 };"""
 
 _PROMOTION = r"""const promotion=()=>{
- const roots=[...document.querySelectorAll('.lv-modal-wrapper.wrapper-u1VKtB')].filter(visible);
+ const roots=[...document.querySelectorAll('.lv-modal-wrapper.wrapper-u1VKtB,.lv-modal-wrapper.wrapper-dYQOPn')].filter(visible);
  if(roots.length!==1)return null;
  const root=roots[0],body=text(root);
- if(!body.includes('Save up to 50% on plans to unlock Seedance.')||
-   !body.includes('Seedance 2.5 at 720p from A$0.12/sec.')||
-   !(body.includes('Upgrade for up to 500 free Seedance 2.5 videos + 6,000 free GPT Image 2.5')||
-     body.includes('Upgrade for up to 500 Seedance 2.5 + 6,000 GPT Image 2.5 free generations.')))return null;
+ const original=body.includes('Save up to 50% on plans to unlock Seedance.')&&
+   body.includes('Seedance 2.5 at 720p from A$0.12/sec.')&&
+   (body.includes('Upgrade for up to 500 free Seedance 2.5 videos + 6,000 free GPT Image 2.5')||
+     body.includes('Upgrade for up to 500 Seedance 2.5 + 6,000 GPT Image 2.5 free generations.'));
+ const fallback=body==='Save up to -% on plans to unlock Seedance. Find the right plan to keep your creations coming. Get offer';
+ if(!original&&!fallback)return null;
  const panels=[...root.querySelectorAll('.lv-modal.lv-modal-simple.lv-modal-closable')].filter(visible);
  const buttons=[...root.querySelectorAll('button')].filter(visible);
  const close=[...root.querySelectorAll('.lv-modal-close-icon')].filter(visible)
@@ -263,6 +269,21 @@ _WATERMARK = r"""(() => {
 })()"""
 
 
+_SIGN_OUT = r"""(() => {
+ const visible=e=>{if(!e)return false;if(e.checkVisibility&&!e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}))return false;
+  const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>2&&r.height>2&&
+   s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)!==0;};
+ const text=e=>(e.innerText||e.textContent||'').trim().replace(/\s+/g,' ');
+ if([...document.querySelectorAll('[role=dialog],dialog,.lv-modal-wrapper')].some(visible))return false;
+ const panels=[...document.querySelectorAll('[class*="top-actions-logged-in-"] [class*="panel-card-"]')].filter(visible);
+ const targets=panels.flatMap(panel=>{const buttons=[...panel.querySelectorAll('button')].filter(visible);
+  return buttons.filter(e=>text(e)==='Sign out'&&String(e.className).includes('settings-row-')&&
+   buttons.filter(other=>text(other)==='Remove watermarks').length===1);});
+ if(targets.length!==1)return false;
+ targets[0].click();return true;
+})()"""
+
+
 class AccountAutomation:
     def __init__(self, account: dict[str, Any], settings: dict[str, Any] | None = None,
                  *, browser: CDPBrowser | None = None, allow_initial_identity: bool = False) -> None:
@@ -301,10 +322,11 @@ class AccountAutomation:
             raise AutomationError('login_required', 'Dreamina signed-in identity does not match this account')
         bound_id = str(self.account.get('login_user_id') or self.verified_user_id or '')
         expected_id = str(self.account.get('user_id') or '')
-        if ((bound_id and user_id != bound_id) or (expected_id and user_id != expected_id)
-                or (masked and self.expected_email and not bound_id
-                    and not (self._password_submitted or self.allow_initial_identity))):
+        if ((bound_id and user_id != bound_id) or (expected_id and user_id != expected_id)):
             raise AutomationError('login_required', 'Dreamina signed-in identity does not match this account')
+        if (masked and self.expected_email and not bound_id
+                and not (self._password_submitted or self.allow_initial_identity)):
+            raise UnboundSessionError('login_required', 'Dreamina residual session requires a fresh credential login')
         self.verified_user_id = user_id
         return {'user_id': user_id, 'email': email}
 
@@ -471,6 +493,36 @@ class AccountAutomation:
             raise AutomationError('login_required', 'Dreamina login page is not ready')
         return value
 
+    def _restart_unbound_session(self) -> None:
+        """Sign out through the recorded menu; never accept the residual identity."""
+        deadline = time.monotonic() + min(30, self.timeout)
+        warmed = opened = False
+        while time.monotonic() < deadline:
+            view = self.browser.evaluate(_VIEW)
+            if not isinstance(view, dict) or view.get('stage') in {'unknown', 'challenge', 'verification'}:
+                raise AutomationError('login_required', 'Dreamina session recovery requires manual page review')
+            current = self._watermark_action()
+            stage = current.get('stage')
+            if stage == 'menu':
+                with _UI_LOCK:
+                    if self.browser.evaluate(_SIGN_OUT) is not True:
+                        raise AutomationError('login_required', 'Dreamina sign-out control was not confirmed')
+                break
+            if stage == 'avatar_loading' and not warmed:
+                warmed = self._watermark_action('warm_avatar').get('stage') == 'warmed'
+            elif stage == 'avatar' and not opened:
+                opened = self._watermark_action('open_avatar').get('stage') == 'opened'
+            time.sleep(.3)
+        else:
+            raise AutomationError('login_required', 'Dreamina sign-out did not finish')
+        while time.monotonic() < deadline:
+            view = self.browser.evaluate(_VIEW)
+            if isinstance(view, dict) and view.get('stage') in {'signed_out', 'provider', 'email', 'password'}:
+                self.verified_user_id = ''
+                return
+            time.sleep(.3)
+        raise AutomationError('login_required', 'Dreamina signed-out state was not confirmed')
+
     def _fill(self, selector: str, value: str) -> bool:
         # insertText delivers normal browser input events; neither return nor
         # persist the password, DOM field values, or arbitrary exception text.
@@ -519,15 +571,17 @@ class AccountAutomation:
             return self.browser.evaluate(_CLICK.replace('__ACTION__', json.dumps(stage))) is True
 
     def run(self, email: str, password: str,
-            on_stage: Callable[[str], Any] | None = None) -> dict[str, Any]:
+            on_stage: Callable[[str], Any] | None = None,
+            on_identity: Callable[[dict[str, Any]], Any] | None = None) -> dict[str, Any]:
         # A cold page can fill the default 250-resource buffer before the
         # signed-in SDK account/info request. Keep one CDP session attached
         # so current and replacement documents retain the genuine URL.
         with self.browser.resource_timing_capture():
-            return self._run_login(email, password, on_stage)
+            return self._run_login(email, password, on_stage, on_identity)
 
     def _run_login(self, email: str, password: str,
-                   on_stage: Callable[[str], Any] | None = None) -> dict[str, Any]:
+                   on_stage: Callable[[str], Any] | None = None,
+                   on_identity: Callable[[dict[str, Any]], Any] | None = None) -> dict[str, Any]:
         email = str(email).strip()
         if not email or not password:
             raise AutomationError('login_required', 'Dreamina email and password are required')
@@ -545,6 +599,7 @@ class AccountAutomation:
         submitted_at: float | None = None
         optional_closed_at: dict[str, float] = {}
         unknown_since: float | None = None
+        restarted_session = False
         callback('login')
         while time.monotonic() < deadline:
             now = time.monotonic()
@@ -585,6 +640,14 @@ class AccountAutomation:
                 identity_checked_at = now
                 try:
                     identity = self._identity()
+                except UnboundSessionError:
+                    if restarted_session or actions.intersection({'email', 'password'}):
+                        raise
+                    # Only a fresh password flow can establish this session's
+                    # initial binding. Sign out once using normal website UI.
+                    self._restart_unbound_session()
+                    restarted_session = True
+                    continue
                 except AutomationError as error:
                     if 'does not match' in str(error):
                         raise
@@ -592,6 +655,10 @@ class AccountAutomation:
                 except BrowserError:
                     identity = None
                 if identity is not None:
+                    # Preserve a verified binding even if a later preference or
+                    # credit read fails. This never marks preferences ready.
+                    if on_identity is not None:
+                        on_identity(dict(identity))
                     callback('settings')
                     evidence = self.ensure_ready()
                     callback('verifying')

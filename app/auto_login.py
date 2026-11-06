@@ -125,7 +125,18 @@ class AutoLoginManager:
                 self.store.update_account(account_id, {'cdp_port': port, 'managed_profile': True})
             account = {**account, 'cdp_port': port}
             stage('login')
-            ready = AccountAutomation(account, settings).run(account['login_email'], account['login_password'], on_stage=stage)
+            def preserve_identity(identity):
+                user_id = verified_login_user_id({'identity_verified': True, 'identity': identity})
+                with self.service._lock:
+                    current = self.store.account(account_id, private=True)
+                    if (not user_id or not current or account_id not in self._pending
+                            or current.get('login_email') != account.get('login_email')
+                            or current.get('login_password') != account.get('login_password')
+                            or current.get('login_user_id') not in ('', None, user_id)):
+                        raise ValueError('account identity changed during login')
+                    self.store.update_account(account_id, {'login_user_id': user_id})
+            ready = AccountAutomation(account, settings).run(account['login_email'], account['login_password'],
+                                                            on_stage=stage, on_identity=preserve_identity)
             if any(ready.get(key) is not True for key in ('watermark_ready', 'agreement_ready', 'identity_verified')):
                 self.store.update_account(account_id, {'status': 'setup_required', 'login_stage': 'setup_required',
                     'last_error': SAFE_FAILURES['setup_required'], 'enabled': False})
