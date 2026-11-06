@@ -1070,12 +1070,13 @@ const make=text=>({innerText:text,textContent:text,disabled:false,className:'',c
 const offer=make('Get offer'),close=make('Close'),panel=make('offer panel'),extra=make('Unknown consent');
 const body=cfg.body||'Save up to 50% on plans to unlock Seedance. Seedance 2.5 at 720p from A$0.12/sec. Upgrade for up to 500 free Seedance 2.5 videos + 6,000 free GPT Image 2.5 images.';
 const root=make(body);close.querySelectorAll=()=>cfg.badClose?[]:[make('')];
+root.contains=e=>e===root||(cfg.nestedDialog&&e===panel)||(cfg.nestedExtra&&e===extra);
 root.querySelectorAll=s=>s==='.lv-modal.lv-modal-simple.lv-modal-closable'?(cfg.badPanel?[]:[panel]):
  s==='button'?(cfg.extraButton?[offer,make('Subscribe')]:[offer]):s==='.lv-modal-close-icon'?
  (cfg.duplicateClose?[close,close]:[close]):s==='input,select,textarea'&&cfg.input?[make('')]:[];
 const document={querySelectorAll(s){
  if(s==='.lv-modal-wrapper.wrapper-u1VKtB,.lv-modal-wrapper.wrapper-dYQOPn')return cfg.otherClass?[]:[root];
- if(s.startsWith('[role=dialog],dialog'))return cfg.extraDialog?[root,extra]:[root];
+ if(s.startsWith('[role=dialog],dialog'))return [root,...(cfg.nestedDialog?[panel]:[]),...(cfg.extraDialog||cfg.nestedExtra?[extra]:[])];
  if(s==='button,[role=button]')return [offer];
  return [];
 }};
@@ -1083,7 +1084,9 @@ const context={document,innerHeight:960,innerWidth:1280,getComputedStyle:()=>({d
 const view=vm.runInNewContext(payload.view,context),action=vm.runInNewContext(payload.action,context);
 process.stdout.write(JSON.stringify({view,action,clicks}));
 '''
-        variants = [({}, True), ({'body': 'Save up to 50% on plans to unlock Seedance. '
+        variants = [({}, True), ({'nestedDialog': True}, True),
+                    ({'nestedExtra': True}, False), ({'nestedDialog': True, 'extraDialog': True}, False),
+                    ({'body': 'Save up to 50% on plans to unlock Seedance. '
             'Seedance 2.5 at 720p from A$0.12/sec. Upgrade for up to 500 Seedance 2.5 + '
             '6,000 GPT Image 2.5 free generations. Get offer'}, True),
                     ({'body': 'Save up to -% on plans to unlock Seedance. Find the right plan to keep your creations coming. Get offer'}, True),

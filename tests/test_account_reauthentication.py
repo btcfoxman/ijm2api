@@ -7,7 +7,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from app.account_automation import AccountAutomation, AutomationError, UnboundSessionError, _IDENTITY, _SIGN_OUT, _VIEW
+from app import account_automation as module
+from app.account_automation import AccountAutomation, AutomationError, UnboundSessionError, _IDENTITY, _SIGN_OUT, _VIEW, _CLICK
 
 
 ACCOUNT = {'id': 42, 'cdp_port': 19342, 'proxy_url': 'socks5://proxy.invalid:10000',
@@ -66,6 +67,143 @@ def test_uncertain_password_result_never_restarts_or_resubmits_credentials():
             instance.run(ACCOUNT['login_email'], 'synthetic-password')
     restart.assert_not_called()
     action.assert_called_once_with('password', ACCOUNT['login_email'], 'synthetic-password')
+
+
+@pytest.mark.parametrize('mounting', [False, True])
+def test_known_promotion_is_closed_inside_signout_transaction_before_one_fresh_password_flow(mounting):
+    instance = automation()
+    clock = [0.]
+    state = {'phase': 'residual', 'identity_reads': 0}
+    actions = []
+    ready = {'identity_verified': True, 'watermark_ready': True, 'agreement_ready': True,
+             'identity': {'user_id': MASKED['user_id'], 'email': MASKED['email']}}
+    promotion_click = _CLICK.replace('__ACTION__', json.dumps('promotion'))
+    password_click = _CLICK.replace('__ACTION__', json.dumps('password'))
+    def evaluate(expression, **_):
+        if expression == _IDENTITY:
+            state['identity_reads'] += 1
+            if state['identity_reads'] == 1:
+                state['phase'] = 'promotion_mounting' if mounting else 'promotion'
+            return MASKED.copy()
+        if expression == _VIEW:
+            if state['phase'] == 'promotion_mounting':
+                state['phase'] = 'promotion'
+                return {'stage': 'unknown'}
+            return {'stage': {'promotion': 'promotion', 'password': 'password'}.get(state['phase'], 'waiting')}
+        if expression == promotion_click:
+            assert module._UI_LOCK._is_owned()
+            assert instance._password_submitted is False
+            actions.append('close_promotion')
+            state['phase'] = 'residual'
+            return True
+        if expression == _SIGN_OUT:
+            assert module._UI_LOCK._is_owned()
+            assert state['phase'] == 'residual' and actions == ['close_promotion']
+            actions.append('sign_out')
+            state['phase'] = 'password'
+            return True
+        if expression == password_click:
+            actions.append('password_continue')
+            state['phase'] = 'authenticated'
+            return True
+        raise AssertionError('Unexpected browser expression')
+    instance.browser.evaluate.side_effect = evaluate
+    def menu(action='view'):
+        assert action == 'view' and state['phase'] == 'residual'
+        return {'stage': 'menu'}
+    with (patch.object(instance, '_watermark_action', side_effect=menu),
+          patch.object(instance, '_fill', return_value=True) as fill,
+          patch.object(instance, 'ensure_ready', return_value=ready),
+          patch.object(module.time, 'monotonic', side_effect=lambda: clock[0]),
+          patch.object(module.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds))):
+        assert instance.run(ACCOUNT['login_email'], 'synthetic-password') == ready
+    assert actions == ['close_promotion', 'sign_out', 'password_continue']
+    assert fill.call_count == 2
+    assert sum('type="password"' in call.args[0] for call in fill.call_args_list) == 1
+    assert instance._password_submitted is True
+    instance.browser.post.assert_not_called()
+
+
+@pytest.mark.parametrize('view', [{'stage': 'unknown'}, {'stage': 'challenge'}, {'stage': 'verification'}])
+def test_unknown_or_review_dialog_before_signout_cannot_close_or_send_credentials(view):
+    instance = automation()
+    instance.browser.evaluate.return_value = view
+    with (patch.object(instance, '_action') as action,
+          patch.object(instance, '_fill') as fill,
+          patch.object(instance, '_watermark_action') as menu):
+        with pytest.raises(AutomationError, match='manual page review'):
+            instance._restart_unbound_session()
+    action.assert_not_called()
+    fill.assert_not_called()
+    menu.assert_not_called()
+    assert instance._password_submitted is False
+    instance.browser.command.assert_not_called()
+    instance.browser.post.assert_not_called()
+
+
+def test_unknown_recheck_cannot_accept_an_unrelated_waiting_page():
+    instance = automation()
+    views = iter([{'stage': 'unknown'}, {'stage': 'waiting'}])
+    instance.browser.evaluate.side_effect = lambda *_args, **_kwargs: next(views, {'stage': 'waiting'})
+    with (patch.object(instance, '_action') as action,
+          patch.object(instance, '_watermark_action') as menu):
+        with pytest.raises(AutomationError, match='manual page review'):
+            instance._restart_unbound_session()
+    action.assert_not_called()
+    menu.assert_not_called()
+    instance.browser.command.assert_not_called()
+
+
+def test_recovery_promotion_close_wait_is_clipped_to_original_login_deadline():
+    instance = automation()
+    clock = [0.]
+    instance._login_deadline = 1.
+    instance.browser.evaluate.return_value = {'stage': 'promotion'}
+    def close(*args):
+        assert args == ('promotion', '', '')
+        assert module._UI_LOCK._is_owned()
+        return True
+    with (patch.object(instance, '_action', side_effect=close) as action,
+          patch.object(instance, '_fill') as fill,
+          patch.object(instance, '_watermark_action') as menu,
+          patch.object(module.time, 'monotonic', side_effect=lambda: clock[0]),
+          patch.object(module.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds))):
+        with pytest.raises(AutomationError, match='optional offer could not be closed'):
+            instance._restart_unbound_session()
+    assert clock[0] == 1.
+    action.assert_called_once_with('promotion', '', '')
+    fill.assert_not_called()
+    menu.assert_not_called()
+    assert instance._password_submitted is False
+
+
+def test_changed_or_rejected_promotion_shape_never_proceeds_to_signout_or_password():
+    instance = automation()
+    instance.browser.evaluate.return_value = {'stage': 'promotion'}
+    with (patch.object(instance, '_action', return_value=False) as action,
+          patch.object(instance, '_fill') as fill,
+          patch.object(instance, '_watermark_action') as menu):
+        with pytest.raises(AutomationError, match='optional offer could not be closed'):
+            instance._restart_unbound_session()
+    action.assert_called_once_with('promotion', '', '')
+    fill.assert_not_called()
+    menu.assert_not_called()
+    instance.browser.post.assert_not_called()
+
+
+def test_missing_password_cannot_start_recovery_or_close_any_dialog():
+    instance = automation()
+    with (patch.object(instance, '_restart_unbound_session') as restart,
+          patch.object(instance, '_action') as action,
+          patch.object(instance, '_fill') as fill):
+        with pytest.raises(AutomationError, match='email and password are required'):
+            instance._run_login(ACCOUNT['login_email'], '')
+    restart.assert_not_called()
+    action.assert_not_called()
+    fill.assert_not_called()
+    instance.browser.evaluate.assert_not_called()
+    instance.browser.command.assert_not_called()
+    instance.browser.post.assert_not_called()
 
 
 def test_signout_requires_an_explicit_logged_out_view_before_password_flow():

@@ -154,7 +154,7 @@ _PROMOTION = r"""const promotion=()=>{
  if(panels.length!==1||buttons.length!==1||text(buttons[0])!=='Get offer'||close.length!==1||
    [...root.querySelectorAll('input,select,textarea')].some(visible))return null;
  const dialogs=[...document.querySelectorAll('[role=dialog],dialog,.lv-modal-wrapper')].filter(visible);
- if(dialogs.some(e=>!e.contains(root)&&!root.contains(e)))return null;
+ if(dialogs.some(e=>e!==root&&e!==panels[0]))return null;
  return {root,close:close[0]};
 };"""
 
@@ -527,12 +527,16 @@ class AccountAutomation:
 
     def _dismiss_promotion(self) -> bool:
         """Close only the recorded optional offer, never a subscription flow."""
+        deadline = min(time.monotonic() + 5,
+                       getattr(self, '_menu_deadline', float('inf')),
+                       getattr(self, '_login_deadline', float('inf')))
         view = self.browser.evaluate(_VIEW)
         if not isinstance(view, dict) or view.get('stage') != 'promotion':
             return False
+        if time.monotonic() >= deadline:
+            raise AutomationError('setup_required', 'Dreamina optional offer could not be closed')
         if not self._action('promotion', '', ''):
             raise AutomationError('setup_required', 'Dreamina optional offer could not be closed')
-        deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             current = self.browser.evaluate(_VIEW)
             if isinstance(current, dict) and current.get('stage') != 'promotion':
@@ -545,7 +549,7 @@ class AccountAutomation:
                     return True
                 # The known modal's fading wrapper briefly outlives its
                 # content. Wait without interacting with any unknown UI.
-            time.sleep(.2)
+            time.sleep(min(.2, max(0, deadline - time.monotonic())))
         raise AutomationError('setup_required', 'Dreamina optional offer could not be closed')
 
     def _watermark_action(self, action: str = 'view') -> dict[str, Any]:
@@ -647,8 +651,25 @@ class AccountAutomation:
 
     def _restart_unbound_session_locked(self, deadline: float) -> None:
         warmed = opened = False
+        promotion_closed = False
         while time.monotonic() < deadline:
             view = self.browser.evaluate(_VIEW)
+            if isinstance(view, dict) and view.get('stage') == 'unknown' and time.monotonic() < deadline:
+                # A mounting offer can be unknown for one frame. Reclassify
+                # once, accepting only the same strict recorded offer shape.
+                latest = self.browser.evaluate(_VIEW)
+                if isinstance(latest, dict) and latest.get('stage') == 'promotion':
+                    view = latest
+            if isinstance(view, dict) and view.get('stage') == 'promotion':
+                if promotion_closed:
+                    raise AutomationError('login_required', 'Dreamina session recovery requires manual page review')
+                promotion_closed = self._dismiss_promotion()
+                # The close can replace wrappers and menu coordinates. Read a
+                # fresh view before opening the normal account sign-out menu.
+                warmed = opened = False
+                if not promotion_closed:
+                    time.sleep(min(.2, max(0, deadline - time.monotonic())))
+                continue
             if not isinstance(view, dict) or view.get('stage') in {'unknown', 'challenge', 'verification'}:
                 raise AutomationError('login_required', 'Dreamina session recovery requires manual page review')
             current = self._watermark_action()
