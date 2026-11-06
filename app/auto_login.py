@@ -174,7 +174,7 @@ class AutoLoginManager:
                     diagnostic = automation.failure_diagnostic(error)
             except Exception:
                 pass
-            log.warning('Automatic login stopped category=%s diagnostic=%s', status,
+            log.warning('account_id=%d Automatic login stopped category=%s diagnostic=%s', int(account_id), status,
                         json.dumps(safe_failure_diagnostic(diagnostic), sort_keys=True))
             self.store.update_account(account_id, {'status': status, 'enabled': False,
                 'login_stage': status, 'last_error': SAFE_FAILURES[status]})

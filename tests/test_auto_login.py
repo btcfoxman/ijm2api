@@ -172,7 +172,8 @@ def test_safe_failure_diagnosis_is_logged_before_browser_cleanup_without_identit
         fn(identifier, enable)
     assert order == ['diagnostic', 'cleanup']
     assert 'settings_read_unavailable' in caplog.text
-    assert secret not in caplog.text and 'account_id' not in caplog.text
+    assert 'account_id=' + str(item['id']) + ' Automatic login stopped category=setup_required' in caplog.text
+    assert secret not in caplog.text
     assert item['name'] not in caplog.text and 'person1@example.test' not in caplog.text
     assert store.account(item['id'])['status'] == 'setup_required'
 

@@ -63,6 +63,24 @@ def _auth_diagnostic(account_id: int, phase: str, error: Exception | None = None
         kind if kind in {'CanvasCLIError', 'BrowserError', 'TimeoutError', 'ConnectionError',
                          'WebSocketTimeoutException', 'RuntimeError', 'AutomationError', 'none'} else 'other',
         bool(confirmed), bool(manual), exit_code, error_class)
+
+
+def _auth_lifecycle(account_id: int, event: str, *, attempt: int, started: float,
+                    deadline: float, expires: float | None = None) -> None:
+    """Observe challenge timing without retaining a code, URL or CLI payload."""
+    events = {'login_started', 'challenge_created', 'consent_dispatched', 'first_poll',
+              'challenge_expired', 'refresh_requested', 'refresh_rejected'}
+    now = time.monotonic()
+    ttl = expires - time.time() if expires is not None else None
+    _AUTH_LOG.warning('canvas_auth_lifecycle account_id=%d event=%s attempt=%d elapsed_s=%d remaining_s=%d ttl_s=%s expired=%s',
+        int(account_id), event if event in events else 'refresh_rejected',
+        attempt if type(attempt) is int and attempt in {1, 2} else 0,
+        min(86400, max(0, int(now - started))),
+        min(600, max(0, math.ceil(deadline - now))),
+        max(-86400, min(86400, math.ceil(ttl))) if ttl is not None else 'none',
+        ttl is not None and ttl <= 0)
+
+
 _CONFIRM = r"""(() => {
  if(location.protocol!=='https:'||location.hostname!=='dreamina.capcut.com'||!/^\/ai-tool\/cli-auth-os\/?$/.test(location.pathname))return 'manual_required';
  const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>1&&r.height>1&&s.display!=='none'&&s.visibility!=='hidden';};
@@ -415,11 +433,13 @@ class CanvasAuthManager:
         return None
 
     def _await_authorization(self, account_id: int, account: dict, client: Any,
-                             device_code: str, deadline: float, browser: Any = None) -> None:
+                             device_code: str, deadline: float, browser: Any = None, *,
+                             lifecycle: dict | None = None) -> str:
         """A click is only dispatched; CLI completion proves consent was saved."""
         cancel = self._jobs[account_id]['cancel']
         clicked = False
         manual = browser is None
+        first_poll = True
         while not cancel.is_set() and not self._closed and time.monotonic() < deadline:
             if browser is not None and not clicked and not manual:
                 try:
@@ -429,32 +449,103 @@ class CanvasAuthManager:
                         self._publish(account_id, 'manual_required', '授权需要人工确认，请打开账号授权画面完成')
                     elif state == 'confirmed':
                         clicked = True
+                        if lifecycle is not None:
+                            _auth_lifecycle(account_id, 'consent_dispatched', **lifecycle)
                 except Exception as exc:
                     _auth_diagnostic(account_id, 'browser_confirmation', exc, confirmed=clicked, manual=True)
                     manual = True
                     self._publish(account_id, 'manual_required', '自动授权未完成，请打开账号授权画面确认')
             try:
+                if time.monotonic() >= deadline or cancel.is_set() or self._closed:
+                    break
                 phase = 'auth_wait'
+                if first_poll and lifecycle is not None:
+                    _auth_lifecycle(account_id, 'first_poll', **lifecycle)
+                first_poll = False
                 result = client.auth_wait(device_code, timeout=5)
+                if time.monotonic() >= deadline or cancel.is_set() or self._closed:
+                    break
                 if isinstance(result, dict) and str(result.get('status') or result.get('state') or '').lower() in {
                         'pending', 'authorization_pending', 'waiting', 'timeout'}:
                     cancel.wait(.5)
                     continue
                 phase = 'identity'
-                self._accept_identity(account_id, account, client.identity())
-                return
+                identity = client.identity()
+                if time.monotonic() >= deadline or cancel.is_set() or self._closed:
+                    break
+                self._accept_identity(account_id, account, identity)
+                return 'complete'
             except Exception as exc:
                 code = str(getattr(exc, 'code', '')).upper()
                 if any(part in code for part in ('PENDING', 'TIMEOUT', 'SLOW_DOWN', 'WAITING')):
                     cancel.wait(1)
                     continue
                 _auth_diagnostic(account_id, phase, exc, confirmed=clicked, manual=manual)
+                if phase == 'auth_wait' and getattr(exc, 'code', None) == 'cli.login_expired':
+                    with self._guard:
+                        for key in ('verification_uri', 'verification_uri_complete', 'user_code'):
+                            self._jobs[account_id]['public'].pop(key, None)
+                    if lifecycle is not None:
+                        _auth_lifecycle(account_id, 'challenge_expired', **lifecycle)
+                    return 'login_expired'
                 self._publish(account_id, 'failed', 'CLI 授权验证失败，请重新授权')
-                return
+                return 'terminal'
         if not cancel.is_set() and not self._closed:
             _auth_diagnostic(account_id, 'authorization_deadline', confirmed=clicked, manual=manual)
         self._publish(account_id, 'cancelled' if cancel.is_set() or self._closed else 'expired',
             'CLI 授权已取消' if cancel.is_set() or self._closed else 'CLI 授权已过期，请重试')
+        return 'terminal'
+
+    def _challenge_attempt(self, account_id: int, account: dict, client: Any, challenge: dict,
+                           *, started: float, deadline: float, attempt: int) -> str:
+        """Return only after this challenge's browser and auxiliary leases close."""
+        cancel = self._jobs[account_id]['cancel']
+        uri = challenge.get('verificationUriComplete') or challenge.get('verificationUri') or ''
+        parsed = urlsplit(str(uri))
+        if parsed.scheme != 'https' or parsed.hostname not in _AUTH_HOSTS or parsed.username or parsed.password:
+            self._publish(account_id, 'failed', 'CLI 授权地址不受支持，请检查官方 CLI 版本')
+            return 'terminal'
+        raw_expiry = challenge.get('expiresAt')
+        expires = self._expiry(raw_expiry)
+        if raw_expiry not in (None, '') and (expires is None or not math.isfinite(expires)):
+            self._publish(account_id, 'failed', 'CLI 授权到期时间无效，请重新授权')
+            return 'terminal'
+        lifecycle = {'attempt': attempt, 'started': started, 'deadline': deadline, 'expires': expires}
+        _auth_lifecycle(account_id, 'challenge_created', **lifecycle)
+        challenge_deadline = min(deadline, time.monotonic() + max(0, expires - time.time())) if expires is not None else deadline
+        if cancel.is_set() or self._closed or time.monotonic() >= challenge_deadline:
+            self._publish(account_id, 'cancelled' if cancel.is_set() or self._closed else 'expired',
+                'CLI 授权已取消' if cancel.is_set() or self._closed else 'CLI 授权已过期，请重试')
+            return 'terminal'
+        self._publish(account_id, 'authorizing', verification_uri=str(challenge.get('verificationUri') or uri),
+            verification_uri_complete=str(uri), user_code=str(challenge.get('userCode') or ''))
+        slot = False
+        while not cancel.is_set() and not self._closed and time.monotonic() < challenge_deadline:
+            if self._browser_slots.acquire(timeout=.25):
+                slot = True
+                break
+        with ExitStack() as resources:
+            browser = None
+            if slot and not cancel.is_set() and not self._closed and time.monotonic() < challenge_deadline:
+                resources.callback(self._browser_slots.release)
+                try:
+                    browser_account = resources.enter_context(self.service.browser_runtime.lease(account))
+                    if time.monotonic() < challenge_deadline and not cancel.is_set() and not self._closed:
+                        browser = self.browser_factory(browser_account)
+                        browser.open(str(uri))
+                        with self._guard:
+                            self._jobs[account_id]['browser_active'] = True
+                        resources.callback(self._browser_inactive, account_id)
+                        resources.callback(self._close_assist, account_id)
+                except Exception as exc:
+                    _auth_diagnostic(account_id, 'browser_open', exc, manual=True)
+                    browser = None
+                    resources.close()
+                    self._publish(account_id, 'manual_required', '自动授权未完成，请打开账号授权画面确认')
+            elif slot:
+                self._browser_slots.release()
+            return self._await_authorization(account_id, account, client,
+                str(challenge['deviceCode']), challenge_deadline, browser=browser, lifecycle=lifecycle)
 
     def _run(self, account_id: int) -> None:
         job = self._jobs[account_id]
@@ -482,51 +573,48 @@ class CanvasAuthManager:
             if identity is not None:
                 self._accept_identity(account_id, account, identity)
                 return
-            phase = 'auth_start'
-            response = client.auth_start(force=True) if job['force'] else client.auth_start()
-            challenge = response.get('challenge') if isinstance(response, dict) else None
-            if not isinstance(challenge, dict) or not challenge.get('deviceCode'):
-                # Some CLI versions finish immediately when the profile is valid.
-                self._accept_identity(account_id, account, client.identity())
-                return
-            uri = challenge.get('verificationUriComplete') or challenge.get('verificationUri') or ''
-            parsed = urlsplit(str(uri))
-            if parsed.scheme != 'https' or parsed.hostname not in _AUTH_HOSTS or parsed.username or parsed.password:
-                self._publish(account_id, 'failed', 'CLI 授权地址不受支持，请检查官方 CLI 版本')
-                return
-            self._publish(account_id, 'authorizing', verification_uri=str(challenge.get('verificationUri') or uri),
-                verification_uri_complete=str(uri), user_code=str(challenge.get('userCode') or ''))
-            deadline = time.monotonic() + self.timeout
-            expires = self._expiry(challenge.get('expiresAt'))
-            if expires is not None:
-                deadline = min(deadline, time.monotonic() + max(0, expires - time.time()))
-            slot = False
-            while not cancel.is_set() and not self._closed and time.monotonic() < deadline:
-                if self._browser_slots.acquire(timeout=.25):
-                    slot = True
-                    break
-            with ExitStack() as resources:
-                browser = None
-                if slot:
-                    resources.callback(self._browser_slots.release)
-                    try:
-                        phase = 'browser_open'
-                        browser_account = resources.enter_context(self.service.browser_runtime.lease(account))
-                        browser = self.browser_factory(browser_account)
-                        browser.open(str(uri))
-                        with self._guard:
-                            job['browser_active'] = True
-                        resources.callback(self._browser_inactive, account_id)
-                        # Close a viewer lease first, the worker browser second,
-                        # and only then release its auxiliary concurrency slot.
-                        resources.callback(self._close_assist, account_id)
-                    except Exception as exc:
-                        _auth_diagnostic(account_id, phase, exc, manual=True)
-                        browser = None
-                        resources.close()
-                        self._publish(account_id, 'manual_required', '自动授权未完成，请打开账号授权画面确认')
-                self._await_authorization(account_id, account, client,
-                    str(challenge['deviceCode']), deadline, browser=browser)
+            started = time.monotonic()
+            deadline = started + self.timeout
+            previous_code = None
+            # Official global 1.2.1 Device Flow: cli.login_expired requires an
+            # ordinary login with a new challenge, never --force or logout.
+            for attempt in (1, 2):
+                if cancel.is_set() or self._closed or time.monotonic() >= deadline:
+                    self._publish(account_id, 'cancelled' if cancel.is_set() or self._closed else 'expired',
+                        'CLI 授权已取消' if cancel.is_set() or self._closed else 'CLI 授权已过期，请重试')
+                    return
+                phase = 'auth_start'
+                _auth_lifecycle(account_id, 'login_started', attempt=attempt, started=started, deadline=deadline)
+                response = client.auth_start(force=True) if job['force'] and attempt == 1 else client.auth_start()
+                if cancel.is_set() or self._closed or time.monotonic() >= deadline:
+                    self._publish(account_id, 'cancelled' if cancel.is_set() or self._closed else 'expired',
+                        'CLI 授权已取消' if cancel.is_set() or self._closed else 'CLI 授权已过期，请重试')
+                    return
+                challenge = response.get('challenge') if isinstance(response, dict) else None
+                if not isinstance(challenge, dict) or not challenge.get('deviceCode'):
+                    # Login may finish immediately, including a delayed prior consent.
+                    phase = 'identity'
+                    identity = client.identity()
+                    if cancel.is_set() or self._closed or time.monotonic() >= deadline:
+                        self._publish(account_id, 'cancelled' if cancel.is_set() or self._closed else 'expired',
+                            'CLI 授权已取消' if cancel.is_set() or self._closed else 'CLI 授权已过期，请重试')
+                    else:
+                        self._accept_identity(account_id, account, identity)
+                    return
+                device_code = str(challenge['deviceCode'])
+                if previous_code is not None and device_code == previous_code:
+                    _auth_lifecycle(account_id, 'refresh_rejected', attempt=attempt, started=started, deadline=deadline)
+                    self._publish(account_id, 'failed', 'CLI 未返回新的授权挑战，请重新授权')
+                    return
+                previous_code = device_code
+                result = self._challenge_attempt(account_id, account, client, challenge,
+                    started=started, deadline=deadline, attempt=attempt)
+                if result != 'login_expired':
+                    return
+                if attempt == 1:
+                    _auth_lifecycle(account_id, 'refresh_requested', attempt=attempt, started=started, deadline=deadline)
+                else:
+                    self._publish(account_id, 'failed', 'CLI 授权验证失败，请重新授权')
         except Exception as exc:
             _auth_diagnostic(account_id, phase, exc)
             self._publish(account_id, 'failed', 'CLI 授权失败，请检查账号代理后重试')
