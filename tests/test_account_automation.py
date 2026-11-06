@@ -1094,6 +1094,17 @@ process.stdout.write(JSON.stringify({view,action,clicks}));
                     ({'body': 'Upgrade now. Get offer'}, False), ({'otherClass': True}, False),
                     ({'extraDialog': True}, False), ({'extraButton': True}, False), ({'badClose': True}, False),
                     ({'duplicateClose': True}, False), ({'input': True}, False), ({'badPanel': True}, False)]
+        def regional_card(price):
+            return ('Save up to 50% on plans to unlock Seedance. Seedance 2.5 at 720p' +
+                    (' from ' + price if price else '.') +
+                    ' Upgrade for up to 500 Seedance 2.5 + 6,000 GPT Image 2.5 free generations. Get offer')
+        for price in ('A$0.12/sec.', 'S$0.09/sec.', 'US$0.08/sec.', 'EUR 0,09/sec.',
+                      'a regional promotional rate.', ''):
+            variants.append(({'body': regional_card(price), 'nestedDialog': True}, True))
+        for extra in ('nestedExtra', 'extraDialog', 'duplicateClose', 'extraButton'):
+            variants.append(({'body': regional_card('S$0.09/sec.'), extra: True}, False))
+        variants.append(({'body': regional_card('S$0.09/sec.').replace('Seedance 2.5 at 720p',
+                          'Another product at 720p')}, False))
         for config, allowed in variants:
             with self.subTest(config=config):
                 data = {'config': config, 'view': _VIEW, 'action': _CLICK.replace('__ACTION__', json.dumps('promotion'))}
