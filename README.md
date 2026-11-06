@@ -349,6 +349,7 @@ until its login identity, credit read, watermark preference, and AI-content
 agreement state are confirmed. The importer does not take over active video
 tasks, change an existing account's identity, or overwrite another profile.
 Duplicates are reported, and failed jobs can use **自动登录** to retry.
+同一桌面的账号可并行加载页面和读取身份，但完整去水印菜单、残留会话登出及新浏览器窗口启动按事务互斥，避免菜单在跨账号抢焦点时关闭。纯页面状态读取不切换焦点；过期等待者不会再填入凭据或点击。失败清理前仅记录白名单原因、身份验证分类、设置布尔值及控件数量，不记录账号标识、UID、输入值、Cookie 或 DOM 全文。身份绑定、网站保存后的去水印读回及 AI 协议校验门槛保持不变。
 Passwords are private database fields and are excluded from management APIs,
 batch results, logs, and exports. A successful import clears the form's password
 textarea. Verification challenges and unknown dialogs remain available for

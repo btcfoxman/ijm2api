@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import json
+import logging
 import time
 from pathlib import Path
 from typing import Callable
 
-from .account_automation import AccountAutomation
+from .account_automation import AccountAutomation, safe_failure_diagnostic
 from .browser import browser_alive, start_managed_browser
 from .client import DreaminaClient
 
@@ -19,6 +21,7 @@ SAFE_FAILURES = {
     'setup_required': '账号设置尚未确认，请使用网页登录检查去水印和 AI 协议',
     'login_required': '登录会话尚未验证，请重试或使用网页登录',
 }
+log = logging.getLogger(__name__)
 
 
 def verified_login_user_id(ready: dict) -> str:
@@ -105,6 +108,7 @@ class AutoLoginManager:
                 self.store.update_account(account_id, {'login_stage': value})
 
         completed = False
+        automation = None
         browser_slots = getattr(self.service, '_browser_aux_slots', None)
         owns_slot = False
         try:
@@ -135,8 +139,9 @@ class AutoLoginManager:
                             or current.get('login_user_id') not in ('', None, user_id)):
                         raise ValueError('account identity changed during login')
                     self.store.update_account(account_id, {'login_user_id': user_id})
-            ready = AccountAutomation(account, settings).run(account['login_email'], account['login_password'],
-                                                            on_stage=stage, on_identity=preserve_identity)
+            automation = AccountAutomation(account, settings)
+            ready = automation.run(account['login_email'], account['login_password'],
+                                   on_stage=stage, on_identity=preserve_identity)
             if any(ready.get(key) is not True for key in ('watermark_ready', 'agreement_ready', 'identity_verified')):
                 self.store.update_account(account_id, {'status': 'setup_required', 'login_stage': 'setup_required',
                     'last_error': SAFE_FAILURES['setup_required'], 'enabled': False})
@@ -161,8 +166,16 @@ class AutoLoginManager:
             completed = True
         except Exception as error:
             status = getattr(error, 'status', '')
-            if status not in SAFE_FAILURES:
+            if not isinstance(status, str) or status not in SAFE_FAILURES:
                 status = 'login_failed'
+            diagnostic = getattr(error, 'safe_diagnostic', None)
+            try:
+                if not isinstance(diagnostic, dict) and automation is not None:
+                    diagnostic = automation.failure_diagnostic(error)
+            except Exception:
+                pass
+            log.warning('Automatic login stopped category=%s diagnostic=%s', status,
+                        json.dumps(safe_failure_diagnostic(diagnostic), sort_keys=True))
             self.store.update_account(account_id, {'status': status, 'enabled': False,
                 'login_stage': status, 'last_error': SAFE_FAILURES[status]})
         finally:

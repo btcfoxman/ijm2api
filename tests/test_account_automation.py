@@ -872,8 +872,7 @@ class LoginTests(unittest.TestCase):
                         AccountAutomation(ACCOUNT, browser=browser).run(ACCOUNT['login_email'], 'synthetic-password')
                 self.assertEqual(caught.exception.status, status)
                 browser.post.assert_not_called()
-                self.assertTrue(browser.command.call_args_list)
-                self.assertTrue(all(call.args[0] == 'Page.bringToFront' for call in browser.command.call_args_list))
+                browser.command.assert_not_called()
 
     def test_no_repeated_password_submission_while_login_is_pending(self):
         automation = AccountAutomation(ACCOUNT, browser=browser_with_settings(READY))

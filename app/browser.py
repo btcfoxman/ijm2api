@@ -27,6 +27,9 @@ COMMERCE_API = "https://commerce-api-sg.capcut.com"
 COMMERCE_US_API = "https://commerce-us-ttp2.us.capcut.com"
 COMMERCE_US_ORIGINS = (COMMERCE_US_API, "https://commerce.us.capcut.com")
 _PROCESS_LOCK = threading.RLock()
+# Visible browser creation and account menu transactions share one desktop.
+# Keep this transport-owned lock independent of account automation imports.
+_DESKTOP_UI_LOCK = threading.RLock()
 _PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 _UPLOAD_LOCKS: dict[int, threading.RLock] = {}
 _TIMING_GUARD = threading.Lock()
@@ -278,7 +281,7 @@ def start_managed_browser(account: dict[str, Any], *, chrome: str, profiles: Pat
     # The new tab is ours and has not loaded account resources yet. Register
     # the persistent init script before its first normal website navigation.
     args.append("about:blank")
-    with _PROCESS_LOCK:
+    with _DESKTOP_UI_LOCK, _PROCESS_LOCK:
         if browser_alive(port, **options):
             ensure_resource_timing_capture(port, **options)
             return port

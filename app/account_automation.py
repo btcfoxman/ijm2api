@@ -11,9 +11,10 @@ import math
 import re
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any, Callable
 
-from .browser import BrowserError, CDPBrowser, account_proxy_url
+from .browser import BrowserError, CDPBrowser, account_proxy_url, _DESKTOP_UI_LOCK
 
 
 class AutomationError(BrowserError):
@@ -26,9 +27,69 @@ class UnboundSessionError(AutomationError):
     """A masked residual session needs a fresh normal credential login."""
 
 
-_UI_LOCK = threading.RLock()
+_UI_LOCK = _DESKTOP_UI_LOCK
 _SETTINGS_GUARD = threading.Lock()
 _SETTINGS_LOCKS: dict[tuple[int, int], threading.RLock] = {}
+
+_DIAGNOSTIC_STAGES = frozenset({'signed_out', 'provider', 'email', 'password', 'questionnaire',
+    'promotion', 'watermark', 'waiting', 'unknown', 'challenge', 'verification', 'failed',
+    'avatar_loading', 'avatar', 'menu', 'modal', 'blocked'})
+_FAILURE_REASONS = {
+    'Dreamina signed-in identity does not match this account': 'identity_mismatch',
+    'Dreamina identity read could not complete': 'identity_read_unavailable',
+    'Dreamina residual session requires a fresh credential login': 'residual_identity_unbound',
+    'Dreamina sign-out control was not confirmed': 'signout_control_unconfirmed',
+    'Dreamina sign-out did not finish': 'signout_unconfirmed',
+    'Dreamina signed-out state was not confirmed': 'signout_unconfirmed',
+    'Dreamina session recovery requires manual page review': 'signout_page_review',
+    'Dreamina account settings could not be verified': 'settings_read_unavailable',
+    'Dreamina account settings response is incomplete': 'settings_read_incomplete',
+    'Dreamina account settings were not confirmed': 'settings_unconfirmed',
+    'Dreamina watermark preference was not confirmed': 'watermark_unconfirmed',
+    'Dreamina account menu is busy': 'menu_transaction_busy',
+    'Dreamina login did not finish before the deadline': 'login_deadline',
+    'Dreamina login result was not confirmed': 'login_result_unconfirmed',
+    'Dreamina did not accept the login': 'login_rejected',
+    'Dreamina login returned to its start after credentials were submitted': 'credential_flow_returned',
+    'Dreamina requires manual page review': 'unknown_page_review',
+    'Dreamina optional dialog could not be closed': 'optional_dialog_unconfirmed',
+    'Dreamina optional offer could not be closed': 'optional_dialog_unconfirmed',
+    'Dreamina login page is not ready': 'login_page_unavailable',
+    'Dreamina login session has not been verified': 'login_identity_unverified',
+}
+
+
+def safe_failure_diagnostic(value: Any) -> dict[str, Any]:
+    """Only static enums, booleans and bounded counts may reach failure logs."""
+    value = value if isinstance(value, dict) else {}
+    reason = value.get('reason')
+    result = {'reason': reason if isinstance(reason, str) and reason in set(_FAILURE_REASONS.values()) else 'unclassified'}
+    for name in ('view_stage', 'watermark_stage'):
+        stage = value.get(name)
+        result[name] = stage if isinstance(stage, str) and stage in _DIAGNOSTIC_STAGES else 'unknown'
+    identity = value.get('identity_observation')
+    result['identity_observation'] = identity if isinstance(identity, str) and identity in {
+        'not_observed', 'identity_read_unavailable', 'identity_not_authenticated', 'identity_mismatch',
+        'residual_identity_unbound', 'identity_verified'} else 'not_observed'
+    for name in ('watermark_checked', 'close_watermark', 'aigc_compliance_confirmed',
+                 'diagnostic_read_failed', 'password_submitted', 'ui_action_expired'):
+        result[name] = value.get(name) if type(value.get(name)) is bool else None
+    for name in ('modal_count', 'watermark_modal_count', 'switch_count', 'save_button_count'):
+        count = value.get(name)
+        result[name] = count if type(count) is int and 0 <= count <= 1000 else 0
+    return result
+
+
+_SAFE_DOM_DIAGNOSTIC = r"""(()=>{
+ const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);
+   return r.width>2&&r.height>2&&s.display!=='none'&&s.visibility!=='hidden';};
+ const text=e=>(e.innerText||e.textContent||'').trim().replace(/\s+/g,' ');
+ const roots=[...document.querySelectorAll('[class*="watermark-setting-modal-"]')].filter(visible);
+ return {modal_count:[...document.querySelectorAll('[role=dialog],dialog,.lv-modal-wrapper')].filter(visible).length,
+   watermark_modal_count:roots.length,
+   switch_count:roots.flatMap(e=>[...e.querySelectorAll('[role=switch],[role=checkbox],input[type=checkbox]')].filter(visible)).length,
+   save_button_count:roots.flatMap(e=>[...e.querySelectorAll('button,[role=button]')].filter(x=>visible(x)&&text(x)==='Save preference')).length};
+})()"""
 
 _IDENTITY = r"""(async()=>{
  const matches=performance.getEntriesByType('resource').map(x=>x.name).filter(value=>{
@@ -294,6 +355,9 @@ class AccountAutomation:
         self.allow_initial_identity = allow_initial_identity is True
         self._password_submitted = False
         self.verified_user_id = ''
+        self._last_settings: dict[str, Any] = {}
+        self._identity_observation = 'not_observed'
+        self._ui_action_expired = False
         settings = settings or {}
         self.timeout = min(300.0, max(15.0, float(settings.get('auto_login_timeout_seconds') or 180)))
         key = (int(account.get('id') or 0), int(account.get('cdp_port') or 0))
@@ -301,14 +365,18 @@ class AccountAutomation:
             self._settings_lock = _SETTINGS_LOCKS.setdefault(key, threading.RLock())
 
     def _identity(self) -> dict[str, Any] | None:
+        self._identity_observation = 'identity_read_unavailable'
         value = self.browser.evaluate(_IDENTITY, await_promise=True)
         if not isinstance(value, dict) or value.get('transport_error'):
+            self._identity_observation = 'identity_read_unavailable'
             raise AutomationError('login_required', 'Dreamina identity read could not complete')
         if value.get('authenticated') is not True or not value.get('user_id'):
+            self._identity_observation = 'identity_not_authenticated'
             return None
         user_id = value['user_id']
         if (not isinstance(user_id, str) or not user_id or user_id == '0' or len(user_id) > 256
                 or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in user_id)):
+            self._identity_observation = 'identity_mismatch'
             raise AutomationError('login_required', 'Dreamina signed-in identity does not match this account')
         email = str(value.get('email') or '').strip().casefold()
         masked = '*' in email
@@ -319,15 +387,19 @@ class AccountAutomation:
                             and self.expected_email.endswith(mask[2])
                             and len(self.expected_email) > len(mask[1]) + len(mask[2]))
         if self.expected_email and ((masked and not mask_matches) or (not masked and email != self.expected_email)):
+            self._identity_observation = 'identity_mismatch'
             raise AutomationError('login_required', 'Dreamina signed-in identity does not match this account')
         bound_id = str(self.account.get('login_user_id') or self.verified_user_id or '')
         expected_id = str(self.account.get('user_id') or '')
         if ((bound_id and user_id != bound_id) or (expected_id and user_id != expected_id)):
+            self._identity_observation = 'identity_mismatch'
             raise AutomationError('login_required', 'Dreamina signed-in identity does not match this account')
         if (masked and self.expected_email and not bound_id
                 and not (self._password_submitted or self.allow_initial_identity)):
+            self._identity_observation = 'residual_identity_unbound'
             raise UnboundSessionError('login_required', 'Dreamina residual session requires a fresh credential login')
         self.verified_user_id = user_id
+        self._identity_observation = 'identity_verified'
         return {'user_id': user_id, 'email': email}
 
     def _settings(self) -> dict[str, Any]:
@@ -338,8 +410,75 @@ class AccountAutomation:
         settings = value.get('user_custom_settings') if isinstance(value, dict) else None
         if not isinstance(settings, dict):
             raise AutomationError('setup_required', 'Dreamina account settings response is incomplete')
-        return {field: settings.get(field) for field in
-                ('close_watermark', 'close_watermark_popup_tip', 'aigc_compliance_confirmed')}
+        self._last_settings = {field: settings.get(field) for field in
+                              ('close_watermark', 'close_watermark_popup_tip', 'aigc_compliance_confirmed')}
+        return dict(self._last_settings)
+
+    def failure_diagnostic(self, error: Exception) -> dict[str, Any]:
+        """Bounded reads only, before cleanup; never identity, inputs or SDK requests."""
+        result = {'reason': _FAILURE_REASONS.get(str(error), 'unclassified'), **self._last_settings,
+                  'identity_observation': self._identity_observation,
+                  'password_submitted': self._password_submitted,
+                  'ui_action_expired': self._ui_action_expired}
+        try:
+            with self.browser.command_budget(time.monotonic() + 3, timeout=1):
+                view = self.browser.evaluate(_VIEW)
+                watermark = self.browser.evaluate(_WATERMARK.replace('__ACTION__', json.dumps('view')))
+                dom = self.browser.evaluate(_SAFE_DOM_DIAGNOSTIC)
+            result.update(view_stage=view.get('stage') if isinstance(view, dict) else None,
+                          watermark_stage=watermark.get('stage') if isinstance(watermark, dict) else None,
+                          watermark_checked=watermark.get('checked') if isinstance(watermark, dict) else None)
+            if isinstance(dom, dict):
+                result.update({key: dom.get(key) for key in
+                    ('modal_count', 'watermark_modal_count', 'switch_count', 'save_button_count')})
+        except Exception:
+            result['diagnostic_read_failed'] = True
+        return safe_failure_diagnostic(result)
+
+    @contextmanager
+    def _menu_transaction(self, deadline: float):
+        deadline = min(deadline, getattr(self, '_login_deadline', deadline))
+        if not _UI_LOCK.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise AutomationError('setup_required', 'Dreamina account menu is busy')
+        previous = getattr(self, '_menu_deadline', None)
+        self._menu_deadline = deadline
+        try:
+            if time.monotonic() >= deadline:
+                raise AutomationError('setup_required', 'Dreamina account menu is busy')
+            yield deadline
+        except Exception as error:
+            # Capture while this transaction still owns focus, before another
+            # account can open a menu and before the manager closes the page.
+            try:
+                error.safe_diagnostic = self.failure_diagnostic(error)
+            except Exception:
+                pass
+            raise
+        finally:
+            if previous is None:
+                del self._menu_deadline
+            else:
+                self._menu_deadline = previous
+            _UI_LOCK.release()
+
+    @contextmanager
+    def _focus_action(self):
+        deadlines = [value for value in (getattr(self, '_login_deadline', None),
+                     getattr(self, '_menu_deadline', None)) if value is not None]
+        deadline = min(deadlines) if deadlines else None
+        acquired = (_UI_LOCK.acquire() if deadline is None else
+                    _UI_LOCK.acquire(timeout=max(0, deadline - time.monotonic())))
+        if not acquired:
+            self._ui_action_expired = True
+            yield False
+            return
+        try:
+            allowed = deadline is None or time.monotonic() < deadline
+            if not allowed:
+                self._ui_action_expired = True
+            yield allowed
+        finally:
+            _UI_LOCK.release()
 
     @staticmethod
     def _ready(identity: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
@@ -412,7 +551,12 @@ class AccountAutomation:
     def _watermark_action(self, action: str = 'view') -> dict[str, Any]:
         if action not in {'view', 'warm_avatar', 'open_avatar', 'open_setting', 'toggle', 'save'}:
             raise ValueError('unsupported watermark UI action')
-        with _UI_LOCK:
+        if action == 'view':
+            value = self.browser.evaluate(_WATERMARK.replace('__ACTION__', json.dumps('view')))
+            return value if isinstance(value, dict) else {'stage': 'unknown'}
+        with self._focus_action() as allowed:
+            if not allowed:
+                return {'stage': 'waiting'}
             self.browser.command('Page.bringToFront')
             value = self.browser.evaluate(_WATERMARK.replace('__ACTION__', json.dumps(action)))
             target_stage = {'open_avatar': 'avatar_target', 'warm_avatar': 'avatar_warmup_target'}.get(action)
@@ -436,6 +580,10 @@ class AccountAutomation:
 
     def _enable_watermark(self) -> None:
         deadline = time.monotonic() + self.timeout
+        with self._menu_transaction(deadline) as deadline:
+            return self._enable_watermark_locked(deadline)
+
+    def _enable_watermark_locked(self, deadline: float) -> None:
         interaction_deadline: float | None = None
         actions: set[str] = set()
         while time.monotonic() < min(deadline, interaction_deadline or deadline):
@@ -486,9 +634,7 @@ class AccountAutomation:
         raise AutomationError('setup_required', 'Dreamina watermark preference was not confirmed')
 
     def _view(self) -> dict[str, Any]:
-        with _UI_LOCK:
-            self.browser.command('Page.bringToFront')
-            value = self.browser.evaluate(_VIEW)
+        value = self.browser.evaluate(_VIEW)
         if not isinstance(value, dict):
             raise AutomationError('login_required', 'Dreamina login page is not ready')
         return value
@@ -496,6 +642,10 @@ class AccountAutomation:
     def _restart_unbound_session(self) -> None:
         """Sign out through the recorded menu; never accept the residual identity."""
         deadline = time.monotonic() + min(30, self.timeout)
+        with self._menu_transaction(deadline) as deadline:
+            return self._restart_unbound_session_locked(deadline)
+
+    def _restart_unbound_session_locked(self, deadline: float) -> None:
         warmed = opened = False
         while time.monotonic() < deadline:
             view = self.browser.evaluate(_VIEW)
@@ -504,7 +654,9 @@ class AccountAutomation:
             current = self._watermark_action()
             stage = current.get('stage')
             if stage == 'menu':
-                with _UI_LOCK:
+                with self._focus_action() as allowed:
+                    if not allowed:
+                        raise AutomationError('login_required', 'Dreamina sign-out did not finish')
                     if self.browser.evaluate(_SIGN_OUT) is not True:
                         raise AutomationError('login_required', 'Dreamina sign-out control was not confirmed')
                 break
@@ -540,7 +692,9 @@ class AccountAutomation:
     def _action(self, stage: str, email: str, password: str) -> bool:
         if stage not in {'signed_out', 'provider', 'email', 'password', 'questionnaire', 'promotion'}:
             return False
-        with _UI_LOCK:
+        with self._focus_action() as allowed:
+            if not allowed:
+                return False
             self.browser.command('Page.bringToFront')
             latest = self.browser.evaluate(_VIEW)
             if not isinstance(latest, dict) or latest.get('stage') != stage:
@@ -589,6 +743,7 @@ class AccountAutomation:
         self._password_submitted = False
         callback = on_stage or (lambda _stage: None)
         deadline = time.monotonic() + self.timeout
+        self._login_deadline = deadline
         actions: set[str] = set()
         # Only opening the login UI and choosing its email provider are safe
         # navigation. A cold page may ignore the first event while its SDK

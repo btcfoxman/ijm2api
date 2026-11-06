@@ -151,6 +151,32 @@ def test_raw_browser_failure_never_exposes_credentials(context):
     assert 'private' not in json.dumps(saved)
 
 
+def test_safe_failure_diagnosis_is_logged_before_browser_cleanup_without_identity(context, caplog):
+    from app.account_automation import AutomationError
+    store, service, manager = context
+    item = account(store)
+    pool = queued(manager)
+    manager.start(item['id'])
+    order = []
+    secret = 'private-uid-cookie-password-email'
+    def diagnostic(error):
+        order.append('diagnostic')
+        return {'reason': 'settings_read_unavailable', 'view_stage': 'waiting',
+                'user_id': secret, 'email': secret, 'cookies': secret, 'dom': secret}
+    service.browser_runtime.close_idle = Mock(side_effect=lambda _: order.append('cleanup'))
+    with (patch('app.auto_login.start_managed_browser', return_value=19301),
+          patch('app.auto_login.AccountAutomation') as factory):
+        factory.return_value.run.side_effect = AutomationError('setup_required', secret)
+        factory.return_value.failure_diagnostic.side_effect = diagnostic
+        fn, identifier, enable = pool.submit.call_args.args
+        fn(identifier, enable)
+    assert order == ['diagnostic', 'cleanup']
+    assert 'settings_read_unavailable' in caplog.text
+    assert secret not in caplog.text and 'account_id' not in caplog.text
+    assert item['name'] not in caplog.text and 'person1@example.test' not in caplog.text
+    assert store.account(item['id'])['status'] == 'setup_required'
+
+
 def test_verified_identity_survives_later_settings_failure_without_enabling(context):
     from app.account_automation import AutomationError
     store, service, manager = context

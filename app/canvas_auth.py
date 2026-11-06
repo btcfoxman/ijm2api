@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import datetime, timezone
 import json
+import logging
 import math
 import threading
 import time
@@ -20,6 +21,31 @@ from .auto_login import verified_login_user_id
 
 _PUBLIC_STATES = {'queued', 'authorizing', 'manual_required', 'ready', 'failed', 'cancelled', 'expired'}
 _AUTH_HOSTS = {'dreamina.capcut.com'}
+_AUTH_LOG = logging.getLogger(__name__)
+_AUTH_DIAGNOSTIC_CODES = {
+    'cli.transport_failed', 'cli.invalid_service_response', 'cli.authentication_required',
+    'cli.authorization_pending', 'cli.authorization_expired', 'cli.rate_limited',
+    'cli.service_unavailable', 'cli.invalid_input', 'cli.internal_error',
+    'cli_command_timeout', 'cli_invalid_response', 'cli_proxy_required',
+    'cli_proxy_wrapper_unavailable', 'cli_output_read_failed', 'cli_unavailable',
+    'cli_account_busy', 'cli_stopping', 'cli_task_deadline_exceeded',
+}
+
+
+def _auth_diagnostic(account_id: int, phase: str, error: Exception | None = None, *,
+                     confirmed: bool = False, manual: bool = False) -> None:
+    """Keep actionable categories, never exception text, device codes or identity values."""
+    phases = {'auth_wait', 'identity', 'browser_confirmation', 'authorization_deadline',
+              'prepare_browser', 'auth_start', 'browser_open', 'flow'}
+    code = getattr(error, 'code', '') if error is not None else ''
+    code = code.lower() if isinstance(code, str) else ''
+    kind = type(error).__name__ if error is not None else 'none'
+    _AUTH_LOG.warning('canvas_auth_diagnostic account_id=%d phase=%s code=%s error_type=%s confirmed=%s manual=%s',
+        int(account_id), phase if phase in phases else 'flow',
+        code if code in _AUTH_DIAGNOSTIC_CODES else 'other' if error is not None else 'none',
+        kind if kind in {'CanvasCLIError', 'BrowserError', 'TimeoutError', 'ConnectionError',
+                         'WebSocketTimeoutException', 'RuntimeError', 'AutomationError', 'none'} else 'other',
+        bool(confirmed), bool(manual))
 _CONFIRM = r"""(() => {
  if(location.protocol!=='https:'||location.hostname!=='dreamina.capcut.com'||!/^\/ai-tool\/cli-auth-os\/?$/.test(location.pathname))return 'manual_required';
  const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>1&&r.height>1&&s.display!=='none'&&s.visibility!=='hidden';};
@@ -386,15 +412,18 @@ class CanvasAuthManager:
                         self._publish(account_id, 'manual_required', '授权需要人工确认，请打开账号授权画面完成')
                     elif state == 'confirmed':
                         clicked = True
-                except Exception:
+                except Exception as exc:
+                    _auth_diagnostic(account_id, 'browser_confirmation', exc, confirmed=clicked, manual=True)
                     manual = True
                     self._publish(account_id, 'manual_required', '自动授权未完成，请打开账号授权画面确认')
             try:
+                phase = 'auth_wait'
                 result = client.auth_wait(device_code, timeout=5)
                 if isinstance(result, dict) and str(result.get('status') or result.get('state') or '').lower() in {
                         'pending', 'authorization_pending', 'waiting', 'timeout'}:
                     cancel.wait(.5)
                     continue
+                phase = 'identity'
                 self._accept_identity(account_id, account, client.identity())
                 return
             except Exception as exc:
@@ -402,19 +431,24 @@ class CanvasAuthManager:
                 if any(part in code for part in ('PENDING', 'TIMEOUT', 'SLOW_DOWN', 'WAITING')):
                     cancel.wait(1)
                     continue
+                _auth_diagnostic(account_id, phase, exc, confirmed=clicked, manual=manual)
                 self._publish(account_id, 'failed', 'CLI 授权验证失败，请重新授权')
                 return
+        if not cancel.is_set() and not self._closed:
+            _auth_diagnostic(account_id, 'authorization_deadline', confirmed=clicked, manual=manual)
         self._publish(account_id, 'cancelled' if cancel.is_set() or self._closed else 'expired',
             'CLI 授权已取消' if cancel.is_set() or self._closed else 'CLI 授权已过期，请重试')
 
     def _run(self, account_id: int) -> None:
         job = self._jobs[account_id]
         cancel = job['cancel']
+        phase = 'flow'
         try:
             if cancel.is_set() or self._closed:
                 self._publish(account_id, 'cancelled', 'CLI 授权已取消')
                 return
             account = self.store.account(account_id, private=True)
+            phase = 'prepare_browser'
             account = self._prepare_browser_account(account_id, account)
             if account is None:
                 return
@@ -431,6 +465,7 @@ class CanvasAuthManager:
             if identity is not None:
                 self._accept_identity(account_id, account, identity)
                 return
+            phase = 'auth_start'
             response = client.auth_start(force=True) if job['force'] else client.auth_start()
             challenge = response.get('challenge') if isinstance(response, dict) else None
             if not isinstance(challenge, dict) or not challenge.get('deviceCode'):
@@ -458,6 +493,7 @@ class CanvasAuthManager:
                 if slot:
                     resources.callback(self._browser_slots.release)
                     try:
+                        phase = 'browser_open'
                         browser_account = resources.enter_context(self.service.browser_runtime.lease(account))
                         browser = self.browser_factory(browser_account)
                         browser.open(str(uri))
@@ -467,13 +503,15 @@ class CanvasAuthManager:
                         # Close a viewer lease first, the worker browser second,
                         # and only then release its auxiliary concurrency slot.
                         resources.callback(self._close_assist, account_id)
-                    except Exception:
+                    except Exception as exc:
+                        _auth_diagnostic(account_id, phase, exc, manual=True)
                         browser = None
                         resources.close()
                         self._publish(account_id, 'manual_required', '自动授权未完成，请打开账号授权画面确认')
                 self._await_authorization(account_id, account, client,
                     str(challenge['deviceCode']), deadline, browser=browser)
-        except Exception:
+        except Exception as exc:
+            _auth_diagnostic(account_id, phase, exc)
             self._publish(account_id, 'failed', 'CLI 授权失败，请检查账号代理后重试')
         finally:
             self._close_assist(account_id)
