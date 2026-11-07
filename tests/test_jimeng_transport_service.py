@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from app.browser import BrowserRejected, CDPTransportError
-from app.errors import BOUNDED_RETRY_FAILURE_MESSAGE
+from app.errors import RETRYABLE_GENERATION_MESSAGE
 from app.service import AccountMaintenanceBusy
 from test_jimeng_execution import context, create
 
@@ -89,7 +89,7 @@ def test_transport_before_dispatch_preserves_truthful_facts_and_never_replays(co
     assert diagnostic == {'code': 'CDP_TRANSPORT_FAILED', 'method': 'Runtime.evaluate', 'phase': 'receive',
                           'command_sent': True, 'exception_type': 'WebSocketTimeoutException', 'retryable': True}
     public = context.service.public_task(result)
-    assert public['error']['message'] == BOUNDED_RETRY_FAILURE_MESSAGE
+    assert public['error']['message'] == RETRYABLE_GENERATION_MESSAGE
     assert public['provider_context']['generation_request_sent'] is False
     assert context.store.account(context.account['id'])['status'] == 'network_error'
     if not late:

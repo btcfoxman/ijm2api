@@ -11,7 +11,9 @@ import pytest
 from app.auto_login import AutoLoginManager
 from app.browser import BrowserError, account_browser_options
 from app.canvas_auth import CanvasAuthManager
-from app.errors import (BOUNDED_RETRY_FAILURE_MESSAGE, GenerationCapabilityDenied,
+from app.canvas_cli import sanitize
+from app.admission import AdmissionRejected
+from app.errors import (RETRYABLE_GENERATION_MESSAGE, GenerationCapabilityDenied,
                         RegionGenerationDenied, public_error)
 from app.store import Store
 
@@ -82,14 +84,15 @@ def test_new_admission_rejections_use_approved_messages_and_no_acceptance(endpoi
     logger = Mock()
     namespace = {'Any': object, 'service': service, 'HTTPException': HTTPException, 'Body': Body,
                  'GenerationCapabilityDenied': GenerationCapabilityDenied, 'RegionGenerationDenied': RegionGenerationDenied,
-                 'public_error': public_error, 'logger': logger}
+                 'public_error': public_error, 'logger': logger, 'AdmissionRejected': AdmissionRejected, 'sanitize': sanitize}
     exec(compile(ast.Module(body=functions, type_ignores=[]), 'main-admission', 'exec'), namespace)
     with pytest.raises(HTTPException) as caught:
         namespace[endpoint]({'model': 'synthetic'})
-    assert caught.value.status_code == 422
-    assert caught.value.detail == BOUNDED_RETRY_FAILURE_MESSAGE
-    assert caught.value.headers == {'X-IJMAPI-Submit-Outcome': 'not-accepted'}
-    logger.info.assert_called_once_with('Generation rejected before submission: %s', getattr(service, method).side_effect)
+    assert caught.value.status_code == 503
+    assert caught.value.detail == RETRYABLE_GENERATION_MESSAGE
+    code = 'REGION_GENERATION_DENIED' if error is RegionGenerationDenied else 'JIMENG_PROTOCOL_UNAVAILABLE'
+    assert caught.value.headers == {'X-IJMAPI-Submit-Outcome': 'not-accepted', 'X-IJMAPI-Error-Code': code}
+    logger.warning.assert_called_once_with('Generation rejected before submission (code=%s): %s', code, diagnostic)
     getattr(service, method).assert_called_once_with({'model': 'synthetic'})
 
 

@@ -19,6 +19,7 @@ RETRYABLE_SUBMISSION_MESSAGE = "视频生成提交失败，请稍后重试~"
 BOUNDED_RETRY_FAILURE_MESSAGE = "视频生成提交失败，请稍后重试~"
 UNCERTAIN_SUBMISSION_MESSAGE = "提交结果未确认，请核对上游任务，暂勿重复提交~"
 PARAMETER_VALIDATION_MESSAGE = "请求参数未通过上游校验，请检查参数或参考素材后重试~"
+RETRYABLE_GENERATION_MESSAGE = "生成失败，请稍后重试~"
 
 
 def upstream_review_error(code: str, message: str) -> str | None:
@@ -48,8 +49,9 @@ def public_error(code: str, message: str) -> dict[str, str]:
         return {'code': kind, 'message': BOUNDED_RETRY_FAILURE_MESSAGE}
     # Typed phases win over arbitrary diagnostic prose. These codes retain
     # routing detail while callers receive only the approved message set.
-    if kind in {'REGION_GENERATION_DENIED', 'JIMENG_PROTOCOL_UNAVAILABLE',
-                'JIMENG_CREDITS_INSUFFICIENT', 'JIMENG_UPSTREAM_FAILED'}:
+    if kind in {'REGION_GENERATION_DENIED', 'JIMENG_PROTOCOL_UNAVAILABLE'}:
+        return {'code': kind, 'message': RETRYABLE_GENERATION_MESSAGE}
+    if kind in {'JIMENG_CREDITS_INSUFFICIENT', 'JIMENG_UPSTREAM_FAILED'}:
         return {'code': kind, 'message': BOUNDED_RETRY_FAILURE_MESSAGE}
     if kind == 'JIMENG_UPSTREAM_REJECTED':
         return {'code': kind, 'message': PARAMETER_VALIDATION_MESSAGE}

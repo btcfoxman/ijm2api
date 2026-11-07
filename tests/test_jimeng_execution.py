@@ -739,9 +739,12 @@ def test_zero_balance_admission_never_relaxes_invalid_balance_or_existing_accoun
                                  'JIMENG_CREDITS_INSUFFICIENT', 'JIMENG_UPSTREAM_FAILED',
                                  'JIMENG_UPSTREAM_REJECTED'])
 def test_typed_jimeng_rejections_preserve_routing_codes_and_only_use_approved_caller_messages(code):
-    from app.errors import public_error, BOUNDED_RETRY_FAILURE_MESSAGE, PARAMETER_VALIDATION_MESSAGE
+    from app.errors import (public_error, BOUNDED_RETRY_FAILURE_MESSAGE, PARAMETER_VALIDATION_MESSAGE,
+                            RETRYABLE_GENERATION_MESSAGE)
     raw = 'raw admin diagnostic: video may contain third-party content; credits returned; region cn'
-    expected = PARAMETER_VALIDATION_MESSAGE if code == 'JIMENG_UPSTREAM_REJECTED' else BOUNDED_RETRY_FAILURE_MESSAGE
+    expected = (PARAMETER_VALIDATION_MESSAGE if code == 'JIMENG_UPSTREAM_REJECTED' else
+                RETRYABLE_GENERATION_MESSAGE if code in {'REGION_GENERATION_DENIED', 'JIMENG_PROTOCOL_UNAVAILABLE'}
+                else BOUNDED_RETRY_FAILURE_MESSAGE)
     assert public_error(code, raw) == {'code': code, 'message': expected}
 
 
@@ -803,7 +806,7 @@ def test_media_format_and_size_categories_preserve_raw_diagnostic_and_approved_c
 
 
 def test_upload_error_retains_the_specific_sanitized_reason_and_uses_approved_jimeng_failure_message(context):
-    from app.errors import BOUNDED_RETRY_FAILURE_MESSAGE
+    from app.errors import RETRYABLE_GENERATION_MESSAGE
     identifier = create(context)
     diagnostic = 'Jimeng upload blob host is unsupported'
     context.client.upload_inputs.side_effect = UploadError(diagnostic)
@@ -812,7 +815,7 @@ def test_upload_error_retains_the_specific_sanitized_reason_and_uses_approved_ji
     assert row['error_code'] == 'MEDIA_UPLOAD_FAILED' and row['error_message'] == diagnostic
     assert row['run_id'] == '' and row['attempted_account_ids'] == [] and row['actual_cost'] is None
     assert context.service.public_task(row)['error'] == {'code': 'MEDIA_UPLOAD_FAILED',
-        'message': BOUNDED_RETRY_FAILURE_MESSAGE}
+        'message': RETRYABLE_GENERATION_MESSAGE}
     context.client.prepare_submit.assert_not_called()
     context.client.submit_prepared.assert_not_called()
 

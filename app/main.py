@@ -24,7 +24,8 @@ from .browser_login_api import register_browser_login
 from .account_import import AccountImporter
 from .auto_login import AutoLoginManager
 from .canvas_auth import CanvasAuthManager
-from .canvas_cli import CanvasCLIError
+from .canvas_cli import CanvasCLIError, sanitize
+from .admission import AdmissionRejected, register_admission_errors
 from .catalog import public_models
 from .image_client import IMAGE_MODELS, image_model_requires_cli
 from .errors import GenerationCapabilityDenied, RegionGenerationDenied, public_error
@@ -70,6 +71,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="IJM2API", version="0.1.0", lifespan=lifespan)
+register_admission_errors(app)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
@@ -558,10 +560,9 @@ def integration_docs() -> PlainTextResponse:
 
 
 def _admission_rejection(exc: ValueError) -> HTTPException:
-    logger.info("Generation rejected before submission: %s", exc)
     code = "REGION_GENERATION_DENIED" if isinstance(exc, RegionGenerationDenied) else "JIMENG_PROTOCOL_UNAVAILABLE"
-    return HTTPException(status_code=422, detail=public_error(code, str(exc))["message"],
-                         headers={"X-IJMAPI-Submit-Outcome": "not-accepted"})
+    logger.warning("Generation rejected before submission (code=%s): %s", code, sanitize(str(exc)))
+    return AdmissionRejected(code, public_error(code, str(exc))["message"])
 
 
 def _create(body: dict[str, Any]) -> dict[str, Any]:
